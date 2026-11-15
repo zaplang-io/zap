@@ -1517,6 +1517,15 @@ smaller elements before and larger after. These exist as methods (`a.argmin()`,
 `a.searchsorted(v)`, `a.partition(kth)` in place, …) and builtins. Partition's
 non-`kth` order is implementation-defined; complex arrays are rejected.
 
+Large unstable sorts auto-dispatch to a SIMD accelerator (#933): on x86-64 the
+vendored Intel x86-simd-sort (AVX2 / AVX-512), on aarch64 Google Highway vqsort
+(NEON), selected at runtime by CPU feature (the shared detection facility) and
+overridable with `ZAP_ACCEL` (`native` forces the own kernel). It covers the
+default (unstable) `sort`/`argsort` over contiguous arrays of the common numeric
+dtypes above a size threshold; small, strided, stable, or other-dtype sorts and
+CPUs without the ISA use the own kernel. This is a performance choice only — a
+sort is a permutation, so results are identical to the own kernel and NumPy.
+
 The `@` operator (PEP 465) and `dot(a, b)` are matrix multiplication on 1-D and
 2-D arrays: 1-D · 1-D is a scalar dot product, 2-D · 2-D a matrix product, and a
 mixed 1-D/2-D operand is promoted to a row/column with its singleton axis

@@ -4817,11 +4817,18 @@ static void zap_asort_run(ZapArray *a, int64_t axis, int flatten, int stable, Za
     free(lane);
 }
 
+/* SIMD sort accelerator (#933, D-0195); defined in zapsortaccel.inc.c (included
+ * after the cpu_features detector). Each returns 1 if it handled the (unstable,
+ * contiguous, eligible) sort, else 0 -> fall through to the own floor above. */
+int zap_sortaccel_sort_array(void *a, int64_t axis, int64_t flatten, int64_t stable);
+int zap_sortaccel_argsort_array(void *a, int64_t axis, int64_t flatten, int64_t stable, void *out);
+
 /* `a.sort(axis=-1, kind=)` — sort in place along `axis` (bad axis raises a
  * catchable ValueError). `stable` selects the kind. */
 void zap_array_sort_inplace(void *ap, int64_t axis, int64_t stable) {
     ZapArray *a = (ZapArray *)ap;
     int64_t ax = zap_array_axis_norm(axis, a->ndim);
+    if (zap_sortaccel_sort_array(a, ax, 0, stable)) return;
     zap_asort_run(a, ax, 0, (int)stable, NULL);
 }
 /* `sort(a, axis=-1|None, kind=)` — a new sorted copy. `flatten` (axis=None)
@@ -4835,7 +4842,8 @@ void *zap_array_sorted(void *ap, int64_t axis, int64_t flatten, int64_t stable) 
         for (int64_t f = 0; f < count; f++)
             memcpy((char *)res->data + (size_t)f * esz,
                    (char *)a->data + (size_t)zap_array_phys_nd(a, f) * esz, esz);
-        zap_asort_run(res, 0, 0, (int)stable, NULL);
+        if (!zap_sortaccel_sort_array(res, 0, 1, stable))
+            zap_asort_run(res, 0, 0, (int)stable, NULL);
         return res;
     }
     int64_t ax = zap_array_axis_norm(axis, a->ndim);
@@ -4846,7 +4854,8 @@ void *zap_array_sorted(void *ap, int64_t axis, int64_t flatten, int64_t stable) 
     for (int64_t f = 0; f < count; f++)
         memcpy((char *)res->data + (size_t)f * esz,
                (char *)a->data + (size_t)zap_array_phys_nd(a, f) * esz, esz);
-    zap_asort_run(res, ax, 0, (int)stable, NULL);
+    if (!zap_sortaccel_sort_array(res, ax, 0, stable))
+        zap_asort_run(res, ax, 0, (int)stable, NULL);
     return res;
 }
 /* `argsort(a, axis=-1|None, kind=)` / `a.argsort(...)` — a new i64 index array
@@ -4856,13 +4865,15 @@ void *zap_array_argsort(void *ap, int64_t axis, int64_t flatten, int64_t stable)
     int64_t count = zap_array_count_of(a);
     if (flatten) {
         ZapArray *out = (ZapArray *)zap_array_new(DTYPE_I64, count);
-        zap_asort_run(a, 0, 1, (int)stable, out);
+        if (!zap_sortaccel_argsort_array(a, 0, 1, stable, out))
+            zap_asort_run(a, 0, 1, (int)stable, out);
         return out;
     }
     int64_t ax = zap_array_axis_norm(axis, a->ndim);
     ZapArray *out = (ZapArray *)zap_array_new_nd(DTYPE_I64, a->ndim, count);
     for (int64_t k = 0; k < a->ndim; k++) zap_array_set_dim(out, k, a->dims[k]);
-    zap_asort_run(a, ax, 0, (int)stable, out);
+    if (!zap_sortaccel_argsort_array(a, ax, 0, stable, out))
+        zap_asort_run(a, ax, 0, (int)stable, out);
     return out;
 }
 
@@ -17056,6 +17067,13 @@ void zap_random_shuffle(void *l) {
  * string/bytes search paths (`zap_str_find_bytes`, forward-declared above) route
  * through. */
 #include "zapmemchr.inc.c"
+
+/* SIMD sort accelerator dispatch (#933, D-0195). After zapcpu.inc.c (for
+ * `zap_cpu_has`); the array sort entry points call its two functions via forward
+ * declarations. The per-ISA kernels (zapxsort.cpp / zaphwysort.cpp) are linked
+ * and ZAP_HAVE_SIMDSORT defined only for a program that reaches the sort path on
+ * a supported arch; otherwise this seam returns 0 and the own floor runs. */
+#include "zapsortaccel.inc.c"
 
 /* ===========================================================================
  * json — JSON tokenizer cursor (ticket #100 / #131, D-0059)

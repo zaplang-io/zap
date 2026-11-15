@@ -9436,6 +9436,44 @@ Relates to #934 / #512 (Phase 3 epic, now complete bar the held SIMD ceiling
 #933), D-0190 (the sort floor these build on). The SIMD sort accelerator (#933)
 remains held pending the #920 dispatch-facility decision and SIMD CI hardware.
 
+## D-0195 — numeric-array sort accelerator: vendored x86-simd-sort / Highway vqsort (#933)
+**Status:** implemented
+The SIMD ceiling for the array sort floor (D-0190), riding the ISA-acceleration
+facility (epic #139: `cpu_features` #943/D-0192, multiversioning #944/D-0193, the
+memchr pilot #945/D-0194). Previously held pending that facility; now built.
+- **Kernels (vendored, the libraries NumPy uses).** x86-64: Intel **x86-simd-sort**
+  (header-only `x86simdsortStatic::qsort`/`argsort`), compiled once per tier —
+  AVX2 and AVX-512. aarch64: Google **Highway vqsort**, the static header-only
+  `VQSortStatic`/`VQArgSortStatic` (`VQSORT_ONLY_STATIC`, no Highway dynamic
+  dispatch), compiled for the NEON baseline (SVE is a follow-up). Both under
+  `third_party/` (BSD-3 / Apache-2.0), headers only (+ Highway's one `abort.cc`).
+- **Dispatch.** Hand-written pointer-resolve in C (`zapsortaccel.inc.c`), like the
+  memchr pilot — NOT the #944 codegen cloner (these are C-runtime kernels). The
+  resolver reads the shared `cpu_features` detector and picks the widest tier;
+  `ZAP_ACCEL=native` forces the own floor (reusing `zap_accel_tier`). The per-ISA
+  C++ objects are compiled + linked, and `-DZAP_HAVE_SIMDSORT` set, only for a
+  program that reaches the sort path (BackendUse::simdsort, per-program like the
+  BLAS/FFT seams); otherwise the seam falls through to the own introsort.
+- **Scope.** Only the **unstable** value sort / argsort, over contiguous arrays
+  (no view strides), the last axis or a flattened sort, the 6 common dtypes
+  (f64/f32/i64/i32/u64/u32), at/above a length threshold (256). The stable kind,
+  8/16-bit + bool + complex, strided views, non-last axes, and small arrays stay
+  on the own floor. x86-simd-sort sorts NaNs last (`nans_last`); Highway counts +
+  restores canonical NaN to the tail — both match the own floor / NumPy, so a
+  sort is a permutation with **no fp-determinism concern** (#946): the sorted
+  VALUES are identical to the floor, and the existing + large-array sort goldens
+  validate whichever kernel the CI host runs (AVX2 on x86, NEON on arm; AVX-512 /
+  SVE are compiled but validated on hardware, with the floor as the fallback).
+- **Shipping the standalone compiler.** The vendored headers (≈119 files) are
+  embedded into `zapc` by `build.rs` (a generated `VENDORED_SORT_FILES` table)
+  and written beside the runtime at `zap build` time, so no source tree is needed
+  on a user's machine — the same mechanism as the single PocketFFT header (#929),
+  generalized to a header tree.
+Relates to #933 / #139 (the facility it rides) / #512, D-0190 (the floor),
+D-0192/D-0193/D-0194 (cpu_features / multiversioning / memchr pilot). Follow-ups:
+the aarch64 SVE tier, 8/16-bit + stable-radix SIMD, and a perf-box benchmark to
+tune the size threshold.
+
 ## D-0192 — `cpu_features` runtime detection (ISA-acceleration epic #139 / #943)
 **Status:** implemented
 The shared CPU-capability detection layer the whole ISA-acceleration facility

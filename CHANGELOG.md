@@ -25,6 +25,13 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Numeric-array sort accelerator — vendored SIMD kernels** (#933, D-0195).
+  Large unstable `sort`/`argsort` auto-dispatch to Intel x86-simd-sort (x86-64
+  AVX2/AVX-512) or Google Highway vqsort (aarch64 NEON) via the `cpu_features`
+  facility (epic #139), overridable with `ZAP_ACCEL`; small/strided/stable/
+  other-dtype sorts and CPUs without the ISA use the own introsort floor (#932).
+  A performance change only — results are identical to the floor / NumPy (a sort
+  is a permutation). The vendored headers ship embedded in the compiler.
 - **SIMD `memchr`/`memmem` — the first multiversioned kernel** (#945, epic #139,
   D-0194). A SIMD byte/substring search in the runtime with hand-written
   scalar/SSE2/AVX2/NEON clones and pointer-once-init dispatch reading

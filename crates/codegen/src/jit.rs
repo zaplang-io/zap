@@ -220,6 +220,10 @@ fn build_runtime_dylib() -> Result<(PathBuf, PathBuf), String> {
         .map_err(|e| format!("failed to write memchr runtime: {e}"))?;
     std::fs::write(dir.join("zapcpu.inc.c"), crate::RUNTIME_CPU_C)
         .map_err(|e| format!("failed to write cpu-features runtime: {e}"))?;
+    // zaprt.c #includes this unconditionally; the REPL links no accelerator
+    // object (no -DZAP_HAVE_SIMDSORT), so its seam falls through to the own floor.
+    std::fs::write(dir.join("zapsortaccel.inc.c"), crate::RUNTIME_SORTACCEL_C)
+        .map_err(|e| format!("failed to write sort-accel runtime: {e}"))?;
 
     let is_macos = triple.as_str().to_string_lossy().contains("darwin");
     let lib = dir.join(if is_macos {

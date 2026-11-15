@@ -1,0 +1,4053 @@
+// Copyright 2026 Google LLC
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Related Work:
+//   Kim et al., "FAST: Fast Architecture Sensitive Tree Search on Modern CPUs
+//   and GPUs", ACM SIGMOD 2010 (Best Paper Award).
+//   https://dl.acm.org/doi/10.1145/1807167.1807206
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <initializer_list>
+#include <iterator>
+#include <limits>
+#include <memory>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include "hwy/aligned_allocator.h"
+#include "hwy/base.h"
+#include "hwy/cache_control.h"
+#include "hwy/contrib/btree/btree_nodes.h"
+
+#if defined(HIGHWAY_HWY_CONTRIB_BTREE_BTREE_INL_H_) == \
+    defined(HWY_TARGET_TOGGLE)
+#ifdef HIGHWAY_HWY_CONTRIB_BTREE_BTREE_INL_H_
+#undef HIGHWAY_HWY_CONTRIB_BTREE_BTREE_INL_H_
+#else
+#define HIGHWAY_HWY_CONTRIB_BTREE_BTREE_INL_H_
+#endif
+
+#include "hwy/contrib/algo/find-inl.h"
+#include "hwy/contrib/algo/is_sorted-inl.h"
+#include "hwy/contrib/sort/vqsort-inl.h"
+#include "hwy/highway.h"
+
+static_assert(HWY_CXX_LANG >= 201703L, "requires C++17 or later.");
+
+// Check that Highway target is not scalar
+#if HWY_TARGET != HWY_SCALAR
+
+HWY_BEFORE_NAMESPACE();
+namespace hwy {
+namespace HWY_NAMESPACE {
+
+// Comparator for IsSorted that checks strict ascending order (in[i] < in[i+1])
+// by flagging any adjacent pair where in[i+1] <= in[i].
+struct IsSortedLessEqual {
+  template <class D, class V>
+  Mask<D> operator()(D /*d*/, V a, V b) const {
+    return Le(a, b);
+  }
+};
+
+// -----------------------------------------------------------------------------
+// Traits Definitions
+// -----------------------------------------------------------------------------
+// Traits specialization for BTreeSet.
+template <typename KeyT>
+struct SetTraits {
+  using key_type = KeyT;
+  using storage_key_type = typename KeyCodec<KeyT>::StorageKey;
+  using value_type = KeyT;  // type of the element stored in the container and
+                            // returned when dereferencing an iterator
+  using mapped_type = void;
+  static constexpr bool kIsMap = false;
+
+  using Leaf = LeafNode<storage_key_type>;
+
+  template <typename OffsetT>
+  static constexpr size_t MaxKeys() {
+    return Leaf::kDataBytes / sizeof(OffsetT);
+  }
+};
+
+// Traits specialization for BTreeMap.
+template <typename KeyT, typename ValueT>
+struct MapTraits {
+  using key_type = KeyT;
+  using storage_key_type = typename KeyCodec<KeyT>::StorageKey;
+  using value_type =
+      std::pair<KeyT, ValueT>;  // type of the element stored in the container
+                                // and returned when dereferencing an iterator
+  using mapped_type = ValueT;
+  static constexpr bool kIsMap = true;
+
+  using Leaf = MapLeafNode<storage_key_type, ValueT>;
+
+  template <typename OffsetT>
+  static constexpr size_t
+  MaxKeys() {  // could be named MaxPairs as well, but MaxKeys for uniformity
+               // with SetTraits and easier duck-typing on common helpers
+    return Leaf::template ComputeMaxPairs<OffsetT>();
+  }
+};
+
+// -----------------------------------------------------------------------------
+// Key Decompression & Slot Search Primitives
+// -----------------------------------------------------------------------------
+
+// Packs 4 consecutive masks of DFrom (N lanes each) into a single mask of DTo
+// (4 * N lanes) via two levels of OrderedDemote2MasksTo.
+template <class DTo, class DFrom>
+HWY_INLINE MFromD<DTo> OrderedDemote4MasksTo(DTo d_to, DFrom d_from,
+                                             MFromD<DFrom> m0, MFromD<DFrom> m1,
+                                             MFromD<DFrom> m2,
+                                             MFromD<DFrom> m3) {
+  // Descriptor for an intermediate mask with 2x as many bits as `d_from`.
+  const RepartitionToNarrow<DFrom> d_mid;
+  return OrderedDemote2MasksTo(d_to, d_mid,
+                               OrderedDemote2MasksTo(d_mid, d_from, m0, m1),
+                               OrderedDemote2MasksTo(d_mid, d_from, m2, m3));
+}
+
+// Given an array of compressed offsets, returns
+// the number of elements strictly less than target_val (kLowerBound) or
+// less than or equal to target_val (kUpperBound).
+template <BoundMode kBound = BoundMode::kLowerBound, typename OffsetT,
+          size_t kTotal>
+HWY_INLINE size_t ScanOffsets(const void* HWY_RESTRICT data,
+                              OffsetT target_val) {
+  // Starting at memory address data, interpret the contents as an array of
+  // OffsetT numbers.
+  const auto* offsets = static_cast<const OffsetT*>(data);
+  const CappedTag<OffsetT, 256 / sizeof(OffsetT)> d;
+  const size_t N = Lanes(d);
+  const auto v_target = Set(d, target_val);
+  static_assert(kTotal <= 512 / sizeof(OffsetT));
+
+  const auto is_before = [&](const auto v) HWY_ATTR {
+    if constexpr (kBound == BoundMode::kLowerBound) {
+      return Lt(v, v_target);
+    } else {
+      return Le(v, v_target);
+    }
+  };
+
+  const auto is_before_masked = [&](const auto mask, const auto v) HWY_ATTR {
+    if constexpr (kBound == BoundMode::kLowerBound) {
+      return MaskedLt(mask, v, v_target);
+    } else {
+      return MaskedLe(mask, v, v_target);
+    }
+  };
+
+  if constexpr (HWY_NATIVE_MASK) {
+    // CountTrue is inexpensive with native mask registers and avoids a
+    // horizontal vector reduction.
+    size_t count = 0;
+    size_t i = 0;
+
+    // On x86 AVX-512, opmask registers (k0..k7) are 64 bits wide, but comparing
+    // elements wider than 1 byte only populates the low bits of the register:
+    //   - 8-byte offsets (8 lanes/vec)  ->  8-bit mask (56 bits unused)
+    //   - 4-byte offsets (16 lanes/vec) -> 16-bit mask (48 bits unused)
+    //   - 2-byte offsets (32 lanes/vec) -> 32-bit mask (32 bits unused)
+    //
+    // Calling CountTrue on each mask individually is suboptimal on x86 because
+    // each call must move a partially filled mask to a 64-bit scalar register
+    // (KMOV) and run a 64-bit scalar POPCNT.
+    //
+    // However, AVX-512 provides hardware instructions (exposed via
+    // OrderedDemote2MasksTo) that combine two masks into a single mask
+    // register. We can use these instructions to pack multiple masks together
+    // to utilize all 64 bits of the mask register, reducing the number of
+    // CountTrue calls we need to make.
+    //
+    // We guard this with HWY_ARCH_X86 because other HWY_NATIVE_MASK targets
+    // (ARM SVE, RISC-V RVV) do not have single-instruction hardware support for
+    // OrderedDemote2MasksTo (and their CountTrue is already a single native
+    // instruction). For sizeof(OffsetT) >= 2 (since 1-byte offsets already fill
+    // all 64 mask bits), we pack 8, 4, or 2 masks into one 64-bit mask before
+    // calling CountTrue.
+    //
+    // Note on future wider x86 SIMD (e.g., 1024-bit vectors):
+    // 1. No mask register overflow: Packing `sizeof(OffsetT)` masks together
+    //    (8x for 8B, 4x for 4B, 2x for 2B) always produces the exact same
+    //    number of mask bits as a single 1-byte (8-bit) vector of width `d`.
+    //    Thus, as long as the mask registers are wide enough to support 8-bit
+    //    types, packing `sizeof(OffsetT)` masks can never overflow a mask
+    //    register.
+    // 2. Automatic fallback across vector widths and leaf sizes: Because the
+    //    cases cascade through 8, 4 (`>= 4`), 2 (`>= 2`), and finally 1 vector
+    //    outside the block, any smaller vector counts or remainders (whether
+    //    from BTreeMap leaves or wider future vectors where 8*N > kTotal)
+    //    automatically fall through to the largest packing factor that fits.
+    if constexpr (HWY_ARCH_X86 && sizeof(OffsetT) >= 2) {
+      // Descriptor for a mask with 2x as many bits as `d`.
+      const RepartitionToNarrow<decltype(d)> d_pack2;
+
+      // Since 8-byte offsets produce 8-bit masks on AVX-512, we can combine 8
+      // of them into a single 64-bit mask and call CountTrue once.
+      if constexpr (sizeof(OffsetT) == 8) {
+        // Descriptors for masks with 4x and 8x as many bits as `d`.
+        const RepartitionToNarrow<decltype(d_pack2)> d_pack4;
+        const RepartitionToNarrow<decltype(d_pack4)> d_pack8;
+
+        for (; i + 8 * N <= kTotal; i += 8 * N) {
+          const auto m0 = is_before(Load(d, offsets + i + 0 * N));
+          const auto m1 = is_before(Load(d, offsets + i + 1 * N));
+          const auto m2 = is_before(Load(d, offsets + i + 2 * N));
+          const auto m3 = is_before(Load(d, offsets + i + 3 * N));
+          const auto m4 = is_before(Load(d, offsets + i + 4 * N));
+          const auto m5 = is_before(Load(d, offsets + i + 5 * N));
+          const auto m6 = is_before(Load(d, offsets + i + 6 * N));
+          const auto m7 = is_before(Load(d, offsets + i + 7 * N));
+
+          const auto m0123 = OrderedDemote4MasksTo(d_pack4, d, m0, m1, m2, m3);
+          const auto m4567 = OrderedDemote4MasksTo(d_pack4, d, m4, m5, m6, m7);
+          count += CountTrue(
+              d_pack8, OrderedDemote2MasksTo(d_pack8, d_pack4, m0123, m4567));
+        }
+
+        if (i + 7 * N < kTotal) {
+          const size_t tail_rem = kTotal - (i + 7 * N);
+          const auto m0 = is_before(Load(d, offsets + i + 0 * N));
+          const auto m1 = is_before(Load(d, offsets + i + 1 * N));
+          const auto m2 = is_before(Load(d, offsets + i + 2 * N));
+          const auto m3 = is_before(Load(d, offsets + i + 3 * N));
+          const auto m4 = is_before(Load(d, offsets + i + 4 * N));
+          const auto m5 = is_before(Load(d, offsets + i + 5 * N));
+          const auto m6 = is_before(Load(d, offsets + i + 6 * N));
+          const auto m7 = is_before_masked(FirstN(d, tail_rem),
+                                           Load(d, offsets + i + 7 * N));
+
+          const auto m0123 = OrderedDemote4MasksTo(d_pack4, d, m0, m1, m2, m3);
+          const auto m4567 = OrderedDemote4MasksTo(d_pack4, d, m4, m5, m6, m7);
+          count += CountTrue(
+              d_pack8, OrderedDemote2MasksTo(d_pack8, d_pack4, m0123, m4567));
+          return count;
+        }
+      }
+
+      // Since 4-byte offsets produce 16-bit masks on AVX-512, we can combine 4
+      // of them into a single 64-bit mask and call CountTrue once.
+      // Note: We use `>= 4` instead of `== 4` to also handle 8-byte BTreeMap
+      // leaf nodes, which store both keys and values inside the 512B leaf and
+      // therefore hold fewer than 8 vectors of keys (e.g., an 8B key, 8B value
+      // Map leaf holds 30 keys = 4 vectors).
+      if constexpr (sizeof(OffsetT) >= 4) {
+        // Descriptor for a mask with 4x as many bits as `d`.
+        const RepartitionToNarrow<decltype(d_pack2)> d_pack4;
+
+        for (; i + 4 * N <= kTotal; i += 4 * N) {
+          const auto m0 = is_before(Load(d, offsets + i + 0 * N));
+          const auto m1 = is_before(Load(d, offsets + i + 1 * N));
+          const auto m2 = is_before(Load(d, offsets + i + 2 * N));
+          const auto m3 = is_before(Load(d, offsets + i + 3 * N));
+
+          count += CountTrue(d_pack4,
+                             OrderedDemote4MasksTo(d_pack4, d, m0, m1, m2, m3));
+        }
+
+        if (i + 3 * N < kTotal) {
+          const size_t tail_rem = kTotal - (i + 3 * N);
+          const auto m4 = is_before(Load(d, offsets + i + 0 * N));
+          const auto m5 = is_before(Load(d, offsets + i + 1 * N));
+          const auto m6 = is_before(Load(d, offsets + i + 2 * N));
+          const auto m7 = is_before_masked(FirstN(d, tail_rem),
+                                           Load(d, offsets + i + 3 * N));
+
+          count += CountTrue(d_pack4,
+                             OrderedDemote4MasksTo(d_pack4, d, m4, m5, m6, m7));
+          return count;
+        }
+      }
+
+      // Since 2-byte offsets produce 32-bit masks on AVX-512, we can combine 2
+      // of them into a single 64-bit mask and call CountTrue once.
+      // Note: We use `>= 2` instead of `== 2` to also handle remaining vectors
+      // from 4-byte or 8-byte BTreeMap leaf nodes that have fewer than 4
+      // vectors left (e.g., a 4B key, 8B value Map leaf holds 40 keys = 3
+      // vectors, so it packs its first 2 vectors here before the 1-vector
+      // fallthrough handles the 3rd).
+      if constexpr (sizeof(OffsetT) >= 2) {
+        for (; i + 2 * N <= kTotal; i += 2 * N) {
+          const auto m0 = is_before(Load(d, offsets + i));
+          const auto m1 = is_before(Load(d, offsets + i + N));
+          count +=
+              CountTrue(d_pack2, OrderedDemote2MasksTo(d_pack2, d, m0, m1));
+        }
+
+        if (i + N < kTotal) {
+          const size_t tail_rem = kTotal - (i + N);
+          const auto m0 = is_before(Load(d, offsets + i));
+          const auto m1 =
+              is_before_masked(FirstN(d, tail_rem), Load(d, offsets + i + N));
+          count +=
+              CountTrue(d_pack2, OrderedDemote2MasksTo(d_pack2, d, m0, m1));
+          return count;
+        }
+      }
+    }
+
+    // Handles:
+    //   1. 1-byte offsets on AVX-512 (where 1 vector = 64 lanes already fills
+    //      all 64 bits of a mask register).
+    //   2. Any single leftover vector on AVX-512 when a BTreeMap leaf has an
+    //      odd number of vectors (e.g., the 3rd vector of a 3-vector Map leaf
+    //      after the 2-vector case above packs the first two).
+    //   3. Non-x86 HWY_NATIVE_MASK targets (ARM SVE, RISC-V RVV).
+    for (; i + N <= kTotal; i += N) {
+      count += CountTrue(d, is_before(Load(d, offsets + i)));
+    }
+
+    if (i < kTotal) {
+      const size_t remaining = kTotal - i;
+      // Safety justification for unmasked aligned Load on tail elements:
+      //
+      // The Potential Problem (Page Boundary Faults):
+      // Because each 512-byte LeafNode is alignas(512), a 4096-byte virtual
+      // memory page holds exactly eight nodes. For the 8th node on a page
+      // (occupying bytes [3584..4095]), reading past the 512-byte struct
+      // boundary would cross into the next virtual memory page (byte 4096+). If
+      // that next page happens to be unmapped, an unmasked full-vector Load
+      // would trigger a SIGSEGV.
+      //
+      // Proof that Load Is Aligned and Never Exceeds the 512-byte Struct
+      // (StartByte % VectorBytes == 0 and EndByte <= 512):
+      //
+      // 1. Alignment & Byte Boundaries:
+      //    Here, i is the loop counter after the preceding for-loops finish.
+      //    Because `offsets` starts at byte 0 of an `alignas(512)` node and i
+      //    starts at 0 and advances by multiples of N lanes on every iteration,
+      //    i is always an exact multiple of N: i = x * N (for some integer x
+      //    >= 0). Thus, the starting byte offset `i * sizeof(OffsetT) = x *
+      //    VectorBytes` is always vector-aligned, making aligned `Load` safe.
+      //    Loading N elements from offsets + i ends at element index:
+      //      (i + N) = (x + 1) * N
+      //    In memory bytes, the load ends at:
+      //      EndByte = (i + N) * sizeof(OffsetT)
+      //              = (x + 1) * [N * sizeof(OffsetT)]
+      //    Since [N * sizeof(OffsetT)] equals the vector register size in bytes
+      //    (VectorBytes), substituting gives:
+      //      EndByte = (x + 1) * VectorBytes
+      //    This proves EndByte is strictly an integer multiple of VectorBytes.
+      //    Specifically, it is the smallest multiple of VectorBytes that is
+      //    >= (kTotal * sizeof(OffsetT)).
+      //
+      // 2. Struct Boundary Proof (LeafNode):
+      //    Key payloads take at most kDataBytes (488B for 64-bit keys, 492B for
+      //    32-bit keys) within the 512-byte node. CappedTag<OffsetT,
+      //    256/sizeof(OffsetT)> guarantees that VectorBytes <= 256 across all
+      //    architectures (including RVV where HWY_MAX_BYTES can exceed 256).
+      //    All supported VectorBytes (16B, 32B, 64B, 128B, 256B) are powers of
+      //    2 that evenly divide 512:
+      //      - 16B vector:  next multiple of 16  after 488/492 is 496 <= 512
+      //      - 32B vector:  next multiple of 32  after 488/492 is 512 <= 512
+      //      - 64B vector:  next multiple of 64  after 488/492 is 512 <= 512
+      //      - 128B vector: next multiple of 128 after 488/492 is 512 <= 512
+      //      - 256B vector: next multiple of 256 after 488/492 is 512 <= 512
+      //    Therefore, EndByte <= 512 bytes across all architectures and bit
+      //    modes. On the 8th node, the load ends at <= 3584 + 512 = 4096 (the
+      //    exact last byte of the page) and never crosses into the next page.
+      //
+      // 3. Extension to MapLeafNode:
+      //    In MapLeafNode, keys and values share the 488B/492B payload, meaning
+      //    key offsets finish even earlier (at <= 244 bytes). The tail load on
+      //    keys ends at <= 256 bytes, staying well within the node.
+      //
+      // Any excess lanes loaded from padding or metadata are suppressed by the
+      // FirstN mask to ensure comparison correctness.
+      //
+      // Note: LoadN is much slower on architectures without native masked byte
+      // loads (e.g. AVX2, SSE4) compared to Load.
+      const auto v = Load(d, offsets + i);
+      const auto mask = FirstN(d, remaining);
+      count += CountTrue(d, is_before_masked(mask, v));
+    }
+
+    return count;
+  } else {
+    // Without native mask registers, accumulate comparison masks in vectors
+    // and reduce once to avoid repeated vector-to-scalar transfers. The loop
+    // is 2x unrolled to shorten the accumulator dependency chain.
+    auto counts0 = Zero(d);
+    auto counts1 = Zero(d);
+    size_t i = 0;
+    if (kTotal >= 2 * N) {
+      for (; i <= kTotal - 2 * N; i += 2 * N) {
+        counts0 = Sub(counts0, VecFromMask(d, is_before(Load(d, offsets + i))));
+        counts1 =
+            Sub(counts1, VecFromMask(d, is_before(Load(d, offsets + i + N))));
+      }
+    }
+
+    for (; i + N <= kTotal; i += N) {
+      counts0 = Sub(counts0, VecFromMask(d, is_before(Load(d, offsets + i))));
+    }
+
+    if (i < kTotal) {
+      const size_t remaining = kTotal - i;
+      // Safe unmasked aligned tail load; see EndByte <= 512 proof in
+      // ScanOffsets above.
+      const auto v = Load(d, offsets + i);
+      const auto mask = FirstN(d, remaining);
+      counts0 = Sub(counts0, VecFromMask(d, And(mask, is_before(v))));
+    }
+
+    const auto counts = Add(counts0, counts1);
+    if constexpr (sizeof(OffsetT) == 1 ||
+                  (HWY_ARCH_X86 && sizeof(OffsetT) == 2)) {
+      // For 8-bit offsets, lanes can overflow if summed directly, so SumsOf8
+      // sums groups of 8 bytes into 64-bit lanes before ReduceSum.
+      //
+      // We also use SumsOf8 for 16-bit offsets on x86 only:
+      // - Even on 128-bit (16B) vectors, a 512B leaf spans at most
+      //   512B / 16B = 32 iterations, so each 16-bit lane counter is <= 32
+      //   (well below 255). Thus its high byte is always 0, and summing 8
+      //   bytes sums four 16-bit lanes into one 64-bit lane.
+      // - Why x86 only: x86 has single-instruction VPSADBW for SumsOf8, whereas
+      //   16-bit ReduceSum requires multi-stage VPSHUFB with memory constant
+      //   loads (unlike ARM NEON, which has single-instruction 16-bit ADDV and
+      //   emulates SumsOf8 with 3 widening adds).
+      // - Why not sizeof(OffsetT) > 2: 32-bit ReduceSum on x86 already uses
+      //   fast immediate VPSHUFD shuffles, and for 64-bit lanes (8 bytes)
+      //   SumsOf8 is a no-op.
+      const Repartition<uint8_t, decltype(d)> d8;
+      const Repartition<uint64_t, decltype(d)> d64;
+      return static_cast<size_t>(ReduceSum(d64, SumsOf8(BitCast(d8, counts))));
+    } else {
+      return static_cast<size_t>(ReduceSum(d, counts));
+    }
+  }
+}
+
+// Returns true if target_val exists in the compressed offsets array using pure
+// vector SIMD equality without scalar ALU popcnt bottlenecks.
+template <typename OffsetT, size_t kTotal>
+HWY_INLINE bool HasOffset(const void* HWY_RESTRICT data, OffsetT target_val) {
+  const auto* offsets = static_cast<const OffsetT*>(data);
+  const CappedTag<OffsetT, 256 / sizeof(OffsetT)> d;
+  const size_t N = Lanes(d);
+  const auto v_target = Set(d, target_val);
+  auto any_match = MaskFalse(d);
+  size_t i = 0;
+  for (; i + N <= kTotal; i += N) {
+    const auto v = Load(d, offsets + i);
+    any_match = Or(any_match, Eq(v, v_target));
+  }
+
+  if (i < kTotal) {
+    const size_t remaining = kTotal - i;
+    // Safe unmasked aligned tail load; see EndByte <= 512 proof in ScanOffsets
+    // above.
+    const auto v = Load(d, offsets + i);
+    const auto mask = FirstN(d, remaining);
+    const auto tail_match = MaskedEq(mask, v, v_target);
+    any_match = Or(any_match, tail_match);
+  }
+
+  return !AllFalse(d, any_match);
+}
+
+// Finds the lower_bound or upper_bound slot index (0..num_keys) for target
+// within a leaf node.
+template <BoundMode kBound = BoundMode::kLowerBound, typename LeafNode,
+          typename KeyT>
+HWY_INLINE size_t FindLeafSlot(const LeafNode* HWY_RESTRICT leaf, KeyT target) {
+  using Node = LeafNode;
+  HWY_DASSERT(leaf->NumKeys() > 0);
+  if constexpr (kBound == BoundMode::kLowerBound) {
+    if (HWY_UNLIKELY(target <= leaf->base_key)) return 0;
+    // On AVX2 (and SSE4), unsigned Le() is faster than unsigned Lt() because
+    // Le(v, t) uses native unsigned min + eq (vpminu + vpcmpeq), whereas Lt()
+    // must flip sign bits (vpxor) on every vector to use signed vpcmpgt.
+    // Since target > base_key >= 0, we can decrement target and always invoke
+    // ScanOffsets with kUpperBound (Le) below.
+    --target;
+  } else {
+    if (HWY_UNLIKELY(target < leaf->base_key)) return 0;
+  }
+
+  const uint64_t delta = static_cast<uint64_t>(target - leaf->base_key);
+  const uint8_t mode = leaf->BitMode();
+
+  if (HWY_LIKELY(mode == kMode16Bit)) {
+    // 0xFFFF also fills inactive slots, so Le() would count them too.
+    if (HWY_UNLIKELY(delta >= 65535)) return leaf->NumKeys();
+    return ScanOffsets<BoundMode::kUpperBound, uint16_t, Node::kMax16>(
+        leaf->KeyData(), static_cast<uint16_t>(delta));
+  } else if (mode == kMode8Bit) {
+    if (HWY_UNLIKELY(delta >= 255)) return leaf->NumKeys();
+    return ScanOffsets<BoundMode::kUpperBound, uint8_t, Node::kMax8>(
+        leaf->KeyData(), static_cast<uint8_t>(delta));
+  } else if (mode == kMode32Bit) {
+    if constexpr (sizeof(KeyT) == 4) {
+      if constexpr (kBound == BoundMode::kUpperBound) {
+        if (HWY_UNLIKELY(target == LimitsMax<KeyT>())) return leaf->NumKeys();
+      }
+      return ScanOffsets<BoundMode::kUpperBound, uint32_t, Node::kMax32>(
+          leaf->KeyData(), static_cast<uint32_t>(target));
+    } else {
+      if (HWY_UNLIKELY(delta >= 0xFFFFFFFFULL)) return leaf->NumKeys();
+      return ScanOffsets<BoundMode::kUpperBound, uint32_t, Node::kMax32>(
+          leaf->KeyData(), static_cast<uint32_t>(delta));
+    }
+  } else {
+    if constexpr (kBound == BoundMode::kUpperBound) {
+      if (HWY_UNLIKELY(target == LimitsMax<KeyT>())) return leaf->NumKeys();
+    }
+    return ScanOffsets<BoundMode::kUpperBound, uint64_t, Node::kMax64>(
+        leaf->KeyData(), static_cast<uint64_t>(target));
+  }
+}
+
+// Returns true if target exists in the leaf. If found, optionally writes the
+// slot index.
+template <typename LeafNode, typename KeyT>
+HWY_INLINE bool LeafContains(const LeafNode* HWY_RESTRICT leaf, KeyT target,
+                             size_t* HWY_RESTRICT out_slot = nullptr) {
+  using Node = LeafNode;
+  HWY_DASSERT(leaf->NumKeys() > 0);
+
+  // If caller requested the exact slot index (for insert/erase/find),
+  // compute the lower_bound slot via Lt comparisons.
+  if (out_slot != nullptr) {
+    const size_t slot = FindLeafSlot(leaf, target);
+    *out_slot = slot;
+    if (slot >= leaf->NumKeys()) return false;
+    return GetLeafKey(leaf, slot) == target;
+  }
+
+  // Fast-path point lookup via SIMD Eq comparisons (for
+  // contains/ContainsBatch).
+  if (HWY_UNLIKELY(target < leaf->base_key)) return false;
+  if (HWY_UNLIKELY(target == leaf->base_key)) return true;
+
+  const uint64_t delta = static_cast<uint64_t>(target - leaf->base_key);
+  const uint8_t mode = leaf->BitMode();
+
+  if (HWY_LIKELY(mode == kMode16Bit)) {
+    if (HWY_UNLIKELY(delta > 65535)) return false;
+    if (HWY_UNLIKELY(delta == 65535)) {
+      return GetLeafKey(leaf, leaf->NumKeys() - 1) == target;
+    }
+    return HasOffset<uint16_t, Node::kMax16>(leaf->KeyData(),
+                                             static_cast<uint16_t>(delta));
+  } else if (mode == kMode8Bit) {
+    if (HWY_UNLIKELY(delta > 255)) return false;
+    if (HWY_UNLIKELY(delta == 255)) {
+      return GetLeafKey(leaf, leaf->NumKeys() - 1) == target;
+    }
+    return HasOffset<uint8_t, Node::kMax8>(leaf->KeyData(),
+                                           static_cast<uint8_t>(delta));
+  } else if (mode == kMode32Bit) {
+    if constexpr (sizeof(KeyT) == 4) {
+      if (HWY_UNLIKELY(target == 0xFFFFFFFF)) {
+        return GetLeafKey(leaf, leaf->NumKeys() - 1) == target;
+      }
+      return HasOffset<uint32_t, Node::kMax32>(leaf->KeyData(),
+                                               static_cast<uint32_t>(target));
+    } else {
+      if (HWY_UNLIKELY(delta > 0xFFFFFFFFULL)) return false;
+      if (HWY_UNLIKELY(delta == 0xFFFFFFFFULL)) {
+        return GetLeafKey(leaf, leaf->NumKeys() - 1) == target;
+      }
+      return HasOffset<uint32_t, Node::kMax32>(leaf->KeyData(),
+                                               static_cast<uint32_t>(delta));
+    }
+  } else {
+    if (HWY_UNLIKELY(target == 0xFFFFFFFFFFFFFFFFULL)) {
+      return GetLeafKey(leaf, leaf->NumKeys() - 1) == target;
+    }
+    return HasOffset<uint64_t, Node::kMax64>(leaf->KeyData(),
+                                             static_cast<uint64_t>(target));
+  }
+}
+
+// Scans an internal node's separator keys and returns the child pointer index
+// to descend.
+template <typename KeyT>
+HWY_INLINE size_t FindChild(const InternalNode<KeyT>* HWY_RESTRICT internal,
+                            typename InternalNode<KeyT>::StorageKeyT target) {
+  using StorageKeyT = typename InternalNode<KeyT>::StorageKeyT;
+  // Inactive separator slots are padded with LimitsMax, so Le(LimitsMax,
+  // target) is false whenever target < LimitsMax. Handling target == LimitsMax
+  // upfront avoids loading internal->num_keys from a separate cache line and
+  // removes the need to do a std::min at the end
+  if (HWY_UNLIKELY(target == LimitsMax<StorageKeyT>())) {
+    return internal->num_keys;
+  }
+  constexpr size_t kCapacity = InternalNode<KeyT>::kCapacity;
+  // Cap vectors at 64 bytes: InternalNode is only alignas(64), so a wider
+  // vector (possible on scalable targets) would make the aligned Load below
+  // unsafe.
+  const CappedTag<StorageKeyT, 64 / sizeof(StorageKeyT)> d;
+  const size_t N = Lanes(d);
+  const auto v_target = Set(d, target);
+
+  // At kCapacity = 16, we don't need the horizontal sum reduction trick used
+  // in ScanOffsets for non-native mask architectures: with such a small element
+  // count, we cannot amortize that cost, making direct CountTrue faster here.
+  size_t count = 0;
+  if constexpr (!HWY_NATIVE_MASK && HWY_ARCH_X86) {
+    // x86 AVX2/SSE4/SSE2 do not have a native unsigned Le() (<=) or Gt() (>)
+    // instruction. Highway emulates unsigned Le(a, b) as Not(Gt(a, b)), where
+    // Gt(a, b) flips the sign bit (XOR 0x8000...) of both operands to use
+    // signed vpcmpgt, and Not() inverts the resulting bitmask (XOR after every
+    // vmovmsk inside CountTrue).
+    if constexpr (sizeof(StorageKeyT) == 4) {
+      // 32-bit unsigned Max (vpmaxud) is native: express a <= b as
+      // max(a, b) == b to avoid both the sign-bit XOR and Not() inversion.
+      for (size_t i = 0; i < kCapacity; i += N) {
+        const auto v_keys = Load(d, internal->keys + i);
+        count += CountTrue(d, Eq(Max(v_keys, v_target), v_target));
+      }
+      return count;
+    } else {
+      // 64-bit lacks native unsigned Max: count Gt() directly and subtract
+      // from kCapacity once to avoid the per-vector Not() inversion.
+      for (size_t i = 0; i < kCapacity; i += N) {
+        const auto v_keys = Load(d, internal->keys + i);
+        count += CountTrue(d, Gt(v_keys, v_target));
+      }
+      return kCapacity - count;
+    }
+  } else {
+    // Unsigned Le() is a native instruction on these architectures.
+    for (size_t i = 0; i < kCapacity; i += N) {
+      const auto v_keys = Load(d, internal->keys + i);
+      count += CountTrue(d, Le(v_keys, v_target));
+    }
+    return count;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Leaf-Level Dynamic Mutation & Compression Helpers
+// -----------------------------------------------------------------------------
+
+// Decompresses all keys from a leaf into the out_keys destination array.
+template <typename LeafNode, typename KeyT>
+HWY_INLINE void DecompressLeaf(const LeafNode* leaf, KeyT* out_keys) {
+  const size_t count = leaf->NumKeys();
+  for (size_t i = 0; i < count; ++i) {
+    out_keys[i] = GetLeafKey(leaf, i);
+  }
+}
+
+// Decompresses all keys and values from a map leaf into destination arrays.
+template <typename KeyT, typename ValueT>
+HWY_INLINE void DecompressLeaf(const MapLeafNode<KeyT, ValueT>* leaf,
+                               KeyT* out_keys, ValueT* out_values) {
+  const size_t count = leaf->NumKeys();
+  const ValueT* vals = leaf->Values();
+  for (size_t i = 0; i < count; ++i) {
+    out_keys[i] = GetLeafKey(leaf, i);
+    out_values[i] = vals[i];
+  }
+}
+
+// Encodes sorted keys as delta offsets from base_key into the destination
+// buffer.
+template <typename OffsetT, OffsetT kSentinel, typename KeyT>
+HWY_INLINE void StoreCompressedOffsets(void* dst_offsets, const KeyT* keys,
+                                       size_t count, KeyT base_key,
+                                       size_t capacity) {
+  auto* offsets = HWY_RCAST_ALIGNED(OffsetT*, dst_offsets);
+  for (size_t k = 0; k < count; ++k) {
+    offsets[k] = static_cast<OffsetT>(keys[k] - base_key);
+  }
+  // Sets all remaining inactive slots to kSentinel.
+  std::fill_n(offsets + count, capacity - count, kSentinel);
+}
+
+// Encodes a sorted key array into a leaf node using the narrowest viable
+// compression mode (Set).
+template <typename KeyT>
+HWY_INLINE void CompressIntoLeaf(LeafNode<KeyT>* leaf, const KeyT* keys,
+                                 size_t count) {
+  if (count == 0) {
+    leaf->SetNumKeys(0);
+    leaf->base_key = 0;
+    std::memset(leaf->data, 0xFF, LeafNode<KeyT>::kDataBytes);
+    return;
+  }
+
+  leaf->base_key = keys[0];
+  constexpr size_t kMax8 = LeafNode<KeyT>::kMax8;
+  constexpr size_t kMax16 = LeafNode<KeyT>::kMax16;
+  constexpr size_t kMax32 = LeafNode<KeyT>::kMax32;
+  constexpr size_t kMax64 = LeafNode<KeyT>::kMax64;
+
+  const uint64_t max_delta =
+      (count > 1) ? static_cast<uint64_t>(keys[count - 1] - keys[0]) : 0;
+
+  if (count <= kMax8 && max_delta <= 255) {
+    leaf->SetBitMode(kMode8Bit);
+    StoreCompressedOffsets<uint8_t, 0xFF>(leaf->data, keys, count,
+                                          leaf->base_key, kMax8);
+  } else if (count <= kMax16 && max_delta <= 65535) {
+    leaf->SetBitMode(kMode16Bit);
+    StoreCompressedOffsets<uint16_t, 0xFFFF>(leaf->data, keys, count,
+                                             leaf->base_key, kMax16);
+  } else if (count <= kMax32 &&
+             (sizeof(KeyT) == 4 || max_delta <= 0xFFFFFFFFULL)) {
+    leaf->SetBitMode(kMode32Bit);
+    if constexpr (sizeof(KeyT) == 4) {
+      auto* raw_keys = HWY_RCAST_ALIGNED(uint32_t*, leaf->data);
+      for (size_t k = 0; k < count; ++k) {
+        raw_keys[k] = static_cast<uint32_t>(keys[k]);
+      }
+      // Sets all remaining inactive slots to the sentinel value.
+      std::fill_n(raw_keys + count, kMax32 - count, 0xFFFFFFFF);
+    } else {
+      StoreCompressedOffsets<uint32_t, 0xFFFFFFFF>(leaf->data, keys, count,
+                                                   leaf->base_key, kMax32);
+    }
+  } else {
+    leaf->SetBitMode(kModeRaw64);
+    auto* raw_keys = HWY_RCAST_ALIGNED(uint64_t*, leaf->data);
+    for (size_t k = 0; k < count; ++k) {
+      raw_keys[k] = static_cast<uint64_t>(keys[k]);
+    }
+    // Sets all remaining inactive slots to the sentinel value.
+    std::fill_n(raw_keys + count, kMax64 - count, 0xFFFFFFFFFFFFFFFFULL);
+  }
+  leaf->SetNumKeys(static_cast<uint16_t>(count));
+}
+
+// Encodes sorted keys and values into a map leaf using the narrowest viable
+// compression mode (Map).
+template <typename KeyT, typename ValueT>
+HWY_INLINE void CompressIntoLeaf(MapLeafNode<KeyT, ValueT>* leaf,
+                                 const KeyT* keys, const ValueT* values,
+                                 size_t count) {
+  if (count == 0) {
+    leaf->SetNumKeys(0);
+    leaf->base_key = 0;
+    std::memset(leaf->payload, 0xFF, MapLeafNode<KeyT, ValueT>::kPayloadBytes);
+    return;
+  }
+
+  leaf->base_key = keys[0];
+  constexpr size_t kMax8 = MapLeafNode<KeyT, ValueT>::kMax8;
+  constexpr size_t kMax16 = MapLeafNode<KeyT, ValueT>::kMax16;
+  constexpr size_t kMax32 = MapLeafNode<KeyT, ValueT>::kMax32;
+  constexpr size_t kMax64 = MapLeafNode<KeyT, ValueT>::kMax64;
+
+  const uint64_t max_delta =
+      (count > 1) ? static_cast<uint64_t>(keys[count - 1] - keys[0]) : 0;
+
+  if (count <= kMax8 && max_delta <= 255) {
+    leaf->SetBitMode(kMode8Bit);
+    StoreCompressedOffsets<uint8_t, 0xFF>(leaf->KeyData(), keys, count,
+                                          leaf->base_key, kMax8);
+  } else if (count <= kMax16 && max_delta <= 65535) {
+    leaf->SetBitMode(kMode16Bit);
+    StoreCompressedOffsets<uint16_t, 0xFFFF>(leaf->KeyData(), keys, count,
+                                             leaf->base_key, kMax16);
+  } else if (count <= kMax32 &&
+             (sizeof(KeyT) == 4 || max_delta <= 0xFFFFFFFFULL)) {
+    leaf->SetBitMode(kMode32Bit);
+    if constexpr (sizeof(KeyT) == 4) {
+      auto* raw_keys = HWY_RCAST_ALIGNED(uint32_t*, leaf->KeyData());
+      for (size_t k = 0; k < count; ++k) {
+        raw_keys[k] = static_cast<uint32_t>(keys[k]);
+      }
+      // Sets all remaining inactive slots to the sentinel value.
+      std::fill_n(raw_keys + count, kMax32 - count, 0xFFFFFFFF);
+    } else {
+      StoreCompressedOffsets<uint32_t, 0xFFFFFFFF>(leaf->KeyData(), keys, count,
+                                                   leaf->base_key, kMax32);
+    }
+  } else {
+    leaf->SetBitMode(kModeRaw64);
+    auto* raw_keys = HWY_RCAST_ALIGNED(uint64_t*, leaf->KeyData());
+    for (size_t k = 0; k < count; ++k) {
+      raw_keys[k] = static_cast<uint64_t>(keys[k]);
+    }
+    // Sets all remaining inactive slots to the sentinel value.
+    std::fill_n(raw_keys + count, kMax64 - count, 0xFFFFFFFFFFFFFFFFULL);
+  }
+
+  ValueT* vals = leaf->Values();
+  std::memcpy(vals, values, count * sizeof(ValueT));
+  leaf->SetNumKeys(static_cast<uint16_t>(count));
+}
+
+// Returns true if `count` keys with key spread `max_delta = max_key - min_key`
+// can fit inside a single LeafNode under its narrowest viable compression mode.
+template <typename LeafNode>
+HWY_INLINE bool CanLeafFitSpan(size_t count, uint64_t max_delta) {
+  using KeyT = typename LeafNode::StorageKeyT;
+  if (count <= LeafNode::kMax8 && max_delta <= 255) return true;
+  if (count <= LeafNode::kMax16 && max_delta <= 65535) return true;
+  if constexpr (sizeof(KeyT) == 4) return count <= LeafNode::kMax32;
+  if (count <= LeafNode::kMax32 && max_delta <= 0xFFFFFFFFULL) return true;
+  return count <= LeafNode::kMax64;
+}
+
+// Returns true if a new key can fit into the leaf (potentially upgrading its
+// compression mode).
+template <typename LeafNode, typename KeyT>
+HWY_INLINE bool CanLeafFitInsert(const LeafNode* leaf, KeyT new_key) {
+  const size_t count = leaf->NumKeys();
+  if (HWY_UNLIKELY(count == 0)) return true;
+  const size_t new_count = count + 1;
+  const KeyT new_min_key = std::min(leaf->base_key, new_key);
+  const KeyT max_existing = GetLeafKey(leaf, count - 1);
+  const KeyT new_max_key = std::max(max_existing, new_key);
+  const uint64_t max_delta = static_cast<uint64_t>(new_max_key - new_min_key);
+  return CanLeafFitSpan<LeafNode>(new_count, max_delta);
+}
+
+// Decompresses all existing leaf keys into the caller-provided out_keys buffer,
+// inserts new_key into out_keys at `slot`, and returns the new key count.
+template <typename KeyT>
+HWY_INLINE size_t DecompressAndInsertKey(const LeafNode<KeyT>* leaf,
+                                         size_t slot, KeyT new_key,
+                                         KeyT* out_keys) {
+  DecompressLeaf(leaf, out_keys);
+  const size_t count = leaf->NumKeys();
+  if (count > slot) {
+    // Shifts existing keys right to open up slot for new_key.
+    std::memmove(out_keys + slot + 1, out_keys + slot,
+                 (count - slot) * sizeof(KeyT));
+  }
+  out_keys[slot] = new_key;
+  return count + 1;
+}
+
+// Decompresses all existing pairs from a map leaf into caller-provided out_keys
+// and out_values buffers, inserts (new_key, new_value) at `slot`, and returns
+// the new count.
+template <typename KeyT, typename ValueT>
+HWY_INLINE size_t DecompressAndInsertMapPair(
+    const MapLeafNode<KeyT, ValueT>* leaf, size_t slot, KeyT new_key,
+    const ValueT& new_value, KeyT* out_keys, ValueT* out_values) {
+  DecompressLeaf(leaf, out_keys, out_values);
+  const size_t count = leaf->NumKeys();
+  // Shifts existing keys and values right to open up slot for the new pair.
+  std::memmove(out_keys + slot + 1, out_keys + slot,
+               (count - slot) * sizeof(KeyT));
+  std::memmove(out_values + slot + 1, out_values + slot,
+               (count - slot) * sizeof(ValueT));
+  out_keys[slot] = new_key;
+  out_values[slot] = new_value;
+  return count + 1;
+}
+
+// Decompresses a leaf, inserts the new key at `slot`, and recompresses the
+// leaf (Set).
+template <typename KeyT>
+HWY_INLINE void InsertIntoLeaf(LeafNode<KeyT>* leaf, size_t slot,
+                               KeyT new_key) {
+  // Temporary scratch buffer on the stack to hold decompressed keys.
+  KeyT temp[512];
+
+  // Decompress existing keys and insert new_key at `slot`.
+  const size_t new_count = DecompressAndInsertKey(leaf, slot, new_key, temp);
+
+  // Recompress the sorted array back into the leaf node.
+  CompressIntoLeaf(leaf, temp, new_count);
+}
+
+// Decompresses a leaf, inserts the new key-value pair at `slot`, and
+// recompresses the leaf (Map).
+template <typename KeyT, typename ValueT>
+HWY_INLINE void InsertIntoLeaf(MapLeafNode<KeyT, ValueT>* leaf, size_t slot,
+                               KeyT new_key, const ValueT& new_value) {
+  // Temporary scratch buffers on the stack to hold decompressed keys and
+  // values.
+  KeyT temp_keys[512];
+  ValueT temp_values[512];
+
+  // Decompress existing pairs and insert (new_key, new_val) at `slot`.
+  const size_t new_count = DecompressAndInsertMapPair(
+      leaf, slot, new_key, new_value, temp_keys, temp_values);
+
+  // Recompress the sorted arrays back into the leaf node.
+  CompressIntoLeaf(leaf, temp_keys, temp_values, new_count);
+}
+
+// In-place fast path for inserting a key into a compressed offset leaf without
+// recompression (Set). Returns true if inserted in-place, or false if the leaf
+// is full or the delta exceeds kMaxDelta (requiring recompression or
+// splitting).
+template <typename Traits, typename OffsetT, uint64_t kMaxDelta, typename KeyT>
+HWY_INLINE bool TryFastInsertOffset(LeafNode<KeyT>* leaf, KeyT new_key,
+                                    size_t slot) {
+  constexpr size_t kCapacity = Traits::template MaxKeys<OffsetT>();
+  const size_t count = leaf->NumKeys();
+  if (HWY_UNLIKELY(count >= kCapacity)) return false;
+
+  auto* offsets = HWY_RCAST_ALIGNED(OffsetT*, leaf->data);
+
+  // new_key >= base_key.
+  // base_key stays unchanged; compute positive offset delta from base_key.
+  if (HWY_LIKELY(new_key >= leaf->base_key)) {
+    const uint64_t delta = static_cast<uint64_t>(new_key - leaf->base_key);
+    if (HWY_LIKELY(delta <= kMaxDelta)) {
+      // Moves up to capacity boundary; safe because destination stays within
+      // leaf->data and inactive trailing slots are simply shifted.
+      std::memmove(offsets + slot + 1, offsets + slot,
+                   (kCapacity - 1 - slot) * sizeof(OffsetT));
+      offsets[slot] = static_cast<OffsetT>(delta);
+      leaf->SetNumKeys(count + 1);
+      return true;
+    }
+  } else {
+    // new_key < base_key (inserted at slot 0).
+    // new_key becomes the new base_key (offset 0), and all existing offsets
+    // are shifted up by (old_base_key - new_key).
+    const KeyT max_existing = GetLeafKey(leaf, count - 1);
+    const uint64_t new_span = static_cast<uint64_t>(max_existing - new_key);
+    if (HWY_LIKELY(new_span <= kMaxDelta)) {
+      const OffsetT shift = static_cast<OffsetT>(leaf->base_key - new_key);
+      // Constant-size move for the full payload without libc
+      // length branching.
+      std::memmove(offsets + 1, offsets, (kCapacity - 1) * sizeof(OffsetT));
+      offsets[0] = 0;
+
+      // Vectorized offset adjustment: add (old_base_key - new_key) to each
+      // existing offset now that new_key has become the base_key.
+      const CappedTag<OffsetT, 256 / sizeof(OffsetT)> d;
+      const size_t N = Lanes(d);
+      const auto v_shift = Set(d, shift);
+      size_t i = 1;
+      for (; i + N <= count + 1; i += N) {
+        const auto v = LoadU(d, offsets + i);
+        StoreU(Add(v, v_shift), d, offsets + i);
+      }
+      if (i <= count) {
+        const size_t remaining = count + 1 - i;
+        // Note on LoadN: Unlike ScanOffsets where the loop starts at i = 0,
+        // here we start at i = 1 to skip slot 0. Because i = 1 + x * N, the
+        // multiple-of-N alignment is broken, so an unmasked LoadU on the tail
+        // could reach byte 513+ and cross into the next page on the 8th node.
+        // While we could start at i = 0 with LoadU and reset offsets[0] = 0
+        // after the loop, starting at 1 with LoadN is more intuitive and
+        // readable. This is anyways an unlikely branch within
+        // TryFastInsertOffset.
+        const auto v = LoadN(d, offsets + i, remaining);
+        StoreN(Add(v, v_shift), d, offsets + i, remaining);
+      }
+      leaf->base_key = new_key;
+      leaf->SetNumKeys(count + 1);
+      return true;
+    }
+  }
+  return false;
+}
+
+// In-place fast path for inserting a key-value pair into a compressed map leaf
+// without recompression (Map). Returns true if inserted in-place, or false if
+// full or the delta exceeds kMaxDelta (requiring recompression or splitting).
+template <typename Traits, typename OffsetT, uint64_t kMaxDelta, typename KeyT,
+          typename ValueT>
+HWY_INLINE bool TryFastInsertOffset(MapLeafNode<KeyT, ValueT>* leaf,
+                                    KeyT new_key, const ValueT& new_value,
+                                    size_t slot) {
+  const size_t count = leaf->NumKeys();
+  const size_t kCapacity = Traits::template MaxKeys<OffsetT>();
+  if (HWY_UNLIKELY(count >= kCapacity)) return false;
+
+  auto* offsets = HWY_RCAST_ALIGNED(OffsetT*, leaf->payload);
+  ValueT* vals = leaf->Values();
+
+  // Branch 1: new_key >= base_key.
+  // base_key stays unchanged; compute positive offset delta and shift values.
+  if (HWY_LIKELY(new_key >= leaf->base_key)) {
+    const uint64_t delta = static_cast<uint64_t>(new_key - leaf->base_key);
+    if (HWY_LIKELY(delta <= kMaxDelta)) {
+      // In MapLeafNode, keys and values share the payload buffer. We must bound
+      // moves by (count - slot) rather than capacity to prevent offsets from
+      // overwriting the values array, and values from overwriting tail
+      // metadata.
+      std::memmove(offsets + slot + 1, offsets + slot,
+                   (count - slot) * sizeof(OffsetT));
+      std::memmove(vals + slot + 1, vals + slot,
+                   (count - slot) * sizeof(ValueT));
+      offsets[slot] = static_cast<OffsetT>(delta);
+      vals[slot] = new_value;
+      leaf->SetNumKeys(count + 1);
+      return true;
+    }
+  } else {
+    // Branch 2: new_key < base_key (inserted at slot 0).
+    // new_key becomes the new base_key (offset 0), and all existing offsets
+    // and values are shifted up by (old_base_key - new_key).
+    const KeyT max_existing = GetLeafKey(leaf, count - 1);
+    const uint64_t new_span = static_cast<uint64_t>(max_existing - new_key);
+    if (HWY_LIKELY(new_span <= kMaxDelta)) {
+      const OffsetT shift = static_cast<OffsetT>(leaf->base_key - new_key);
+      // Moves must be bounded by count (not capacity) because offsets and
+      // values share the payload buffer.
+      std::memmove(offsets + 1, offsets, count * sizeof(OffsetT));
+      std::memmove(vals + 1, vals, count * sizeof(ValueT));
+      offsets[0] = 0;
+      vals[0] = new_value;
+
+      // Vectorized offset adjustment: add (old_base_key - new_key) to each
+      // existing offset now that new_key has become the base_key.
+      const CappedTag<OffsetT, 256 / sizeof(OffsetT)> d;
+      const size_t N = Lanes(d);
+      const auto v_shift = Set(d, shift);
+      size_t i = 1;
+      for (; i + N <= count + 1; i += N) {
+        const auto v = LoadU(d, offsets + i);
+        StoreU(Add(v, v_shift), d, offsets + i);
+      }
+      if (i <= count) {
+        const size_t remaining = count + 1 - i;
+        // Safe tail load; see LoadN note in TryFastInsertOffset above.
+        const auto v = LoadN(d, offsets + i, remaining);
+        StoreN(Add(v, v_shift), d, offsets + i, remaining);
+      }
+      leaf->base_key = new_key;
+      leaf->SetNumKeys(count + 1);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Fast-path dispatcher that attempts in-place insertion into a leaf without
+// full recompression (Set). Returns true if inserted in-place, or false if
+// the leaf is full or recompression/splitting is required.
+template <typename Traits, typename KeyT>
+HWY_INLINE bool TryFastInsertIntoLeaf(LeafNode<KeyT>* leaf, KeyT new_key,
+                                      size_t slot) {
+  using Leaf = LeafNode<KeyT>;
+  const size_t count = leaf->NumKeys();
+  if (HWY_UNLIKELY(count == 0)) {
+    CompressIntoLeaf(leaf, &new_key, 1);
+    return true;
+  }
+
+  const uint8_t mode = leaf->BitMode();
+  if (HWY_LIKELY(mode == kMode16Bit)) {
+    return TryFastInsertOffset<Traits, uint16_t, 65535>(leaf, new_key, slot);
+  } else if (mode == kMode8Bit) {
+    return TryFastInsertOffset<Traits, uint8_t, 255>(leaf, new_key, slot);
+  } else if (mode == kMode32Bit) {
+    if constexpr (sizeof(KeyT) == 4) {
+      if (HWY_UNLIKELY(count >= Leaf::kMax32)) return false;
+      auto* raw_keys = HWY_RCAST_ALIGNED(uint32_t*, leaf->data);
+      std::memmove(raw_keys + slot + 1, raw_keys + slot,
+                   (Leaf::kMax32 - 1 - slot) * sizeof(uint32_t));
+      raw_keys[slot] = static_cast<uint32_t>(new_key);
+      if (HWY_UNLIKELY(slot == 0)) leaf->base_key = new_key;
+      leaf->SetNumKeys(count + 1);
+      return true;
+    } else {
+      return TryFastInsertOffset<Traits, uint32_t, 0xFFFFFFFFULL>(leaf, new_key,
+                                                                  slot);
+    }
+  } else {
+    if (HWY_UNLIKELY(count >= Leaf::kMax64)) return false;
+    auto* raw_keys = HWY_RCAST_ALIGNED(uint64_t*, leaf->data);
+    std::memmove(raw_keys + slot + 1, raw_keys + slot,
+                 (Leaf::kMax64 - 1 - slot) * sizeof(uint64_t));
+    raw_keys[slot] = static_cast<uint64_t>(new_key);
+    if (HWY_UNLIKELY(slot == 0)) leaf->base_key = new_key;
+    leaf->SetNumKeys(count + 1);
+    return true;
+  }
+}
+
+// Fast-path dispatcher that attempts in-place insertion into a map leaf across
+// all bit modes (Map). Returns true if inserted in-place, or false if the leaf
+// is full or recompression/splitting is required.
+template <typename Traits, typename KeyT, typename ValueT>
+HWY_INLINE bool TryFastInsertIntoLeaf(MapLeafNode<KeyT, ValueT>* leaf,
+                                      KeyT new_key, const ValueT& value,
+                                      size_t slot) {
+  using Leaf = MapLeafNode<KeyT, ValueT>;
+  const size_t count = leaf->NumKeys();
+  if (HWY_UNLIKELY(count == 0)) {
+    CompressIntoLeaf(leaf, &new_key, &value, 1);
+    return true;
+  }
+
+  const uint8_t mode = leaf->BitMode();
+  if (HWY_LIKELY(mode == kMode16Bit)) {
+    return TryFastInsertOffset<Traits, uint16_t, 65535>(leaf, new_key, value,
+                                                        slot);
+  } else if (mode == kMode8Bit) {
+    return TryFastInsertOffset<Traits, uint8_t, 255>(leaf, new_key, value,
+                                                     slot);
+  } else if (mode == kMode32Bit) {
+    if constexpr (sizeof(KeyT) == 4) {
+      if (HWY_UNLIKELY(count >= Leaf::kMax32)) return false;
+      ValueT* vals = leaf->Values();
+      auto* raw_keys = HWY_RCAST_ALIGNED(uint32_t*, leaf->payload);
+      std::memmove(raw_keys + slot + 1, raw_keys + slot,
+                   (count - slot) * sizeof(uint32_t));
+      std::memmove(vals + slot + 1, vals + slot,
+                   (count - slot) * sizeof(ValueT));
+      raw_keys[slot] = static_cast<uint32_t>(new_key);
+      vals[slot] = value;
+      if (HWY_UNLIKELY(slot == 0)) leaf->base_key = new_key;
+      leaf->SetNumKeys(count + 1);
+      return true;
+    } else {
+      return TryFastInsertOffset<Traits, uint32_t, 0xFFFFFFFFULL>(leaf, new_key,
+                                                                  value, slot);
+    }
+  } else {
+    if (HWY_UNLIKELY(count >= Leaf::kMax64)) return false;
+    ValueT* vals = leaf->Values();
+    auto* raw_keys = HWY_RCAST_ALIGNED(uint64_t*, leaf->payload);
+    std::memmove(raw_keys + slot + 1, raw_keys + slot,
+                 (count - slot) * sizeof(uint64_t));
+    std::memmove(vals + slot + 1, vals + slot, (count - slot) * sizeof(ValueT));
+    raw_keys[slot] = static_cast<uint64_t>(new_key);
+    vals[slot] = value;
+    if (HWY_UNLIKELY(slot == 0)) leaf->base_key = new_key;
+    leaf->SetNumKeys(count + 1);
+    return true;
+  }
+}
+
+// In-place fast path for erasing a key at slot from a compressed offset leaf
+// (Set). Returns true after in-place erasure (always succeeds as key deletion
+// never increases delta or capacity).
+template <typename OffsetT, OffsetT kSentinel, typename KeyT>
+HWY_INLINE bool TryFastEraseOffset(LeafNode<KeyT>* leaf, size_t slot) {
+  constexpr size_t kCapacity = LeafNode<KeyT>::kDataBytes / sizeof(OffsetT);
+  const size_t count = leaf->NumKeys();
+  auto* offsets = HWY_RCAST_ALIGNED(OffsetT*, leaf->data);
+  // If erasing slot 0 (the base_key), re-base remaining offsets by subtracting
+  // offsets[1] while shifting them left to overwrite slot 0, then advance
+  // base_key by offsets[1].
+  if (HWY_UNLIKELY(slot == 0)) {
+    const OffsetT shift = offsets[1];
+    for (size_t i = 1; i < count; ++i) {
+      offsets[i - 1] = offsets[i] - shift;
+    }
+    offsets[count - 1] = kSentinel;
+    leaf->base_key += shift;
+  } else {
+    // If erasing slot > 0, shift subsequent offsets left.
+    // Constant-size move up to capacity boundary without libc length branching.
+    std::memmove(offsets + slot, offsets + slot + 1,
+                 (kCapacity - 1 - slot) * sizeof(OffsetT));
+    offsets[count - 1] = kSentinel;
+  }
+  leaf->SetNumKeys(count - 1);
+  return true;
+}
+
+// In-place fast path for erasing a key-value pair from a compressed map leaf
+// (Map). Returns true after in-place erasure (always succeeds as key deletion
+// never increases delta or capacity).
+template <typename OffsetT, OffsetT kSentinel, typename KeyT, typename ValueT>
+HWY_INLINE bool TryFastEraseOffset(MapLeafNode<KeyT, ValueT>* leaf,
+                                   size_t slot) {
+  const size_t count = leaf->NumKeys();
+  auto* offsets = HWY_RCAST_ALIGNED(OffsetT*, leaf->payload);
+  ValueT* vals = leaf->Values();
+  // If erasing slot 0 (the base_key), re-base remaining offsets by subtracting
+  // offsets[1] while shifting them left to overwrite slot 0, shift values left,
+  // and advance base_key by offsets[1].
+  if (HWY_UNLIKELY(slot == 0)) {
+    const OffsetT shift = offsets[1];
+    for (size_t i = 1; i < count; ++i) {
+      offsets[i - 1] = offsets[i] - shift;
+    }
+    std::memmove(vals, vals + 1, (count - 1) * sizeof(ValueT));
+    offsets[count - 1] = kSentinel;
+    leaf->base_key += shift;
+  } else {
+    // If erasing slot > 0, shift subsequent offsets and values left.
+    std::memmove(offsets + slot, offsets + slot + 1,
+                 (count - 1 - slot) * sizeof(OffsetT));
+    std::memmove(vals + slot, vals + slot + 1,
+                 (count - 1 - slot) * sizeof(ValueT));
+    offsets[count - 1] = kSentinel;
+  }
+  leaf->SetNumKeys(count - 1);
+  return true;
+}
+
+// Fast-path dispatcher that erases a key from a leaf in-place across all bit
+// modes (Set). Always returns true after in-place erasure.
+template <typename KeyT>
+HWY_INLINE bool TryFastEraseFromLeaf(LeafNode<KeyT>* leaf, size_t slot) {
+  using Leaf = LeafNode<KeyT>;
+  const size_t count = leaf->NumKeys();
+  if (HWY_UNLIKELY(count <= 1)) {
+    leaf->SetNumKeys(0);
+    leaf->base_key = 0;
+    std::memset(leaf->data, 0xFF, Leaf::kDataBytes);
+    return true;
+  }
+
+  const uint8_t mode = leaf->BitMode();
+  if (HWY_LIKELY(mode == kMode16Bit)) {
+    return TryFastEraseOffset<uint16_t, 0xFFFF>(leaf, slot);
+  } else if (mode == kMode8Bit) {
+    return TryFastEraseOffset<uint8_t, 0xFF>(leaf, slot);
+  } else if (mode == kMode32Bit) {
+    if constexpr (sizeof(KeyT) == 4) {
+      auto* raw_keys = HWY_RCAST_ALIGNED(uint32_t*, leaf->data);
+      // Constant-size move up to capacity boundary without libc length
+      // branching.
+      std::memmove(raw_keys + slot, raw_keys + slot + 1,
+                   (Leaf::kMax32 - 1 - slot) * sizeof(uint32_t));
+      raw_keys[count - 1] = 0xFFFFFFFF;
+      if (HWY_UNLIKELY(slot == 0)) {
+        leaf->base_key = static_cast<KeyT>(raw_keys[0]);
+      }
+      leaf->SetNumKeys(count - 1);
+      return true;
+    } else {
+      return TryFastEraseOffset<uint32_t, 0xFFFFFFFF>(leaf, slot);
+    }
+  } else {
+    auto* raw_keys = HWY_RCAST_ALIGNED(uint64_t*, leaf->data);
+    // Constant-size move up to capacity boundary without libc length branching.
+    std::memmove(raw_keys + slot, raw_keys + slot + 1,
+                 (Leaf::kMax64 - 1 - slot) * sizeof(uint64_t));
+    raw_keys[count - 1] = 0xFFFFFFFFFFFFFFFFULL;
+    if (HWY_UNLIKELY(slot == 0)) {
+      leaf->base_key = static_cast<KeyT>(raw_keys[0]);
+    }
+    leaf->SetNumKeys(count - 1);
+    return true;
+  }
+}
+
+// Fast-path dispatcher that erases a key from a map leaf in-place across all
+// bit modes (Map). Always returns true after in-place erasure.
+template <typename KeyT, typename ValueT>
+HWY_INLINE bool TryFastEraseFromLeaf(MapLeafNode<KeyT, ValueT>* leaf,
+                                     size_t slot) {
+  using Leaf = MapLeafNode<KeyT, ValueT>;
+  const size_t count = leaf->NumKeys();
+  if (HWY_UNLIKELY(count <= 1)) {
+    leaf->SetNumKeys(0);
+    leaf->base_key = 0;
+    std::memset(leaf->payload, 0xFF, Leaf::kPayloadBytes);
+    return true;
+  }
+
+  const uint8_t mode = leaf->BitMode();
+  if (HWY_LIKELY(mode == kMode16Bit)) {
+    return TryFastEraseOffset<uint16_t, 0xFFFF>(leaf, slot);
+  } else if (mode == kMode8Bit) {
+    return TryFastEraseOffset<uint8_t, 0xFF>(leaf, slot);
+  } else if (mode == kMode32Bit) {
+    if constexpr (sizeof(KeyT) == 4) {
+      ValueT* vals = leaf->Values();
+      auto* raw_keys = HWY_RCAST_ALIGNED(uint32_t*, leaf->payload);
+      std::memmove(raw_keys + slot, raw_keys + slot + 1,
+                   (count - 1 - slot) * sizeof(uint32_t));
+      std::memmove(vals + slot, vals + slot + 1,
+                   (count - 1 - slot) * sizeof(ValueT));
+      raw_keys[count - 1] = 0xFFFFFFFF;
+      if (HWY_UNLIKELY(slot == 0)) {
+        leaf->base_key = static_cast<KeyT>(raw_keys[0]);
+      }
+      leaf->SetNumKeys(count - 1);
+      return true;
+    } else {
+      return TryFastEraseOffset<uint32_t, 0xFFFFFFFF>(leaf, slot);
+    }
+  } else {
+    ValueT* vals = leaf->Values();
+    auto* raw_keys = HWY_RCAST_ALIGNED(uint64_t*, leaf->payload);
+    std::memmove(raw_keys + slot, raw_keys + slot + 1,
+                 (count - 1 - slot) * sizeof(uint64_t));
+    std::memmove(vals + slot, vals + slot + 1,
+                 (count - 1 - slot) * sizeof(ValueT));
+    raw_keys[count - 1] = 0xFFFFFFFFFFFFFFFFULL;
+    if (HWY_UNLIKELY(slot == 0)) {
+      leaf->base_key = static_cast<KeyT>(raw_keys[0]);
+    }
+    leaf->SetNumKeys(count - 1);
+    return true;
+  }
+}
+
+// Separator key for parent routing between two adjacent leaves after a split
+// or rebalance. Any value in (left_max, right_min] is valid; we use the
+// midpoint of the gap so that a later key falling into the gap routes to the
+// nearer leaf, i.e. the one whose key span (and thus compression mode) it
+// disturbs least. Example: left = [1000 .. 1243], right = [2^32 .. 2^32 + 99],
+// insert 2^32 - 5. With sep = right_min = 2^32 it goes to the left leaf, whose
+// span jumps to ~2^32 (forcing a rebalance or split); with the midpoint
+// (~2^31) it goes to the right leaf, next to its neighbours.
+template <typename KeyT>
+HWY_INLINE KeyT GapMidpointSeparator(KeyT left_max, KeyT right_min) {
+  const KeyT gap = static_cast<KeyT>(right_min - left_max);  // >= 1
+  // Round up (ceil) so that sep > left_max even when gap == 1; computed as
+  // gap / 2 + (gap & 1) because (gap + 1) / 2 overflows when gap == max.
+  return static_cast<KeyT>(left_max + (gap / 2) + (gap & 1));
+}
+
+// Splits a full leaf plus a new key at `slot` into two balanced leaves and
+// returns the separator key (Set).
+template <typename KeyT>
+void SplitLeafNode(LeafNode<KeyT>* leaf, LeafNode<KeyT>* new_leaf, size_t slot,
+                   KeyT new_key, KeyT* out_promo_key) {
+  using Leaf = LeafNode<KeyT>;
+  // Stack storage to avoid heap allocation.
+  KeyT temp[512];
+
+  // Decompress all existing keys from leaf and insert new_key at `slot`.
+  const size_t total = DecompressAndInsertKey(leaf, slot, new_key, temp);
+
+  // Position-biased split (inspired by absl::btree, but restricted to tree
+  // boundaries to avoid creating underfilled interior leaves on random
+  // inserts): When appending at the end of the rightmost leaf (ascending
+  // sequence), bias the split so the left leaf stays full (100% fill factor).
+  // When prepending at the start of the leftmost leaf (descending sequence),
+  // bias the split so the right leaf stays full.
+  // Otherwise, split 50/50 for balanced tree depth under random workloads.
+  size_t split_point = total / 2;
+  if (leaf->Next() == nullptr && new_key == temp[total - 1]) {
+    split_point = total - 1;
+  } else if (leaf->Prev() == nullptr && new_key == temp[0]) {
+    split_point = 1;
+  }
+
+  // Why a 50/50 split can overflow when `new_key` widens the key span:
+  // Suppose `leaf` (64-bit Set) holds 244 keys in 8/16-bit mode (or 122 keys in
+  // 32-bit mode), and `new_key` has a huge delta (> 2^32) that forces whichever
+  // half receives it down to 64-bit raw mode (max capacity kMax64 = 61 keys).
+  // A 50/50 split (122/123 keys, or 61/62 keys) would give that half > 61 keys
+  // and overflow the 512B leaf!
+  //
+  // Fix: Cap the half containing `new_key` at kMinModeCap (123 for 32-bit keys,
+  // 61 for 64-bit keys), which always fits even in uncompressed mode; the other
+  // half is a subset of the original leaf's keys and still fits in its original
+  // denser mode.
+  constexpr size_t kMinModeCap =
+      (sizeof(KeyT) == 4) ? Leaf::kMax32 : Leaf::kMax64;
+  // Case 1 (Left half overflow): e.g. leaf had [10^10 .. 10^10 + 243] and
+  // new_key = 5*10^9 landed at temp[0]. Give left half 61 keys; right half gets
+  // the remaining 184 dense keys.
+  if (!CanLeafFitSpan<Leaf>(
+          split_point,
+          static_cast<uint64_t>(temp[split_point - 1] - temp[0]))) {
+    split_point = kMinModeCap;
+  } else if (!CanLeafFitSpan<Leaf>(
+                 total - split_point,
+                 static_cast<uint64_t>(temp[total - 1] - temp[split_point]))) {
+    // Case 2 (Right half overflow): e.g. leaf had [10000 .. 10243] and
+    // new_key = 5*10^9 landed at temp[244]. Keep 184 dense keys in left half;
+    // right half gets the last 61 keys.
+    split_point = total - kMinModeCap;
+  }
+
+  // Recompress left half (temp[0..split_point-1]) back into original leaf.
+  CompressIntoLeaf(leaf, temp, split_point);
+
+  // Recompress right half (temp[split_point..total-1]) into the new_leaf.
+  CompressIntoLeaf(new_leaf, temp + split_point, total - split_point);
+
+  // Separator for parent routing: midpoint of the gap between the halves (see
+  // GapMidpointSeparator).
+  *out_promo_key =
+      GapMidpointSeparator(temp[split_point - 1], temp[split_point]);
+}
+
+// Splits a full leaf plus a new key/value pair at `slot` into two balanced
+// leaves and returns the separator key (Map).
+template <typename KeyT, typename ValueT>
+void SplitLeafNode(MapLeafNode<KeyT, ValueT>* leaf,
+                   MapLeafNode<KeyT, ValueT>* new_leaf, size_t slot,
+                   KeyT new_key, const ValueT& new_value, KeyT* out_promo_key) {
+  using Leaf = MapLeafNode<KeyT, ValueT>;
+  // Stack storage to avoid heap allocation.
+  KeyT temp_keys[512];
+  ValueT temp_values[512];
+
+  // Decompress all existing pairs from leaf and insert (new_key, new_value) at
+  // `slot`.
+  const size_t total = DecompressAndInsertMapPair(
+      leaf, slot, new_key, new_value, temp_keys, temp_values);
+
+  // Position-biased split (inspired by absl::btree, but restricted to tree
+  // boundaries to avoid creating underfilled interior leaves on random
+  // inserts): When appending at the end of the rightmost leaf (ascending
+  // sequence), bias the split so the left leaf stays full (100% fill factor).
+  // When prepending at the start of the leftmost leaf (descending sequence),
+  // bias the split so the right leaf stays full.
+  // Otherwise, split 50/50 for balanced tree depth under random workloads.
+  size_t split_point = total / 2;
+  if (leaf->Next() == nullptr && new_key == temp_keys[total - 1]) {
+    split_point = total - 1;
+  } else if (leaf->Prev() == nullptr && new_key == temp_keys[0]) {
+    split_point = 1;
+  }
+
+  // Mode-downgrade guard: see SplitLeafNode (Set) above.
+  constexpr size_t kMinModeCap =
+      (sizeof(KeyT) == 4) ? Leaf::kMax32 : Leaf::kMax64;
+  if (!CanLeafFitSpan<Leaf>(
+          split_point,
+          static_cast<uint64_t>(temp_keys[split_point - 1] - temp_keys[0]))) {
+    split_point = kMinModeCap;
+  } else if (!CanLeafFitSpan<Leaf>(
+                 total - split_point,
+                 static_cast<uint64_t>(temp_keys[total - 1] -
+                                       temp_keys[split_point]))) {
+    split_point = total - kMinModeCap;
+  }
+
+  // Recompress left half back into original leaf.
+  CompressIntoLeaf(leaf, temp_keys, temp_values, split_point);
+
+  // Recompress right half into the new_leaf.
+  CompressIntoLeaf(new_leaf, temp_keys + split_point, temp_values + split_point,
+                   total - split_point);
+
+  // Separator for parent routing: midpoint of the gap between the halves (see
+  // GapMidpointSeparator).
+  *out_promo_key =
+      GapMidpointSeparator(temp_keys[split_point - 1], temp_keys[split_point]);
+}
+
+template <typename Leaf>
+HWY_INLINE constexpr size_t LeafCapacityForMode(uint8_t mode) {
+  if (mode == kMode16Bit) return Leaf::kMax16;
+  if (mode == kMode8Bit) return Leaf::kMax8;
+  if (mode == kMode32Bit) return Leaf::kMax32;
+  return Leaf::kMax64;
+}
+
+// Free slots a leaf in compression `mode` must keep after a sibling rebalance
+// on insert: about 1/64 of that mode's capacity, at least 1. E.g. 4 for a
+// 16-bit Set leaf (244 slots), 2 for a 32-bit Set leaf (122), 1 for a raw
+// 64-bit Set leaf (61) or a 16-bit BTreeMap<uint32_t, uint64_t> leaf (49).
+// 8-bit leaves hold at most kMaxLiveLeafKeys keys, not kMax8.
+template <typename Leaf>
+HWY_INLINE size_t RebalanceHeadroom(uint8_t mode) {
+  const size_t capacity =
+      HWY_MIN(LeafCapacityForMode<Leaf>(mode), kMaxLiveLeafKeys<Leaf>);
+  return (capacity + 63) / 64;  // ceil(capacity / 64) = (a + b - 1) / b
+}
+
+// O(1) filter run before decompressing two sibling leaves for a rebalance:
+// returns false if the pair clearly has no room for one more key plus
+// RebalanceHeadroom free slots in each leaf, at their current compression
+// modes. It does not depend on where CalculateRebalanceSplitPoint will cut, and
+// it is not exact (modes can change once keys move between the leaves); the
+// exact check runs after the cut is chosen.
+template <typename Leaf>
+HWY_INLINE bool CanRebalanceLeaves(const Leaf* l_leaf, const Leaf* r_leaf) {
+  const size_t l_count = l_leaf->NumKeys();
+  const size_t r_count = r_leaf->NumKeys();
+  // Leaves of a tree with height >= 1 are never empty: an emptied leaf is
+  // always merged away on erase (see CanMergeLeaves).
+  HWY_DASSERT(l_count != 0 && r_count != 0);
+
+  const size_t total = l_count + r_count + 1;
+  const uint8_t l_mode = l_leaf->BitMode();
+  const uint8_t r_mode = r_leaf->BitMode();
+  return total + RebalanceHeadroom<Leaf>(l_mode) +
+             RebalanceHeadroom<Leaf>(r_mode) <=
+         LeafCapacityForMode<Leaf>(l_mode) + LeafCapacityForMode<Leaf>(r_mode);
+}
+
+// Index (kMode8Bit .. kModeRaw64) of the narrowest compression mode whose
+// offsets can represent `span = max_key - min_key`, ignoring the key count.
+template <typename KeyT>
+HWY_INLINE uint8_t NarrowestModeForSpan(uint64_t span) {
+  if (span <= 255) return kMode8Bit;
+  if (span <= 65535) return kMode16Bit;
+  if (sizeof(KeyT) == 4 || span <= 0xFFFFFFFFULL) return kMode32Bit;
+  return kModeRaw64;
+}
+
+// Returns where to cut the sorted keys of two sibling leaves (plus the new key)
+// between them: the left leaf gets keys[0, cut) and the right leaf the rest.
+//
+// The cut is in the middle unless one side should be filled as much as it can
+// hold (minus RebalanceHeadroom):
+//  - Position bias (as in absl::btree::rebalance_or_split): `append_right`
+//    means the leaf new_key was initially routed to is the right one of the
+//    pair and new_key is its new maximum, i.e. an ascending run. Later keys
+//    can keep landing there, so fill the left leaf and leave the room where
+//    the run continues. `prepend_left` is the descending mirror image.
+//  - Mode bias: if the two halves would need different compression modes, fill
+//    the half with the narrower mode, which has more slots. E.g. 237 dense
+//    keys followed by one far key F: a 50/50 cut gives [119 dense] (16-bit,
+//    half full) | [118 dense + F] (32-bit, nearly full); mode bias gives
+//    [237 dense] (16-bit) | [F].
+//
+// How many keys fit in a leaf depends on their span (which sets the mode), so
+// the largest count that fits is found by binary search. If even the 50/50 cut
+// does not fit, it is returned anyway; the caller verifies both sides.
+template <typename Leaf, typename KeyT>
+HWY_INLINE size_t CalculateRebalanceSplitPoint(const KeyT* keys, size_t total,
+                                               bool append_right,
+                                               bool prepend_left) {
+  const size_t half = total / 2;
+  bool fill_left = append_right;
+  bool fill_right = prepend_left;
+  if (!fill_left && !fill_right) {
+    const uint8_t mode_l = NarrowestModeForSpan<KeyT>(
+        static_cast<uint64_t>(keys[half - 1] - keys[0]));
+    const uint8_t mode_r = NarrowestModeForSpan<KeyT>(
+        static_cast<uint64_t>(keys[total - 1] - keys[half]));
+    fill_left = mode_l < mode_r;
+    fill_right = mode_r < mode_l;
+  }
+  if (!fill_left && !fill_right) return half;
+  // Exactly one of fill_left / fill_right is set here; the ':' branches of the
+  // ternaries below handle fill_right.
+  HWY_DASSERT(fill_left != fill_right);
+
+  // n = number of keys on the side being packed. It gets at least its 50/50
+  // share (n_lo) and at most all keys but one, since the other side must keep
+  // at least one key (n_hi).
+  const size_t n_lo = fill_left ? half : total - half;
+  const size_t n_hi = total - 1;
+
+  const auto fits = [&](size_t n) HWY_ATTR {
+    const uint64_t span =
+        fill_left ? static_cast<uint64_t>(keys[n - 1] - keys[0])
+                  : static_cast<uint64_t>(keys[total - 1] - keys[total - n]);
+    const size_t headroom =
+        RebalanceHeadroom<Leaf>(NarrowestModeForSpan<KeyT>(span));
+    return CanLeafFitSpan<Leaf>(n + headroom, span);
+  };
+
+  size_t n = n_lo;
+  if (fits(n_lo)) {
+    // Invariant: fits(lo). Find the largest n in [n_lo, n_hi] with fits(n).
+    size_t lo = n_lo;
+    size_t hi = n_hi;
+    while (lo < hi) {
+      const size_t probe = hi - (hi - lo) / 2;
+      if (fits(probe)) {
+        lo = probe;
+      } else {
+        hi = probe - 1;
+      }
+    }
+    n = lo;
+  }
+  return fill_left ? n : total - n;
+}
+
+// Redistributes keys between the two adjacent leaves parent->children[sep_idx]
+// and parent->children[sep_idx + 1], one of which is `parent->children[c_idx]`,
+// the leaf new_key was initially routed to, and inserts new_key at `slot`
+// within that leaf (Set). Returns false, leaving both leaves unchanged, if no
+// cut lets both leaves fit.
+template <typename KeyT>
+bool TryRebalanceAdjacentLeaves(InternalNode<KeyT>* parent, size_t c_idx,
+                                size_t sep_idx, size_t slot, KeyT new_key) {
+  using Leaf = LeafNode<KeyT>;
+  auto* l_leaf = static_cast<Leaf*>(parent->children[sep_idx]);
+  auto* r_leaf = static_cast<Leaf*>(parent->children[sep_idx + 1]);
+  const size_t l_count = l_leaf->NumKeys();
+  const size_t r_count = r_leaf->NumKeys();
+  const size_t total = l_count + r_count + 1;
+
+  KeyT temp[2 * kMaxLiveLeafKeys<Leaf> + 1];
+  if (sep_idx == c_idx - 1) {
+    DecompressLeaf(l_leaf, temp);
+    DecompressAndInsertKey(r_leaf, slot, new_key, temp + l_count);
+  } else {
+    const size_t new_l = DecompressAndInsertKey(l_leaf, slot, new_key, temp);
+    DecompressLeaf(r_leaf, temp + new_l);
+  }
+
+  // Position bias (see CalculateRebalanceSplitPoint): the leaf new_key was
+  // initially routed to (children[c_idx]) is the right one of the pair and
+  // new_key is its new maximum (ascending run), or it is the left one and
+  // new_key is its new minimum (descending run).
+  const bool append_right =
+      (sep_idx == c_idx - 1) && new_key == temp[total - 1];
+  const bool prepend_left = (sep_idx == c_idx) && new_key == temp[0];
+  const size_t split_point = CalculateRebalanceSplitPoint<Leaf>(
+      temp, total, append_right, prepend_left);
+  const size_t right_half = total - split_point;
+
+  const uint64_t l_span =
+      static_cast<uint64_t>(temp[split_point - 1] - temp[0]);
+  const uint64_t r_span =
+      static_cast<uint64_t>(temp[total - 1] - temp[split_point]);
+
+  const size_t l_needed =
+      split_point + RebalanceHeadroom<Leaf>(NarrowestModeForSpan<KeyT>(l_span));
+  const size_t r_needed =
+      right_half + RebalanceHeadroom<Leaf>(NarrowestModeForSpan<KeyT>(r_span));
+  if (!CanLeafFitSpan<Leaf>(l_needed, l_span) ||
+      !CanLeafFitSpan<Leaf>(r_needed, r_span)) {
+    return false;
+  }
+
+  CompressIntoLeaf(l_leaf, temp, split_point);
+  CompressIntoLeaf(r_leaf, temp + split_point, right_half);
+  parent->keys[sep_idx] =
+      GapMidpointSeparator(temp[split_point - 1], temp[split_point]);
+  return true;
+}
+
+// Map counterpart of TryRebalanceAdjacentLeaves above: redistributes key-value
+// pairs between parent->children[sep_idx] and parent->children[sep_idx + 1]
+// and inserts (new_key, new_value) at `slot` within `parent->children[c_idx]`.
+// Returns false, leaving both leaves unchanged, if no cut lets both leaves fit.
+template <typename KeyT, typename ValueT>
+bool TryRebalanceAdjacentLeaves(InternalNode<KeyT>* parent, size_t c_idx,
+                                size_t sep_idx, size_t slot, KeyT new_key,
+                                const ValueT& new_value) {
+  using Leaf = MapLeafNode<KeyT, ValueT>;
+  auto* l_leaf = static_cast<Leaf*>(parent->children[sep_idx]);
+  auto* r_leaf = static_cast<Leaf*>(parent->children[sep_idx + 1]);
+  const size_t l_count = l_leaf->NumKeys();
+  const size_t r_count = r_leaf->NumKeys();
+  const size_t total = l_count + r_count + 1;
+
+  KeyT temp_keys[2 * kMaxLiveLeafKeys<Leaf> + 1];
+  ValueT temp_values[2 * kMaxLiveLeafKeys<Leaf> + 1];
+  if (sep_idx == c_idx - 1) {
+    DecompressLeaf(l_leaf, temp_keys, temp_values);
+    DecompressAndInsertMapPair(r_leaf, slot, new_key, new_value,
+                               temp_keys + l_count, temp_values + l_count);
+  } else {
+    const size_t new_l = DecompressAndInsertMapPair(
+        l_leaf, slot, new_key, new_value, temp_keys, temp_values);
+    DecompressLeaf(r_leaf, temp_keys + new_l, temp_values + new_l);
+  }
+
+  // Position bias (see CalculateRebalanceSplitPoint): the leaf new_key was
+  // initially routed to (children[c_idx]) is the right one of the pair and
+  // new_key is its new maximum (ascending run), or it is the left one and
+  // new_key is its new minimum (descending run).
+  const bool append_right =
+      (sep_idx == c_idx - 1) && new_key == temp_keys[total - 1];
+  const bool prepend_left = (sep_idx == c_idx) && new_key == temp_keys[0];
+  const size_t split_point = CalculateRebalanceSplitPoint<Leaf>(
+      temp_keys, total, append_right, prepend_left);
+  const size_t right_half = total - split_point;
+
+  const uint64_t l_span =
+      static_cast<uint64_t>(temp_keys[split_point - 1] - temp_keys[0]);
+  const uint64_t r_span =
+      static_cast<uint64_t>(temp_keys[total - 1] - temp_keys[split_point]);
+
+  const size_t l_needed =
+      split_point + RebalanceHeadroom<Leaf>(NarrowestModeForSpan<KeyT>(l_span));
+  const size_t r_needed =
+      right_half + RebalanceHeadroom<Leaf>(NarrowestModeForSpan<KeyT>(r_span));
+  if (!CanLeafFitSpan<Leaf>(l_needed, l_span) ||
+      !CanLeafFitSpan<Leaf>(r_needed, r_span)) {
+    return false;
+  }
+
+  CompressIntoLeaf(l_leaf, temp_keys, temp_values, split_point);
+  CompressIntoLeaf(r_leaf, temp_keys + split_point, temp_values + split_point,
+                   right_half);
+  parent->keys[sep_idx] =
+      GapMidpointSeparator(temp_keys[split_point - 1], temp_keys[split_point]);
+  return true;
+}
+
+// Attempts to redistribute keys between `leaf` (at `parent->children[c_idx]`),
+// which cannot absorb `new_key` in any compression mode (it is at capacity, or
+// `new_key` would widen its span into a mode with too few slots), and an
+// adjacent sibling in `parent`, so that `new_key` (at `slot` in `leaf`) fits
+// without allocating a new leaf node (Set). Returns false if no sibling can
+// take enough keys.
+template <typename KeyT>
+bool TryRebalanceLeafOnInsert(InternalNode<KeyT>* parent, size_t c_idx,
+                              LeafNode<KeyT>* leaf, size_t slot, KeyT new_key) {
+  using Leaf = LeafNode<KeyT>;
+  // Try the left sibling first, then the right one, similar to
+  // absl::btree::rebalance_or_split. If the left attempt is rejected by the
+  // exact check, the right sibling is still tried.
+  if (c_idx > 0 &&
+      CanRebalanceLeaves(static_cast<Leaf*>(parent->children[c_idx - 1]),
+                         leaf) &&
+      TryRebalanceAdjacentLeaves(parent, c_idx, c_idx - 1, slot, new_key)) {
+    return true;
+  }
+  return c_idx + 1 <= parent->num_keys &&
+         CanRebalanceLeaves(leaf,
+                            static_cast<Leaf*>(parent->children[c_idx + 1])) &&
+         TryRebalanceAdjacentLeaves(parent, c_idx, c_idx, slot, new_key);
+}
+
+// Map counterpart of the Set TryRebalanceLeafOnInsert: redistributes key-value
+// pairs between `leaf` (which cannot absorb `new_key` in any compression mode)
+// and an adjacent sibling in `parent` so that `(new_key, new_value)` (at `slot`
+// in `leaf`) fits without allocating a new leaf node. Returns false if no
+// sibling can take enough keys.
+template <typename KeyT, typename ValueT>
+bool TryRebalanceLeafOnInsert(InternalNode<KeyT>* parent, size_t c_idx,
+                              MapLeafNode<KeyT, ValueT>* leaf, size_t slot,
+                              KeyT new_key, const ValueT& new_value) {
+  using Leaf = MapLeafNode<KeyT, ValueT>;
+  if (c_idx > 0 &&
+      CanRebalanceLeaves(static_cast<Leaf*>(parent->children[c_idx - 1]),
+                         leaf) &&
+      TryRebalanceAdjacentLeaves(parent, c_idx, c_idx - 1, slot, new_key,
+                                 new_value)) {
+    return true;
+  }
+  return c_idx + 1 <= parent->num_keys &&
+         CanRebalanceLeaves(leaf,
+                            static_cast<Leaf*>(parent->children[c_idx + 1])) &&
+         TryRebalanceAdjacentLeaves(parent, c_idx, c_idx, slot, new_key,
+                                    new_value);
+}
+
+// Returns true if two adjacent leaves can merge without exceeding leaf
+// capacity.
+template <typename LeafNode>
+HWY_INLINE bool CanMergeLeaves(const LeafNode* leaf,
+                               const LeafNode* next_leaf) {
+  using Node = LeafNode;
+  using KeyT = decltype(leaf->base_key);
+  const size_t total_keys = leaf->NumKeys() + next_leaf->NumKeys();
+  // If either leaf is empty, all surviving keys already fit in the other leaf
+  // (even if it is an 8-bit leaf with > kMax16 keys), so always allow merging.
+  if (leaf->NumKeys() == 0 || next_leaf->NumKeys() == 0) return true;
+  // kMax16 is the upper bound for 16-bit, 32-bit, and 64-bit modes. Capping
+  // merges at kMax16 avoids creating fragile, near-full 8-bit leaves that
+  // immediately split again on the next insert (preventing thrashing).
+  if (total_keys > Node::kMax16) return false;
+
+  const KeyT max_key = GetLeafKey(next_leaf, next_leaf->NumKeys() - 1);
+  const uint64_t spread = static_cast<uint64_t>(max_key - leaf->base_key);
+
+  if (spread <= 65535) return true;
+  if constexpr (sizeof(KeyT) == 4) {
+    return (total_keys <= Node::kMax32);
+  } else {
+    if (spread <= 0xFFFFFFFFULL) {
+      return (total_keys <= Node::kMax32);
+    }
+    return (total_keys <= Node::kMax64);
+  }
+}
+
+// Merges next_leaf into leaf, updates doubly linked pointers, and frees
+// next_leaf (Set).
+template <typename KeyT>
+void MergeLeaves(LeafNode<KeyT>* leaf, LeafNode<KeyT>* next_leaf,
+                 LeafNode<KeyT>*& last_leaf) {
+  const size_t leaf_keys = leaf->NumKeys();
+  const size_t next_keys = next_leaf->NumKeys();
+  if (next_keys > 0) {
+    const size_t total_keys = leaf_keys + next_keys;
+    // A single 512B leaf holds at most kMax8 (<= 492) keys, guaranteeing
+    // total_keys fits within the 512-element stack buffer below.
+    HWY_DASSERT(total_keys <= LeafNode<KeyT>::kMax8);
+    KeyT temp_keys[512];
+    DecompressLeaf(leaf, temp_keys);
+    DecompressLeaf(next_leaf, temp_keys + leaf_keys);
+    CompressIntoLeaf(leaf, temp_keys, total_keys);
+  }
+
+  LeafNode<KeyT>* next_next = next_leaf->Next();
+  leaf->SetNext(next_next);
+  if (next_next != nullptr) {
+    next_next->SetPrev(leaf);
+  } else {
+    last_leaf = leaf;
+  }
+
+  delete next_leaf;
+}
+
+// Merges next_leaf into leaf, updates doubly linked pointers, and frees
+// next_leaf (Map).
+template <typename KeyT, typename ValueT>
+void MergeLeaves(MapLeafNode<KeyT, ValueT>* leaf,
+                 MapLeafNode<KeyT, ValueT>* next_leaf,
+                 MapLeafNode<KeyT, ValueT>*& last_leaf) {
+  const size_t leaf_keys = leaf->NumKeys();
+  const size_t next_keys = next_leaf->NumKeys();
+  if (next_keys > 0) {
+    const size_t total_keys = leaf_keys + next_keys;
+    // A single 512B leaf holds at most kMax8 (<= 96) pairs, guaranteeing
+    // total_keys fits within the 512-element stack buffers below.
+    HWY_DASSERT((total_keys <= MapLeafNode<KeyT, ValueT>::kMax8));
+    KeyT temp_keys[512];
+    ValueT temp_values[512];
+    DecompressLeaf(leaf, temp_keys, temp_values);
+    DecompressLeaf(next_leaf, temp_keys + leaf_keys, temp_values + leaf_keys);
+    CompressIntoLeaf(leaf, temp_keys, temp_values, total_keys);
+  }
+
+  MapLeafNode<KeyT, ValueT>* next_next = next_leaf->Next();
+  leaf->SetNext(next_next);
+  if (next_next != nullptr) {
+    next_next->SetPrev(leaf);
+  } else {
+    last_leaf = leaf;
+  }
+
+  delete next_leaf;
+}
+
+// -----------------------------------------------------------------------------
+// Unified BTree Engine
+// -----------------------------------------------------------------------------
+
+// Supports two operational modes:
+// 1. Standalone Mode (Owning): Default-constructed BTree instances own their
+//    own state (owned_state_) and deallocate nodes upon destruction.
+// 2. Adapter Mode (Non-owning): Constructed with an external BTreeState pointer
+//    (e.g., from hwy::BTreeSet). Operates directly on the external state
+//    without copying data, and leaves node deallocation to the external owner.
+//
+// Iterator invalidation: as with absl::btree_*, any mutation (insert, erase,
+// insert_or_assign, operator[], clear, Build, swap, assignment) may invalidate
+// ALL outstanding iterators, pointers and references, including end(). Keys
+// are stored delta-compressed inside 512-byte leaves, so an insert can shift,
+// recompress or split a leaf, and an erase can merge or free one. To continue
+// iterating after a mutation, use the iterator returned by insert() or
+// erase(iterator); do not reuse iterators obtained before the mutation.
+template <typename Traits>
+class BTree {
+ public:
+  using KeyT = typename Traits::key_type;
+  using StorageKeyT = typename Traits::storage_key_type;
+  using Leaf = typename Traits::Leaf;
+  using Internal = InternalNode<StorageKeyT>;
+  using State = BTreeState<KeyT, Leaf>;
+
+  State* state() { return state_; }
+  const State* state() const { return state_; }
+  using key_type = KeyT;
+  using value_type = typename Traits::value_type;
+  using mapped_type = typename Traits::mapped_type;
+  using size_type = size_t;
+  using difference_type = std::ptrdiff_t;
+  static constexpr bool kIsMap = Traits::kIsMap;
+
+  // ---------------------------------------------------------------------------
+  // Bidirectional Iterators
+  // ---------------------------------------------------------------------------
+  // Iterators traverse leaf linked-list nodes in ascending sorted order.
+  // Because keys are compressed dynamically on the fly, operator* and
+  // operator-> return lightweight proxy objects without heap allocation.
+
+  struct SetConstRef {
+    KeyT val;
+    KeyT operator*() const { return val; }
+    const KeyT* operator->() const { return &val; }
+  };
+
+  struct MapConstRef {
+    KeyT first;
+    const mapped_type& second;
+    // Lets `value_type kv = *it;` and range constructors such as
+    // std::vector<value_type>(m.begin(), m.end()) compile.
+    operator std::pair<KeyT, mapped_type>() const { return {first, second}; }
+  };
+
+  struct MapConstArrowProxy {
+    MapConstRef ref;
+    const MapConstRef* operator->() const { return &ref; }
+  };
+
+  struct MapMutRef {
+    KeyT first;
+    mapped_type& second;
+    operator std::pair<KeyT, mapped_type>() const { return {first, second}; }
+    // iterator::reference -> const_iterator::reference, as for std containers.
+    operator MapConstRef() const { return {first, second}; }
+  };
+
+  struct MapMutArrowProxy {
+    MapMutRef ref;
+    MapMutRef* operator->() { return &ref; }
+  };
+
+  class const_iterator {
+   public:
+    using iterator_category = std::bidirectional_iterator_tag;
+    using value_type = typename Traits::value_type;
+    using difference_type = std::ptrdiff_t;
+    using reference = hwy::If<Traits::kIsMap, MapConstRef, KeyT>;
+    using pointer = hwy::If<Traits::kIsMap, MapConstArrowProxy, SetConstRef>;
+
+    const_iterator() = default;
+    const_iterator(const Leaf* leaf, size_t slot,
+                   const Leaf* last_leaf = nullptr)
+        : leaf_(leaf), slot_(slot), last_leaf_(last_leaf) {}
+
+    auto operator*() const {
+      if constexpr (Traits::kIsMap) {
+        return MapConstRef{
+            KeyCodec<KeyT>::FromStorage(GetLeafKey(leaf_, slot_)),
+            leaf_->Values()[slot_]};
+      } else {
+        return KeyCodec<KeyT>::FromStorage(GetLeafKey(leaf_, slot_));
+      }
+    }
+
+    auto operator->() const {
+      if constexpr (Traits::kIsMap) {
+        return MapConstArrowProxy{operator*()};
+      } else {
+        return SetConstRef{
+            KeyCodec<KeyT>::FromStorage(GetLeafKey(leaf_, slot_))};
+      }
+    }
+
+    const_iterator& operator++() {
+      if (HWY_UNLIKELY(leaf_ == nullptr)) return *this;
+      slot_++;
+      if (HWY_UNLIKELY(slot_ >= leaf_->NumKeys())) {
+        last_leaf_ = leaf_;
+        leaf_ = leaf_->Next();
+        slot_ = 0;
+      }
+      return *this;
+    }
+
+    const_iterator operator++(int) {
+      const_iterator tmp = *this;
+      ++(*this);
+      return tmp;
+    }
+
+    const_iterator& operator--() {
+      if (HWY_UNLIKELY(leaf_ == nullptr)) {
+        leaf_ = last_leaf_;
+        slot_ = (leaf_ != nullptr) ? leaf_->NumKeys() - 1 : 0;
+        return *this;
+      }
+      if (HWY_UNLIKELY(slot_ == 0)) {
+        leaf_ = leaf_->Prev();
+        slot_ = (leaf_ != nullptr) ? leaf_->NumKeys() - 1 : 0;
+      } else {
+        --slot_;
+      }
+      return *this;
+    }
+
+    const_iterator operator--(int) {
+      const_iterator tmp = *this;
+      --(*this);
+      return tmp;
+    }
+
+    bool operator==(const const_iterator& other) const {
+      if (leaf_ == nullptr && other.leaf_ == nullptr) return true;
+      return leaf_ == other.leaf_ && slot_ == other.slot_;
+    }
+    bool operator!=(const const_iterator& other) const {
+      return !(*this == other);
+    }
+
+    const Leaf* node() const { return leaf_; }
+    const Leaf* leaf() const { return leaf_; }
+    size_t slot() const { return slot_; }
+
+   protected:
+    const Leaf* leaf_ = nullptr;
+    size_t slot_ = 0;
+    const Leaf* last_leaf_ = nullptr;
+  };
+
+  class iterator : public const_iterator {
+   public:
+    using iterator_category = std::bidirectional_iterator_tag;
+    using value_type = typename Traits::value_type;
+    using difference_type = std::ptrdiff_t;
+    using reference = hwy::If<Traits::kIsMap, MapMutRef, KeyT>;
+    using pointer = hwy::If<Traits::kIsMap, MapMutArrowProxy, SetConstRef>;
+
+    iterator() = default;
+    iterator(Leaf* leaf, size_t slot, Leaf* last_leaf = nullptr)
+        : const_iterator(leaf, slot, last_leaf) {}
+
+    auto operator*() const {
+      if constexpr (Traits::kIsMap) {
+        return MapMutRef{
+            KeyCodec<KeyT>::FromStorage(GetLeafKey(this->leaf_, this->slot_)),
+            const_cast<Leaf*>(this->leaf_)->Values()[this->slot_]};
+      } else {
+        return KeyCodec<KeyT>::FromStorage(
+            GetLeafKey(this->leaf_, this->slot_));
+      }
+    }
+
+    auto operator->() const {
+      if constexpr (Traits::kIsMap) {
+        return MapMutArrowProxy{operator*()};
+      } else {
+        return SetConstRef{
+            KeyCodec<KeyT>::FromStorage(GetLeafKey(this->leaf_, this->slot_))};
+      }
+    }
+
+    iterator& operator++() {
+      const_iterator::operator++();
+      return *this;
+    }
+
+    iterator operator++(int) {
+      iterator tmp = *this;
+      ++(*this);
+      return tmp;
+    }
+
+    iterator& operator--() {
+      const_iterator::operator--();
+      return *this;
+    }
+
+    iterator operator--(int) {
+      iterator tmp = *this;
+      --(*this);
+      return tmp;
+    }
+
+    operator const_iterator() const {
+      return const_iterator(this->leaf_, this->slot_, this->last_leaf_);
+    }
+
+    Leaf* leaf() const { return const_cast<Leaf*>(this->leaf_); }
+  };
+
+  class const_reverse_iterator {
+   public:
+    using iterator_category = std::bidirectional_iterator_tag;
+    using value_type = typename Traits::value_type;
+    using difference_type = std::ptrdiff_t;
+    using reference = hwy::If<Traits::kIsMap, MapConstRef, KeyT>;
+    using pointer = hwy::If<Traits::kIsMap, MapConstArrowProxy, SetConstRef>;
+
+    const_reverse_iterator() = default;
+    explicit const_reverse_iterator(const_iterator it) : current_(it) {}
+
+    auto operator*() const {
+      auto tmp = current_;
+      --tmp;
+      return *tmp;
+    }
+
+    auto operator->() const {
+      auto tmp = current_;
+      --tmp;
+      return tmp.operator->();
+    }
+
+    const_reverse_iterator& operator++() {
+      --current_;
+      return *this;
+    }
+    const_reverse_iterator operator++(int) {
+      const_reverse_iterator tmp = *this;
+      --current_;
+      return tmp;
+    }
+    const_reverse_iterator& operator--() {
+      ++current_;
+      return *this;
+    }
+    const_reverse_iterator operator--(int) {
+      const_reverse_iterator tmp = *this;
+      ++current_;
+      return tmp;
+    }
+
+    bool operator==(const const_reverse_iterator& other) const {
+      return current_ == other.current_;
+    }
+    bool operator!=(const const_reverse_iterator& other) const {
+      return current_ != other.current_;
+    }
+
+    const_iterator base() const { return current_; }
+
+   private:
+    const_iterator current_;
+  };
+
+  class reverse_iterator {
+   public:
+    using iterator_category = std::bidirectional_iterator_tag;
+    using value_type = typename Traits::value_type;
+    using difference_type = std::ptrdiff_t;
+    using reference = hwy::If<Traits::kIsMap, MapMutRef, KeyT>;
+    using pointer = hwy::If<Traits::kIsMap, MapMutArrowProxy, SetConstRef>;
+
+    reverse_iterator() = default;
+    explicit reverse_iterator(iterator it) : current_(it) {}
+
+    auto operator*() const {
+      auto tmp = current_;
+      --tmp;
+      return *tmp;
+    }
+
+    auto operator->() const {
+      auto tmp = current_;
+      --tmp;
+      return tmp.operator->();
+    }
+
+    reverse_iterator& operator++() {
+      --current_;
+      return *this;
+    }
+    reverse_iterator operator++(int) {
+      reverse_iterator tmp = *this;
+      --current_;
+      return tmp;
+    }
+    reverse_iterator& operator--() {
+      ++current_;
+      return *this;
+    }
+    reverse_iterator operator--(int) {
+      reverse_iterator tmp = *this;
+      ++current_;
+      return tmp;
+    }
+
+    bool operator==(const reverse_iterator& other) const {
+      return current_ == other.current_;
+    }
+    bool operator!=(const reverse_iterator& other) const {
+      return current_ != other.current_;
+    }
+    // Mixed comparisons (rit == crit). Needed before C++20, where the
+    // implicit object parameter does not undergo user-defined conversions.
+    bool operator==(const const_reverse_iterator& other) const {
+      return current_ == other.base();
+    }
+    bool operator!=(const const_reverse_iterator& other) const {
+      return current_ != other.base();
+    }
+
+    operator const_reverse_iterator() const {
+      return const_reverse_iterator(current_);
+    }
+
+    iterator base() const { return current_; }
+
+   private:
+    iterator current_;
+  };
+
+  using key_compare = std::less<KeyT>;
+
+  class value_compare {
+   public:
+    bool operator()(const value_type& lhs, const value_type& rhs) const {
+      if constexpr (kIsMap) {
+        return key_compare()(lhs.first, rhs.first);
+      } else {
+        return key_compare()(lhs, rhs);
+      }
+    }
+  };
+
+  using reference = typename iterator::reference;
+  using const_reference = typename const_iterator::reference;
+  using pointer = typename iterator::pointer;
+  using const_pointer = typename const_iterator::pointer;
+  using allocator_type = std::allocator<value_type>;
+
+  // Standalone constructor: owns its own state.
+  BTree() : state_(&owned_state_) {}
+  explicit BTree(const key_compare& /*comp*/) : BTree() {}
+
+  // Adapter constructor: operates directly on an external BTreeState (e.g.
+  // from hwy::BTreeSet) without copying nodes or taking ownership.
+  explicit BTree(State* external_state) : state_(external_state) {}
+
+  ~BTree() {
+    // Only deallocate nodes if this instance owns the state. In adapter mode,
+    // the external owner (e.g. BTreeSet) manages the node lifetimes.
+    if (state_ == &owned_state_) {
+      clear();
+    }
+  }
+
+  // Moves transfer the tree's contents, like copy-assignment and swap:
+  // afterwards *this holds other's nodes and other is empty. Each side reads or
+  // writes through its state_ pointer, so for an adapter the contents move into
+  // or out of the external state it refers to (moving from an adapter empties
+  // the external owner's tree). A move-constructed BTree always owns its state.
+  BTree(BTree&& other) noexcept : state_(&owned_state_) {
+    owned_state_ = *other.state_;
+    *other.state_ = State{};
+  }
+
+  BTree& operator=(BTree&& other) noexcept {
+    // Guard on the state, not the object: self-assignment and assignment
+    // between two adapters of the same external state are both no-ops.
+    if (state_ != other.state_) {
+      clear();
+      *state_ = *other.state_;
+      *other.state_ = State{};
+    }
+    return *this;
+  }
+
+  BTree(const BTree& other) : state_(&owned_state_) {
+    if (other.empty()) return;
+    if constexpr (Traits::kIsMap) {
+      std::vector<KeyT> keys;
+      std::vector<mapped_type> values;
+      keys.reserve(other.size());
+      values.reserve(other.size());
+      for (auto it = other.begin(); it != other.end(); ++it) {
+        auto pair = *it;
+        keys.push_back(pair.first);
+        values.push_back(pair.second);
+      }
+      *this = Build(keys.data(), values.data(), keys.size());
+    } else {
+      std::vector<KeyT> keys;
+      keys.reserve(other.size());
+      for (auto it = other.begin(); it != other.end(); ++it) {
+        keys.push_back(*it);
+      }
+      *this = Build(keys.data(), keys.size());
+    }
+  }
+
+  BTree& operator=(const BTree& other) {
+    // Same guard as move-assignment; avoids an O(N) rebuild (which would also
+    // invalidate iterators) when both sides already refer to the same state.
+    if (state_ != other.state_) {
+      BTree temp(other);
+      swap(temp);
+    }
+    return *this;
+  }
+
+  BTree& operator=(std::initializer_list<value_type> ilist) {
+    clear();
+    for (const auto& item : ilist) {
+      insert(item);
+    }
+    return *this;
+  }
+
+  void swap(BTree& other) noexcept {
+    using std::swap;
+    swap(*state_, *other.state_);
+  }
+
+  friend void swap(BTree& a, BTree& b) noexcept { a.swap(b); }
+
+  // ---------------------------------------------------------------------------
+  // Bulk Construction from Keys / Key-Value Pairs
+  // ---------------------------------------------------------------------------
+
+  // Constructs a BTreeSet from an array of keys in O(N) time if strictly
+  // ascending, or O(N log N) time via VQSort if unsorted/duplicates are
+  // present (duplicates are dropped). Assigning the result to an existing
+  // tree invalidates all of that tree's iterators, pointers and references.
+  //
+  // Example usage:
+  //   std::vector<uint32_t> keys = {30, 10, 50, 20, 40};
+  //   auto tree = BTreeSet<uint32_t>::Build(keys.data(), keys.size());
+  //   bool found = tree.contains(30);
+  //
+  // Parameters:
+  // - keys: Pointer to keys, in any order; duplicates are allowed.
+  // - num_keys: Total number of keys in the array.
+  // - fill_ratio: Target fill factor per leaf node (between 0.1 and 1.0).
+  //     * 1.0f (default): Maximum memory density and fastest throughput for
+  //       read-heavy or static lookup workloads.
+  //     * 0.75f - 0.85f: Leaves headroom in leaves to accommodate subsequent
+  //       dynamic insertions without immediate splits.
+  static BTree Build(const KeyT* keys, size_t num_keys, float fill_ratio = 1.0f,
+                     StorageKeyT sign_mask = KeyCodec<KeyT>::kSignMask) {
+    static_assert(!Traits::kIsMap, "Build with keys only is for Sets");
+    if (HWY_UNLIKELY(num_keys == 0)) return BTree();
+    if (sign_mask == 0) {
+      const ScalableTag<StorageKeyT> d;
+      const StorageKeyT* ukeys = HWY_RCAST_ALIGNED(const StorageKeyT*, keys);
+      if (IsSorted(d, ukeys, num_keys, IsSortedLessEqual())) {
+        return BuildInternal(ukeys, static_cast<const mapped_type*>(nullptr),
+                             num_keys, fill_ratio);
+      }
+    } else {
+      using SignedKeyT = SignedFromSize<sizeof(StorageKeyT)>;
+      const ScalableTag<SignedKeyT> d;
+      const SignedKeyT* skeys = HWY_RCAST_ALIGNED(const SignedKeyT*, keys);
+      if (IsSorted(d, skeys, num_keys, IsSortedLessEqual())) {
+        // Allocate temporary contiguous storage buffer to encode signed keys
+        // upfront. Although heap-allocated, this buffer is transient (freed
+        // immediately upon Build return), keeping the builder algorithm in
+        // BuildInternal uniform and simple.
+        AlignedPtr<StorageKeyT> ukeys = AllocateAligned<StorageKeyT>(num_keys);
+        for (size_t i = 0; i < num_keys; ++i) {
+          ukeys[i] = BitCastScalar<StorageKeyT>(keys[i]) ^ sign_mask;
+        }
+        return BuildInternal(ukeys.get(),
+                             static_cast<const mapped_type*>(nullptr), num_keys,
+                             fill_ratio);
+      }
+    }
+
+    // Path when input is unsorted and/or contains duplicates.
+    AlignedPtr<StorageKeyT> ukeys = AllocateAligned<StorageKeyT>(num_keys);
+    if (sign_mask != 0) {
+      for (size_t i = 0; i < num_keys; ++i) {
+        ukeys[i] = BitCastScalar<StorageKeyT>(keys[i]) ^ sign_mask;
+      }
+    } else {
+      std::memcpy(ukeys.get(), keys, num_keys * sizeof(StorageKeyT));
+    }
+
+    VQSortStatic(ukeys.get(), num_keys, SortAscending());
+    const ScalableTag<StorageKeyT> d_ukey;
+    const size_t num_unique = Unique(d_ukey, ukeys.get(), num_keys);
+    return BuildInternal(ukeys.get(), static_cast<const mapped_type*>(nullptr),
+                         num_unique, fill_ratio);
+  }
+
+  // Constructs a BTreeMap from arrays of keys and values in O(N) time if
+  // strictly ascending, or O(N log N) time via VQSort if unsorted/duplicates
+  // are present (retaining the first occurrence of each duplicate key).
+  //
+  // Example usage:
+  //   std::vector<uint32_t> keys = {10, 20, 30, 40, 50};
+  //   std::vector<uint64_t> vals = {100, 200, 300, 400, 500};
+  //   auto map = BTreeMap<uint32_t, uint64_t>::Build(
+  //       keys.data(), vals.data(), keys.size());
+  //   bool found = map.contains(30);
+  //
+  // Parameters:
+  // - keys: Pointer to keys.
+  // - values: Pointer to corresponding values.
+  // - num_keys: Number of key-value pairs.
+  // - fill_ratio: Target fill factor per leaf node (between 0.1 and 1.0).
+  template <typename V = mapped_type,
+            typename = std::enable_if_t<Traits::kIsMap && !std::is_void_v<V>>>
+  static BTree Build(const KeyT* keys, const V* values, size_t num_keys,
+                     float fill_ratio = 1.0f,
+                     StorageKeyT sign_mask = KeyCodec<KeyT>::kSignMask) {
+    if (HWY_UNLIKELY(num_keys == 0)) return BTree();
+    if (sign_mask == 0) {
+      const ScalableTag<StorageKeyT> d;
+      const StorageKeyT* ukeys = HWY_RCAST_ALIGNED(const StorageKeyT*, keys);
+      if (IsSorted(d, ukeys, num_keys, IsSortedLessEqual())) {
+        return BuildInternal(ukeys, values, num_keys, fill_ratio);
+      }
+    } else {
+      using SignedKeyT = SignedFromSize<sizeof(StorageKeyT)>;
+      const ScalableTag<SignedKeyT> d;
+      const SignedKeyT* skeys = HWY_RCAST_ALIGNED(const SignedKeyT*, keys);
+      if (IsSorted(d, skeys, num_keys, IsSortedLessEqual())) {
+        // Allocate temporary contiguous storage buffer to encode signed keys
+        // upfront. Although heap-allocated, this buffer is transient (freed
+        // immediately upon Build return), keeping the builder algorithm in
+        // BuildInternal uniform and simple.
+        AlignedPtr<StorageKeyT> ukeys = AllocateAligned<StorageKeyT>(num_keys);
+        for (size_t i = 0; i < num_keys; ++i) {
+          ukeys[i] = BitCastScalar<StorageKeyT>(keys[i]) ^ sign_mask;
+        }
+        return BuildInternal(ukeys.get(), values, num_keys, fill_ratio);
+      }
+    }
+
+    // Path when input is unsorted and/or contains duplicates.
+    // Pack (StorageKeyT, original_idx) so VQSortStatic sorts by key and
+    // breaks ties by ascending original_idx (first-occurrence wins).
+    AlignedPtr<StorageKeyT> ukeys = AllocateAligned<StorageKeyT>(num_keys);
+    AlignedPtr<V> uvals = AllocateAligned<V>(num_keys);
+    size_t num_unique = 0;
+
+    if constexpr (sizeof(StorageKeyT) == 4) {
+      if (HWY_LIKELY(num_keys <= std::numeric_limits<uint32_t>::max())) {
+        AlignedPtr<uint64_t> packed = AllocateAligned<uint64_t>(num_keys);
+        for (size_t i = 0; i < num_keys; ++i) {
+          const uint64_t sk = BitCastScalar<StorageKeyT>(keys[i]) ^ sign_mask;
+          packed[i] = (sk << 32) | static_cast<uint32_t>(i);
+        }
+        VQSortStatic(packed.get(), num_keys, SortAscending());
+
+        StorageKeyT prev_key = static_cast<StorageKeyT>(packed[0] >> 32);
+        ukeys[0] = prev_key;
+        uvals[0] = values[static_cast<uint32_t>(packed[0])];
+        num_unique = 1;
+        for (size_t i = 1; i < num_keys; ++i) {
+          const StorageKeyT k = static_cast<StorageKeyT>(packed[i] >> 32);
+          if (k != prev_key) {
+            prev_key = k;
+            ukeys[num_unique] = k;
+            uvals[num_unique] = values[static_cast<uint32_t>(packed[i])];
+            ++num_unique;
+          }
+        }
+        return BuildInternal(ukeys.get(), uvals.get(), num_unique, fill_ratio);
+      }
+    }
+
+    AlignedPtr<uint128_t> packed = AllocateAligned<uint128_t>(num_keys);
+    for (size_t i = 0; i < num_keys; ++i) {
+      packed[i] =
+          uint128_t{.lo = static_cast<uint64_t>(i),
+                    .hi = static_cast<uint64_t>(
+                        BitCastScalar<StorageKeyT>(keys[i]) ^ sign_mask)};
+    }
+    VQSortStatic(packed.get(), num_keys, SortAscending());
+
+    StorageKeyT prev_key = static_cast<StorageKeyT>(packed[0].hi);
+    ukeys[0] = prev_key;
+    uvals[0] = values[packed[0].lo];
+    num_unique = 1;
+    for (size_t i = 1; i < num_keys; ++i) {
+      const StorageKeyT k = static_cast<StorageKeyT>(packed[i].hi);
+      if (k != prev_key) {
+        prev_key = k;
+        ukeys[num_unique] = k;
+        uvals[num_unique] = values[packed[i].lo];
+        ++num_unique;
+      }
+    }
+    return BuildInternal(ukeys.get(), uvals.get(), num_unique, fill_ratio);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Point Lookups
+  // ---------------------------------------------------------------------------
+
+  // Returns true if key is present in the tree.
+  HWY_INLINE bool contains(KeyT key) const {
+    return ContainsInternal(KeyCodec<KeyT>::ToStorage(key));
+  }
+
+  // Returns const_iterator to key if found, or end() otherwise.
+  HWY_INLINE const_iterator find(KeyT key) const {
+    return FindInternal(KeyCodec<KeyT>::ToStorage(key));
+  }
+
+  // Returns iterator to key if found, or end() otherwise.
+  HWY_INLINE iterator find(KeyT key) {
+    return FindInternal(KeyCodec<KeyT>::ToStorage(key));
+  }
+
+  // Returns const_iterator to the first key >= target, or end() if all keys <
+  // target.
+  HWY_INLINE const_iterator lower_bound(KeyT target) const {
+    return LowerBoundInternal(KeyCodec<KeyT>::ToStorage(target));
+  }
+
+  // Returns iterator to the first key >= target, or end() if all keys < target.
+  HWY_INLINE iterator lower_bound(KeyT target) {
+    return LowerBoundInternal(KeyCodec<KeyT>::ToStorage(target));
+  }
+
+  // Returns an iterator to the first key that is > target, or end() if none.
+  HWY_INLINE const_iterator upper_bound(KeyT target) const {
+    return UpperBoundInternal(KeyCodec<KeyT>::ToStorage(target));
+  }
+
+  // Returns an iterator to the first key that is > target, or end() if none.
+  HWY_INLINE iterator upper_bound(KeyT target) {
+    return UpperBoundInternal(KeyCodec<KeyT>::ToStorage(target));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Batch Lookups (8-Way Pipelined SIMD Prefetching)
+  // ---------------------------------------------------------------------------
+  // Point lookups suffer from serialized pointer-chasing latency: at each level
+  // of the tree, the CPU stalls waiting for outer caches or DRAM to load the
+  // child node into L1D before it can evaluate the next node. Prefetching
+  // cannot help point lookups because the very next instruction immediately
+  // demands that child node, leaving zero window for the prefetch to arrive.
+  //
+  // Batch lookups eliminate this bottleneck by traversing a micro-batch of 8
+  // queries concurrently level-by-level (software pipelining):
+  // 1. For query slot 0, we compute its child index using our SIMD search
+  //    primitives (FindChild / ScanOffsets) and issue an explicit software
+  //    prefetch (hwy::Prefetch) for that child node's cache line.
+  // 2. The core repeats Step 1 for the remaining queries in the batch (slots 1
+  //    through 7), issuing their prefetch requests one by one.
+  // 3. Finding the child indices across the other queries keeps the CPU busy,
+  //    creating a generous window for the background
+  //    memory transfer of slot 0's child node to fully complete.
+  // 4. By the time the outer loop advances to the next tree level, the child
+  //    nodes have already arrived in L1D, turning what was a serialized DRAM
+  //    stall in point queries into an immediate L1D cache hit.
+  //
+  // Why kBatchSize = 8:
+  // - Memory-Level Parallelism : Modern cores have 10-16 Line Fill Buffers
+  //   (LFBs). An 8-way batch maximizes concurrent memory requests without
+  //   exhausting the core's fill buffers.
+  // - Latency Hiding: Evaluating 7 other SIMD child searches provides enough
+  //   execution time to fully mask memory round-trip latency.
+  // - Register Pressure (GPR's): Holding 8 query keys and 8 node pointers is
+  //   doable on most CPU's without reigster spilling.
+  template <typename FoundT>
+  void ContainsBatch(const KeyT* HWY_RESTRICT queries, size_t num_queries,
+                     FoundT* HWY_RESTRICT out_found,
+                     StorageKeyT sign_mask = KeyCodec<KeyT>::kSignMask) const {
+    if (HWY_UNLIKELY(state_->root_ == nullptr)) {
+      std::fill_n(out_found, num_queries, static_cast<FoundT>(0));
+      return;
+    }
+
+    constexpr size_t kBatchSize = 8;
+    size_t i = 0;
+    for (; i + kBatchSize <= num_queries; i += kBatchSize) {
+      // Stack scratchpad holding pre-converted storage keys for this 8-way
+      // micro-batch.
+      StorageKeyT q[kBatchSize];
+      void* curr[kBatchSize];
+      for (size_t b = 0; b < kBatchSize; ++b) {
+        q[b] = BitCastScalar<StorageKeyT>(queries[i + b]) ^ sign_mask;
+        curr[b] = state_->root_;
+      }
+
+      for (size_t lvl = state_->tree_height_; lvl > 0; --lvl) {
+        for (size_t b = 0; b < kBatchSize; ++b) {
+          auto* internal = static_cast<Internal*>(curr[b]);
+          size_t child_idx = FindChild(internal, q[b]);
+          curr[b] = internal->children[child_idx];
+          hwy::Prefetch(curr[b]);
+        }
+      }
+
+      for (size_t b = 0; b < kBatchSize; ++b) {
+        out_found[i + b] = static_cast<FoundT>(
+            LeafContains(static_cast<Leaf*>(curr[b]), q[b]));
+      }
+    }
+
+    for (; i < num_queries; ++i) {
+      out_found[i] = static_cast<FoundT>(
+          ContainsInternal(BitCastScalar<StorageKeyT>(queries[i]) ^ sign_mask));
+    }
+  }
+
+  // Executes multiple map value lookups with 8-way pipelined prefetching.
+  template <typename V = mapped_type,
+            typename = std::enable_if_t<Traits::kIsMap && !std::is_void_v<V>>>
+  void LookupBatch(const KeyT* HWY_RESTRICT queries, size_t num_queries,
+                   V* HWY_RESTRICT out_values, bool* HWY_RESTRICT out_found,
+                   StorageKeyT sign_mask = KeyCodec<KeyT>::kSignMask) const {
+    if (HWY_UNLIKELY(state_->root_ == nullptr)) {
+      std::fill_n(out_found, num_queries, false);
+      return;
+    }
+
+    constexpr size_t kBatchSize = 8;
+    size_t i = 0;
+    for (; i + kBatchSize <= num_queries; i += kBatchSize) {
+      // Stack scratchpad holding pre-converted storage keys for this 8-way
+      // micro-batch.
+      StorageKeyT q[kBatchSize];
+      void* curr[kBatchSize];
+      for (size_t b = 0; b < kBatchSize; ++b) {
+        q[b] = BitCastScalar<StorageKeyT>(queries[i + b]) ^ sign_mask;
+        curr[b] = state_->root_;
+      }
+
+      for (size_t lvl = state_->tree_height_; lvl > 0; --lvl) {
+        for (size_t b = 0; b < kBatchSize; ++b) {
+          auto* internal = static_cast<Internal*>(curr[b]);
+          size_t child_idx = FindChild(internal, q[b]);
+          curr[b] = internal->children[child_idx];
+          hwy::Prefetch(curr[b]);
+        }
+      }
+
+      for (size_t b = 0; b < kBatchSize; ++b) {
+        auto* leaf = static_cast<Leaf*>(curr[b]);
+        size_t slot = 0;
+        if (LeafContains(leaf, q[b], &slot)) {
+          out_found[i + b] = true;
+          out_values[i + b] = leaf->Values()[slot];
+        } else {
+          out_found[i + b] = false;
+        }
+      }
+    }
+
+    for (; i < num_queries; ++i) {
+      const V* val_ptr =
+          FindValueInternal(BitCastScalar<StorageKeyT>(queries[i]) ^ sign_mask);
+      if (val_ptr != nullptr) {
+        out_found[i] = true;
+        out_values[i] = *val_ptr;
+      } else {
+        out_found[i] = false;
+      }
+    }
+  }
+
+  // Executes multiple find queries with 8-way pipelined prefetching.
+  void FindBatch(const KeyT* HWY_RESTRICT targets, size_t num_queries,
+                 const_iterator* HWY_RESTRICT results,
+                 StorageKeyT sign_mask = KeyCodec<KeyT>::kSignMask) const {
+    if (HWY_UNLIKELY(state_->root_ == nullptr)) {
+      for (size_t k = 0; k < num_queries; ++k) results[k] = end();
+      return;
+    }
+
+    constexpr size_t kBatchSize = 8;
+    size_t i = 0;
+    for (; i + kBatchSize <= num_queries; i += kBatchSize) {
+      // Stack scratchpad holding pre-converted storage keys for this 8-way
+      // micro-batch.
+      StorageKeyT q[kBatchSize];
+      void* curr[kBatchSize];
+      for (size_t b = 0; b < kBatchSize; ++b) {
+        q[b] = BitCastScalar<StorageKeyT>(targets[i + b]) ^ sign_mask;
+        curr[b] = state_->root_;
+      }
+
+      for (size_t lvl = state_->tree_height_; lvl > 0; --lvl) {
+        for (size_t b = 0; b < kBatchSize; ++b) {
+          auto* internal = static_cast<Internal*>(curr[b]);
+          size_t child_idx = FindChild(internal, q[b]);
+          curr[b] = internal->children[child_idx];
+          hwy::Prefetch(curr[b]);
+        }
+      }
+
+      for (size_t b = 0; b < kBatchSize; ++b) {
+        auto* leaf = static_cast<Leaf*>(curr[b]);
+        size_t slot = 0;
+        if (LeafContains(leaf, q[b], &slot)) {
+          results[i + b] = const_iterator(leaf, slot, state_->last_leaf_);
+        } else {
+          results[i + b] = end();
+        }
+      }
+    }
+
+    for (; i < num_queries; ++i) {
+      results[i] =
+          FindInternal(BitCastScalar<StorageKeyT>(targets[i]) ^ sign_mask);
+    }
+  }
+
+  // Executes multiple lower_bound queries with 8-way pipelined prefetching.
+  void LowerBoundBatch(
+      const KeyT* HWY_RESTRICT targets, size_t num_queries,
+      const_iterator* HWY_RESTRICT results,
+      StorageKeyT sign_mask = KeyCodec<KeyT>::kSignMask) const {
+    if (HWY_UNLIKELY(state_->root_ == nullptr)) {
+      for (size_t k = 0; k < num_queries; ++k) results[k] = end();
+      return;
+    }
+
+    constexpr size_t kBatchSize = 8;
+    size_t i = 0;
+    for (; i + kBatchSize <= num_queries; i += kBatchSize) {
+      // Stack scratchpad holding pre-converted storage keys for this 8-way
+      // micro-batch.
+      StorageKeyT q[kBatchSize];
+      void* curr[kBatchSize];
+      for (size_t b = 0; b < kBatchSize; ++b) {
+        q[b] = BitCastScalar<StorageKeyT>(targets[i + b]) ^ sign_mask;
+        curr[b] = state_->root_;
+      }
+
+      for (size_t lvl = state_->tree_height_; lvl > 0; --lvl) {
+        for (size_t b = 0; b < kBatchSize; ++b) {
+          auto* internal = static_cast<Internal*>(curr[b]);
+          size_t child_idx = FindChild(internal, q[b]);
+          curr[b] = internal->children[child_idx];
+          hwy::Prefetch(curr[b]);
+        }
+      }
+
+      for (size_t b = 0; b < kBatchSize; ++b) {
+        auto* leaf = static_cast<Leaf*>(curr[b]);
+        size_t slot = FindLeafSlot(leaf, q[b]);
+        if (HWY_LIKELY(slot < leaf->NumKeys())) {
+          results[i + b] = const_iterator(leaf, slot, state_->last_leaf_);
+        } else if (HWY_LIKELY(leaf->Next() != nullptr)) {
+          results[i + b] = const_iterator(leaf->Next(), 0, state_->last_leaf_);
+        } else {
+          results[i + b] = end();
+        }
+      }
+    }
+
+    for (; i < num_queries; ++i) {
+      results[i] = LowerBoundInternal(BitCastScalar<StorageKeyT>(targets[i]) ^
+                                      sign_mask);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Dynamic Mutations (Insertions & Deletions)
+  // ---------------------------------------------------------------------------
+  // If an insertion or erasure occurs, every outstanding iterator, pointer and
+  // reference (including end()) may be invalidated. The returned iterator (if
+  // any) is valid until the next mutation.
+
+  // Inserts a key into the Set. Returns pair of (iterator, bool_inserted).
+  template <bool IsMap = Traits::kIsMap, typename = std::enable_if_t<!IsMap>>
+  std::pair<iterator, bool> insert(KeyT key) {
+    return InsertSetInternal(KeyCodec<KeyT>::ToStorage(key));
+  }
+
+  // Inserts a key-value pair into the Map. Returns pair of (iterator,
+  // bool_inserted).
+  template <typename V = mapped_type,
+            typename = std::enable_if_t<Traits::kIsMap && !std::is_void_v<V>>>
+  std::pair<iterator, bool> insert(const std::pair<KeyT, V>& kv) {
+    return InsertMapInternal(KeyCodec<KeyT>::ToStorage(kv.first),
+                             static_cast<mapped_type>(kv.second),
+                             /*assign_if_exists=*/false);
+  }
+
+  // Inserts a key and value into the Map. Returns pair of (iterator,
+  // bool_inserted).
+  template <typename V = mapped_type,
+            typename = std::enable_if_t<Traits::kIsMap && !std::is_void_v<V>>>
+  std::pair<iterator, bool> insert(KeyT key, const V& value) {
+    return InsertMapInternal(KeyCodec<KeyT>::ToStorage(key),
+                             static_cast<mapped_type>(value),
+                             /*assign_if_exists=*/false);
+  }
+
+  // Inserts a key-value pair or updates existing key's value.
+  template <typename V = mapped_type,
+            typename = std::enable_if_t<Traits::kIsMap && !std::is_void_v<V>>>
+  std::pair<iterator, bool> insert_or_assign(KeyT key, const V& value) {
+    return InsertMapInternal(KeyCodec<KeyT>::ToStorage(key),
+                             static_cast<mapped_type>(value),
+                             /*assign_if_exists=*/true);
+  }
+
+  // Emplaces a key-value pair into the Map (does not overwrite if key exists).
+  template <typename V = mapped_type, typename... Args,
+            typename = std::enable_if_t<Traits::kIsMap && !std::is_void_v<V>>>
+  std::pair<iterator, bool> emplace(KeyT key, Args&&... args) {
+    return insert(key, V(std::forward<Args>(args)...));
+  }
+
+  // Emplaces a key into the Set.
+  template <typename... Args, bool IsMap = Traits::kIsMap,
+            typename = std::enable_if_t<!IsMap>>
+  std::pair<iterator, bool> emplace(Args&&... args) {
+    return insert(KeyT(std::forward<Args>(args)...));
+  }
+
+  // Inserts a key into the Set using `hint` as a suggestion for the insertion
+  // position. Returns an iterator to the inserted or existing element.
+  template <bool IsMap = Traits::kIsMap, typename = std::enable_if_t<!IsMap>>
+  iterator insert(const_iterator hint, KeyT key) {
+    return InsertHintSetInternal(hint, KeyCodec<KeyT>::ToStorage(key));
+  }
+
+  // Inserts a key-value pair into the Map using `hint` as a suggestion for the
+  // insertion position. Returns an iterator to the inserted or existing
+  // element.
+  template <typename V = mapped_type,
+            typename = std::enable_if_t<Traits::kIsMap && !std::is_void_v<V>>>
+  iterator insert(const_iterator hint, const std::pair<KeyT, V>& kv) {
+    return InsertHintMapInternal(hint, KeyCodec<KeyT>::ToStorage(kv.first),
+                                 static_cast<mapped_type>(kv.second),
+                                 /*assign_if_exists=*/false);
+  }
+
+  // Inserts a key and value into the Map using `hint` as a suggestion for the
+  // insertion position. Returns an iterator to the inserted or existing
+  // element.
+  template <typename V = mapped_type,
+            typename = std::enable_if_t<Traits::kIsMap && !std::is_void_v<V>>>
+  iterator insert(const_iterator hint, KeyT key, const V& value) {
+    return InsertHintMapInternal(hint, KeyCodec<KeyT>::ToStorage(key),
+                                 static_cast<mapped_type>(value),
+                                 /*assign_if_exists=*/false);
+  }
+
+  // Inserts a key-value pair or updates an existing key's value using `hint`
+  // as a suggestion for the insertion position.
+  template <typename V = mapped_type,
+            typename = std::enable_if_t<Traits::kIsMap && !std::is_void_v<V>>>
+  iterator insert_or_assign(const_iterator hint, KeyT key, const V& value) {
+    return InsertHintMapInternal(hint, KeyCodec<KeyT>::ToStorage(key),
+                                 static_cast<mapped_type>(value),
+                                 /*assign_if_exists=*/true);
+  }
+
+  // Emplaces a key-value pair into the Map using `hint` (does not overwrite if
+  // key exists).
+  template <typename V = mapped_type, typename... Args,
+            typename = std::enable_if_t<Traits::kIsMap && !std::is_void_v<V>>>
+  iterator emplace_hint(const_iterator hint, KeyT key, Args&&... args) {
+    return insert(hint, key, V(std::forward<Args>(args)...));
+  }
+
+  // Emplaces a key into the Set using `hint`.
+  template <typename... Args, bool IsMap = Traits::kIsMap,
+            typename = std::enable_if_t<!IsMap>>
+  iterator emplace_hint(const_iterator hint, Args&&... args) {
+    return insert(hint, KeyT(std::forward<Args>(args)...));
+  }
+
+  // Subscript operator for Map: inserts default value if key not present.
+  template <typename V = mapped_type,
+            typename = std::enable_if_t<Traits::kIsMap && !std::is_void_v<V>>>
+  V& operator[](KeyT key) {
+    auto res = insert(key, V{});
+    return res.first.leaf()->Values()[res.first.slot()];
+  }
+
+  // Bounds-checked value accessor (const).
+  template <typename V = mapped_type,
+            typename = std::enable_if_t<Traits::kIsMap && !std::is_void_v<V>>>
+  const V& at(KeyT key) const {
+    auto it = find(key);
+    if (it == end()) {
+      HWY_ABORT("BTreeMap::at: key not found");
+    }
+    return it.leaf()->Values()[it.slot()];
+  }
+
+  // Bounds-checked value accessor (mutable).
+  template <typename V = mapped_type,
+            typename = std::enable_if_t<Traits::kIsMap && !std::is_void_v<V>>>
+  V& at(KeyT key) {
+    auto it = find(key);
+    if (it == end()) {
+      HWY_ABORT("BTreeMap::at: key not found");
+    }
+    return it.leaf()->Values()[it.slot()];
+  }
+
+  // Fast direct value pointer lookup without iterator construction (const).
+  template <typename V = mapped_type,
+            typename = std::enable_if_t<Traits::kIsMap && !std::is_void_v<V>>>
+  const V* FindValue(KeyT key) const {
+    return FindValueInternal(KeyCodec<KeyT>::ToStorage(key));
+  }
+
+  // Fast direct value pointer lookup without iterator construction (mutable).
+  template <typename V = mapped_type,
+            typename = std::enable_if_t<Traits::kIsMap && !std::is_void_v<V>>>
+  V* FindValue(KeyT key) {
+    return FindValueInternal(KeyCodec<KeyT>::ToStorage(key));
+  }
+
+  // Erases a key from the tree. Returns 1 if erased, 0 if not found.
+  size_t erase(KeyT key) {
+    return EraseInternal(KeyCodec<KeyT>::ToStorage(key));
+  }
+
+  // Erases the element at `pos`, which must be dereferenceable (not end()).
+  // Returns an iterator to the element following the erased one, or end().
+  // Like absl::btree, this is the only safe way to erase while iterating:
+  //   for (auto it = t.begin(); it != t.end();) {
+  //     if (ShouldErase(*it)) it = t.erase(it); else ++it;
+  //   }
+  // Cost is one additional root-to-leaf descent to re-locate the successor,
+  // because erasing may merge or free the leaf that `pos` pointed into.
+  iterator erase(const_iterator pos) {
+    HWY_DASSERT(pos.leaf() != nullptr && pos.slot() < pos.leaf()->NumKeys());
+    const StorageKeyT key = GetLeafKey(pos.leaf(), pos.slot());
+    const size_t erased = EraseInternal(key);
+    HWY_DASSERT(erased == 1);
+    (void)erased;
+    // The key is gone, so lower_bound yields the first element greater than it.
+    return LowerBoundInternal(key);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Capacity & Iteration
+  // ---------------------------------------------------------------------------
+
+  // Removes all elements and frees all nodes. Invalidates all iterators,
+  // pointers and references.
+  void clear() {
+    DestroySubtree(state_->root_, state_->tree_height_);
+    state_->root_ = nullptr;
+    state_->first_leaf_ = nullptr;
+    state_->last_leaf_ = nullptr;
+    state_->tree_height_ = 0;
+    state_->num_elements_ = 0;
+    state_->num_leaves_ = 0;
+    state_->num_internals_ = 0;
+  }
+
+  size_t size() const { return state_->num_elements_; }
+  bool empty() const { return state_->num_elements_ == 0; }
+  size_t height() const { return state_->tree_height_; }
+  size_t AllocatedBytes() const {
+    return state_->num_leaves_ * sizeof(Leaf) +
+           state_->num_internals_ * sizeof(Internal);
+  }
+
+  iterator begin() {
+    return iterator(state_->first_leaf_, 0, state_->last_leaf_);
+  }
+  iterator end() { return iterator(nullptr, 0, state_->last_leaf_); }
+  const_iterator begin() const {
+    return const_iterator(state_->first_leaf_, 0, state_->last_leaf_);
+  }
+  const_iterator end() const {
+    return const_iterator(nullptr, 0, state_->last_leaf_);
+  }
+  const_iterator cbegin() const { return begin(); }
+  const_iterator cend() const { return end(); }
+
+  reverse_iterator rbegin() { return reverse_iterator(end()); }
+  reverse_iterator rend() { return reverse_iterator(begin()); }
+  const_reverse_iterator rbegin() const {
+    return const_reverse_iterator(end());
+  }
+  const_reverse_iterator rend() const {
+    return const_reverse_iterator(begin());
+  }
+  const_reverse_iterator crbegin() const {
+    return const_reverse_iterator(cend());
+  }
+  const_reverse_iterator crend() const {
+    return const_reverse_iterator(cbegin());
+  }
+
+  // ---------------------------------------------------------------------------
+  // Observers
+  // ---------------------------------------------------------------------------
+
+  key_compare key_comp() const noexcept { return key_compare(); }
+  value_compare value_comp() const noexcept { return value_compare(); }
+  allocator_type get_allocator() const noexcept { return allocator_type(); }
+
+ private:
+  HWY_INLINE bool ContainsInternal(StorageKeyT key) const {
+    if (HWY_UNLIKELY(state_->root_ == nullptr)) return false;
+    void* curr = state_->root_;
+    for (size_t lvl = state_->tree_height_; lvl > 0; --lvl) {
+      auto* internal = static_cast<Internal*>(curr);
+      size_t child_idx = FindChild(internal, key);
+      curr = internal->children[child_idx];
+    }
+    return LeafContains(static_cast<Leaf*>(curr), key);
+  }
+
+  HWY_INLINE const_iterator FindInternal(StorageKeyT key) const {
+    if (HWY_UNLIKELY(state_->root_ == nullptr)) return end();
+    void* curr = state_->root_;
+    for (size_t lvl = state_->tree_height_; lvl > 0; --lvl) {
+      auto* internal = static_cast<Internal*>(curr);
+      size_t child_idx = FindChild(internal, key);
+      curr = internal->children[child_idx];
+    }
+    auto* leaf = static_cast<Leaf*>(curr);
+    size_t slot = 0;
+    if (LeafContains(leaf, key, &slot)) {
+      return const_iterator(leaf, slot, state_->last_leaf_);
+    }
+    return end();
+  }
+
+  HWY_INLINE iterator FindInternal(StorageKeyT key) {
+    if (HWY_UNLIKELY(state_->root_ == nullptr)) return end();
+    void* curr = state_->root_;
+    for (size_t lvl = state_->tree_height_; lvl > 0; --lvl) {
+      auto* internal = static_cast<Internal*>(curr);
+      size_t child_idx = FindChild(internal, key);
+      curr = internal->children[child_idx];
+    }
+    auto* leaf = static_cast<Leaf*>(curr);
+    size_t slot = 0;
+    if (LeafContains(leaf, key, &slot)) {
+      return iterator(leaf, slot, state_->last_leaf_);
+    }
+    return end();
+  }
+
+  HWY_INLINE const_iterator LowerBoundInternal(StorageKeyT target) const {
+    if (HWY_UNLIKELY(state_->root_ == nullptr)) return end();
+    void* curr = state_->root_;
+    for (size_t lvl = state_->tree_height_; lvl > 0; --lvl) {
+      auto* internal = static_cast<Internal*>(curr);
+      size_t child_idx = FindChild(internal, target);
+      curr = internal->children[child_idx];
+    }
+    auto* leaf = static_cast<Leaf*>(curr);
+    size_t slot = FindLeafSlot(leaf, target);
+    if (HWY_LIKELY(slot < leaf->NumKeys())) {
+      return const_iterator(leaf, slot, state_->last_leaf_);
+    }
+    if (HWY_LIKELY(leaf->Next() != nullptr)) {
+      return const_iterator(leaf->Next(), 0, state_->last_leaf_);
+    }
+    return end();
+  }
+
+  HWY_INLINE iterator LowerBoundInternal(StorageKeyT target) {
+    if (HWY_UNLIKELY(state_->root_ == nullptr)) return end();
+    void* curr = state_->root_;
+    for (size_t lvl = state_->tree_height_; lvl > 0; --lvl) {
+      auto* internal = static_cast<Internal*>(curr);
+      size_t child_idx = FindChild(internal, target);
+      curr = internal->children[child_idx];
+    }
+    auto* leaf = static_cast<Leaf*>(curr);
+    size_t slot = FindLeafSlot(leaf, target);
+    if (HWY_LIKELY(slot < leaf->NumKeys())) {
+      return iterator(leaf, slot, state_->last_leaf_);
+    }
+    if (HWY_LIKELY(leaf->Next() != nullptr)) {
+      return iterator(leaf->Next(), 0, state_->last_leaf_);
+    }
+    return end();
+  }
+
+  HWY_INLINE const_iterator UpperBoundInternal(StorageKeyT target) const {
+    if (HWY_UNLIKELY(state_->root_ == nullptr)) return end();
+    void* curr = state_->root_;
+    for (size_t lvl = state_->tree_height_; lvl > 0; --lvl) {
+      auto* internal = static_cast<Internal*>(curr);
+      size_t child_idx = FindChild(internal, target);
+      curr = internal->children[child_idx];
+    }
+    auto* leaf = static_cast<Leaf*>(curr);
+    size_t slot = FindLeafSlot<BoundMode::kUpperBound>(leaf, target);
+    if (HWY_LIKELY(slot < leaf->NumKeys())) {
+      return const_iterator(leaf, slot, state_->last_leaf_);
+    }
+    if (HWY_LIKELY(leaf->Next() != nullptr)) {
+      return const_iterator(leaf->Next(), 0, state_->last_leaf_);
+    }
+    return end();
+  }
+
+  HWY_INLINE iterator UpperBoundInternal(StorageKeyT target) {
+    if (HWY_UNLIKELY(state_->root_ == nullptr)) return end();
+    void* curr = state_->root_;
+    for (size_t lvl = state_->tree_height_; lvl > 0; --lvl) {
+      auto* internal = static_cast<Internal*>(curr);
+      size_t child_idx = FindChild(internal, target);
+      curr = internal->children[child_idx];
+    }
+    auto* leaf = static_cast<Leaf*>(curr);
+    size_t slot = FindLeafSlot<BoundMode::kUpperBound>(leaf, target);
+    if (HWY_LIKELY(slot < leaf->NumKeys())) {
+      return iterator(leaf, slot, state_->last_leaf_);
+    }
+    if (HWY_LIKELY(leaf->Next() != nullptr)) {
+      return iterator(leaf->Next(), 0, state_->last_leaf_);
+    }
+    return end();
+  }
+
+  template <typename V = mapped_type,
+            typename = std::enable_if_t<Traits::kIsMap && !std::is_void_v<V>>>
+  HWY_INLINE const V* FindValueInternal(StorageKeyT key) const {
+    if (HWY_UNLIKELY(state_->root_ == nullptr)) return nullptr;
+    void* curr = state_->root_;
+    for (size_t lvl = state_->tree_height_; lvl > 0; --lvl) {
+      auto* internal = static_cast<Internal*>(curr);
+      size_t child_idx = FindChild(internal, key);
+      curr = internal->children[child_idx];
+    }
+    auto* leaf = static_cast<Leaf*>(curr);
+    size_t slot = 0;
+    if (LeafContains(leaf, key, &slot)) {
+      return leaf->Values() + slot;
+    }
+    return nullptr;
+  }
+
+  template <typename V = mapped_type,
+            typename = std::enable_if_t<Traits::kIsMap && !std::is_void_v<V>>>
+  HWY_INLINE V* FindValueInternal(StorageKeyT key) {
+    if (HWY_UNLIKELY(state_->root_ == nullptr)) return nullptr;
+    void* curr = state_->root_;
+    for (size_t lvl = state_->tree_height_; lvl > 0; --lvl) {
+      auto* internal = static_cast<Internal*>(curr);
+      size_t child_idx = FindChild(internal, key);
+      curr = internal->children[child_idx];
+    }
+    auto* leaf = static_cast<Leaf*>(curr);
+    size_t slot = 0;
+    if (LeafContains(leaf, key, &slot)) {
+      return leaf->Values() + slot;
+    }
+    return nullptr;
+  }
+
+  // Removes keys[idx] (separator key) and children[idx + 1] (merged right
+  // child) from `node`, shifting trailing elements left by 1 and resetting the
+  // vacated tail slots to MAX/nullptr.
+  static HWY_INLINE void RemoveInternalEntry(Internal* node, size_t idx) {
+    std::memmove(node->keys + idx, node->keys + idx + 1,
+                 (node->num_keys - 1 - idx) * sizeof(StorageKeyT));
+    std::memmove(node->children + idx + 1, node->children + idx + 2,
+                 (node->num_keys - 1 - idx) * sizeof(void*));
+    node->num_keys--;
+    node->keys[node->num_keys] = std::numeric_limits<StorageKeyT>::max();
+    node->children[node->num_keys + 1] = nullptr;
+  }
+
+  // Underflow Handling: If leaf has <= Leaf::kMax16 / 2 keys, attempt merge
+  // with adjacent siblings and propagate any internal node underflows up to
+  // the root.
+  void RebalanceAfterErase(Leaf* leaf, Internal** path,
+                           const size_t* child_indices) {
+    Internal* parent = path[1];
+    size_t c_idx = child_indices[1];
+
+    if (HWY_UNLIKELY(leaf->NumKeys() <= Leaf::kMax16 / 2)) {
+      // Try merging with right sibling (c_idx) first; if unavailable or too
+      // full, fall back to left sibling (c_idx - 1). Similar to
+      // absl::btree::try_merge_or_rebalance, which tries the left one first.
+      size_t merge_idx = static_cast<size_t>(-1);
+      if (c_idx + 1 <= parent->num_keys &&
+          CanMergeLeaves(static_cast<Leaf*>(parent->children[c_idx]),
+                         static_cast<Leaf*>(parent->children[c_idx + 1]))) {
+        merge_idx = c_idx;
+      } else if (c_idx > 0 &&
+                 CanMergeLeaves(static_cast<Leaf*>(parent->children[c_idx - 1]),
+                                static_cast<Leaf*>(parent->children[c_idx]))) {
+        merge_idx = c_idx - 1;
+      }
+
+      if (merge_idx != static_cast<size_t>(-1)) {
+        auto* l_leaf = static_cast<Leaf*>(parent->children[merge_idx]);
+        auto* r_leaf = static_cast<Leaf*>(parent->children[merge_idx + 1]);
+
+        MergeLeaves(l_leaf, r_leaf, state_->last_leaf_);
+        state_->num_leaves_--;
+
+        // Remove separator key and child pointer from parent
+        RemoveInternalEntry(parent, merge_idx);
+
+        // Propagate internal node underflow up ancestor levels (lvl = 1..H-1,
+        // where lvl = 0 is leaves, lvl = 1 is parent of leaves, and
+        // lvl = tree_height_ is root).
+        // Each internal node holds up to 16 keys (17 children). Just as a full
+        // node splits 50/50 into 8 keys each on insert, every non-root internal
+        // node must stay at least 50% full (>= 8 keys = 9 children) on erase.
+        constexpr size_t kMinInternalKeys = Internal::kCapacity / 2;
+        for (size_t lvl = 1; lvl < state_->tree_height_; ++lvl) {
+          Internal* curr_internal = path[lvl];
+          // Stop climbing as soon as the current internal node is >= 50% full.
+          if (curr_internal->num_keys >= kMinInternalKeys) break;
+
+          // upper_parent is curr_internal's parent at lvl + 1, and u_idx is
+          // curr_internal's slot in upper_parent->children[].
+          Internal* upper_parent = path[lvl + 1];
+          const size_t u_idx = child_indices[lvl + 1];
+
+          // Choose the left index (u_merge_idx) of the adjacent sibling pair
+          // (children[u_merge_idx], children[u_merge_idx + 1]):
+          // - Default to right sibling (u_merge_idx = u_idx) if one exists,
+          //   otherwise left sibling (u_merge_idx = u_idx - 1).
+          // - If both siblings exist and the right sibling is too full to merge
+          //   (> 16 combined keys) while the left sibling can merge (<= 16),
+          //   switch to the left sibling to save an internal node allocation.
+          size_t u_merge_idx =
+              (u_idx + 1 <= upper_parent->num_keys) ? u_idx : (u_idx - 1);
+          if (u_idx + 1 <= upper_parent->num_keys && u_idx > 0) {
+            auto* right_sib =
+                static_cast<Internal*>(upper_parent->children[u_idx + 1]);
+            auto* left_sib =
+                static_cast<Internal*>(upper_parent->children[u_idx - 1]);
+            if (curr_internal->num_keys + 1 + right_sib->num_keys >
+                    Internal::kCapacity &&
+                left_sib->num_keys + 1 + curr_internal->num_keys <=
+                    Internal::kCapacity) {
+              u_merge_idx = u_idx - 1;
+            }
+          }
+
+          auto* left_internal =
+              static_cast<Internal*>(upper_parent->children[u_merge_idx]);
+          auto* right_internal =
+              static_cast<Internal*>(upper_parent->children[u_merge_idx + 1]);
+          // Separator key in upper_parent sitting between left_internal and
+          // right_internal.
+          const StorageKeyT sep_key = upper_parent->keys[u_merge_idx];
+
+          const size_t left_k = left_internal->num_keys;
+          const size_t right_k = right_internal->num_keys;
+          // Combined keys = left_k + 1 (sep_key) + right_k.
+          // Combined children = (left_k + 1) + (right_k + 1) = total_k + 1.
+          const size_t total_k = left_k + 1 + right_k;
+
+          if (total_k <= Internal::kCapacity) {
+            // Case 1 (Merge): All total_k keys fit in a single internal node
+            // (<= 16 keys). Absorb sep_key and right_internal into
+            // left_internal:
+            // 1. Place sep_key right after left_internal's keys (at [left_k]).
+            left_internal->keys[left_k] = sep_key;
+            // 2. Append right_internal's keys into [left_k + 1 .. total_k - 1].
+            std::copy_n(right_internal->keys, right_k,
+                        left_internal->keys + left_k + 1);
+            // 3. Append right_internal's (right_k + 1) children right after
+            //    left_internal's (left_k + 1) children, into
+            //    [left_k + 1 .. total_k].
+            std::copy_n(right_internal->children, right_k + 1,
+                        left_internal->children + left_k + 1);
+            left_internal->num_keys = static_cast<uint8_t>(total_k);
+
+            // 4. Free the absorbed right_internal node.
+            delete right_internal;
+            state_->num_internals_--;
+
+            // 5. Remove keys[u_merge_idx] (sep_key) and
+            //    children[u_merge_idx + 1] (right_internal) from upper_parent,
+            //    then continue the loop to lvl + 1 in case upper_parent now
+            //    underflowed.
+            RemoveInternalEntry(upper_parent, u_merge_idx);
+          } else {
+            // Case 2 (Rebalance): Combined keys exceed one node (> 16), so
+            // they cannot merge. Redistribute (split 50/50) across both nodes:
+            StorageKeyT temp_keys[2 * Internal::kCapacity + 1];
+            void* temp_children[2 * Internal::kCapacity + 2];
+
+            // 1. Concatenate all total_k keys into temp_keys[0 .. total_k - 1]:
+            //    [0 .. left_k - 1]         = left_internal->keys
+            //    [left_k]                  = sep_key
+            //    [left_k + 1 .. total_k-1] = right_internal->keys
+            std::copy_n(left_internal->keys, left_k, temp_keys);
+            temp_keys[left_k] = sep_key;
+            std::copy_n(right_internal->keys, right_k, temp_keys + left_k + 1);
+
+            // 2. Concatenate all (total_k + 1) children into temp_children:
+            //    [0 .. left_k]             = left_internal->children
+            //    [left_k + 1 .. total_k]   = right_internal->children
+            std::copy_n(left_internal->children, left_k + 1, temp_children);
+            std::copy_n(right_internal->children, right_k + 1,
+                        temp_children + left_k + 1);
+
+            // 3. Promote the middle key temp_keys[mid] as the new separator
+            //    in upper_parent.
+            const size_t mid = total_k / 2;
+            upper_parent->keys[u_merge_idx] = temp_keys[mid];
+
+            // 4. Write the left half (mid keys, mid + 1 children) into
+            //    left_internal, and reset unused trailing slots to MAX/nullptr.
+            std::copy_n(temp_keys, mid, left_internal->keys);
+            std::copy_n(temp_children, mid + 1, left_internal->children);
+            left_internal->num_keys = static_cast<uint8_t>(mid);
+            std::fill_n(left_internal->keys + mid, Internal::kCapacity - mid,
+                        std::numeric_limits<StorageKeyT>::max());
+            std::fill_n(left_internal->children + mid + 1,
+                        Internal::kMaxChildren - (mid + 1), nullptr);
+
+            // 5. Write the right half after temp_keys[mid] (new_right_k keys,
+            //    new_right_k + 1 children) into right_internal, and reset
+            //    unused trailing slots to MAX/nullptr.
+            const size_t new_right_k = total_k - mid - 1;
+            std::copy_n(temp_keys + mid + 1, new_right_k, right_internal->keys);
+            std::copy_n(temp_children + mid + 1, new_right_k + 1,
+                        right_internal->children);
+            right_internal->num_keys = static_cast<uint8_t>(new_right_k);
+            std::fill_n(right_internal->keys + new_right_k,
+                        Internal::kCapacity - new_right_k,
+                        std::numeric_limits<StorageKeyT>::max());
+            std::fill_n(right_internal->children + new_right_k + 1,
+                        Internal::kMaxChildren - (new_right_k + 1), nullptr);
+
+            // 6. Because no internal node was deleted, upper_parent->num_keys
+            //    is unchanged, so underflow propagation stops here.
+            break;
+          }
+        }
+
+        // Root Collapse: If merges reached the root and merged its last 2
+        // children into 1 child (num_keys == 0), promote that sole child
+        // (root->children[0]) as the new root and shrink tree_height_ by 1.
+        auto* root = static_cast<Internal*>(state_->root_);
+        if (root->num_keys == 0) {
+          state_->root_ = root->children[0];
+          state_->tree_height_--;
+          delete root;
+          state_->num_internals_--;
+        }
+      }
+    }
+  }
+
+  // Propagates a leaf or internal node split (`promo_key` and `promo_child`)
+  // up the ancestor `path` (lvl = 1..tree_height_), splitting full internal
+  // nodes 50/50 and growing the root if the split reaches the top.
+  void PropagateSplit(StorageKeyT promo_key, void* promo_child, Internal** path,
+                      const size_t* child_indices) {
+    for (size_t lvl = 1; lvl <= state_->tree_height_; ++lvl) {
+      Internal* parent = path[lvl];
+      // Case A: Parent has room (num_keys < 16).
+      // Shift keys and children right of c_idx to insert the new entry.
+      if (HWY_LIKELY(parent->num_keys < Internal::kCapacity)) {
+        size_t c_idx = child_indices[lvl];
+        for (size_t k = parent->num_keys; k > c_idx; --k) {
+          parent->keys[k] = parent->keys[k - 1];
+          parent->children[k + 1] = parent->children[k];
+        }
+        parent->keys[c_idx] = promo_key;
+        parent->children[c_idx + 1] = promo_child;
+        parent->num_keys++;
+        return;
+      }
+
+      // Case B: Parent is full (16 keys, 17 children) -> Internal node split!
+      auto* new_internal = new Internal();
+      state_->num_internals_++;
+
+      // Assemble all 17 keys and 18 children in sorted order on the stack.
+      constexpr size_t kTotalK = Internal::kCapacity + 1;
+      StorageKeyT temp_keys[kTotalK];
+      void* temp_children[kTotalK + 1];
+      size_t c_idx = child_indices[lvl];
+
+      for (size_t i = 0; i < c_idx; ++i) {
+        temp_keys[i] = parent->keys[i];
+        temp_children[i] = parent->children[i];
+      }
+      temp_children[c_idx] = parent->children[c_idx];
+      temp_keys[c_idx] = promo_key;
+      temp_children[c_idx + 1] = promo_child;
+      for (size_t i = c_idx; i < parent->num_keys; ++i) {
+        temp_keys[i + 1] = parent->keys[i];
+        temp_children[i + 2] = parent->children[i + 1];
+      }
+
+      // Promote the middle key (index 8) to the next ancestor level.
+      constexpr size_t kMid = kTotalK / 2;
+      promo_key = temp_keys[kMid];
+      promo_child = new_internal;
+
+      // Left node (parent) keeps 8 keys and 9 children.
+      std::copy_n(temp_keys, kMid, parent->keys);
+      std::copy_n(temp_children, kMid + 1, parent->children);
+      parent->num_keys = static_cast<uint8_t>(kMid);
+      std::fill_n(parent->keys + kMid, Internal::kCapacity - kMid,
+                  std::numeric_limits<StorageKeyT>::max());
+      std::fill_n(parent->children + kMid + 1,
+                  Internal::kMaxChildren - (kMid + 1), nullptr);
+
+      // Right node (new_internal) gets 8 keys and 9 children.
+      const size_t right_k = kTotalK - kMid - 1;
+      std::copy_n(temp_keys + kMid + 1, right_k, new_internal->keys);
+      std::copy_n(temp_children + kMid + 1, right_k + 1,
+                  new_internal->children);
+      new_internal->num_keys = static_cast<uint8_t>(right_k);
+      std::fill_n(new_internal->keys + right_k, Internal::kCapacity - right_k,
+                  std::numeric_limits<StorageKeyT>::max());
+    }
+
+    // Root split (grows tree height by 1)
+    auto* new_root = new Internal();
+    state_->num_internals_++;
+    new_root->keys[0] = promo_key;
+    new_root->children[0] = state_->root_;
+    new_root->children[1] = promo_child;
+    new_root->num_keys = 1;
+    state_->root_ = new_root;
+    state_->tree_height_++;
+  }
+
+  size_t EraseInternal(StorageKeyT key) {
+    if (HWY_UNLIKELY(state_->root_ == nullptr || state_->num_elements_ == 0)) {
+      return 0;
+    }
+
+    // Handle single-node tree (height == 0)
+    if (state_->tree_height_ == 0) {
+      auto* leaf = static_cast<Leaf*>(state_->root_);
+      size_t slot = 0;
+      // Check if key exists in leaf
+      if (!LeafContains(leaf, key, &slot)) return 0;
+
+      // In-place fast erase from leaf
+      TryFastEraseFromLeaf(leaf, slot);
+      state_->num_elements_--;
+      if (HWY_UNLIKELY(leaf->NumKeys() == 0)) {
+        delete leaf;
+        state_->root_ = nullptr;
+        state_->first_leaf_ = nullptr;
+        state_->last_leaf_ = nullptr;
+        state_->num_leaves_ = 0;
+      }
+      return 1;
+    }
+
+    // Multi-level tree: Record descent path from root to target leaf
+    // (ancestors are saved on stack to propagate parent splits without
+    // recursion).
+    Internal* path[kMaxTreeHeight];
+    size_t child_indices[kMaxTreeHeight];
+    void* curr = state_->root_;
+    for (size_t lvl = state_->tree_height_; lvl > 0; --lvl) {
+      auto* internal = static_cast<Internal*>(curr);
+      path[lvl] = internal;
+      size_t child_idx = FindChild(internal, key);
+      child_indices[lvl] = child_idx;
+      curr = internal->children[child_idx];
+    }
+
+    auto* leaf = static_cast<Leaf*>(curr);
+    size_t slot = 0;
+    // Check if key exists in leaf
+    if (!LeafContains(leaf, key, &slot)) return 0;
+
+    // In-place fast erase from leaf
+    TryFastEraseFromLeaf(leaf, slot);
+    state_->num_elements_--;
+
+    // Underflow Handling: If leaf has <= Leaf::kMax16 / 2 keys, attempt merge
+    // with adjacent siblings
+    RebalanceAfterErase(leaf, path, child_indices);
+
+    return 1;
+  }
+
+  // Validates `hint` in O(1) by checking if `key` fits immediately to the left
+  // or right of the hinted slot.
+  HWY_INLINE bool CheckInsertHint(const_iterator hint, StorageKeyT key,
+                                  Leaf** HWY_RESTRICT out_leaf,
+                                  size_t* HWY_RESTRICT out_slot,
+                                  bool* HWY_RESTRICT out_duplicate) {
+    if (HWY_UNLIKELY(state_->root_ == nullptr)) return false;
+
+    Leaf* leaf = const_cast<Leaf*>(hint.leaf());
+    size_t h_slot = hint.slot();
+    // end() has leaf == nullptr; normalize it to the last element in the tree
+    // so appending at end() is simply inserting to the right of h_slot.
+    if (leaf == nullptr) {
+      leaf = state_->last_leaf_;
+      h_slot = leaf->NumKeys() - 1;
+    }
+
+    const size_t count = leaf->NumKeys();
+    HWY_DASSERT(h_slot < count);
+    const StorageKeyT hint_key = GetLeafKey(leaf, h_slot);
+
+    if (HWY_UNLIKELY(key == hint_key)) {
+      *out_leaf = leaf;
+      *out_slot = h_slot;
+      *out_duplicate = true;
+      return true;
+    }
+
+    // Check left of h_slot: does `key` go immediately before `h_slot`?
+    if (key < hint_key) {
+      if (HWY_LIKELY(h_slot > 0)) {
+        const StorageKeyT prev_key = GetLeafKey(leaf, h_slot - 1);
+        if (HWY_LIKELY(prev_key < key)) {
+          *out_leaf = leaf;
+          *out_slot = h_slot;
+          *out_duplicate = false;
+          return true;
+        }
+        if (prev_key == key) {
+          *out_leaf = leaf;
+          *out_slot = h_slot - 1;
+          *out_duplicate = true;
+          return true;
+        }
+        return false;
+      }
+      // Why h_slot == 0 requires checking `leaf == state_->first_leaf_`:
+      // Between any two adjacent leaves (prev_leaf, curr_leaf), the parent
+      // internal node stores a midpoint separator key `sep` in
+      // (prev_max, curr_min] (see GapMidpointSeparator): keys < sep route to
+      // prev_leaf, while keys >= sep route to curr_leaf. Because leaves do not
+      // have parent pointers, a hinted insert cannot see `sep` to decide which
+      // leaf a key in the gap (prev_max, curr_min) belongs to.
+      // When `leaf == state_->first_leaf_`, there is no prev_leaf (and no
+      // separator to the left), so `key` unconditionally goes at slot 0.
+      if (leaf == state_->first_leaf_) {
+        *out_leaf = leaf;
+        *out_slot = 0;
+        *out_duplicate = false;
+        return true;
+      }
+      return false;
+    }
+
+    // Check right of h_slot: does `key` go immediately after `h_slot`?
+    if (HWY_LIKELY(h_slot + 1 < count)) {
+      const StorageKeyT next_key = GetLeafKey(leaf, h_slot + 1);
+      if (HWY_LIKELY(key < next_key)) {
+        *out_leaf = leaf;
+        *out_slot = h_slot + 1;
+        *out_duplicate = false;
+        return true;
+      }
+      if (key == next_key) {
+        *out_leaf = leaf;
+        *out_slot = h_slot + 1;
+        *out_duplicate = true;
+        return true;
+      }
+      return false;
+    }
+    // Same midpoint separator constraint at the right boundary (h_slot ==
+    // count - 1): only safe without a root walkdown if `leaf == last_leaf_`
+    // (no next_leaf to the right).
+    if (leaf == state_->last_leaf_) {
+      *out_leaf = leaf;
+      *out_slot = count;
+      *out_duplicate = false;
+      return true;
+    }
+    return false;
+  }
+
+  // Attempts an in-place leaf insertion at `slot` via Tier 1 (no recompression)
+  // or Tier 2 (mode widening) (Set). Returns true if inserted, or false if the
+  // leaf is full and requires rebalancing or splitting (Tier 2.5 / Tier 3).
+  HWY_INLINE bool TryInsertInPlace(Leaf* leaf, size_t slot, StorageKeyT key) {
+    // Tier 1: Fast-path in-place insert without recompression
+    if (HWY_LIKELY(TryFastInsertIntoLeaf<Traits>(leaf, key, slot))) {
+      state_->num_elements_++;
+      return true;
+    }
+    // Tier 2: Slow-path mode widening (upgrades compression mode if leaf has
+    // capacity)
+    if (CanLeafFitInsert(leaf, key)) {
+      InsertIntoLeaf(leaf, slot, key);
+      state_->num_elements_++;
+      return true;
+    }
+    return false;
+  }
+
+  // Attempts an in-place leaf insertion at `slot` via Tier 1 (no recompression)
+  // or Tier 2 (mode widening) (Map). Returns true if inserted, or false if the
+  // leaf is full and requires rebalancing or splitting (Tier 2.5 / Tier 3).
+  template <typename V>
+  HWY_INLINE bool TryInsertInPlace(Leaf* leaf, size_t slot, StorageKeyT key,
+                                   const V& value) {
+    // Tier 1: Fast-path in-place insert without recompression
+    if (HWY_LIKELY(TryFastInsertIntoLeaf<Traits>(leaf, key, value, slot))) {
+      state_->num_elements_++;
+      return true;
+    }
+    // Tier 2: Slow-path mode widening (upgrades compression mode if leaf has
+    // capacity)
+    if (CanLeafFitInsert(leaf, key)) {
+      InsertIntoLeaf(leaf, slot, key, value);
+      state_->num_elements_++;
+      return true;
+    }
+    return false;
+  }
+
+  std::pair<iterator, bool> InsertSetInternal(StorageKeyT key) {
+    // Handle empty tree initialization
+    if (HWY_UNLIKELY(state_->root_ == nullptr)) {
+      state_->first_leaf_ = state_->last_leaf_ = new Leaf();
+      state_->num_leaves_ = 1;
+      CompressIntoLeaf(state_->first_leaf_, &key, 1);
+      state_->root_ = state_->first_leaf_;
+      state_->tree_height_ = 0;
+      state_->num_elements_ = 1;
+      return {iterator(state_->first_leaf_, 0, state_->last_leaf_), true};
+    }
+
+    // Root leaf handling (height == 0)
+    if (state_->tree_height_ == 0) {
+      auto* leaf = static_cast<Leaf*>(state_->root_);
+      size_t slot = 0;
+      // Check for duplicate key (set semantics)
+      if (LeafContains(leaf, key, &slot)) {
+        return {iterator(leaf, slot, state_->last_leaf_), false};
+      }
+
+      // Tier 1 & Tier 2: In-place insert (fast path or mode widening)
+      if (HWY_LIKELY(TryInsertInPlace(leaf, slot, key))) {
+        return {iterator(leaf, slot, state_->last_leaf_), true};
+      }
+
+      // Tier 3: Root leaf split (allocates new leaf and creates root internal
+      // node)
+      auto* new_leaf = new Leaf();
+      state_->num_leaves_++;
+      StorageKeyT promo_key = 0;
+      SplitLeafNode(leaf, new_leaf, slot, key, &promo_key);
+
+      new_leaf->SetNext(leaf->Next());
+      new_leaf->SetPrev(leaf);
+      if (leaf->Next() != nullptr) {
+        leaf->Next()->SetPrev(new_leaf);
+      }
+      leaf->SetNext(new_leaf);
+      state_->last_leaf_ = new_leaf;
+
+      auto* new_root = new Internal();
+      state_->num_internals_++;
+      new_root->keys[0] = promo_key;
+      new_root->children[0] = leaf;
+      new_root->children[1] = new_leaf;
+      new_root->num_keys = 1;
+      state_->root_ = new_root;
+      state_->tree_height_ = 1;
+      state_->num_elements_++;
+
+      return {FindInternal(key), true};
+    }
+
+    // General case (height >= 1): Record descent path from root to target
+    // leaf (ancestors are saved on stack to propagate parent splits without
+    // recursion).
+    Internal* path[kMaxTreeHeight];
+    size_t child_indices[kMaxTreeHeight];
+    void* curr = state_->root_;
+    for (size_t lvl = state_->tree_height_; lvl > 0; --lvl) {
+      auto* internal = static_cast<Internal*>(curr);
+      path[lvl] = internal;
+      size_t child_idx = FindChild(internal, key);
+      child_indices[lvl] = child_idx;
+      curr = internal->children[child_idx];
+    }
+
+    auto* leaf = static_cast<Leaf*>(curr);
+    size_t slot = 0;
+    // Check for duplicate key (set semantics)
+    if (LeafContains(leaf, key, &slot)) {
+      return {iterator(leaf, slot, state_->last_leaf_), false};
+    }
+
+    // Tier 1 & Tier 2: In-place insert (fast path or mode widening)
+    if (HWY_LIKELY(TryInsertInPlace(leaf, slot, key))) {
+      return {iterator(leaf, slot, state_->last_leaf_), true};
+    }
+
+    // Tier 2.5: Spill/rebalance with adjacent sibling before splitting
+    if (TryRebalanceLeafOnInsert(path[1], child_indices[1], leaf, slot, key)) {
+      state_->num_elements_++;
+      return {FindInternal(key), true};
+    }
+
+    // Tier 3: Leaf split (allocates new leaf and splits via SplitLeafNode:
+    // 50/50 by default, boundary-biased for sequential appends/prepends, or
+    // clamped to kMinModeCap if an outlier key forces a mode downgrade)
+    auto* new_leaf = new Leaf();
+    state_->num_leaves_++;
+    StorageKeyT promo_key = 0;
+    SplitLeafNode(leaf, new_leaf, slot, key, &promo_key);
+
+    new_leaf->SetNext(leaf->Next());
+    new_leaf->SetPrev(leaf);
+    if (leaf->Next() != nullptr) {
+      leaf->Next()->SetPrev(new_leaf);
+    } else {
+      state_->last_leaf_ = new_leaf;
+    }
+    leaf->SetNext(new_leaf);
+    state_->num_elements_++;
+
+    // Propagate separator keys and splits up ancestor internal levels
+    PropagateSplit(promo_key, new_leaf, path, child_indices);
+
+    return {FindInternal(key), true};
+  }
+
+  iterator InsertHintSetInternal(const_iterator hint, StorageKeyT key) {
+    Leaf* leaf = nullptr;
+    size_t slot = 0;
+    bool duplicate = false;
+    if (HWY_LIKELY(CheckInsertHint(hint, key, &leaf, &slot, &duplicate))) {
+      if (HWY_UNLIKELY(duplicate)) {
+        return iterator(leaf, slot, state_->last_leaf_);
+      }
+      if (HWY_LIKELY(TryInsertInPlace(leaf, slot, key))) {
+        return iterator(leaf, slot, state_->last_leaf_);
+      }
+    }
+    return InsertSetInternal(key).first;
+  }
+
+  template <typename V>
+  std::pair<iterator, bool> InsertMapInternal(StorageKeyT key, const V& value,
+                                              bool assign_if_exists) {
+    // Handle empty tree initialization
+    if (HWY_UNLIKELY(state_->root_ == nullptr)) {
+      state_->first_leaf_ = state_->last_leaf_ = new Leaf();
+      state_->num_leaves_ = 1;
+      CompressIntoLeaf(state_->first_leaf_, &key, &value, 1);
+      state_->root_ = state_->first_leaf_;
+      state_->tree_height_ = 0;
+      state_->num_elements_ = 1;
+      return {iterator(state_->first_leaf_, 0, state_->last_leaf_), true};
+    }
+
+    // Root leaf handling (height == 0)
+    if (state_->tree_height_ == 0) {
+      auto* leaf = static_cast<Leaf*>(state_->root_);
+      size_t slot = 0;
+      // Check for existing key (map assign semantics)
+      if (LeafContains(leaf, key, &slot)) {
+        if (assign_if_exists) {
+          leaf->Values()[slot] = value;
+        }
+        return {iterator(leaf, slot, state_->last_leaf_), false};
+      }
+
+      // Tier 1 & Tier 2: In-place insert (fast path or mode widening)
+      if (HWY_LIKELY(TryInsertInPlace(leaf, slot, key, value))) {
+        return {iterator(leaf, slot, state_->last_leaf_), true};
+      }
+
+      // Tier 3: Root leaf split (allocates new leaf and creates root internal
+      // node)
+      auto* new_leaf = new Leaf();
+      state_->num_leaves_++;
+      StorageKeyT promo_key = 0;
+      SplitLeafNode(leaf, new_leaf, slot, key, value, &promo_key);
+
+      new_leaf->SetNext(leaf->Next());
+      new_leaf->SetPrev(leaf);
+      if (leaf->Next() != nullptr) {
+        leaf->Next()->SetPrev(new_leaf);
+      }
+      leaf->SetNext(new_leaf);
+      state_->last_leaf_ = new_leaf;
+
+      auto* new_root = new Internal();
+      state_->num_internals_++;
+      new_root->keys[0] = promo_key;
+      new_root->children[0] = leaf;
+      new_root->children[1] = new_leaf;
+      new_root->num_keys = 1;
+      state_->root_ = new_root;
+      state_->tree_height_ = 1;
+      state_->num_elements_++;
+
+      return {FindInternal(key), true};
+    }
+
+    // General case (height >= 1): Record descent path from root to target
+    // leaf (ancestors are saved on stack to propagate parent splits without
+    // recursion).
+    Internal* path[kMaxTreeHeight];
+    size_t child_indices[kMaxTreeHeight];
+    void* curr = state_->root_;
+    for (size_t lvl = state_->tree_height_; lvl > 0; --lvl) {
+      auto* internal = static_cast<Internal*>(curr);
+      path[lvl] = internal;
+      size_t child_idx = FindChild(internal, key);
+      child_indices[lvl] = child_idx;
+      curr = internal->children[child_idx];
+    }
+
+    auto* leaf = static_cast<Leaf*>(curr);
+    size_t slot = 0;
+    // Check for existing key (map assign semantics)
+    if (LeafContains(leaf, key, &slot)) {
+      if (assign_if_exists) {
+        leaf->Values()[slot] = value;
+      }
+      return {iterator(leaf, slot, state_->last_leaf_), false};
+    }
+
+    // Tier 1 & Tier 2: In-place insert (fast path or mode widening)
+    if (HWY_LIKELY(TryInsertInPlace(leaf, slot, key, value))) {
+      return {iterator(leaf, slot, state_->last_leaf_), true};
+    }
+
+    // Tier 2.5: Spill/rebalance with adjacent sibling before splitting
+    if (TryRebalanceLeafOnInsert(path[1], child_indices[1], leaf, slot, key,
+                                 value)) {
+      state_->num_elements_++;
+      return {FindInternal(key), true};
+    }
+
+    // Tier 3: Leaf split (allocates new leaf and splits via SplitLeafNode:
+    // 50/50 by default, boundary-biased for sequential appends/prepends, or
+    // clamped to kMinModeCap if an outlier key forces a mode downgrade)
+    auto* new_leaf = new Leaf();
+    state_->num_leaves_++;
+    StorageKeyT promo_key = 0;
+    SplitLeafNode(leaf, new_leaf, slot, key, value, &promo_key);
+
+    new_leaf->SetNext(leaf->Next());
+    new_leaf->SetPrev(leaf);
+    if (leaf->Next() != nullptr) {
+      leaf->Next()->SetPrev(new_leaf);
+    } else {
+      state_->last_leaf_ = new_leaf;
+    }
+    leaf->SetNext(new_leaf);
+    state_->num_elements_++;
+
+    // Propagate separator keys and splits up ancestor internal levels
+    PropagateSplit(promo_key, new_leaf, path, child_indices);
+
+    return {FindInternal(key), true};
+  }
+
+  template <typename V>
+  iterator InsertHintMapInternal(const_iterator hint, StorageKeyT key,
+                                 const V& value, bool assign_if_exists) {
+    Leaf* leaf = nullptr;
+    size_t slot = 0;
+    bool duplicate = false;
+    if (HWY_LIKELY(CheckInsertHint(hint, key, &leaf, &slot, &duplicate))) {
+      if (HWY_UNLIKELY(duplicate)) {
+        if (assign_if_exists) {
+          leaf->Values()[slot] = value;
+        }
+        return iterator(leaf, slot, state_->last_leaf_);
+      }
+      if (HWY_LIKELY(TryInsertInPlace(leaf, slot, key, value))) {
+        return iterator(leaf, slot, state_->last_leaf_);
+      }
+    }
+    return InsertMapInternal(key, value, assign_if_exists).first;
+  }
+
+  template <typename V>
+  static BTree BuildInternal(const StorageKeyT* sorted_keys,
+                             const V* sorted_values, size_t num_keys,
+                             float fill_ratio) {
+    BTree tree;
+    if (num_keys == 0) return tree;
+
+    if constexpr (HWY_IS_DEBUG_BUILD) {
+      for (size_t i = 1; i < num_keys; ++i) {
+        HWY_DASSERT_M(sorted_keys[i - 1] < sorted_keys[i],
+                      "BTree::Build requires strictly ascending unique keys");
+      }
+    }
+
+    tree.state_->num_elements_ = num_keys;
+    fill_ratio = std::clamp(fill_ratio, 0.1f, 1.0f);
+
+    // Unique 8-bit offsets (0..255) fit at most 256 keys; trying kMax8 (488+)
+    // keys would always fail the span check below.
+    const size_t max_keys_8 = std::max<size_t>(
+        1, static_cast<size_t>(kMaxLiveLeafKeys<Leaf> * fill_ratio));
+    const size_t max_keys_16 =
+        std::max<size_t>(1, static_cast<size_t>(Leaf::kMax16 * fill_ratio));
+    const size_t max_keys_32 =
+        std::max<size_t>(1, static_cast<size_t>(Leaf::kMax32 * fill_ratio));
+    const size_t max_keys_64 =
+        std::max<size_t>(1, static_cast<size_t>(Leaf::kMax64 * fill_ratio));
+
+    // Pointers to nodes at the current level being linked into parent internal
+    // nodes.
+    std::vector<void*> current_level_ptrs;
+    // Separator keys between adjacent children, used to populate internal node
+    // keys.
+    std::vector<StorageKeyT> separators;
+    Leaf* prev_leaf = nullptr;
+
+    // Build compressed leaf level
+    for (size_t key_idx = 0; key_idx < num_keys;) {
+      auto* leaf = new Leaf();
+      tree.state_->num_leaves_++;
+      if (tree.state_->first_leaf_ == nullptr) tree.state_->first_leaf_ = leaf;
+      if (prev_leaf != nullptr) {
+        prev_leaf->SetNext(leaf);
+        leaf->SetPrev(prev_leaf);
+      }
+
+      leaf->base_key = sorted_keys[key_idx];
+      const size_t remaining = num_keys - key_idx;
+      size_t count = 0;
+
+      // Select the narrowest compression mode that can accommodate the key
+      // range. Tries 8-bit, then 16-bit, then 32-bit, and falls back to raw
+      // 64-bit keys.
+      const size_t try8 = std::min(remaining, max_keys_8);
+      if (try8 > 0 && static_cast<uint64_t>(sorted_keys[key_idx + try8 - 1] -
+                                            leaf->base_key) <= 255) {
+        leaf->SetBitMode(kMode8Bit);
+        count = try8;
+        auto* offsets = HWY_RCAST_ALIGNED(uint8_t*, leaf->KeyData());
+        for (size_t k = 0; k < count; ++k) {
+          offsets[k] =
+              static_cast<uint8_t>(sorted_keys[key_idx + k] - leaf->base_key);
+        }
+        // Pad unused trailing slots with sentinels for SIMD scanning.
+        std::fill_n(offsets + count, Leaf::kMax8 - count, 0xFF);
+      } else if (const size_t try16 = std::min(remaining, max_keys_16);
+                 try16 > 0 &&
+                 static_cast<uint64_t>(sorted_keys[key_idx + try16 - 1] -
+                                       leaf->base_key) <= 65535) {
+        leaf->SetBitMode(kMode16Bit);
+        count = try16;
+        auto* offsets = HWY_RCAST_ALIGNED(uint16_t*, leaf->KeyData());
+        for (size_t k = 0; k < count; ++k) {
+          offsets[k] =
+              static_cast<uint16_t>(sorted_keys[key_idx + k] - leaf->base_key);
+        }
+        // Pad unused trailing slots with sentinels for SIMD scanning.
+        std::fill_n(offsets + count, Leaf::kMax16 - count, 0xFFFF);
+      } else if (const size_t try32 = std::min(remaining, max_keys_32);
+                 try32 > 0 &&
+                 (sizeof(StorageKeyT) == 4 ||
+                  static_cast<uint64_t>(sorted_keys[key_idx + try32 - 1] -
+                                        leaf->base_key) <= 0xFFFFFFFFULL)) {
+        leaf->SetBitMode(kMode32Bit);
+        count = try32;
+        if constexpr (sizeof(StorageKeyT) == 4) {
+          auto* raw_keys = HWY_RCAST_ALIGNED(uint32_t*, leaf->KeyData());
+          for (size_t k = 0; k < count; ++k) {
+            raw_keys[k] = static_cast<uint32_t>(sorted_keys[key_idx + k]);
+          }
+          std::fill_n(raw_keys + count, Leaf::kMax32 - count, 0xFFFFFFFF);
+        } else {
+          auto* offsets = HWY_RCAST_ALIGNED(uint32_t*, leaf->KeyData());
+          for (size_t k = 0; k < count; ++k) {
+            offsets[k] = static_cast<uint32_t>(sorted_keys[key_idx + k] -
+                                               leaf->base_key);
+          }
+          // Pad unused trailing slots with sentinels for SIMD scanning.
+          std::fill_n(offsets + count, Leaf::kMax32 - count, 0xFFFFFFFF);
+        }
+      } else {
+        leaf->SetBitMode(kModeRaw64);
+        count = std::min(remaining, max_keys_64);
+        auto* raw_keys = HWY_RCAST_ALIGNED(uint64_t*, leaf->KeyData());
+        for (size_t k = 0; k < count; ++k) {
+          raw_keys[k] = static_cast<uint64_t>(sorted_keys[key_idx + k]);
+        }
+        std::fill_n(raw_keys + count, Leaf::kMax64 - count,
+                    0xFFFFFFFFFFFFFFFFULL);
+      }
+
+      if constexpr (Traits::kIsMap) {
+        auto* vals = leaf->Values();
+        for (size_t k = 0; k < count; ++k) {
+          vals[k] = sorted_values[key_idx + k];
+        }
+      }
+
+      leaf->SetNumKeys(static_cast<uint16_t>(count));
+      current_level_ptrs.push_back(leaf);
+
+      if (key_idx > 0) {
+        separators.push_back(
+            GapMidpointSeparator(sorted_keys[key_idx - 1], leaf->base_key));
+      }
+
+      key_idx += count;
+      prev_leaf = leaf;
+    }
+
+    tree.state_->last_leaf_ = prev_leaf;
+
+    // If single leaf, root is the leaf
+    if (current_level_ptrs.size() == 1) {
+      tree.state_->root_ = current_level_ptrs[0];
+      tree.state_->tree_height_ = 0;
+      return tree;
+    }
+
+    // Build internal levels bottom-up until a single root node remains.
+    size_t current_height = 0;
+    while (current_level_ptrs.size() > 1) {
+      current_height++;
+      std::vector<void*> next_level_ptrs;
+      std::vector<StorageKeyT> next_separators;
+
+      constexpr size_t kBranching = Internal::kMaxChildren;
+      constexpr size_t kMinChildren = Internal::kCapacity / 2 + 1;
+      size_t num_nodes = current_level_ptrs.size();
+
+      for (size_t idx = 0; idx < num_nodes;) {
+        auto* internal = new Internal();
+        tree.state_->num_internals_++;
+
+        const size_t remaining_nodes = num_nodes - idx;
+        // Ensure every non-root internal node is at least 50% full (>= 9
+        // children = 8 keys): if packing 17 children into this node would leave
+        // fewer than 9 children for the final node (i.e. 18..25 nodes left),
+        // split the remaining nodes evenly between the last two internal nodes.
+        const size_t children_count =
+            (remaining_nodes > kBranching &&
+             remaining_nodes < kBranching + kMinChildren)
+                ? (remaining_nodes / 2)
+                : std::min(kBranching, remaining_nodes);
+        // Link child node pointers into this internal node.
+        for (size_t c = 0; c < children_count; ++c) {
+          internal->children[c] = current_level_ptrs[idx + c];
+          // Set separator keys (N children are separated by N - 1 keys).
+          if (c > 0) {
+            internal->keys[c - 1] = separators[idx + c - 1];
+          }
+        }
+        internal->num_keys = static_cast<uint8_t>(children_count - 1);
+        next_level_ptrs.push_back(internal);
+
+        // Propagate the delimiter separating this internal node from the
+        // previous one.
+        if (idx > 0) {
+          next_separators.push_back(separators[idx - 1]);
+        }
+
+        idx += children_count;
+      }
+
+      // Advance up to the next internal level.
+      current_level_ptrs = std::move(next_level_ptrs);
+      separators = std::move(next_separators);
+    }
+
+    tree.state_->root_ = current_level_ptrs[0];
+    tree.state_->tree_height_ = current_height;
+    return tree;
+  }
+
+  static void DestroySubtree(void* node, size_t height) {
+    if (node == nullptr) return;
+    if (height == 0) {
+      delete static_cast<Leaf*>(node);
+      return;
+    }
+    auto* internal = static_cast<Internal*>(node);
+    for (size_t i = 0; i <= internal->num_keys; ++i) {
+      DestroySubtree(internal->children[i], height - 1);
+    }
+    delete internal;
+  }
+
+ private:
+  // Internal state storage used when BTree operates in standalone mode.
+  State owned_state_;
+  // Pointer to the active BTreeState. Points to &owned_state_ in standalone
+  // mode, or to an externally owned state (e.g. from BTreeSet) in adapter mode.
+  State* state_ = &owned_state_;
+};
+
+// -----------------------------------------------------------------------------
+// Public Type Aliases
+// -----------------------------------------------------------------------------
+
+template <typename KeyT>
+using BTreeSet = BTree<SetTraits<KeyT>>;
+
+template <typename KeyT, typename ValueT>
+using BTreeMap = BTree<MapTraits<KeyT, ValueT>>;
+
+template <typename KeyT>
+using btree_set = BTree<SetTraits<KeyT>>;
+
+template <typename KeyT, typename ValueT>
+using btree_map = BTree<MapTraits<KeyT, ValueT>>;
+
+// NOLINTNEXTLINE(google-readability-namespace-comments)
+}  // namespace HWY_NAMESPACE
+}  // namespace hwy
+HWY_AFTER_NAMESPACE();
+
+#endif  // HWY_TARGET != HWY_SCALAR
+#endif  // HIGHWAY_HWY_CONTRIB_BTREE_BTREE_INL_H_

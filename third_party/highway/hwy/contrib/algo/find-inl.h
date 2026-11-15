@@ -1,0 +1,430 @@
+// Copyright 2022 Google LLC
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Per-target include guard
+#if defined(HIGHWAY_HWY_CONTRIB_ALGO_FIND_INL_H_) == \
+    defined(HWY_TARGET_TOGGLE)  // NOLINT
+#ifdef HIGHWAY_HWY_CONTRIB_ALGO_FIND_INL_H_
+#undef HIGHWAY_HWY_CONTRIB_ALGO_FIND_INL_H_
+#else
+#define HIGHWAY_HWY_CONTRIB_ALGO_FIND_INL_H_
+#endif
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "hwy/highway.h"
+
+HWY_BEFORE_NAMESPACE();
+namespace hwy {
+namespace HWY_NAMESPACE {
+
+// Returns index of the first element equal to `value` in `in[0, count)`, or
+// `count` if not found.
+template <class D, typename T = TFromD<D>>
+size_t Find(D d, T value, const T* HWY_RESTRICT in, size_t count) {
+  HWY_LANES_CONSTEXPR size_t N = Lanes(d);
+  const Vec<D> broadcasted = Set(d, value);
+
+  size_t i = 0;
+  if (HWY_LIKELY(count >= 2 * N)) {
+    for (; i <= count - 2 * N; i += 2 * N) {
+      const Mask<D> eq0 = Eq(broadcasted, LoadU(d, in + i + 0 * N));
+      const Mask<D> eq1 = Eq(broadcasted, LoadU(d, in + i + 1 * N));
+      if (AllFalse(d, Or(eq0, eq1))) continue;
+      const intptr_t pos = FindFirstTrue(d, eq0);
+      if (pos >= 0) return i + static_cast<size_t>(pos);
+      return i + N + FindKnownFirstTrue(d, eq1);
+    }
+  }
+
+  size_t remaining = count - i;
+  if (remaining >= N) {
+    const Mask<D> eq = Eq(broadcasted, LoadU(d, in + i));
+    const intptr_t pos = FindFirstTrue(d, eq);
+    if (pos >= 0) return i + static_cast<size_t>(pos);
+    i += N;
+    remaining -= N;
+  }
+
+  HWY_DASSERT(remaining < N);
+  if (remaining != 0) {
+    const Mask<D> mask = FirstN(d, remaining);
+    const Mask<D> eq = MaskedEq(mask, broadcasted, LoadN(d, in + i, remaining));
+    const intptr_t pos = FindFirstTrue(d, eq);
+    if (pos >= 0) return i + static_cast<size_t>(pos);
+  }
+
+  return count;  // not found
+}
+
+// Returns index of the first element in `in[0, count)` for which `func(d, vec)`
+// returns true, otherwise `count`.
+template <class D, class Func, typename T = TFromD<D>>
+size_t FindIf(D d, const T* HWY_RESTRICT in, size_t count, const Func& func) {
+  HWY_LANES_CONSTEXPR size_t N = Lanes(d);
+
+  size_t i = 0;
+  if (HWY_LIKELY(count >= 2 * N)) {
+    for (; i <= count - 2 * N; i += 2 * N) {
+      const Mask<D> eq0 = func(d, LoadU(d, in + i + 0 * N));
+      const Mask<D> eq1 = func(d, LoadU(d, in + i + 1 * N));
+      if (AllFalse(d, Or(eq0, eq1))) continue;
+      const intptr_t pos = FindFirstTrue(d, eq0);
+      if (pos >= 0) return i + static_cast<size_t>(pos);
+      return i + N + FindKnownFirstTrue(d, eq1);
+    }
+  }
+
+  size_t remaining = count - i;
+  if (remaining >= N) {
+    const Mask<D> eq = func(d, LoadU(d, in + i));
+    const intptr_t pos = FindFirstTrue(d, eq);
+    if (pos >= 0) return i + static_cast<size_t>(pos);
+    i += N;
+    remaining -= N;
+  }
+
+  HWY_DASSERT(remaining < N);
+  if (remaining != 0) {
+    const Mask<D> mask = FirstN(d, remaining);
+    const Mask<D> eq = And(mask, func(d, LoadN(d, in + i, remaining)));
+    const intptr_t pos = FindFirstTrue(d, eq);
+    if (pos >= 0) return i + static_cast<size_t>(pos);
+  }
+
+  return count;  // not found
+}
+
+// Returns index of the last element in `in[0, count)` for which `func(d, vec)`
+// returns true, or `count` if no element matches.
+template <class D, class Func, typename T = TFromD<D>>
+size_t FindLastIf(D d, const T* HWY_RESTRICT in, size_t count,
+                  const Func& func) {
+  HWY_LANES_CONSTEXPR size_t N = Lanes(d);
+  size_t remaining = count;
+
+  // Visit pairs of vectors from the end so the highest matching index wins.
+  if (HWY_LIKELY(remaining >= 2 * N)) {
+    for (; remaining >= 2 * N; remaining -= 2 * N) {
+      const size_t i = remaining - 2 * N;
+      const Mask<D> match0 = func(d, LoadU(d, in + i));
+      const Mask<D> match1 = func(d, LoadU(d, in + i + N));
+      if (AllFalse(d, Or(match0, match1))) continue;
+      const intptr_t pos1 = FindLastTrue(d, match1);
+      if (pos1 >= 0) return i + N + static_cast<size_t>(pos1);
+      return i + FindKnownLastTrue(d, match0);
+    }
+  }
+
+  if (remaining >= N) {
+    const size_t i = remaining - N;
+    const Mask<D> match = func(d, LoadU(d, in + i));
+    const intptr_t pos = FindLastTrue(d, match);
+    if (pos >= 0) return i + static_cast<size_t>(pos);
+    remaining -= N;
+  }
+
+  HWY_DASSERT(remaining < N);
+  if (remaining != 0) {
+    const Mask<D> valid = FirstN(d, remaining);
+    const Mask<D> match = And(valid, func(d, LoadN(d, in, remaining)));
+    const intptr_t pos = FindLastTrue(d, match);
+    if (pos >= 0) return static_cast<size_t>(pos);
+  }
+
+  return count;  // not found
+}
+
+// Returns index of the last element equal to `value` in `in[0, count)`, or
+// `count` if not found.
+template <class D, typename T = TFromD<D>>
+size_t FindLast(D d, T value, const T* HWY_RESTRICT in, size_t count) {
+  const auto equal = [value](const auto d2, const auto v) HWY_ATTR {
+    return Eq(Set(d2, value), v);
+  };
+  return FindLastIf(d, in, count, equal);
+}
+
+// AnyOf/AllOf/NoneOf unroll 4x, matching AllUnique below rather than the 2x in
+// Find/FindIf: none of them needs the position of a match, so an iteration is
+// just the loads, the predicate and one mask test, with no loop-carried state.
+
+// Returns true if `func(d, vec)` is true for at least one element of
+// `in[0, count)`, like std::any_of. Returns false if `count` is 0. Stops
+// reading as soon as the answer is known.
+template <class D, class Func, typename T = TFromD<D>>
+bool AnyOf(D d, const T* HWY_RESTRICT in, size_t count, const Func& func) {
+  HWY_LANES_CONSTEXPR size_t N = Lanes(d);
+
+  size_t i = 0;
+  if (HWY_LIKELY(count >= 4 * N)) {
+    for (; i <= count - 4 * N; i += 4 * N) {
+      const Mask<D> m0 = func(d, LoadU(d, in + i + 0 * N));
+      const Mask<D> m1 = func(d, LoadU(d, in + i + 1 * N));
+      const Mask<D> m2 = func(d, LoadU(d, in + i + 2 * N));
+      const Mask<D> m3 = func(d, LoadU(d, in + i + 3 * N));
+      if (HWY_UNLIKELY(!AllFalse(d, Or(Or(m0, m1), Or(m2, m3))))) return true;
+    }
+  }
+
+  for (; i + N <= count; i += N) {
+    if (HWY_UNLIKELY(!AllFalse(d, func(d, LoadU(d, in + i))))) return true;
+  }
+
+  const size_t remaining = count - i;
+  HWY_DASSERT(remaining < N);
+  if (remaining != 0) {
+    // LoadN zeros the lanes past `remaining` and `func` may well return true
+    // for a zero, so restrict the result to lanes holding a real element.
+    const Mask<D> mask = FirstN(d, remaining);
+    if (!AllFalse(d, And(mask, func(d, LoadN(d, in + i, remaining))))) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Returns true if `func(d, vec)` is true for every element of `in[0, count)`,
+// like std::all_of. Returns true if `count` is 0. Stops reading as soon as the
+// answer is known.
+template <class D, class Func, typename T = TFromD<D>>
+bool AllOf(D d, const T* HWY_RESTRICT in, size_t count, const Func& func) {
+  HWY_LANES_CONSTEXPR size_t N = Lanes(d);
+
+  size_t i = 0;
+  if (HWY_LIKELY(count >= 4 * N)) {
+    for (; i <= count - 4 * N; i += 4 * N) {
+      const Mask<D> m0 = func(d, LoadU(d, in + i + 0 * N));
+      const Mask<D> m1 = func(d, LoadU(d, in + i + 1 * N));
+      const Mask<D> m2 = func(d, LoadU(d, in + i + 2 * N));
+      const Mask<D> m3 = func(d, LoadU(d, in + i + 3 * N));
+      if (HWY_UNLIKELY(!AllTrue(d, And(And(m0, m1), And(m2, m3))))) {
+        return false;
+      }
+    }
+  }
+
+  for (; i + N <= count; i += N) {
+    if (HWY_UNLIKELY(!AllTrue(d, func(d, LoadU(d, in + i))))) return false;
+  }
+
+  const size_t remaining = count - i;
+  HWY_DASSERT(remaining < N);
+  if (remaining != 0) {
+    // AndNot(a, b) is "a is false and b is true", so this is the set of lanes
+    // that hold a real element and failed the predicate. Asking whether that
+    // is empty is cheaper than forcing the padding lanes true.
+    const Mask<D> mask = FirstN(d, remaining);
+    if (!AllFalse(d, AndNot(func(d, LoadN(d, in + i, remaining)), mask))) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// Returns true if `func(d, vec)` is false for every element of `in[0, count)`,
+// like std::none_of. Returns true if `count` is 0.
+template <class D, class Func, typename T = TFromD<D>>
+bool NoneOf(D d, const T* HWY_RESTRICT in, size_t count, const Func& func) {
+  return !AnyOf(d, in, count, func);
+}
+
+// Like std::unique: removes consecutive duplicates in [in, in + count) and
+// returns the number of unique elements. Requires sorted/grouped input.
+// Operates in-place: the unique elements are packed to the front of `in`.
+// Works for integer types. `count` may be zero.
+template <class D, typename T = TFromD<D>, HWY_IF_NOT_FLOAT(T)>
+size_t Unique(D d, T* HWY_RESTRICT in, size_t count) {
+  if (HWY_UNLIKELY(count <= 1)) return count;
+
+  HWY_LANES_CONSTEXPR size_t N = Lanes(d);
+
+  // prev_last tracks the last element of the previous chunk for bridging
+  // across vector boundaries. Initialize to bitwise complement of in[0]
+  // to guarantee in[0] is always kept.
+  Vec<D> prev_last =
+      Set(d, static_cast<T>(~static_cast<MakeUnsigned<T>>(in[0])));
+
+  size_t i = 0;    // read position
+  size_t num = 0;  // write position = number of unique elements written
+
+  // Main loop: process 4 * N elements at a time.
+  for (; i + 4 * N <= count; i += 4 * N) {
+    const Vec<D> v1 = LoadU(d, in + i);
+    const Vec<D> v2 = LoadU(d, in + i + N);
+    const Vec<D> v3 = LoadU(d, in + i + 2 * N);
+    const Vec<D> v4 = LoadU(d, in + i + 3 * N);
+
+    // Shift v up by 1 lane and insert prev_last. If v is [a, b, c, d], then
+    // prev is [prev_last, a, b, c].
+    const Vec<D> prev1 = SlideUpLanesOr(prev_last, d, v1, 1);
+    prev_last = SlideDownLanes(d, v1, N - 1);
+    const Vec<D> prev2 = SlideUpLanesOr(prev_last, d, v2, 1);
+    prev_last = SlideDownLanes(d, v2, N - 1);
+    const Vec<D> prev3 = SlideUpLanesOr(prev_last, d, v3, 1);
+    prev_last = SlideDownLanes(d, v3, N - 1);
+    const Vec<D> prev4 = SlideUpLanesOr(prev_last, d, v4, 1);
+    prev_last = SlideDownLanes(d, v4, N - 1);
+
+    // Lanes where v[lane] != prev[lane] are unique (not a consecutive dup).
+    const Mask<D> unique1 = Ne(v1, prev1);
+    const Mask<D> unique2 = Ne(v2, prev2);
+    const Mask<D> unique3 = Ne(v3, prev3);
+    const Mask<D> unique4 = Ne(v4, prev4);
+
+    num += CompressStore(v1, unique1, d, in + num);
+    num += CompressStore(v2, unique2, d, in + num);
+    num += CompressStore(v3, unique3, d, in + num);
+    num += CompressStore(v4, unique4, d, in + num);
+  }
+  // Remainder 1: process N elements at a time, fewer than 4 * N elements left.
+  for (; i + N <= count; i += N) {
+    const Vec<D> v = LoadU(d, in + i);
+
+    // Shift v up by 1 lane and insert prev_last. If v is [a, b, c, d], then
+    // prev is [prev_last, a, b, c].
+    const Vec<D> prev = SlideUpLanesOr(prev_last, d, v, 1);
+
+    // Lanes where v[lane] != prev[lane] are unique (not a consecutive dup).
+    const Mask<D> unique = Ne(v, prev);
+    num += CompressStore(v, unique, d, in + num);
+
+    prev_last = SlideDownLanes(d, v, N - 1);
+  }
+
+  // Remainder 2: fewer than N elements left.
+  const size_t remaining = count - i;
+  if (remaining != 0) {
+    const Mask<D> mask = FirstN(d, remaining);
+    const Vec<D> v = LoadN(d, in + i, remaining);
+    const Vec<D> prev = SlideUpLanesOr(prev_last, d, v, 1);
+    const Mask<D> unique = MaskedNe(mask, v, prev);
+    const size_t cnt = CountTrue(d, unique);
+    StoreN(Compress(v, unique), d, in + num, cnt);
+    num += cnt;
+  }
+
+  return num;
+}
+
+// Returns true if all elements in sorted `in[0, count)` are unique (no
+// consecutive duplicates). Requires sorted/grouped input. Unlike Unique(),
+// this does not modify the array and returns false immediately on the first
+// duplicate found. Works for integer types.
+template <class D, typename T = TFromD<D>, HWY_IF_NOT_FLOAT(T)>
+bool AllUnique(D d, const T* HWY_RESTRICT in, size_t count) {
+  if (HWY_UNLIKELY(count <= 1)) return true;
+
+  HWY_LANES_CONSTEXPR size_t N = Lanes(d);
+
+  // Initialize to bitwise complement of in[0] to guarantee in[0] != prev_last.
+  Vec<D> prev_last =
+      Set(d, static_cast<T>(~static_cast<MakeUnsigned<T>>(in[0])));
+
+  size_t i = 0;
+
+  for (; i + 4 * N <= count; i += 4 * N) {
+    const Vec<D> v1 = LoadU(d, in + i);
+    const Vec<D> v2 = LoadU(d, in + i + N);
+    const Vec<D> v3 = LoadU(d, in + i + 2 * N);
+    const Vec<D> v4 = LoadU(d, in + i + 3 * N);
+    // Shift v up by 1 lane and insert prev_last. If v is [a, b, c, d], then
+    // prev is [prev_last, a, b, c].
+    const Vec<D> prev1 = SlideUpLanesOr(prev_last, d, v1, 1);
+    prev_last = SlideDownLanes(d, v1, N - 1);
+    const Vec<D> prev2 = SlideUpLanesOr(prev_last, d, v2, 1);
+    prev_last = SlideDownLanes(d, v2, N - 1);
+    const Vec<D> prev3 = SlideUpLanesOr(prev_last, d, v3, 1);
+    prev_last = SlideDownLanes(d, v3, N - 1);
+    const Vec<D> prev4 = SlideUpLanesOr(prev_last, d, v4, 1);
+    prev_last = SlideDownLanes(d, v4, N - 1);
+    // Any lane where v == prev is a consecutive duplicate.
+    const Mask<D> not_unique1 = Eq(v1, prev1);
+    const Mask<D> not_unique2 = Eq(v2, prev2);
+    const Mask<D> not_unique3 = Eq(v3, prev3);
+    const Mask<D> not_unique4 = Eq(v4, prev4);
+    if (HWY_UNLIKELY(!AllFalse(d, Or(Or(not_unique1, not_unique2), Or(not_unique3, not_unique4))))) return false;
+  }
+  for (; i + N <= count; i += N) {
+    const Vec<D> v = LoadU(d, in + i);
+    const Vec<D> prev = SlideUpLanesOr(prev_last, d, v, 1);
+    if (HWY_UNLIKELY(!AllFalse(d, Eq(v, prev)))) return false;
+    prev_last = SlideDownLanes(d, v, N - 1);
+  }
+
+  const size_t remaining = count - i;
+  if (remaining != 0) {
+    const Mask<D> mask = FirstN(d, remaining);
+    const Vec<D> v = LoadN(d, in + i, remaining);
+    const Vec<D> prev = SlideUpLanesOr(prev_last, d, v, 1);
+    if (!AllFalse(d, MaskedEq(mask, v, prev))) return false;
+  }
+
+  return true;
+}
+
+// Returns true if `a[0, count)` and `b[0, count)` are equal element-wise, like
+// std::equal. Returns true if `count` is 0, and stops reading as soon as a
+// mismatch is found. As with std::equal and `operator==`, a NaN is not equal to
+// itself, so spans holding a NaN at the same index are reported as unequal.
+// Argument order follows Dot::Compute(d, pa, pb, num) in contrib/dot, the other
+// function here that reads two spans of the same length.
+template <class D, typename T = TFromD<D>>
+bool EqualSpan(D d, const T* HWY_RESTRICT a, const T* HWY_RESTRICT b,
+               size_t count) {
+  HWY_LANES_CONSTEXPR size_t N = Lanes(d);
+
+  // Unrolls 4x like AnyOf above, for the same reason: the position of the
+  // mismatch is never needed, so an iteration is the loads, the compares and a
+  // single mask test.
+  size_t i = 0;
+  if (HWY_LIKELY(count >= 4 * N)) {
+    for (; i <= count - 4 * N; i += 4 * N) {
+      const Mask<D> m0 = Ne(LoadU(d, a + i + 0 * N), LoadU(d, b + i + 0 * N));
+      const Mask<D> m1 = Ne(LoadU(d, a + i + 1 * N), LoadU(d, b + i + 1 * N));
+      const Mask<D> m2 = Ne(LoadU(d, a + i + 2 * N), LoadU(d, b + i + 2 * N));
+      const Mask<D> m3 = Ne(LoadU(d, a + i + 3 * N), LoadU(d, b + i + 3 * N));
+      if (HWY_UNLIKELY(!AllFalse(d, Or(Or(m0, m1), Or(m2, m3))))) return false;
+    }
+  }
+
+  for (; i + N <= count; i += N) {
+    const Mask<D> ne = Ne(LoadU(d, a + i), LoadU(d, b + i));
+    if (HWY_UNLIKELY(!AllFalse(d, ne))) return false;
+  }
+
+  const size_t remaining = count - i;
+  HWY_DASSERT(remaining < N);
+  if (remaining != 0) {
+    // No FirstN mask here, unlike AnyOf: LoadN zero-fills the lanes past
+    // `remaining` on both sides, so those lanes hold the same value and cannot
+    // produce a spurious mismatch.
+    const Mask<D> ne =
+        Ne(LoadN(d, a + i, remaining), LoadN(d, b + i, remaining));
+    if (!AllFalse(d, ne)) return false;
+  }
+
+  return true;
+}
+
+// NOLINTNEXTLINE(google-readability-namespace-comments)
+}  // namespace HWY_NAMESPACE
+}  // namespace hwy
+HWY_AFTER_NAMESPACE();
+
+#endif  // HIGHWAY_HWY_CONTRIB_ALGO_FIND_INL_H_
