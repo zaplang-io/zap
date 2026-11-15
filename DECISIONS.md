@@ -9247,3 +9247,38 @@ N-D complex array is the only representation that composes (fft2/fftn, complex
 Relates to #938 / #512 (Phase 3 epic), #928/D-0185 (the `list[complex]` element
 kind and the `eig`/fft complex dependency this lifts), #503/#890/D-0166 (the array
 dtype matrix this extends).
+
+## D-0187 — `import fft`: FFTs over arrays, vendored PocketFFT (#929)
+**Status:** implemented
+`import fft` provides fast Fourier transforms over numeric arrays, matching
+`numpy.fft`, the second Phase 3 track (#512) after the linalg slices. Builds on
+the complex array dtype (#938/D-0186), which it returns.
+- **Surface** (f64): `fft`/`ifft` (transform the last axis), `fft2`/`ifft2` (the
+  last two), `fftn`/`ifftn` (all axes) → `array[complex]`; `rfft` → a complex
+  half spectrum and `irfft` → a real array (1-D); `fftfreq`/`rfftfreq` → f64
+  sample-frequency arrays. Optional `norm=` ("backward" default / "ortho" /
+  "forward") sets the normalization; `irfft` takes an optional output length
+  `n=` (default `2*(len-1)`); the freq helpers an optional spacing `d=`.
+- **Backend: vendored PocketFFT** (`third_party/pocketfft/pocketfft_hdronly.h`,
+  BSD-3, the transform NumPy/SciPy use — arbitrary sizes, not power-of-two-
+  limited). This is the **first C++ in the shipping runtime**. A thin extern-"C"
+  wrapper (`crates/codegen/src/zapfft.cpp`) operates only on raw contiguous
+  `double` buffers (a complex value is two lanes) — it touches no Zap runtime
+  type — so `zaprt.c` (C) owns all `ZapArray` marshalling and the C++ unit owns
+  only the math. PocketFFT throws on a malformed transform; a C++ exception must
+  not cross into C, so every wrapper entry point is `try/catch` → an int status,
+  and the C caller raises a catchable `ValueError`.
+- **Build integration.** Gated by `BackendUse::fft` (a program reaching a
+  `zap_fft_*` seam), exactly like the pcre2/zlib/BLAS seams: the runtime compiles
+  with `-DZAP_HAVE_FFT` (so the PocketFFT-backed transforms are included, not the
+  no-backend stubs), the C++ wrapper compiles to a standalone native object
+  (`-x c++ -std=c++17 -fexceptions`, never merged into the program's LTO bitcode
+  — the C↔C++ boundary stays an ordinary extern-"C" call), and that object links
+  against the C++ stdlib already on the link line (`-lstdc++`). A program that
+  does not import `fft` pulls in no C++ and the `zap_fft_*` entry points compile
+  as catchable-error stubs. `fftfreq`/`rfftfreq` are pure C (no backend).
+- **Determinism.** The transform is PocketFFT's, so results match NumPy within
+  floating-point tolerance; the goldens pin exact 4-point impulse/constant cases
+  (±1/±i twiddles) and the exact-rational sample frequencies.
+Relates to #929 / #512 (Phase 3 epic), #938/D-0186 (the complex array dtype it
+returns), #853 (the per-program optional-backend link gate it follows).

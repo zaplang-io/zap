@@ -25,6 +25,14 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`import fft` — FFTs over arrays (vendored PocketFFT)** (#929, D-0187). Second
+  Phase 3 track (#512): `fft`/`ifft`, `rfft`/`irfft`, `fft2`/`ifft2`,
+  `fftn`/`ifftn`, and `fftfreq`/`rfftfreq`, matching `numpy.fft`, returning
+  `array[complex]` (rfft a half spectrum, irfft a real array). Optional `norm=`
+  ("backward"/"ortho"/"forward"). Backed by vendored PocketFFT (the NumPy/SciPy
+  transform, arbitrary sizes) — the first C++ in the runtime, via a thin
+  extern-"C" wrapper linked (as a native object + the C++ stdlib) only for a
+  program that imports `fft`. Builds on the complex array dtype (#938).
 - **Complex arrays — `array[complex]`** (#938, D-0186). A dense `complex128` array
   dtype (each element a 16-byte `(re, im)` f64 pair; `a[i]` is a `complex`
   scalar). Constructed from `complex` literals or from promoted real/int literals;

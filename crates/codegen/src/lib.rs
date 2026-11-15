@@ -688,6 +688,13 @@ const RUNTIME_WIN_A3_C: &str = include_str!("zap_win_a3.c");
 const RUNTIME_NP_IOCP_C: &str = include_str!("zap_np_iocp.c");
 const RUNTIME_NP_IOCP_H: &str = include_str!("zap_np_iocp.h");
 
+/// The FFT backend (#929): the C++ PocketFFT wrapper and the vendored header it
+/// includes. Written out and compiled to a native object (linked against the C++
+/// stdlib already on the link line) only for a program that reaches a `zap_fft_*`
+/// seam (`BackendUse::fft`).
+const RUNTIME_FFT_CPP: &str = include_str!("zapfft.cpp");
+const POCKETFFT_H: &str = include_str!("../../../third_party/pocketfft/pocketfft_hdronly.h");
+
 /// Whether the (already module-linked, D-0081) program reaches `import python`
 /// anywhere in its import graph (#852). `modlink` drops Zap `import <name>`
 /// statements when merging but KEEPS every `import python` item so sema can bind
@@ -743,6 +750,15 @@ pub(crate) struct BackendUse {
     /// `native` and no provider is linked. The always-compiled tier/thread knobs
     /// (`zap_accel_tier` / `zap_accel_threads_env`) do not set this.
     pub blas: bool,
+    /// FFT via vendored PocketFFT (#929): the program calls a `zap_fft_*` seam
+    /// whose transform lives in the C++ backend TU (`zapfft.cpp`). Gates
+    /// `-DZAP_HAVE_FFT` on the runtime compile, compiles + links the C++ object,
+    /// and switches the final link driver to the C++ variant (which pulls the C++
+    /// stdlib). Off ⇒ no C++ object, no libc++/libstdc++, and the `zap_fft_*`
+    /// entry points compile as catchable-error stubs. (`zap_fft_fftfreq` /
+    /// `rfftfreq` are pure C and do not need the backend, but referencing any
+    /// `zap_fft_*` conservatively links it — only over-linking, never a miss.)
+    pub fft: bool,
 }
 
 /// `zap_crypto_*` seams that are implemented in pure C (SHA-2 family, SHA-1,
@@ -814,6 +830,14 @@ pub(crate) fn program_backend_use(module: &AstModule, race: bool) -> BackendUse 
                     // seams. 1-D·1-D `dot` (`zap_array_dot{i,f}`) stays the scalar
                     // accumulator and never needs BLAS.
                     u.blas = true;
+                } else if callee.starts_with("zap_fft_") {
+                    // #929: `import fft` is PocketFFT-backed; its transform lives
+                    // in the C++ backend TU, so a program that reaches it compiles
+                    // the runtime with `ZAP_HAVE_FFT`, compiles + links the C++
+                    // object, and links the C++ stdlib. (fftfreq/rfftfreq are pure
+                    // C, but referencing any `zap_fft_*` conservatively links the
+                    // backend — only over-linking, never a miss.)
+                    u.fft = true;
                 }
             }
         }
@@ -1043,10 +1067,69 @@ pub fn build_executable(
     // — otherwise nothing probes for a provider and nothing links. A reaching
     // program with no provider available gets empty flags (the seam compiles as
     // its no-provider stubs: `fast` degrades to `native`).
-    let (blas_defines, blas_libs): (Vec<String>, Vec<String>) = if backends.blas {
+    let (mut blas_defines, blas_libs): (Vec<String>, Vec<String>) = if backends.blas {
         blas_build_flags().unwrap_or_default()
     } else {
         (Vec::new(), Vec::new())
+    };
+    // FFT backend (#929). A program that reaches a `zap_fft_*` seam compiles the
+    // runtime with `-DZAP_HAVE_FFT` (so the PocketFFT-backed transforms are
+    // included, not the no-backend stubs) — folded into the runtime compile
+    // defines here (same mechanism as the BLAS gate) — and compiles the C++
+    // wrapper to a native object linked below (the C++ stdlib is already on the
+    // link line). The wrapper and the vendored PocketFFT header are written next
+    // to the runtime so the `#include` resolves.
+    let fft_obj: Option<std::path::PathBuf> = if backends.fft {
+        blas_defines.push("-DZAP_HAVE_FFT".to_string());
+        let cpp_path = build_dir.join("zapfft.cpp");
+        if let Err(e) = std::fs::write(&cpp_path, RUNTIME_FFT_CPP)
+            .and_then(|_| std::fs::write(build_dir.join("pocketfft_hdronly.h"), POCKETFFT_H))
+        {
+            let _ = std::fs::remove_file(&prog_path);
+            let _ = std::fs::remove_dir_all(&build_dir);
+            return Err(format!("failed to write fft backend: {e}"));
+        }
+        let obj = build_dir.join("zapfft.o");
+        // Compile the C++ TU with the C driver in C++ mode (`-x c++`), so no
+        // separate C++ compiler path is needed; `-fexceptions` because PocketFFT
+        // throws on a malformed transform and the wrapper catches at the boundary
+        // (I#841: a unit that unwinds must be built with exceptions). It is a
+        // standalone native object (never merged into the program's LTO bitcode),
+        // so the C↔C++ boundary stays an ordinary extern-"C" call.
+        let cxx = if lto {
+            std::env::var("ZAP_LTO_CC").unwrap_or_else(|_| "clang".to_string())
+        } else {
+            std::env::var("ZAP_CC").unwrap_or_else(|_| "cc".to_string())
+        };
+        let status = Command::new(&cxx)
+            .arg("-x")
+            .arg("c++")
+            .arg("-std=c++17")
+            .arg("-O2")
+            .arg("-fexceptions")
+            .arg("-c")
+            .arg(&cpp_path)
+            .arg(format!("-I{}", build_dir.display()))
+            .arg("-o")
+            .arg(&obj)
+            .status();
+        match status {
+            Ok(s) if s.success() => Some(obj),
+            Ok(_) => {
+                let _ = std::fs::remove_file(&prog_path);
+                let _ = std::fs::remove_dir_all(&build_dir);
+                return Err("failed to compile the FFT backend (zapfft.cpp)".to_string());
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&prog_path);
+                let _ = std::fs::remove_dir_all(&build_dir);
+                return Err(format!(
+                    "failed to run the C++ compiler for zapfft.cpp: {e}"
+                ));
+            }
+        }
+    } else {
+        None
     };
 
     // Linker driver. On the default path, `cc` (the MinGW-w64 `gcc`/`cc` on a
@@ -1275,6 +1358,11 @@ pub fn build_executable(
     // link lines — the dev container / CI provide the `-dev` packages on Linux,
     // and the MinGW-w64 `mingw-w64-x86_64-{pcre2,zlib,openssl}` packages provide
     // the import libraries with the same `-l` names on Windows (MSYS2).
+    // FFT backend object (#929): the PocketFFT C++ wrapper, listed before the C++
+    // stdlib it references. Present only for a program that reaches `zap_fft_*`.
+    if let Some(o) = &fft_obj {
+        cmd.arg(o);
+    }
     cmd.arg("-lstdc++")
         // `-lm` provides libm `pow`/`floor`, used by the scalar `**` and `//`
         // runtime helpers (ticket #19).
@@ -2583,6 +2671,27 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), i.into()],
             Some(p.into()),
         );
+        // FFT (#929), PocketFFT-backed. The c2c transforms and rfft take
+        // (array, norm); irfft takes (array, n, norm); the freq helpers take
+        // (n, d). All return an array pointer (complex, except irfft/freq -> f64).
+        for name in [
+            "zap_fft_fft",
+            "zap_fft_ifft",
+            "zap_fft_fft2",
+            "zap_fft_ifft2",
+            "zap_fft_fftn",
+            "zap_fft_ifftn",
+            "zap_fft_rfft",
+        ] {
+            self.declare_rt(name, &[p.into(), i.into()], Some(p.into()));
+        }
+        self.declare_rt(
+            "zap_fft_irfft",
+            &[p.into(), i.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt("zap_fft_fftfreq", &[i.into(), f.into()], Some(p.into()));
+        self.declare_rt("zap_fft_rfftfreq", &[i.into(), f.into()], Some(p.into()));
         // Shape ops (#511, D-0174): transpose/flatten/reshape (views or copies)
         // and concatenate/stack (over a `list` of arrays). `i64buf`/`i64set`
         // build the reshape target-dims buffer.

@@ -4111,6 +4111,247 @@ void *zap_array_sum_complex(void *ap) {
     }
     return zap_complex_new(sr, si);
 }
+/* --- FFT (#929), vendored PocketFFT backend (crates/codegen/src/zapfft.cpp) --
+ * The public `zap_fft_*` entry points are ALWAYS compiled (so a program that
+ * imports `fft` links), but the PocketFFT-backed transforms need the C++ backend
+ * object, linked only for such a program (`BackendUse::fft` ->
+ * `-DZAP_HAVE_FFT` + the C++ `zapfft.o` + the C++ stdlib). A build without the
+ * gate raises a catchable ValueError (never reached in practice — reaching `fft`
+ * sets the gate). `norm` is 0 = backward (default), 1 = ortho, 2 = forward. All
+ * transforms output `complex` arrays (rfft's half spectrum, irfft a real array);
+ * `fftfreq`/`rfftfreq` are pure arithmetic and need no backend. */
+static void zap_fft_err(const char *m) {
+    zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+}
+#if defined(ZAP_HAVE_FFT)
+extern int zapfft_c2c(const double *in, double *out, const size_t *shape,
+                      size_t ndim, const size_t *axes, size_t naxes, int forward,
+                      double fct);
+extern int zapfft_r2c(const double *in, double *out, size_t n, int forward,
+                      double fct);
+extern int zapfft_c2r(const double *in, double *out, size_t n, int forward,
+                      double fct);
+/* The normalization scale (NumPy `norm`): backward scales the inverse by 1/N,
+ * forward scales the forward by 1/N, ortho scales both by 1/sqrt(N). */
+static double zap_fft_norm_fct(double nn, int inv, int64_t norm) {
+    if (norm == 1)
+        return 1.0 / sqrt(nn);
+    if (norm == 2)
+        return inv ? 1.0 : 1.0 / nn;
+    return inv ? 1.0 / nn : 1.0;
+}
+/* Materialize `a` (real or complex) into a fresh interleaved (re, im) buffer. */
+static double *zap_fft_to_cbuf(ZapArray *a, int64_t n) {
+    double *buf = (double *)zap_buf((size_t)(n > 0 ? n : 1) * 2 * sizeof(double));
+    for (int64_t i = 0; i < n; i++) {
+        double re, im;
+        zap_cx_load(a, i, &re, &im);
+        buf[2 * i] = re;
+        buf[2 * i + 1] = im;
+    }
+    return buf;
+}
+/* c2c over `axes` (the shared core of fft/ifft/fft2/ifft2/fftn/ifftn). The input
+ * promotes to complex; the result is a complex array of the same shape. */
+static void *zap_fft_c2c_core(void *ap, const int64_t *axes, int64_t naxes,
+                              int inv, int64_t norm) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t nd = a->ndim;
+    int64_t cnt = zap_array_count_of(a);
+    double *inbuf = zap_fft_to_cbuf(a, cnt);
+    ZapArray *res = (ZapArray *)zap_array_new_nd(DTYPE_COMPLEX, nd, cnt);
+    for (int64_t k = 0; k < nd; k++)
+        zap_array_set_dim(res, k, a->dims[k]);
+    size_t *shp = (size_t *)zap_buf((size_t)(nd > 0 ? nd : 1) * sizeof(size_t));
+    for (int64_t k = 0; k < nd; k++)
+        shp[k] = (size_t)a->dims[k];
+    size_t *ax = (size_t *)zap_buf((size_t)(naxes > 0 ? naxes : 1) * sizeof(size_t));
+    double nn = 1.0;
+    for (int64_t k = 0; k < naxes; k++) {
+        ax[k] = (size_t)axes[k];
+        nn *= (double)a->dims[axes[k]];
+    }
+    double fct = zap_fft_norm_fct(nn, inv, norm);
+    int e = zapfft_c2c(inbuf, (double *)res->data, shp, (size_t)nd, ax,
+                       (size_t)naxes, inv ? 0 : 1, fct);
+    if (e)
+        zap_fft_err("fft: transform failed (invalid shape)");
+    return res;
+}
+static void *zap_fft_rfft_impl(ZapArray *a, int64_t norm) {
+    int64_t n = a->dims[0];
+    int64_t m = n / 2 + 1;
+    double *inbuf = (double *)zap_buf((size_t)(n > 0 ? n : 1) * sizeof(double));
+    for (int64_t i = 0; i < n; i++) {
+        double re, im;
+        zap_cx_load(a, i, &re, &im);
+        inbuf[i] = re;
+    }
+    ZapArray *res = (ZapArray *)zap_array_new(DTYPE_COMPLEX, m);
+    double fct = zap_fft_norm_fct((double)n, 0, norm);
+    int e = zapfft_r2c(inbuf, (double *)res->data, (size_t)n, 1, fct);
+    if (e)
+        zap_fft_err("rfft: transform failed");
+    return res;
+}
+static void *zap_fft_irfft_impl(ZapArray *a, int64_t n, int64_t norm) {
+    int64_t m = a->dims[0]; /* complex input length = n/2 + 1 */
+    if (n <= 0)
+        n = 2 * (m - 1); /* NumPy default output length */
+    double *inbuf = zap_fft_to_cbuf(a, m);
+    ZapArray *res = (ZapArray *)zap_array_new(DTYPE_F64, n);
+    double fct = zap_fft_norm_fct((double)n, 1, norm);
+    int e = zapfft_c2r(inbuf, (double *)res->data, (size_t)n, 0, fct);
+    if (e)
+        zap_fft_err("irfft: transform failed");
+    return res;
+}
+#endif /* ZAP_HAVE_FFT */
+
+#if defined(ZAP_HAVE_FFT)
+#define ZAP_FFT_NEED_BACKEND 0
+#else
+#define ZAP_FFT_NEED_BACKEND 1
+static void zap_fft_no_backend(void) {
+    zap_fft_err("fft requires the FFT backend (this build has none)");
+}
+#endif
+
+/* c2c public entry points: fft/ifft transform the LAST axis, fft2/ifft2 the last
+ * two, fftn/ifftn all axes (matching numpy.fft's default axis selection). */
+void *zap_fft_fft(void *ap, int64_t norm) {
+    ZapArray *a = (ZapArray *)ap;
+    if (a->ndim < 1)
+        zap_fft_err("fft: expected an array");
+#if ZAP_FFT_NEED_BACKEND
+    (void)norm;
+    zap_fft_no_backend();
+    return NULL;
+#else
+    int64_t ax = a->ndim - 1;
+    return zap_fft_c2c_core(ap, &ax, 1, 0, norm);
+#endif
+}
+void *zap_fft_ifft(void *ap, int64_t norm) {
+    ZapArray *a = (ZapArray *)ap;
+    if (a->ndim < 1)
+        zap_fft_err("ifft: expected an array");
+#if ZAP_FFT_NEED_BACKEND
+    (void)norm;
+    zap_fft_no_backend();
+    return NULL;
+#else
+    int64_t ax = a->ndim - 1;
+    return zap_fft_c2c_core(ap, &ax, 1, 1, norm);
+#endif
+}
+void *zap_fft_fft2(void *ap, int64_t norm) {
+    ZapArray *a = (ZapArray *)ap;
+    if (a->ndim < 2)
+        zap_fft_err("fft2: expected a >= 2-D array");
+#if ZAP_FFT_NEED_BACKEND
+    (void)norm;
+    zap_fft_no_backend();
+    return NULL;
+#else
+    int64_t ax[2] = {a->ndim - 2, a->ndim - 1};
+    return zap_fft_c2c_core(ap, ax, 2, 0, norm);
+#endif
+}
+void *zap_fft_ifft2(void *ap, int64_t norm) {
+    ZapArray *a = (ZapArray *)ap;
+    if (a->ndim < 2)
+        zap_fft_err("ifft2: expected a >= 2-D array");
+#if ZAP_FFT_NEED_BACKEND
+    (void)norm;
+    zap_fft_no_backend();
+    return NULL;
+#else
+    int64_t ax[2] = {a->ndim - 2, a->ndim - 1};
+    return zap_fft_c2c_core(ap, ax, 2, 1, norm);
+#endif
+}
+void *zap_fft_fftn(void *ap, int64_t norm) {
+    ZapArray *a = (ZapArray *)ap;
+    if (a->ndim < 1)
+        zap_fft_err("fftn: expected an array");
+#if ZAP_FFT_NEED_BACKEND
+    (void)norm;
+    zap_fft_no_backend();
+    return NULL;
+#else
+    int64_t nd = a->ndim;
+    int64_t *ax = (int64_t *)zap_buf((size_t)(nd > 0 ? nd : 1) * sizeof(int64_t));
+    for (int64_t k = 0; k < nd; k++)
+        ax[k] = k;
+    return zap_fft_c2c_core(ap, ax, nd, 0, norm);
+#endif
+}
+void *zap_fft_ifftn(void *ap, int64_t norm) {
+    ZapArray *a = (ZapArray *)ap;
+    if (a->ndim < 1)
+        zap_fft_err("ifftn: expected an array");
+#if ZAP_FFT_NEED_BACKEND
+    (void)norm;
+    zap_fft_no_backend();
+    return NULL;
+#else
+    int64_t nd = a->ndim;
+    int64_t *ax = (int64_t *)zap_buf((size_t)(nd > 0 ? nd : 1) * sizeof(int64_t));
+    for (int64_t k = 0; k < nd; k++)
+        ax[k] = k;
+    return zap_fft_c2c_core(ap, ax, nd, 1, norm);
+#endif
+}
+void *zap_fft_rfft(void *ap, int64_t norm) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    if (a->ndim != 1)
+        zap_fft_err("rfft: expected a 1-D array");
+#if ZAP_FFT_NEED_BACKEND
+    (void)norm;
+    zap_fft_no_backend();
+    return NULL;
+#else
+    return zap_fft_rfft_impl(a, norm);
+#endif
+}
+void *zap_fft_irfft(void *ap, int64_t n, int64_t norm) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    if (a->ndim != 1)
+        zap_fft_err("irfft: expected a 1-D array");
+#if ZAP_FFT_NEED_BACKEND
+    (void)n;
+    (void)norm;
+    zap_fft_no_backend();
+    return NULL;
+#else
+    return zap_fft_irfft_impl(a, n, norm);
+#endif
+}
+/* Sample frequencies — pure arithmetic, no backend. fftfreq: n bins, the
+ * non-negative then negative half; rfftfreq: n/2+1 non-negative bins. */
+void *zap_fft_fftfreq(int64_t n, double d) {
+    if (n <= 0)
+        zap_fft_err("fftfreq: n must be positive");
+    ZapArray *res = (ZapArray *)zap_array_new(DTYPE_F64, n);
+    double val = 1.0 / ((double)n * d);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t f = (i < (n + 1) / 2) ? i : i - n;
+        arr_store_f(res, i, (double)f * val);
+    }
+    return res;
+}
+void *zap_fft_rfftfreq(int64_t n, double d) {
+    if (n <= 0)
+        zap_fft_err("rfftfreq: n must be positive");
+    int64_t m = n / 2 + 1;
+    ZapArray *res = (ZapArray *)zap_array_new(DTYPE_F64, m);
+    double val = 1.0 / ((double)n * d);
+    for (int64_t i = 0; i < m; i++)
+        arr_store_f(res, i, (double)i * val);
+    return res;
+}
+
 /* bool reductions (#507): min/max/prod stay 0/1 (prod = logical "all"); mean is
  * the fraction of True, a float. Elements are normalized 0/1 bytes. */
 int64_t zap_array_prod_bool(void *ap) {
