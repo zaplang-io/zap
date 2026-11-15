@@ -1077,12 +1077,50 @@ pub struct Block {
     pub term: Term,
 }
 
+/// One variant in a function-multiversioning clone set (#944, epic #139). A
+/// clone is an ordinary [`Func`] (translated by the normal path) carrying a
+/// `target_feature` tag; the group records how codegen wires them to a resolver
+/// + pointer-once-init dispatcher under the public name.
+#[derive(Clone, Debug)]
+pub struct MvTier {
+    /// The emitted clone function's mangled name (e.g. `kernel$mv$avx2`), a
+    /// [`Func`] present in [`Module::funcs`].
+    pub clone_name: String,
+    /// The stable feature-tier name (e.g. `avx2`, `sse4.2`, `default`), as the
+    /// `@multiversion` decorator spelled it; codegen maps it to the
+    /// `cpu_features` bit index (resolver) and the LLVM `target-features` string.
+    pub tier: String,
+    /// The mandatory portable fallback (`"default"`): always selectable last, so
+    /// there is never a "no impl for this CPU" hole.
+    pub is_default: bool,
+}
+
+/// A `@multiversion` clone set (#944, epic #139). Lowering emits the clone
+/// [`Func`]s and records one group per multiversioned function; codegen builds
+/// the resolver (reading `cpu_features`) and the pointer-once-init dispatcher
+/// exported under `public_name`, so every caller of `public_name` dispatches to
+/// the best clone with no call-site change.
+#[derive(Clone, Debug)]
+pub struct MvGroup {
+    /// The public symbol callers invoke — codegen emits this as the dispatcher.
+    pub public_name: String,
+    /// Clones in resolver-priority order (highest-capability first); exactly one
+    /// has `is_default == true` and it is the last resort.
+    pub tiers: Vec<MvTier>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Func {
     pub name: String,
     pub params: Vec<Ty>,
     pub ret: Ty,
     pub is_main: bool,
+    /// Function-multiversioning tier tag (#944, epic #139): `Some(tier)` on a
+    /// `@multiversion` clone (e.g. `"avx2"`), which codegen compiles with that
+    /// tier's LLVM `target-features` and keeps as a non-inlined dispatch target.
+    /// `None` for an ordinary function. The default/baseline clone carries
+    /// `Some("default")` (no extra features, but still a distinct clone).
+    pub target_feature: Option<String>,
     /// `true` when parameter 0 is a by-reference method receiver (`self`). A
     /// `value struct` `self` is passed **by reference** (a pointer), Swift-style,
     /// so a mutating method acts on the receiver variable — unlike ordinary
@@ -1235,6 +1273,13 @@ pub struct Module {
     /// renderer slot — not reachable for the field types D-0124 supports. Empty
     /// when no interface value is ever constructed.
     pub iface_renderers: std::collections::HashMap<u32, String>,
+    /// Function-multiversioning clone sets (#944, epic #139): one [`MvGroup`] per
+    /// `@multiversion` function. Codegen emits, for each group, a resolver
+    /// (reading the `cpu_features` detector, #943) and a pointer-once-init
+    /// dispatcher under the group's `public_name`; the clone bodies themselves
+    /// are ordinary [`Func`]s in [`Self::funcs`]. Empty when no function is
+    /// multiversioned.
+    pub multiversion_groups: Vec<MvGroup>,
 }
 
 // --- textual form (for `zapc ir` and tests) ---

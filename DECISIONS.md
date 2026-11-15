@@ -9504,3 +9504,56 @@ build on it. Design snapshot: #920 comment 4.
   matrix (an acceptance criterion carried forward into #944/#945).
 Relates to epic #139, Discussion #920 (comment 4), and the deferred `arch.*`
 curated-intrinsics surface specced in #139. Consumed by #944 and #945.
+
+## D-0193 — function multiversioning: `@multiversion` clones + pointer-once-init dispatch (ISA-acceleration epic #139 / #944)
+**Status:** implemented
+The dispatch mechanism the ISA-acceleration facility is built on (Discussion
+#920 §6–§7): `@multiversion(...)` on a free function compiles one clone per
+CPU-feature tier and a runtime resolver that picks the best clone the host
+supports, reading the `cpu_features` detector (#943, D-0192). Builds on #943;
+the first client is SIMD memchr (#945). Design: #920 §6, §7, comment 3.
+- **Surface.** `@multiversion("avx2", "sse4.2", "default")` — positional tier
+  NAMES, stable `cpu_features` names (#943): x86 `sse2`/`sse4.2`/`avx2`/`avx512f`,
+  aarch64 `neon`/`aes`/`sha2`/`crc32`/`dotprod`/`i8mm`/`sve`/`sve2`/`sme`, aliases
+  accepted. **Experimental** (STABILITY §3.1). The standalone `@target_feature`
+  building block and its unsafe-to-call-directly rule are a documented follow-on
+  (each clone is internally a target-feature function, but only the dispatcher is
+  public, so a clone is never called unguarded).
+- **A `default` tier is MANDATORY** (**ZAP5133** on its absence) — there is never
+  a "no implementation for this CPU" hole. A program targets one arch, so the
+  other arch's tiers are simply never selected (their names are not that arch's);
+  codegen ignores them and leaves their clone at baseline.
+- **Clones are the body stamped N times**, differing only by LLVM
+  `target-features` (`+avx2,+fma`, `+sve`, …). They are `noinline` so the
+  dispatched call survives to runtime (rule #3: a multiversioned fn is an
+  inlining barrier), and they are the ONE exception to the I#841 target-feature
+  strip (the `$mv$` symbol marker) so their features survive LTO — stripping
+  them would silently demote every clone to baseline. Only clone bodies carry a
+  feature; the resolver + dispatcher stay baseline (rule #4: no feature leak →
+  no SIGILL in the dispatcher).
+- **Dispatch default = pointer-with-once-init** (#920 §7): a per-group global
+  caches the resolved clone pointer (null until first call); the dispatcher loads
+  it, and on the first call an inline resolver `select`s the highest-priority
+  supported clone (via `zap_cpu_has`), caches it, then indirect-calls it — one
+  load + one indirect call steady-state, and the call is coarse (dispatch once at
+  the top of a kernel, not a hot leaf). **GNU `ifunc`** (the zero-steady-state
+  x86-Linux optimization) is a documented follow-on: inkwell 0.5 cannot express
+  an `ifunc` global (it would need raw `llvm-sys` FFI), and the design classes it
+  as an optimization over the portable pointer path, weak on macOS/Windows (#224).
+- **Scalable (SVE) clone stays first-class** (#920 comment 3): a tier is a
+  feature axis (`scalar | NEON | SVE`), not width-indexed; the taxonomy carries
+  `sve`/`sve2`/`sme` and the runtime SVE width (`sve_vl_bytes`, #943), so an
+  SVE/SME lowering is not foreclosed.
+- **Pipeline placement.** Lowering emits the clone `Func`s + an `MvGroup` per
+  multiversioned function (arch-agnostic); codegen builds the resolver +
+  dispatcher from the group, reading the taxonomy mirror `cpu_features.rs`
+  (locked to the #943 C header). Callers invoke the public name unchanged — the
+  dispatcher IS that symbol — so no call site changes.
+- **Validation under LTO/`-O2`, not just debug** (#920 §7, the #845 lesson): the
+  clones' surviving `target-features`, the exception-unwind through the baseline
+  dispatcher (it carries a `uwtable`), and the resolver running correctly are all
+  exercised by the `full`/`arm64` CI + the `qemu -cpu` matrix, where a feature is
+  faked absent to prove the baseline path and no SIGILL. Correct variant
+  selection is CI/qemu-gated; a dispatch bug is invisible on the dev machine.
+Relates to epic #139, Discussion #920 (§6, §7, comment 3), D-0192 (`cpu_features`,
+the detector it reads). Consumed by #945 (SIMD memchr).

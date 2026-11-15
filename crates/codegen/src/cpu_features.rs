@@ -74,6 +74,75 @@ const AARCH64_TAXONOMY: &[(&str, u32)] = &[
     ("ZAP_CPU_AARCH64_SME", aarch64::SME),
 ];
 
+/// The CPU architecture a feature tier belongs to. A compiled Zap binary targets
+/// exactly one arch, so a `@multiversion` tier for the *other* arch can never be
+/// selected; codegen (#944) ignores it when building the resolver and leaves its
+/// clone at baseline.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Arch {
+    X86,
+    Aarch64,
+}
+
+/// Resolved spec for a `@multiversion` tier name (#944): which arch it belongs
+/// to, its `cpu_features` bit index (what the resolver passes to `zap_cpu_has`),
+/// and the LLVM `target-features` string codegen stamps on the clone (empty for
+/// a baseline tier that needs no extra feature). The `"default"` tier has no
+/// spec — it is the universal fallback, handled directly by codegen.
+#[derive(Clone, Copy, Debug)]
+pub struct TierSpec {
+    pub arch: Arch,
+    pub idx: u32,
+    pub llvm_features: &'static str,
+}
+
+/// Map a stable tier name (as `@multiversion(...)` / sema's `MULTIVERSION_TIERS`
+/// spell it, aliases included) to its [`TierSpec`]. `None` for `"default"` (the
+/// fallback, which has no feature gate) and for any unknown name. The bit
+/// indices come from [`x86`] / [`aarch64`] — the same mirror the C header is
+/// locked to — so the resolver's `zap_cpu_has(idx)` and the runtime detector
+/// never disagree. LLVM `target-features` spellings follow the backend's own
+/// names (e.g. aarch64 CRC32 is `+crc`).
+pub fn tier_spec(name: &str) -> Option<TierSpec> {
+    use Arch::{Aarch64, X86};
+    let (arch, idx, feats) = match name {
+        // x86-64. SSE2/NEON are the baselines: a real clone, but no extra feature.
+        "sse2" => (X86, x86::SSE2, ""),
+        "sse4.2" | "sse42" => (X86, x86::SSE42, "+sse4.2"),
+        "avx2" | "fma" => (X86, x86::AVX2_FMA, "+avx2,+fma"),
+        "avx512f" | "avx512" => (X86, x86::AVX512F, "+avx512f"),
+        // aarch64.
+        "neon" | "asimd" => (Aarch64, aarch64::NEON, ""),
+        "aes" => (Aarch64, aarch64::AES, "+aes"),
+        "sha2" => (Aarch64, aarch64::SHA2, "+sha2"),
+        "crc32" => (Aarch64, aarch64::CRC32, "+crc"),
+        "dotprod" => (Aarch64, aarch64::DOTPROD, "+dotprod"),
+        "i8mm" => (Aarch64, aarch64::I8MM, "+i8mm"),
+        "sve" => (Aarch64, aarch64::SVE, "+sve"),
+        "sve2" => (Aarch64, aarch64::SVE2, "+sve2"),
+        "sme" => (Aarch64, aarch64::SME, "+sme"),
+        _ => return None,
+    };
+    Some(TierSpec {
+        arch,
+        idx,
+        llvm_features: feats,
+    })
+}
+
+/// The target [`Arch`] of an LLVM triple string (`x86_64-…`, `aarch64-…` /
+/// `arm64-…`). `None` for a triple whose arch carries no multiversioning tiers,
+/// in which case codegen emits only the `"default"` clone for every group.
+pub fn arch_of_triple(triple: &str) -> Option<Arch> {
+    if triple.starts_with("x86_64") || triple.starts_with("amd64") {
+        Some(Arch::X86)
+    } else if triple.starts_with("aarch64") || triple.starts_with("arm64") {
+        Some(Arch::Aarch64)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +210,50 @@ mod tests {
     /// Within one arch the indices must be a dense, collision-free numbering
     /// from 0 (bits are a scarce, append-only resource; a gap or a reuse is a
     /// taxonomy bug).
+    #[test]
+    fn tier_spec_matches_taxonomy_and_aliases() {
+        // Aliases resolve to the same bit as the canonical name.
+        assert_eq!(tier_spec("sse42").unwrap().idx, x86::SSE42);
+        assert_eq!(tier_spec("sse4.2").unwrap().idx, x86::SSE42);
+        assert_eq!(tier_spec("avx2").unwrap().idx, x86::AVX2_FMA);
+        assert_eq!(tier_spec("fma").unwrap().idx, x86::AVX2_FMA);
+        assert_eq!(tier_spec("avx512").unwrap().idx, x86::AVX512F);
+        assert_eq!(tier_spec("asimd").unwrap().idx, aarch64::NEON);
+        assert_eq!(tier_spec("sve2").unwrap().idx, aarch64::SVE2);
+        // Arch is classified correctly.
+        assert_eq!(tier_spec("avx2").unwrap().arch, Arch::X86);
+        assert_eq!(tier_spec("sve").unwrap().arch, Arch::Aarch64);
+        // The AVX2+FMA bundle carries both LLVM features.
+        assert_eq!(tier_spec("avx2").unwrap().llvm_features, "+avx2,+fma");
+        // aarch64 CRC32's LLVM feature name is `+crc`, not `+crc32`.
+        assert_eq!(tier_spec("crc32").unwrap().llvm_features, "+crc");
+        // Baseline tiers resolve but add no feature.
+        assert_eq!(tier_spec("sse2").unwrap().llvm_features, "");
+        assert_eq!(tier_spec("neon").unwrap().llvm_features, "");
+        // `default` and unknown names have no spec.
+        assert!(tier_spec("default").is_none());
+        assert!(tier_spec("bogus").is_none());
+        // Every sema-accepted tier name (besides `default`) must resolve here, so
+        // sema and codegen never disagree about what names are valid.
+        for name in [
+            "sse2", "sse4.2", "sse42", "avx2", "fma", "avx512f", "avx512", "neon", "asimd", "aes",
+            "sha2", "crc32", "dotprod", "i8mm", "sve", "sve2", "sme",
+        ] {
+            assert!(tier_spec(name).is_some(), "tier {name:?} must resolve");
+        }
+    }
+
+    #[test]
+    fn arch_of_triple_classifies() {
+        assert_eq!(arch_of_triple("x86_64-unknown-linux-gnu"), Some(Arch::X86));
+        assert_eq!(
+            arch_of_triple("aarch64-unknown-linux-gnu"),
+            Some(Arch::Aarch64)
+        );
+        assert_eq!(arch_of_triple("arm64-apple-darwin"), Some(Arch::Aarch64));
+        assert_eq!(arch_of_triple("wasm32-unknown-unknown"), None);
+    }
+
     #[test]
     fn indices_are_dense_and_unique_per_arch() {
         for taxonomy in [X86_TAXONOMY, AARCH64_TAXONOMY] {

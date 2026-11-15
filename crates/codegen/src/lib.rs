@@ -234,6 +234,13 @@ impl LlvmBackend {
 /// DEFAULT target for the triple (the x86-64 / aarch64 baseline the runtime was
 /// written for — no feature is lost, correctness is unchanged) and the inliner
 /// can finally cross the program↔runtime boundary.
+/// The internal global that caches a `@multiversion` group's resolved clone
+/// pointer (#944, epic #139): null until the first call, then the chosen clone's
+/// address. One per public dispatcher name.
+fn mv_selected_global(public_name: &str) -> String {
+    format!("{public_name}$mv$selected")
+}
+
 fn strip_target_attrs_bitcode(path: &Path) -> Result<(), String> {
     let ctx = Context::create();
     let m = LlvmModule::parse_bitcode_from_path(path, &ctx).map_err(|e| {
@@ -266,8 +273,21 @@ fn strip_target_attrs_bitcode(path: &Path) -> Result<(), String> {
     ];
     let mut f = m.get_first_function();
     while let Some(func) = f {
-        for key in INLINE_BLOCKING_FN_ATTRS {
-            func.remove_string_attribute(AttributeLoc::Function, key);
+        // EXCEPTION: a `@multiversion` clone (name carries the `$mv$` marker,
+        // #944) MUST keep its `target-features` — that attribute is the whole
+        // point of the clone, and it is exactly what makes the clone an
+        // un-inlinable dispatch barrier (rule #3). Stripping it would silently
+        // demote every clone to baseline and erase the specialization. Every
+        // other function is stripped so the I#841 cross-boundary inlining holds.
+        let is_mv_clone = func
+            .get_name()
+            .to_str()
+            .map(|n| n.contains("$mv$"))
+            .unwrap_or(false);
+        if !is_mv_clone {
+            for key in INLINE_BLOCKING_FN_ATTRS {
+                func.remove_string_attribute(AttributeLoc::Function, key);
+            }
         }
         f = func.get_next_function();
     }
@@ -3396,11 +3416,219 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             if self.jit && !f.is_main && !f.name.starts_with("__repl_entry_") {
                 fv.set_linkage(inkwell::module::Linkage::Internal);
             }
+            // `@multiversion` clone (#944, epic #139): stamp the tier's LLVM
+            // `target-features` so the backend may use the wider ISA in this
+            // clone, and mark it `noinline` so the dispatched call survives to
+            // runtime (rule #3: a multiversioned fn is an inlining barrier). Only
+            // for a tier of the TARGET arch — a foreign-arch tier (an `avx2`
+            // clone in an aarch64 build) can never be selected, so it stays a
+            // plain baseline copy rather than carrying an invalid feature. The
+            // resolver/dispatcher themselves never get features (rule #4).
+            if let Some(tier) = &f.target_feature {
+                self.apply_tier_features(fv, tier);
+            }
             self.fns.insert(f.name.clone(), fv);
         }
 
+        // Declare the dispatcher symbol for every `@multiversion` group BEFORE
+        // translating bodies, so a caller's `Inst::Call{func: public_name}`
+        // resolves to it (lowering emits no `Func` under the public name — codegen
+        // owns the dispatcher). Bodies are filled in after the clones translate.
+        self.declare_multiversion_dispatchers(m);
+
         for f in &m.funcs {
             self.translate_fn(f)?;
+        }
+        self.emit_multiversion_dispatchers(m)?;
+        Ok(())
+    }
+
+    /// Stamp a `@multiversion` clone's LLVM `target-features` + `noinline` for
+    /// tier `tier`, when `tier` belongs to the target arch (#944, epic #139). A
+    /// baseline tier (`sse2`/`neon`/`default`) adds no feature but still gets
+    /// `noinline`; a foreign-arch tier is left completely baseline.
+    fn apply_tier_features(&self, fv: FunctionValue<'ctx>, tier: &str) {
+        let noinline = Attribute::get_named_enum_kind_id("noinline");
+        if noinline != 0 {
+            fv.add_attribute(
+                AttributeLoc::Function,
+                self.ctx.create_enum_attribute(noinline, 0),
+            );
+        }
+        if tier == "default" {
+            return;
+        }
+        let triple = self.module.get_triple();
+        let target_arch = cpu_features::arch_of_triple(&triple.as_str().to_string_lossy());
+        if let Some(spec) = cpu_features::tier_spec(tier) {
+            if Some(spec.arch) == target_arch && !spec.llvm_features.is_empty() {
+                let attr = self
+                    .ctx
+                    .create_string_attribute("target-features", spec.llvm_features);
+                fv.add_attribute(AttributeLoc::Function, attr);
+            }
+        }
+    }
+
+    /// Declare the public dispatcher symbol + the cached-pointer global for every
+    /// `@multiversion` group (#944, epic #139), BEFORE bodies translate, so a
+    /// caller's `Inst::Call{func: public_name}` resolves to the dispatcher
+    /// (lowering emits no `Func` under that name). The signature is copied from a
+    /// clone — they all share it. Also declares the `zap_cpu_has` runtime query
+    /// the resolver uses.
+    fn declare_multiversion_dispatchers(&mut self, m: &zir::Module) {
+        if m.multiversion_groups.is_empty() {
+            return;
+        }
+        let ptr = self.ctx.ptr_type(AddressSpace::default());
+        if !self.fns.contains_key("zap_cpu_has") {
+            // int zap_cpu_has(unsigned idx) — the #943 index-based query (cached,
+            // malloc-free). i32(i32) matches the C ABI.
+            let i32t = self.ctx.i32_type();
+            let f =
+                self.module
+                    .add_function("zap_cpu_has", i32t.fn_type(&[i32t.into()], false), None);
+            self.fns.insert("zap_cpu_has".to_string(), f);
+        }
+        for g in &m.multiversion_groups {
+            let Some(sig_fn) = g
+                .tiers
+                .iter()
+                .find_map(|t| self.fns.get(&t.clone_name).copied())
+            else {
+                continue; // defensive: a group with no emitted clone
+            };
+            let disp = self
+                .module
+                .add_function(&g.public_name, sig_fn.get_type(), None);
+            // The dispatcher is a plain forwarding stub, but a clone can raise a
+            // Zap exception that must unwind THROUGH it; give it an unwind table
+            // like every ordinary function (the #845 / LTO lesson — a frame
+            // without CFI drops the landing pad and terminates). It carries no
+            // `target-features` (rule #4: resolver/dispatcher stay baseline).
+            let uwtable = Attribute::get_named_enum_kind_id("uwtable");
+            if uwtable != 0 {
+                disp.add_attribute(
+                    AttributeLoc::Function,
+                    self.ctx.create_enum_attribute(uwtable, 2),
+                );
+            }
+            self.fns.insert(g.public_name.clone(), disp);
+            let gv = self
+                .module
+                .add_global(ptr, None, &mv_selected_global(&g.public_name));
+            gv.set_initializer(&ptr.const_null());
+            gv.set_linkage(inkwell::module::Linkage::Internal);
+        }
+    }
+
+    /// Fill in each `@multiversion` dispatcher body (#944, epic #139): the
+    /// pointer-with-once-init pattern (#920 §6a). On the first call the inline
+    /// resolver reads `cpu_features` (`zap_cpu_has`) and `select`s the
+    /// highest-priority clone the host supports, falling back to the mandatory
+    /// `default`; it caches the choice in the group's global so every later call
+    /// is one load + one indirect call. The resolver/dispatcher stay baseline —
+    /// only the clone bodies carry `target-features` (rule #4), and the clones
+    /// are `noinline` so the dispatched call survives to runtime (rule #3).
+    fn emit_multiversion_dispatchers(&mut self, m: &zir::Module) -> Result<(), String> {
+        if m.multiversion_groups.is_empty() {
+            return Ok(());
+        }
+        let ptr = self.ctx.ptr_type(AddressSpace::default());
+        let i32t = self.ctx.i32_type();
+        let triple = self.module.get_triple();
+        let target_arch = cpu_features::arch_of_triple(&triple.as_str().to_string_lossy());
+        let zchf = self.fns["zap_cpu_has"];
+        let b = self.builder;
+        for g in &m.multiversion_groups {
+            let Some(&disp) = self.fns.get(&g.public_name) else {
+                continue;
+            };
+            let selected = self
+                .module
+                .get_global(&mv_selected_global(&g.public_name))
+                .ok_or_else(|| format!("missing @multiversion global for {}", g.public_name))?;
+            let sel_slot = selected.as_pointer_value();
+            let default_tier =
+                g.tiers.iter().find(|t| t.is_default).ok_or_else(|| {
+                    format!("@multiversion group {} has no default", g.public_name)
+                })?;
+            let default_addr = self.fns[&default_tier.clone_name]
+                .as_global_value()
+                .as_pointer_value();
+
+            let entry = self.ctx.append_basic_block(disp, "entry");
+            let resolve = self.ctx.append_basic_block(disp, "resolve");
+            let call = self.ctx.append_basic_block(disp, "call");
+
+            // entry: load the cached pointer; branch to resolve on first call.
+            b.position_at_end(entry);
+            let cur = b
+                .build_load(ptr, sel_slot, "mv.cur")
+                .map_err(|e| e.to_string())?
+                .into_pointer_value();
+            let is_null = b
+                .build_is_null(cur, "mv.unset")
+                .map_err(|e| e.to_string())?;
+            b.build_conditional_branch(is_null, resolve, call)
+                .map_err(|e| e.to_string())?;
+
+            // resolve: select the best supported clone, then cache it. Tiers are
+            // in priority order (highest first); applying them in REVERSE makes
+            // the highest-priority match the last `select`, so it wins. Foreign-
+            // arch tiers can never be selected (their names are not this arch's),
+            // so they are skipped entirely.
+            b.position_at_end(resolve);
+            let mut sel = default_addr;
+            let applicable: Vec<&zir::MvTier> = g
+                .tiers
+                .iter()
+                .filter(|t| !t.is_default)
+                .filter(|t| {
+                    cpu_features::tier_spec(&t.tier).map(|s| Some(s.arch) == target_arch)
+                        == Some(true)
+                })
+                .collect();
+            for t in applicable.iter().rev() {
+                let spec = cpu_features::tier_spec(&t.tier).expect("applicable tier has a spec");
+                let idx = i32t.const_int(spec.idx as u64, false);
+                let has = b
+                    .build_call(zchf, &[idx.into()], "mv.has")
+                    .map_err(|e| e.to_string())?
+                    .try_as_basic_value()
+                    .left()
+                    .ok_or("zap_cpu_has returned void")?
+                    .into_int_value();
+                let hit = b
+                    .build_int_compare(IntPredicate::NE, has, i32t.const_zero(), "mv.hit")
+                    .map_err(|e| e.to_string())?;
+                let clone_addr = self.fns[&t.clone_name].as_global_value().as_pointer_value();
+                sel = b
+                    .build_select(hit, clone_addr, sel, "mv.sel")
+                    .map_err(|e| e.to_string())?
+                    .into_pointer_value();
+            }
+            b.build_store(sel_slot, sel).map_err(|e| e.to_string())?;
+            b.build_unconditional_branch(call)
+                .map_err(|e| e.to_string())?;
+
+            // call: indirect-call the chosen clone with the forwarded args.
+            b.position_at_end(call);
+            let fp = b.build_phi(ptr, "mv.fp").map_err(|e| e.to_string())?;
+            fp.add_incoming(&[
+                (&cur as &dyn BasicValue, entry),
+                (&sel as &dyn BasicValue, resolve),
+            ]);
+            let fp = fp.as_basic_value().into_pointer_value();
+            let args: Vec<BasicMetadataValueEnum> =
+                disp.get_param_iter().map(|p| p.into()).collect();
+            let cs = b
+                .build_indirect_call(disp.get_type(), fp, &args, "mv.dispatch")
+                .map_err(|e| e.to_string())?;
+            match cs.try_as_basic_value().left() {
+                Some(v) => b.build_return(Some(&v)).map_err(|e| e.to_string())?,
+                None => b.build_return(None).map_err(|e| e.to_string())?,
+            };
         }
         Ok(())
     }

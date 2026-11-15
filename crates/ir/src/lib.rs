@@ -18,7 +18,7 @@ pub use zapc_mono as mono;
 pub use lower::{lower_module, lower_module_opts};
 pub use zapc_ir_core::{
     ArrayMathOp, AtomicOrd, AtomicRmwOp, BinOp, Block, BlockId, CastKind, CmpPred, Dtype, Elem,
-    Func, Inst, Module, Owner, Term, Ty, UnOp, Value,
+    Func, Inst, Module, MvGroup, MvTier, Owner, Term, Ty, UnOp, Value,
 };
 // `LowerError` moved to `zapc_mono` with monomorphization (#129); re-export it
 // here (and at `zapc_ir::lower::LowerError`, via `lower.rs`) unchanged.
@@ -36,6 +36,57 @@ mod tests {
         let (module, errs) = lower_module(&ast);
         assert!(errs.is_empty(), "lower errors: {errs:?}");
         module
+    }
+
+    // --- @multiversion clone expansion (#944, epic #139) ----------------------
+
+    #[test]
+    fn multiversion_expands_to_clones_and_a_group() {
+        let m = lower_ok(
+            "@multiversion(\"avx2\", \"sse4.2\", \"default\")\n\
+             def k(int64 a) -> int64:\n    return a + 1\n\
+             def main():\n    print(k(1))\n",
+        );
+        // Exactly one group, named for the public function.
+        assert_eq!(m.multiversion_groups.len(), 1);
+        let g = &m.multiversion_groups[0];
+        assert_eq!(g.public_name, "k");
+        // One tier per decorator argument, in priority (decorator) order, with
+        // exactly one `default` and it flagged.
+        let tiers: Vec<&str> = g.tiers.iter().map(|t| t.tier.as_str()).collect();
+        assert_eq!(tiers, ["avx2", "sse4.2", "default"]);
+        assert_eq!(g.tiers.iter().filter(|t| t.is_default).count(), 1);
+        assert!(g.tiers.last().unwrap().is_default);
+        // Each tier names a distinct clone Func that actually exists, tagged with
+        // its tier; the dots in `sse4.2` are mangled out of the symbol.
+        for t in &g.tiers {
+            let f = m.funcs.iter().find(|f| f.name == t.clone_name);
+            assert!(f.is_some(), "clone {} must be emitted", t.clone_name);
+            assert_eq!(f.unwrap().target_feature.as_deref(), Some(t.tier.as_str()));
+            assert!(
+                !t.clone_name.contains('.'),
+                "clone symbol must not contain '.'"
+            );
+        }
+        assert_eq!(g.tiers[0].clone_name, "k$mv$avx2");
+        assert_eq!(g.tiers[1].clone_name, "k$mv$sse4_2");
+        // The public name is NOT emitted as an ordinary Func — codegen owns the
+        // dispatcher under that name, so a stray `k` body would collide with it.
+        assert!(
+            m.funcs.iter().all(|f| f.name != "k"),
+            "the public @multiversion name must not be emitted as a plain Func"
+        );
+    }
+
+    #[test]
+    fn ordinary_function_has_no_multiversion_metadata() {
+        let m = lower_ok(
+            "def k(int64 a) -> int64:\n    return a\n\
+             def main():\n    print(k(1))\n",
+        );
+        assert!(m.multiversion_groups.is_empty());
+        assert!(m.funcs.iter().all(|f| f.target_feature.is_none()));
+        assert!(m.funcs.iter().any(|f| f.name == "k"));
     }
 
     // --- AtomicArray[T] (#844) -------------------------------------------------
