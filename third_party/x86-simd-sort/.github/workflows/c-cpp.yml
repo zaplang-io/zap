@@ -1,0 +1,258 @@
+name: Build and run tests
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions: read-all
+
+jobs:
+  build-windows-msvc:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Set up MSVC environment
+      - name: Set up MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Install Python (Meson requires it)
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      # Install Meson and Ninja
+      - name: Install Meson + Ninja
+        run: |
+          python -m pip install --upgrade pip
+          pip install meson ninja
+
+      - name: Setup environment
+        run: |
+          echo "PKG_CONFIG=${{ github.workspace }}/vcpkg/installed/x64-windows/tools/pkgconf/pkgconf.exe" >> $env:GITHUB_ENV
+          echo "PKG_CONFIG_PATH=${{ github.workspace }}/vcpkg/installed/x64-windows/lib/pkgconfig" >> $env:GITHUB_ENV
+          echo "LIB=${{ github.workspace }}/vcpkg/installed/x64-windows/lib;$env:LIB" >> $env:GITHUB_ENV
+          echo "INCLUDE=${{ github.workspace }}/vcpkg/installed/x64-windows/include;$env:INCLUDE" >> $env:GITHUB_ENV
+        shell: pwsh
+
+      - name: Setup vcpkg and install pkg-config and gtest
+        run: |
+          git clone https://github.com/Microsoft/vcpkg.git
+          .\vcpkg\bootstrap-vcpkg.bat
+          .\vcpkg\vcpkg install gtest:x64-windows pkgconf:x64-windows
+
+      # Configure and build with Meson (MSVC will be used automatically)
+      - name: Configure (Meson)
+        run: meson setup -Dbuild_tests=true --warnlevel 2 --buildtype release builddir --backend=ninja
+
+      - name: Build (Ninja)
+        run: ninja -C builddir
+      
+      - name: Run tests 
+        run: meson test -C builddir --test-args "\-\-gtest_filter=*qsort*" -v 
+        
+  SKL-gcc9:
+
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+    - name: Setup build environment
+      uses: ./.github/actions/setup-build-env
+      with:
+        compiler: g++-9
+
+    - name: Build
+      uses: ./.github/actions/meson-build
+      with:
+        compiler: g++-9
+
+    - name: Run test suite on SKL
+      run: sde -skl -- ./builddir/testexe
+
+  SKX-gcc10:
+
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+    - name: Setup build environment
+      uses: ./.github/actions/setup-build-env
+      with:
+        compiler: g++-10
+
+    - name: Build
+      uses: ./.github/actions/meson-build
+      with:
+        compiler: g++-10
+
+    - name: Run test suite on SKX
+      run: sde -skx -- ./builddir/testexe
+
+  TGL-gcc11:
+
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+    - name: Setup build environment
+      uses: ./.github/actions/setup-build-env
+      with:
+        compiler: g++-11
+
+    - name: Build
+      uses: ./.github/actions/meson-build
+      with:
+        compiler: g++-11
+    - name: Run test suite on TGL
+      run: sde -tgl -- ./builddir/testexe
+
+  SPR-gcc13:
+
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+    - name: Setup build environment
+      uses: ./.github/actions/setup-build-env
+      with:
+        compiler: g++-13
+
+    - name: Build
+      uses: ./.github/actions/meson-build
+      with:
+        compiler: g++-13
+        build-examples: 'true'
+
+    - name: Run test suite on SPR
+      run: sde -spr -- ./builddir/testexe --gtest_filter="*simdsort*"
+
+  ASAN-clang18:
+
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+    - name: Setup build environment
+      uses: ./.github/actions/setup-build-env
+      with:
+        compiler: clang-18
+        extra-packages: libomp-18-dev
+
+    - name: Build
+      uses: ./.github/actions/meson-build
+      with:
+        compiler: clang++-18
+        meson-options: '-Dbuild_tests=true -Duse_openmp=true -Db_sanitize=address,undefined -Dfatal_sanitizers=true -Dasan_ci_dont_validate=true -Db_lundef=false --warnlevel 0 --buildtype release'
+        build-examples: 'true'
+
+    - name: Run test suite
+      run: ./builddir/testexe --gtest_filter="*simdsort*"
+
+
+  SKX-SKL-openmp:
+
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+    - name: Setup build environment
+      uses: ./.github/actions/setup-build-env
+      with:
+        compiler: g++-10
+
+    - name: Build
+      uses: ./.github/actions/meson-build
+      with:
+        compiler: g++-10
+        meson-options: '-Dbuild_tests=true -Duse_openmp=true --warnlevel 2 --werror --buildtype release'
+
+    - name: Run test suite on SKX and SKL
+      run: |
+        sde -skx -- ./builddir/testexe
+        sde -skl -- ./builddir/testexe
+
+  SPR-gcc13-special-cases:
+
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+    - name: Setup build environment
+      uses: ./.github/actions/setup-build-env
+      with:
+        compiler: g++-13
+
+    - name: Build
+      uses: ./.github/actions/meson-build
+      with:
+        compiler: g++-13
+        cxxflags: '-DXSS_MINIMAL_NETWORK_SORT -DXSS_TEST_KEYVALUE_BASE_CASE'
+
+    - name: List exported symbols
+      run: |
+        nm --demangle --dynamic --defined-only --extern-only builddir/libx86simdsortcpp.so
+
+    - name: Run test suite on SPR
+      run: sde -spr -- ./builddir/testexe
+
+  manylinux-32bit:
+
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+    - name: Build and test on 32-bit manylinux2014
+      run: |
+        docker run -v $(pwd):/xss quay.io/pypa/manylinux2014_i686 \
+        /bin/bash -xc "source /xss/.github/workflows/build-test-on-32bit.sh"
+
+  SPR-icpx:
+
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+    - name: Install Intel oneAPI repository and dependencies
+      run: |
+        echo "deb https://apt.repos.intel.com/oneapi all main" | sudo tee /etc/apt/sources.list.d/oneAPI.list
+        sudo add-apt-repository -y "deb https://apt.repos.intel.com/oneapi all main"
+        sudo apt update --allow-insecure-repositories
+        sudo apt --allow-unauthenticated -y install intel-oneapi-compiler-dpcpp-cpp libgtest-dev wget git python3-pip meson
+
+    - name: Setup Intel SDE
+      uses: petarpetrovt/setup-sde@31aa4a8e85e109bef00f1d838613fcc6ec421271 # v5.0
+      with:
+        environmentVariableName: SDE_PATH
+        sdeVersion: 9.58.0
+
+    - name: Add Intel SDE to PATH
+      run: echo "$SDE_PATH" >> "$GITHUB_PATH"
+
+    - name: Build
+      uses: ./.github/actions/meson-build
+      with:
+        compiler: icpx
+        cxxflags: '-fp-model=precise'
+        build-examples: 'true'
+        pre-build-commands: 'source /opt/intel/oneapi/setvars.sh && icpx --version'
+
+    - name: Run test suite on SPR
+      run: |
+        source /opt/intel/oneapi/setvars.sh
+        ./builddir/testexe
