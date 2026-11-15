@@ -470,6 +470,12 @@ const BUILTINS: &[&str] = &[
     "where",
     "sort",
     "argsort",
+    "argmin",
+    "argmax",
+    "searchsorted",
+    "partition",
+    "argpartition",
+    "unique",
     "sorted",
     // String / char builtins (ticket #284, D-0025).
     "ord",
@@ -6223,6 +6229,15 @@ impl Checker {
                     // Array sort/argsort (#932): a new sorted array / i64 index
                     // array. Arrays type loosely, so the result is loose; the
                     // lowering derives the real dtype/rank and rejects non-arrays.
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                    return Ty::Unknown;
+                }
+                "argmin" | "argmax" | "searchsorted" | "partition" | "argpartition" | "unique" => {
+                    // Array searching/selection (#934). Arrays type loosely, so
+                    // the result is loose (scalar index / array / tuple); the
+                    // lowering derives the real type and rejects non-arrays.
                     for a in args {
                         self.infer(&a.value);
                     }

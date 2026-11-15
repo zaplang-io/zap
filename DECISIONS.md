@@ -9399,3 +9399,39 @@ Relates to #932 / #512 (Phase 3 epic), D-0164 (N-D arrays / axis), D-0167
 (the array dtype matrix). The SIMD sort accelerator (#933, behind the Discussion
 #920 dispatch facility) and searching/selection — `searchsorted` / `unique` /
 `partition` / `argmin` / `argmax` (#934) — build on this floor.
+
+## D-0191 — numeric-array searching / selection: searchsorted / unique / partition / argmin / argmax (#934)
+**Status:** implemented
+NumPy's searching + selection over numeric arrays, own kernels (no provider),
+built on the sort floor (D-0190). Methods (`a.argmin()`, `a.searchsorted(v)`,
+`a.partition(kth)` in place, …) and builtins (`argmin(a)`, `unique(a)`, …),
+distinct from `list`/`sorted`. Complex has no ordering → rejected.
+- **`searchsorted(a, v, side=)`** — binary search into a sorted `a`; `v` a scalar
+  (→ a scalar index) or an array (→ an `array[i64]` shaped like `v`); `side`
+  `"left"` (default: first `i` with `a[i] >= v`) or `"right"` (`a[i] > v`).
+- **`unique(a, return_index=, return_inverse=, return_counts=)`** — sorted unique
+  values (NaNs collapse to one, matching NumPy ≥1.21). With any `return_*`, a
+  tuple `(values[, index][, inverse][, counts])` in NumPy's order: `index` the
+  first-occurrence original index of each value (from a **stable** sort),
+  `inverse` the unique-index per original element (reconstructs `a`), `counts`
+  the per-value multiplicity. Flattens the input (an `axis=` form is a follow-up).
+- **`argmin`/`argmax(a, axis=)`** — the first-occurrence index of the min/max.
+  No `axis` (or a rank-1 array) → a flattened scalar index (NumPy `axis=None`);
+  an `axis` on a rank-(≥2) array → a rank-(n-1) `array[i64]`. **NaN propagates**:
+  the index of the first NaN wins (both), matching NumPy. Empty → ValueError.
+- **`partition`/`argpartition(a, kth, axis=)`** — **quickselect** (median-of-3,
+  insertion base case) placing each `kth` in its final sorted slot (smaller
+  before, larger after). `kth` is an int or an `array[i64]` sequence (negative
+  indexes from the end; out of range → ValueError); `axis=` defaults to the last.
+  `a.partition()` sorts in place; `partition(a, …)` returns a copy; `argpartition`
+  returns an `array[i64]`. Only `a[kth]` (the kth order statistic) is pinned — the
+  order of the non-kth elements is implementation-defined (quickselect), as in
+  NumPy; tests assert the partition invariant, not an exact arrangement.
+- **Implementation.** Reuses the D-0190 comparator (NaN to the end, `-0.0 ==
+  +0.0`), stable permutation (unique) and the stride-aware lane walk (argmin/max
+  axis, partition). Dtype-generic over the numeric matrix. Verified bit-for-bit
+  against NumPy host-side (`zaprt.c` `zap_array_searchsorted` / `_unique_*` /
+  `_argminmax*` / `_partitioned` / `_argpartition`).
+Relates to #934 / #512 (Phase 3 epic, now complete bar the held SIMD ceiling
+#933), D-0190 (the sort floor these build on). The SIMD sort accelerator (#933)
+remains held pending the #920 dispatch-facility decision and SIMD CI hardware.

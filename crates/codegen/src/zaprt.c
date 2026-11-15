@@ -4866,6 +4866,347 @@ void *zap_array_argsort(void *ap, int64_t axis, int64_t flatten, int64_t stable)
     return out;
 }
 
+/* ===========================================================================
+ * Numeric-array searching / selection — own kernels (#934, D-0191)
+ *
+ * searchsorted / unique / partition / argpartition / argmin / argmax over numeric
+ * arrays, built on the sort floor (#932). `unique` and `argsort`-style ops reuse
+ * the stable permutation; `partition`/`argpartition` use a real quickselect
+ * (median-of-3, insertion base case) that places each `kth` in its final slot.
+ * NaNs sort/compare to the end (shared comparator); argmin/argmax propagate NaN
+ * (the first NaN's index wins, matching NumPy). Verified bit-for-bit vs NumPy.
+ * ======================================================================== */
+
+/* compare element ia of buffer A vs element iv of buffer V (same dtype). */
+static int zap_srch_cmp(const void *A, int64_t ia, const void *V, int64_t iv, int64_t dt) {
+    switch (dt) {
+    case DTYPE_F64:
+    case DTYPE_F32:
+        return zap_asort_fcmp(zap_asort_rdf(A, ia, dt), zap_asort_rdf(V, iv, dt));
+    case DTYPE_I64: {
+        int64_t a = ((const int64_t *)A)[ia], b = ((const int64_t *)V)[iv];
+        return a < b ? -1 : a > b ? 1 : 0;
+    }
+    case DTYPE_I32: {
+        int32_t a = ((const int32_t *)A)[ia], b = ((const int32_t *)V)[iv];
+        return a < b ? -1 : a > b ? 1 : 0;
+    }
+    case DTYPE_I16: {
+        int16_t a = ((const int16_t *)A)[ia], b = ((const int16_t *)V)[iv];
+        return a < b ? -1 : a > b ? 1 : 0;
+    }
+    case DTYPE_I8: {
+        int8_t a = ((const int8_t *)A)[ia], b = ((const int8_t *)V)[iv];
+        return a < b ? -1 : a > b ? 1 : 0;
+    }
+    case DTYPE_U64: {
+        uint64_t a = ((const uint64_t *)A)[ia], b = ((const uint64_t *)V)[iv];
+        return a < b ? -1 : a > b ? 1 : 0;
+    }
+    case DTYPE_U32: {
+        uint32_t a = ((const uint32_t *)A)[ia], b = ((const uint32_t *)V)[iv];
+        return a < b ? -1 : a > b ? 1 : 0;
+    }
+    case DTYPE_U16: {
+        uint16_t a = ((const uint16_t *)A)[ia], b = ((const uint16_t *)V)[iv];
+        return a < b ? -1 : a > b ? 1 : 0;
+    }
+    default: {
+        uint8_t a = ((const uint8_t *)A)[ia], b = ((const uint8_t *)V)[iv];
+        return a < b ? -1 : a > b ? 1 : 0;
+    }
+    }
+}
+/* Gather `a`'s elements in row-major logical order into a fresh contiguous buffer
+ * (honours a view's off/strides). Caller frees. */
+static void *zap_srch_gather(ZapArray *a, int64_t *n_out) {
+    int64_t n = zap_array_count_of(a);
+    size_t esz = zap_array_elem_size(a->dtype);
+    char *buf = (char *)malloc((size_t)(n > 0 ? n : 1) * esz);
+    for (int64_t f = 0; f < n; f++)
+        memcpy(buf + (size_t)f * esz, (char *)a->data + (size_t)zap_array_phys_nd(a, f) * esz, esz);
+    *n_out = n;
+    return buf;
+}
+
+/* searchsorted(a, v, side): a sorted (1-D logical), v any shape -> i64 insertion
+ * indices shaped like v. side 0 = left (first i: a[i] >= v), 1 = right (a[i] > v). */
+void *zap_array_searchsorted(void *ap, void *vp, int64_t side) {
+    ZapArray *a = (ZapArray *)ap, *v = (ZapArray *)vp;
+    int64_t dt = a->dtype;
+    int64_t na, nv;
+    char *abuf = (char *)zap_srch_gather(a, &na);
+    char *vbuf = (char *)zap_srch_gather(v, &nv);
+    ZapArray *out = (ZapArray *)zap_array_new_nd(DTYPE_I64, v->ndim, nv);
+    for (int64_t k = 0; k < v->ndim; k++) zap_array_set_dim(out, k, v->dims[k]);
+    int64_t *od = (int64_t *)out->data;
+    for (int64_t j = 0; j < nv; j++) {
+        int64_t lo = 0, hi = na;
+        while (lo < hi) {
+            int64_t mid = lo + (hi - lo) / 2;
+            int c = zap_srch_cmp(abuf, mid, vbuf, j, dt);
+            if (side == 0 ? (c < 0) : (c <= 0)) lo = mid + 1;
+            else hi = mid;
+        }
+        od[j] = lo;
+    }
+    free(abuf);
+    free(vbuf);
+    return out;
+}
+
+/* argmin/argmax over a contiguous lane buffer; the first NaN's index wins (both),
+ * else the first-occurrence extremum (NumPy semantics). */
+static int64_t zap_srch_argextreme(const void *b, int64_t n, int64_t dt, int is_max) {
+    int is_float = (dt == DTYPE_F64 || dt == DTYPE_F32);
+    int64_t best = 0;
+    for (int64_t k = 0; k < n; k++) {
+        if (is_float && isnan(zap_asort_rdf(b, k, dt))) return k;
+        if (k == 0) continue;
+        int c = zap_asort_cmp(b, k, best, dt);
+        if (is_max ? c > 0 : c < 0) best = k;
+    }
+    return best;
+}
+/* argmin/argmax over the flattened array -> a scalar index (NumPy axis=None). */
+int64_t zap_array_argminmax(void *ap, int64_t is_max) {
+    ZapArray *a = (ZapArray *)ap;
+    int64_t n;
+    char *buf = (char *)zap_srch_gather(a, &n);
+    if (n == 0) {
+        free(buf);
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("argmin/argmax of an empty array", 31));
+    }
+    int64_t r = zap_srch_argextreme(buf, n, a->dtype, (int)is_max);
+    free(buf);
+    return r;
+}
+/* argmin/argmax along `axis` -> a rank-(n-1) i64 array of per-lane indices. */
+void *zap_array_argminmax_axis(void *ap, int64_t axis, int64_t is_max) {
+    ZapArray *a = (ZapArray *)ap;
+    int64_t ax = zap_array_axis_norm(axis, a->ndim);
+    int64_t outer, L, inner;
+    ZapArray *res = zap_array_reduce_alloc(a, ax, DTYPE_I64, &outer, &L, &inner);
+    int64_t dt = a->dtype;
+    size_t esz = zap_array_elem_size(dt);
+    char *lane = (char *)malloc((size_t)(L > 0 ? L : 1) * esz);
+    int64_t *rd = (int64_t *)res->data;
+    for (int64_t o = 0; o < outer; o++)
+        for (int64_t in = 0; in < inner; in++) {
+            int64_t start = o * (L * inner) + in;
+            for (int64_t k = 0; k < L; k++)
+                memcpy(lane + (size_t)k * esz,
+                       (char *)a->data + (size_t)zap_array_phys_nd(a, start + k * inner) * esz, esz);
+            rd[o * inner + in] = zap_srch_argextreme(lane, L, dt, (int)is_max);
+        }
+    free(lane);
+    return res;
+}
+
+/* unique core: stable-sort a gathered buffer, record each group's first sorted
+ * position in `bnd` (with bnd[u] = n). Returns the unique count. */
+static int64_t zap_srch_unique_core(const void *buf, int64_t n, int64_t dt, int64_t *perm, int64_t *bnd) {
+    zap_asort_perm(perm, buf, n, dt, 1); /* stable */
+    int64_t u = 0;
+    for (int64_t k = 0; k < n; k++)
+        if (k == 0 || zap_asort_cmp(buf, perm[k], perm[k - 1], dt) != 0) bnd[u++] = k;
+    bnd[u] = n;
+    return u;
+}
+/* unique(a) -> sorted unique values (1-D, a's dtype). NaNs collapse to one. */
+void *zap_array_unique_values(void *ap) {
+    ZapArray *a = (ZapArray *)ap;
+    int64_t dt = a->dtype, n;
+    char *buf = (char *)zap_srch_gather(a, &n);
+    size_t esz = zap_array_elem_size(dt);
+    int64_t *perm = (int64_t *)malloc((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    int64_t *bnd = (int64_t *)malloc((size_t)(n + 1) * sizeof(int64_t));
+    int64_t u = zap_srch_unique_core(buf, n, dt, perm, bnd);
+    ZapArray *res = (ZapArray *)zap_array_new(dt, u);
+    for (int64_t t = 0; t < u; t++)
+        memcpy((char *)res->data + (size_t)t * esz, buf + (size_t)perm[bnd[t]] * esz, esz);
+    free(buf); free(perm); free(bnd);
+    return res;
+}
+/* unique return_index: first-occurrence original index of each unique value. */
+void *zap_array_unique_index(void *ap) {
+    ZapArray *a = (ZapArray *)ap;
+    int64_t dt = a->dtype, n;
+    char *buf = (char *)zap_srch_gather(a, &n);
+    int64_t *perm = (int64_t *)malloc((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    int64_t *bnd = (int64_t *)malloc((size_t)(n + 1) * sizeof(int64_t));
+    int64_t u = zap_srch_unique_core(buf, n, dt, perm, bnd);
+    ZapArray *res = (ZapArray *)zap_array_new(DTYPE_I64, u);
+    int64_t *rd = (int64_t *)res->data;
+    for (int64_t t = 0; t < u; t++) rd[t] = perm[bnd[t]];
+    free(buf); free(perm); free(bnd);
+    return res;
+}
+/* unique return_counts: occurrence count of each unique value. */
+void *zap_array_unique_counts(void *ap) {
+    ZapArray *a = (ZapArray *)ap;
+    int64_t dt = a->dtype, n;
+    char *buf = (char *)zap_srch_gather(a, &n);
+    int64_t *perm = (int64_t *)malloc((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    int64_t *bnd = (int64_t *)malloc((size_t)(n + 1) * sizeof(int64_t));
+    int64_t u = zap_srch_unique_core(buf, n, dt, perm, bnd);
+    ZapArray *res = (ZapArray *)zap_array_new(DTYPE_I64, u);
+    int64_t *rd = (int64_t *)res->data;
+    for (int64_t t = 0; t < u; t++) rd[t] = bnd[t + 1] - bnd[t];
+    free(buf); free(perm); free(bnd);
+    return res;
+}
+/* unique return_inverse: for each original element, its unique index. 1-D len n. */
+void *zap_array_unique_inverse(void *ap) {
+    ZapArray *a = (ZapArray *)ap;
+    int64_t dt = a->dtype, n;
+    char *buf = (char *)zap_srch_gather(a, &n);
+    int64_t *perm = (int64_t *)malloc((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    ZapArray *res = (ZapArray *)zap_array_new(DTYPE_I64, n);
+    int64_t *rd = (int64_t *)res->data;
+    zap_asort_perm(perm, buf, n, dt, 1);
+    int64_t ui = -1;
+    for (int64_t k = 0; k < n; k++) {
+        if (k == 0 || zap_asort_cmp(buf, perm[k], perm[k - 1], dt) != 0) ui++;
+        rd[perm[k]] = ui;
+    }
+    free(buf); free(perm);
+    return res;
+}
+
+/* quickselect: place each `kth` (ascending, deduped, in [0,L)) of the index perm
+ * `p[lo..hi]` over buffer `b` in its final sorted slot; smaller before, larger
+ * after. Small ranges fall back to insertion sort (every kth in range placed). */
+static void zap_srch_qselect(int64_t *p, int64_t lo, int64_t hi, const void *b, int64_t dt,
+                             const int64_t *kth, int64_t kl, int64_t kh) {
+    if (kl > kh) return;
+    while (lo < hi) {
+        if (hi - lo < 16) {
+            zap_asort_insertion(p, lo, hi, b, dt);
+            return;
+        }
+        int64_t mid = lo + (hi - lo) / 2;
+        if (zap_asort_cmp(b, p[mid], p[lo], dt) < 0) zap_asort_swap(p, lo, mid);
+        if (zap_asort_cmp(b, p[hi], p[lo], dt) < 0) zap_asort_swap(p, lo, hi);
+        if (zap_asort_cmp(b, p[hi], p[mid], dt) < 0) zap_asort_swap(p, mid, hi);
+        zap_asort_swap(p, mid, hi - 1);
+        int64_t pivot = p[hi - 1], i = lo, j = hi - 1;
+        for (;;) {
+            while (zap_asort_cmp(b, p[++i], pivot, dt) < 0) {}
+            while (zap_asort_cmp(b, pivot, p[--j], dt) < 0) {}
+            if (i >= j) break;
+            zap_asort_swap(p, i, j);
+        }
+        zap_asort_swap(p, i, hi - 1);
+        int64_t m = kl;
+        while (m <= kh && kth[m] < i) m++;
+        if (m <= kh && kth[m] == i) {
+            zap_srch_qselect(p, lo, i - 1, b, dt, kth, kl, m - 1);
+            zap_srch_qselect(p, i + 1, hi, b, dt, kth, m + 1, kh);
+            return;
+        }
+        zap_srch_qselect(p, lo, i - 1, b, dt, kth, kl, m - 1);
+        lo = i + 1;
+        kl = m;
+    }
+}
+/* Normalize the kth array for a lane of length L into an ascending, deduped,
+ * validated int64 list; returns the count. Raises ValueError on out-of-range. */
+static int64_t zap_srch_norm_kth(const int64_t *ksrc, int64_t nk, int64_t L, int64_t *kout) {
+    for (int64_t t = 0; t < nk; t++) {
+        int64_t k = ksrc[t];
+        if (k < 0) k += L;
+        if (k < 0 || k >= L)
+            zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new("kth out of bounds", 17));
+        kout[t] = k;
+    }
+    /* insertion sort + dedup (nk is tiny) */
+    for (int64_t i = 1; i < nk; i++) {
+        int64_t v = kout[i], j = i - 1;
+        while (j >= 0 && kout[j] > v) { kout[j + 1] = kout[j]; j--; }
+        kout[j + 1] = v;
+    }
+    int64_t m = 0;
+    for (int64_t i = 0; i < nk; i++)
+        if (i == 0 || kout[i] != kout[i - 1]) kout[m++] = kout[i];
+    return m;
+}
+/* The partition lane driver: for each lane along `axis`, gather, quickselect the
+ * (normalized) kths, then scatter the partitioned values back (argpartition!=0
+ * writes the lane's index perm into `out`). Mirrors zap_asort_run. */
+static void zap_srch_partition_run(ZapArray *a, int64_t axis, const int64_t *ksrc, int64_t nk, ZapArray *out) {
+    int64_t dt = a->dtype;
+    size_t esz = zap_array_elem_size(dt);
+    int64_t L = a->dims[axis];
+    int64_t sax = zap_asort_axis_stride(a, axis);
+    int64_t count = zap_array_count_of(a);
+    int64_t nlanes = L ? count / L : 0;
+    char *lane = (char *)malloc((size_t)(L > 0 ? L : 1) * esz);
+    int64_t *perm = (int64_t *)malloc((size_t)(L > 0 ? L : 1) * sizeof(int64_t));
+    int64_t *kth = (int64_t *)malloc((size_t)(nk > 0 ? nk : 1) * sizeof(int64_t));
+    int64_t nd = a->ndim;
+    int64_t *idx = (int64_t *)calloc((size_t)nd, sizeof(int64_t));
+    char *adata = (char *)a->data;
+    for (int64_t ln = 0; ln < nlanes; ln++) {
+        int64_t base = a->off;
+        for (int64_t k = 0; k < nd; k++)
+            if (k != axis) base += idx[k] * zap_asort_axis_stride(a, k);
+        for (int64_t m = 0; m < L; m++)
+            memcpy(lane + (size_t)m * esz, adata + (size_t)(base + m * sax) * esz, esz);
+        for (int64_t m = 0; m < L; m++) perm[m] = m;
+        int64_t nkk = zap_srch_norm_kth(ksrc, nk, L, kth);
+        zap_srch_qselect(perm, 0, L - 1, lane, dt, kth, 0, nkk - 1);
+        if (out) {
+            int64_t obase = out->off;
+            for (int64_t k = 0; k < nd; k++)
+                if (k != axis) obase += idx[k] * zap_asort_axis_stride(out, k);
+            int64_t osax = zap_asort_axis_stride(out, axis);
+            int64_t *od = (int64_t *)out->data;
+            for (int64_t m = 0; m < L; m++) od[obase + m * osax] = perm[m];
+        } else {
+            for (int64_t m = 0; m < L; m++)
+                memcpy(adata + (size_t)(base + m * sax) * esz, lane + (size_t)perm[m] * esz, esz);
+        }
+        for (int64_t k = nd - 1; k >= 0; k--) {
+            if (k == axis) continue;
+            if (++idx[k] < a->dims[k]) break;
+            idx[k] = 0;
+        }
+    }
+    free(idx); free(kth); free(perm); free(lane);
+}
+/* partition(a, kth, axis) in place. kth is an i64 array (1 element or a list). */
+void zap_array_partition_inplace(void *ap, void *kp, int64_t axis) {
+    ZapArray *a = (ZapArray *)ap, *k = (ZapArray *)kp;
+    int64_t ax = zap_array_axis_norm(axis, a->ndim);
+    zap_srch_partition_run(a, ax, (int64_t *)k->data + k->off, zap_array_count_of(k), NULL);
+}
+/* partition(a, kth, axis) -> a partitioned copy (same shape). */
+void *zap_array_partitioned(void *ap, void *kp, int64_t axis) {
+    ZapArray *a = (ZapArray *)ap, *k = (ZapArray *)kp;
+    int64_t ax = zap_array_axis_norm(axis, a->ndim);
+    int64_t count = zap_array_count_of(a);
+    size_t esz = zap_array_elem_size(a->dtype);
+    ZapArray *res = (ZapArray *)zap_array_new_nd(a->dtype, a->ndim, count);
+    for (int64_t d = 0; d < a->ndim; d++) zap_array_set_dim(res, d, a->dims[d]);
+    for (int64_t f = 0; f < count; f++)
+        memcpy((char *)res->data + (size_t)f * esz,
+               (char *)a->data + (size_t)zap_array_phys_nd(a, f) * esz, esz);
+    zap_srch_partition_run(res, ax, (int64_t *)k->data + k->off, zap_array_count_of(k), NULL);
+    return res;
+}
+/* argpartition(a, kth, axis) -> an i64 index array (same shape). */
+void *zap_array_argpartition(void *ap, void *kp, int64_t axis) {
+    ZapArray *a = (ZapArray *)ap, *k = (ZapArray *)kp;
+    int64_t ax = zap_array_axis_norm(axis, a->ndim);
+    int64_t count = zap_array_count_of(a);
+    ZapArray *out = (ZapArray *)zap_array_new_nd(DTYPE_I64, a->ndim, count);
+    for (int64_t d = 0; d < a->ndim; d++) zap_array_set_dim(out, d, a->dims[d]);
+    zap_srch_partition_run(a, ax, (int64_t *)k->data + k->off, zap_array_count_of(k), out);
+    return out;
+}
+
 /* sum/min/max/prod along `axis` (op 0/1/2/3). Result keeps the input dtype. */
 void *zap_array_reduce_axis(void *ap, int64_t axis, int64_t op) {
     /* Compact a strided view so the factorization below walks a dense buffer

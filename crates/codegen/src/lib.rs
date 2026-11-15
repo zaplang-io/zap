@@ -2732,6 +2732,38 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), i.into(), i.into(), i.into()],
             Some(p.into()),
         );
+        // Searching / selection (#934): searchsorted, argmin/argmax, unique,
+        // partition/argpartition.
+        self.declare_rt(
+            "zap_array_searchsorted",
+            &[p.into(), p.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt("zap_array_argminmax", &[p.into(), i.into()], Some(i.into()));
+        self.declare_rt(
+            "zap_array_argminmax_axis",
+            &[p.into(), i.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt("zap_array_unique_values", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_array_unique_index", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_array_unique_inverse", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_array_unique_counts", &[p.into()], Some(p.into()));
+        self.declare_rt(
+            "zap_array_partition_inplace",
+            &[p.into(), p.into(), i.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_array_partitioned",
+            &[p.into(), p.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_array_argpartition",
+            &[p.into(), p.into(), i.into()],
+            Some(p.into()),
+        );
         self.declare_rt("zap_i64buf", &[i.into()], Some(p.into()));
         self.declare_rt("zap_i64set", &[p.into(), i.into(), i.into()], None);
         self.declare_rt(
