@@ -358,6 +358,9 @@ fn lto_runtime_bitcode(
     RUNTIME_BLAS_C.hash(&mut h);
     RUNTIME_RANDOM_C.hash(&mut h);
     ZIGGURAT_H.hash(&mut h);
+    RUNTIME_SORTACCEL_C.hash(&mut h);
+    RUNTIME_XSORT_CPP.hash(&mut h);
+    RUNTIME_HWYSORT_CPP.hash(&mut h);
     cc.hash(&mut h);
     triple.hash(&mut h);
     immix.hash(&mut h);
@@ -529,6 +532,9 @@ fn native_runtime_object(
     RUNTIME_BLAS_C.hash(&mut h);
     RUNTIME_RANDOM_C.hash(&mut h);
     ZIGGURAT_H.hash(&mut h);
+    RUNTIME_SORTACCEL_C.hash(&mut h);
+    RUNTIME_XSORT_CPP.hash(&mut h);
+    RUNTIME_HWYSORT_CPP.hash(&mut h);
     cc.hash(&mut h);
     triple.hash(&mut h);
     opt_flag.hash(&mut h);
@@ -716,6 +722,19 @@ const CPU_FEATURES_H: &str = include_str!("zap_cpu_features.h");
 /// first multiversioned kernel: hand-written clones (scalar/SSE2/AVX2/NEON) +
 /// pointer-once-init dispatch reading `cpu_features`.
 const RUNTIME_MEMCHR_C: &str = include_str!("zapmemchr.inc.c");
+/// The SIMD sort accelerator dispatch seam (#933, epic #139, D-0195),
+/// `#include`d by `zaprt.c` after `zapcpu.inc.c`. Always compiled; its entry
+/// points fall through to the own floor unless `-DZAP_HAVE_SIMDSORT` and a
+/// per-ISA kernel object are linked (BackendUse::simdsort).
+const RUNTIME_SORTACCEL_C: &str = include_str!("zapsortaccel.inc.c");
+/// The per-ISA SIMD sort kernels (standalone C++ objects, like `zapfft.cpp`):
+/// x86 via vendored Intel x86-simd-sort, aarch64 via vendored Google Highway
+/// vqsort. Compiled + linked only for a program that sorts (BackendUse::simdsort)
+/// on the matching arch. The vendored headers they `#include` are embedded by
+/// `build.rs` as `VENDORED_SORT_FILES` and written beside them at compile time.
+const RUNTIME_XSORT_CPP: &str = include_str!("zapxsort.cpp");
+const RUNTIME_HWYSORT_CPP: &str = include_str!("zaphwysort.cpp");
+include!(concat!(env!("OUT_DIR"), "/vendored_sort.rs"));
 /// The Windows x86_64 coroutine context switch (ticket #195 / A1): the asm
 /// backend for the `zap_ctx_swap`/`zap_ctx_make` seam, a separate translation
 /// unit so it links into the Windows program build AND compiles standalone in
@@ -813,6 +832,14 @@ pub(crate) struct BackendUse {
     /// `rfftfreq` are pure C and do not need the backend, but referencing any
     /// `zap_fft_*` conservatively links it — only over-linking, never a miss.)
     pub fft: bool,
+    /// SIMD sort accelerator (#933): the program reaches the array sort path
+    /// (`zap_array_sort_inplace` / `zap_array_sorted` / `zap_array_argsort`),
+    /// whose unstable kernels live in the vendored C++ TUs (x86: x86-simd-sort
+    /// `zapxsort.cpp`; aarch64: Highway vqsort `zaphwysort.cpp`). Gates
+    /// `-DZAP_HAVE_SIMDSORT` on the runtime compile, compiles + links the per-ISA
+    /// C++ object(s), and pulls the C++ stdlib. Off ⇒ no C++ object and the
+    /// accelerator seam falls through to the own introsort floor (#932).
+    pub simdsort: bool,
 }
 
 /// `zap_crypto_*` seams that are implemented in pure C (SHA-2 family, SHA-1,
@@ -892,6 +919,17 @@ pub(crate) fn program_backend_use(module: &AstModule, race: bool) -> BackendUse 
                     // C, but referencing any `zap_fft_*` conservatively links the
                     // backend — only over-linking, never a miss.)
                     u.fft = true;
+                } else if callee.starts_with("zap_array_sort")
+                    || callee.starts_with("zap_array_argsort")
+                {
+                    // #933: the array sort path (sort/argsort) has a vendored SIMD
+                    // accelerator (x86-simd-sort / Highway vqsort) in a C++ TU; a
+                    // program that sorts compiles the runtime with
+                    // `-DZAP_HAVE_SIMDSORT`, compiles + links the per-ISA object(s),
+                    // and links the C++ stdlib. The own introsort floor stays the
+                    // fallback (small/strided/stable/other-dtype), so this is only
+                    // over-linking (the accelerator), never a correctness miss.
+                    u.simdsort = true;
                 }
             }
         }
@@ -1074,6 +1112,8 @@ pub fn build_executable(
         .map_err(|e| format!("failed to write memchr runtime: {e}"))?;
     std::fs::write(build_dir.join("zapcpu.inc.c"), RUNTIME_CPU_C)
         .map_err(|e| format!("failed to write cpu-features runtime: {e}"))?;
+    std::fs::write(build_dir.join("zapsortaccel.inc.c"), RUNTIME_SORTACCEL_C)
+        .map_err(|e| format!("failed to write sort-accel runtime: {e}"))?;
 
     // Target-aware link step (ticket #199, platform epic #158 / Area A5). Today
     // codegen emits for the host triple only, so "Windows target" means "running
@@ -1194,6 +1234,131 @@ pub fn build_executable(
         }
     } else {
         None
+    };
+
+    // SIMD sort accelerator objects (#933): for a program that sorts
+    // (BackendUse::simdsort), compile the per-ISA vendored kernels and gate the
+    // dispatch seam on `-DZAP_HAVE_SIMDSORT`. x86-64 → two x86-simd-sort tiers
+    // (AVX2 + AVX-512); aarch64 → one Highway NEON object + Highway's one needed
+    // `abort.cc`. The vendored headers (embedded by build.rs) are written under a
+    // `vendored/` subtree so each library's internal `#include`s resolve. Native
+    // objects (never merged into the program bitcode), linked below with the C++
+    // stdlib that is already on the link line.
+    let simdsort_objs: Vec<std::path::PathBuf> = if backends.simdsort {
+        blas_defines.push("-DZAP_HAVE_SIMDSORT".to_string());
+        let fail = |build_dir: &std::path::Path, prog_path: &std::path::Path, msg: String| {
+            let _ = std::fs::remove_file(prog_path);
+            let _ = std::fs::remove_dir_all(build_dir);
+            msg
+        };
+        // Write the embedded vendored headers under build_dir/vendored/<relpath>.
+        let vroot = build_dir.join("vendored");
+        for (rel, content) in VENDORED_SORT_FILES {
+            let dst = vroot.join(rel);
+            if let Some(parent) = dst.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return Err(fail(
+                        &build_dir,
+                        &prog_path,
+                        format!("failed to write vendored sort header dir: {e}"),
+                    ));
+                }
+            }
+            if let Err(e) = std::fs::write(&dst, content) {
+                return Err(fail(
+                    &build_dir,
+                    &prog_path,
+                    format!("failed to write vendored sort header {rel}: {e}"),
+                ));
+            }
+        }
+        let cxx = if lto {
+            std::env::var("ZAP_LTO_CC").unwrap_or_else(|_| "clang".to_string())
+        } else {
+            std::env::var("ZAP_CC").unwrap_or_else(|_| "cc".to_string())
+        };
+        let triple_s = triple.as_str().to_string_lossy().to_string();
+        let is_x86 = triple_s.contains("x86_64") || triple_s.contains("x86-64");
+        let is_arm = triple_s.contains("aarch64") || triple_s.contains("arm64");
+        // Compile one C++ TU to a native object with the given extra flags.
+        let compile = |src_name: &str,
+                       src: &str,
+                       obj_name: &str,
+                       extra: &[&str]|
+         -> Result<std::path::PathBuf, String> {
+            let src_path = build_dir.join(src_name);
+            std::fs::write(&src_path, src).map_err(|e| format!("write {src_name}: {e}"))?;
+            let obj = build_dir.join(obj_name);
+            let mut c = Command::new(&cxx);
+            c.arg("-x")
+                .arg("c++")
+                .arg("-std=c++17")
+                .arg("-O2")
+                .arg("-c")
+                .arg(&src_path);
+            for a in extra {
+                c.arg(a);
+            }
+            c.arg("-o").arg(&obj);
+            match c.status() {
+                Ok(s) if s.success() => Ok(obj),
+                Ok(_) => Err(format!(
+                    "failed to compile the SIMD sort kernel ({src_name})"
+                )),
+                Err(e) => Err(format!(
+                    "failed to run the C++ compiler for {src_name}: {e}"
+                )),
+            }
+        };
+        let mut objs = Vec::new();
+        let r: Result<(), String> = (|| {
+            if is_x86 {
+                let xinc = format!("-I{}", vroot.join("x86-simd-sort/src").display());
+                objs.push(compile(
+                    "zapxsort_avx2.cpp",
+                    RUNTIME_XSORT_CPP,
+                    "zapxsort_avx2.o",
+                    &["-DZAP_XSORT_TIER=avx2", "-mavx2", &xinc],
+                )?);
+                objs.push(compile(
+                    "zapxsort_avx512.cpp",
+                    RUNTIME_XSORT_CPP,
+                    "zapxsort_avx512.o",
+                    &[
+                        "-DZAP_XSORT_TIER=avx512",
+                        "-mavx512f",
+                        "-mavx512dq",
+                        "-mavx512vl",
+                        "-mavx512bw",
+                        &xinc,
+                    ],
+                )?);
+            } else if is_arm {
+                let hinc = format!("-I{}", vroot.join("highway").display());
+                objs.push(compile(
+                    "zaphwysort.cpp",
+                    RUNTIME_HWYSORT_CPP,
+                    "zaphwysort.o",
+                    &[&hinc],
+                )?);
+                // Highway's static vqsort references hwy::Abort (abort.cc only).
+                let abort_src = std::fs::read_to_string(vroot.join("highway/hwy/abort.cc"))
+                    .map_err(|e| format!("read vendored highway abort.cc: {e}"))?;
+                objs.push(compile(
+                    "hwy_abort.cpp",
+                    &abort_src,
+                    "hwy_abort.o",
+                    &[&hinc],
+                )?);
+            }
+            Ok(())
+        })();
+        if let Err(e) = r {
+            return Err(fail(&build_dir, &prog_path, e));
+        }
+        objs
+    } else {
+        Vec::new()
     };
 
     // Linker driver. On the default path, `cc` (the MinGW-w64 `gcc`/`cc` on a
@@ -1425,6 +1590,12 @@ pub fn build_executable(
     // FFT backend object (#929): the PocketFFT C++ wrapper, listed before the C++
     // stdlib it references. Present only for a program that reaches `zap_fft_*`.
     if let Some(o) = &fft_obj {
+        cmd.arg(o);
+    }
+    // SIMD sort accelerator objects (#933): the per-ISA x86-simd-sort / Highway
+    // kernels, before the C++ stdlib they reference. Empty unless the program
+    // sorts (BackendUse::simdsort).
+    for o in &simdsort_objs {
         cmd.arg(o);
     }
     cmd.arg("-lstdc++")
