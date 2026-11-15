@@ -8,7 +8,7 @@
  * rejection distribution algorithms + choice/shuffle) follows NumPy's
  * `bit_generator.pyx` / `pcg64.*` / `distributions.c` / `_generator.pyx`
  * (BSD-3) exactly; the ziggurat tables are vendored verbatim in
- * `third_party/numpy/ziggurat_constants.h`. Every path here was cross-checked
+ * `ziggurat_constants.h` (beside this file). Every path here was cross-checked
  * bit-for-bit against NumPy 2.5.4 before landing.
  *
  * This is the array `Generator` surface and coexists with the pre-existing

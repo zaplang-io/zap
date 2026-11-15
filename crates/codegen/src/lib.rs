@@ -672,7 +672,7 @@ const RUNTIME_BLAS_C: &str = include_str!("zapblas.inc.c");
 /// `#include`s (`ziggurat_constants.h`). Pointer-free, no provider — always
 /// compiled into the runtime like the rest of `random`.
 const RUNTIME_RANDOM_C: &str = include_str!("zaprandom.inc.c");
-const ZIGGURAT_H: &str = include_str!("../../../third_party/numpy/ziggurat_constants.h");
+const ZIGGURAT_H: &str = include_str!("ziggurat_constants.h");
 /// The Windows x86_64 coroutine context switch (ticket #195 / A1): the asm
 /// backend for the `zap_ctx_swap`/`zap_ctx_make` seam, a separate translation
 /// unit so it links into the Windows program build AND compiles standalone in

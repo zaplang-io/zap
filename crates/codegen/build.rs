@@ -33,7 +33,7 @@ fn main() {
         // random Generator (#930/#931): the bit-exact PCG64 surface and the
         // vendored NumPy ziggurat tables it includes.
         "src/zaprandom.inc.c",
-        "../../third_party/numpy/ziggurat_constants.h",
+        "src/ziggurat_constants.h",
     ];
     for f in EMBEDDED_RUNTIME_FILES {
         println!("cargo:rerun-if-changed={f}");

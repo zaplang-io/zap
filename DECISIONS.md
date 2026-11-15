@@ -9340,8 +9340,8 @@ so this is a durable contract.
 - **Distributions / sampling (each follows NumPy's exact algorithm).**
   `random`/`uniform`/`integers` (Lemire-bounded, `endpoint=`); `normal`/
   `standard_normal` and `exponential`/`standard_exponential` (256-region
-  **ziggurat**, tables vendored verbatim in `third_party/numpy/
-  ziggurat_constants.h`, BSD-3); `gamma`/`standard_gamma` (Marsaglia–Tsang /
+  **ziggurat**, tables vendored verbatim from NumPy in
+  `crates/codegen/src/ziggurat_constants.h`, BSD-3); `gamma`/`standard_gamma` (Marsaglia–Tsang /
   small-shape), `beta` (Johnk / gamma-ratio); `poisson` (Knuth multiplication for
   λ<10, PTRS transformed-rejection with NumPy's own `loggam` for λ≥10);
   `binomial` (inversion for n·p≤30, BTPE above); `choice` over an int population

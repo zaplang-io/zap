@@ -1,3 +1,21 @@
+/* Vendored from NumPy — ziggurat constant tables for the bit-exact `random`
+ * Generator (#930/#931, D-0189): the normal (ki/wi/fi_double) and exponential
+ * (ke/we/fe_double) ziggurat layers plus the `ziggurat_nor_r` / `_inv_r` /
+ * `ziggurat_exp_r` scalars, used by `zaprandom.inc.c` to reproduce
+ * `numpy.random.default_rng(...)`'s normal / exponential streams exactly.
+ *
+ *   Upstream : https://github.com/numpy/numpy  (tag v2.5.4)
+ *   File     : numpy/random/src/distributions/ziggurat_constants.h
+ *   Retrieved: 2026-11-15
+ *   License  : BSD 3-Clause (NumPy). Copyright (c) 2005-2024, NumPy Developers.
+ *              All rights reserved. Redistribution with the copyright notice,
+ *              this list of conditions and the BSD-3 disclaimer is permitted;
+ *              the NumPy Developers' name may not be used for endorsement.
+ *
+ * Kept verbatim (the `_float` tables ship unused — f32 sampling is a follow-up).
+ * Lives beside the runtime source so `zaprt.c`'s one-translation-unit build
+ * (including the in-place Windows A4 compile) resolves the `#include`.
+ */
 static const uint64_t ki_double[] = {
     0x000EF33D8025EF6AULL, 0x0000000000000000ULL, 0x000C08BE98FBC6A8ULL,
     0x000DA354FABD8142ULL, 0x000E51F67EC1EEEAULL, 0x000EB255E9D3F77EULL,
