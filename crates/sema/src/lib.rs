@@ -729,7 +729,9 @@ const F32_COLLECTION_MSG: &str =
     "'f32'/'float32' is not supported as a collection element yet (only 'f64' is); \
      use 'array[f32]' for dense f32 data";
 const BIGINT_COMPLEX_COLLECTION_MSG: &str =
-    "bigint and complex values are not supported as collection elements yet";
+    "bigint is not supported as a collection element, and complex only as a list \
+     element / dict value / channel element (not a dict/set key, heap element, or \
+     array dtype), yet";
 
 impl Checker {
     /// Representation-readiness gate for the element/key/value *positions* of the
@@ -779,36 +781,61 @@ impl Checker {
         if f32_slot(ty) {
             self.error(ErrorCode::ZAP4027, F32_COLLECTION_MSG.to_string(), span);
         }
-        // `bigint`/`complex` have no collection slot in any container (`array`
-        // included). Once inside a container, the gap applies at any depth.
-        fn contains_numeric(ty: &Type, in_container: bool) -> bool {
+        // `bigint` has no collection slot in any container (`array` included).
+        // `complex` (#928) is admitted as a *value* element — a `list`/`channel`
+        // element or a `dict` VALUE — but not as a `dict`/`set` key, a `heap`
+        // element, or an `array` dtype (there is no complex array dtype). A tuple
+        // nested in a container keeps the stricter (key) rule, as before.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Pos {
+            Free,
+            Value,
+            Key,
+            Dtype,
+        }
+        fn contains_numeric(ty: &Type, pos: Pos) -> bool {
             match ty {
                 Type::Named { name, args, .. } => {
-                    let is_container = matches!(
-                        name.as_str(),
-                        "list" | "dict" | "set" | "array" | "heap" | "channel"
-                    );
-                    let now_in_container = in_container || is_container;
-                    (now_in_container && matches!(name.as_str(), "bigint" | "complex"))
-                        || args
-                            .iter()
-                            .any(|arg| contains_numeric(arg, now_in_container))
+                    let here = match name.as_str() {
+                        "bigint" => pos != Pos::Free,
+                        "complex" => matches!(pos, Pos::Key | Pos::Dtype),
+                        _ => false,
+                    };
+                    here || args.iter().enumerate().any(|(i, arg)| {
+                        let p = match name.as_str() {
+                            "list" | "channel" => Pos::Value,
+                            "set" | "heap" => Pos::Key,
+                            "array" => Pos::Dtype,
+                            "dict" => {
+                                if i == 0 {
+                                    Pos::Key
+                                } else {
+                                    Pos::Value
+                                }
+                            }
+                            // A non-container generic propagates the current
+                            // position (it is not itself a collection slot).
+                            _ => pos,
+                        };
+                        contains_numeric(arg, p)
+                    })
                 }
-                Type::Tuple { elems, .. } => elems
-                    .iter()
-                    .any(|elem| contains_numeric(elem, in_container)),
+                Type::Tuple { elems, .. } => {
+                    let p = if pos == Pos::Free {
+                        Pos::Free
+                    } else {
+                        Pos::Key
+                    };
+                    elems.iter().any(|elem| contains_numeric(elem, p))
+                }
                 Type::Func { params, ret, .. } => {
-                    params
-                        .iter()
-                        .any(|param| contains_numeric(param, in_container))
-                        || ret
-                            .as_deref()
-                            .is_some_and(|ret| contains_numeric(ret, in_container))
+                    params.iter().any(|param| contains_numeric(param, pos))
+                        || ret.as_deref().is_some_and(|ret| contains_numeric(ret, pos))
                 }
             }
         }
 
-        if contains_numeric(ty, false) {
+        if contains_numeric(ty, Pos::Free) {
             let span = match ty {
                 Type::Named { span, .. } | Type::Tuple { span, .. } | Type::Func { span, .. } => {
                     *span
@@ -825,23 +852,38 @@ impl Checker {
     /// Resolved-type (`Ty`) sibling of the `bigint`/`complex` representation gate
     /// (D-0139/#807): `bigint`/`complex` have no collection slot in any container.
     fn check_numeric_container_value(&mut self, ty: &Ty, span: Span) {
-        fn contains_numeric(ty: &Ty, in_container: bool) -> bool {
+        // `complex` is admitted as a *value* element (#928): a `list` element, a
+        // `dict` VALUE, or a `channel` element — but not as a `dict`/`set` key or a
+        // `heap` element (a hashed/ordered position; complex-as-key is a follow-up).
+        // `bigint` still has no collection slot in any position. A tuple nested
+        // inside a container keeps the stricter (key) rule for its fields, which
+        // preserves the pre-#928 behaviour for complex-in-a-nested-tuple.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Pos {
+            Free,
+            Value,
+            Key,
+        }
+        fn bad(ty: &Ty, pos: Pos) -> bool {
             match ty {
-                Ty::Bigint | Ty::Complex => in_container,
-                Ty::List(elem) | Ty::Set(elem) | Ty::Heap(elem) | Ty::Chan(elem) => {
-                    contains_numeric(elem, true)
+                Ty::Bigint => pos != Pos::Free,
+                Ty::Complex => pos == Pos::Key,
+                Ty::List(elem) | Ty::Chan(elem) => bad(elem, Pos::Value),
+                Ty::Set(elem) | Ty::Heap(elem) => bad(elem, Pos::Key),
+                Ty::Dict(key, value) => bad(key, Pos::Key) || bad(value, Pos::Value),
+                Ty::Tuple(elems) => {
+                    let p = if pos == Pos::Free {
+                        Pos::Free
+                    } else {
+                        Pos::Key
+                    };
+                    elems.iter().any(|elem| bad(elem, p))
                 }
-                Ty::Dict(key, value) => {
-                    contains_numeric(key, true) || contains_numeric(value, true)
-                }
-                Ty::Tuple(elems) => elems
-                    .iter()
-                    .any(|elem| contains_numeric(elem, in_container)),
                 _ => false,
             }
         }
 
-        if contains_numeric(ty, false) {
+        if bad(ty, Pos::Free) {
             self.error(
                 ErrorCode::ZAP4024,
                 BIGINT_COMPLEX_COLLECTION_MSG.to_string(),
@@ -9933,24 +9975,47 @@ def main():
 
     #[test]
     fn bigint_complex_collection_elements_still_rejected() {
-        // #800 lifts the *float* collection guard (ZAP4027) for value positions,
-        // but the sibling bigint/complex guard (ZAP4024) is unrelated and
-        // unchanged: bigint/complex remain unsupported as any collection
-        // element/key, in every container.
+        // `bigint` has no collection slot in any position (ZAP4024). `complex`
+        // (#928) is admitted as a VALUE element but is still rejected as a
+        // dict/set key, a heap element, or an array dtype.
         for source in [
             "list[bigint] x = []",
             "dict[str, bigint] x = {}",
             "dict[bigint, str] x = {}",
             "set[bigint] x = set()",
             "heap[bigint] x = heap[bigint]()",
-            "list[complex] x = []",
-            "dict[str, complex] x = {}",
-            "channel[complex] x = channel[complex]()",
+            // complex in a key / ordered / dtype position:
+            "dict[complex, str] x = {}",
+            "set[complex] x = set()",
+            "heap[complex] x = heap[complex]()",
+            "array[complex] x = array[complex]()",
+            // bigint/complex nested inside a container-held tuple stay rejected.
+            "list[(complex, int)] x = []",
         ] {
             let source = format!("def main():\n    {source}\n");
             assert!(
                 errors(&source).iter().any(|e| e.code == ErrorCode::ZAP4024),
                 "expected ZAP4024 for: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn complex_value_collection_elements_accepted() {
+        // #928: a `complex` VALUE element — a list element, a dict VALUE, or a
+        // channel element — is admitted (it lets `linalg.eigvals` return a
+        // `list[complex]`), at any value-position nesting depth. No ZAP4024.
+        for source in [
+            "list[complex] x = []",
+            "dict[str, complex] x = {}",
+            "channel[complex] x = channel[complex]()",
+            "list[list[complex]] x = []",
+            "dict[str, list[complex]] x = {}",
+        ] {
+            let source = format!("def main():\n    {source}\n");
+            assert!(
+                !errors(&source).iter().any(|e| e.code == ErrorCode::ZAP4024),
+                "unexpected ZAP4024 for: {source}"
             );
         }
     }
