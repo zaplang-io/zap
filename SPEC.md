@@ -1508,10 +1508,11 @@ non-convergent `svd`, or a bad shape raises a catchable `ValueError`.
 
 It also provides the eigensolvers, least squares, norms, pseudo-inverse, and
 matrix power (#928), f64: `linalg.eigvals(a)` returns the eigenvalues of a general
-square matrix as a `list[complex]` (a real matrix has real or conjugate-pair
-eigenvalues, LAPACK-ordered with the +imaginary member of a pair first; `eig`
-itself — whose eigenvectors are a complex matrix — is deferred until a complex
-array dtype exists). For a symmetric matrix, `linalg.eigh(a)` returns `(w, v)` with
+square matrix as a 1-D `array[complex]` (a real matrix has real or conjugate-pair
+eigenvalues, LAPACK-ordered with the +imaginary member of a pair first), and
+`linalg.eig(a)` returns `(w, v)` — the eigenvalues `w` and the complex eigenvector
+matrix `v` (2-D `array[complex]`, columns = eigenvectors), matching
+`numpy.linalg.eig`. For a symmetric matrix, `linalg.eigh(a)` returns `(w, v)` with
 real eigenvalues `w` **ascending** and orthonormal eigenvector columns `v`, and
 `linalg.eigvalsh(a)` returns just `w`. `linalg.lstsq(a, b)` returns the
 minimum-norm least-squares tuple `(x, residuals, rank, singular_values)` (residuals

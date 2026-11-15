@@ -1,17 +1,19 @@
 # claim: ARR-19
 # SPEC §15 (#928): `import linalg` eigensolvers / least squares / norms / pinv /
-# matrix_power. eigvals(a) -> list[complex] (general; conjugate pairs with +imag
-# first); eig deferred (no complex array dtype). eigh(a) -> (w ascending, v),
-# eigvalsh(a) -> w (symmetric, real). lstsq(a, b) -> (x, residuals, rank, s).
-# norm(a[, ord]) -> f64 (default 2-norm / Frobenius; integer/inf ords). pinv(a)
-# via SVD. matrix_power(a, p). Results f64; eigenvector / SVD-solution gauge is
-# ambiguous, so this pins the well-defined facts.
+# matrix_power. eigvals(a) -> array[complex] (general; conjugate pairs with +imag
+# first); eig(a) -> (w, v) eigenvalues + complex eigenvector matrix (#928-eig).
+# eigh(a) -> (w ascending, v), eigvalsh(a) -> w (symmetric, real). lstsq(a, b) ->
+# (x, residuals, rank, s). norm(a[, ord]) -> f64 (default 2-norm / Frobenius;
+# integer/inf ords). pinv(a) via SVD. matrix_power(a, p). Results f64; eigenvector
+# / SVD-solution gauge is ambiguous, so this pins the well-defined facts.
 import linalg
 import math
 
 def main():
     auto ev = linalg.eigvals(array[f64]([[0.0, -1.0], [1.0, 0.0]]))
-    print("eigvals", str(ev))  # [(0+1j), (0-1j)]
+    print("eigvals", str(ev[0]), str(ev[1]), len(ev))  # (0+1j) (0-1j) 2
+    auto ew, evec = linalg.eig(array[f64]([[2.0, 0.0], [0.0, 3.0]]))
+    print("eig", str(ew[0]), str(ew[1]), str(evec[0, 0]), str(evec[1, 1]))  # (2+0j) (3+0j) (1+0j) (1+0j)
 
     auto w, v = linalg.eigh(array[f64]([[2.0, 0.0], [0.0, 3.0]]))
     print("eigh", str(w[0]), str(w[1]), v.shape[0], v.shape[1])  # 2.0 3.0 2 2

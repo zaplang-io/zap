@@ -6,8 +6,9 @@
 //! (#928). Each can raise a catchable `ValueError` (bad shape / singular /
 //! non-convergent / no provider), so all route through `throwing_call`. Array
 //! results are typed `Ty::Array` (f64) — like matmul — so indexing/`len` route to
-//! the array ops, not the generic-pointer/string paths; `eigvals` returns a
-//! `list[complex]` and the multi-output ops (qr/svd/eigh/lstsq) assemble a tuple.
+//! the array ops, not the generic-pointer/string paths; `eigvals` returns an
+//! `array[complex]` and the multi-output ops (eig/qr/svd/eigh/lstsq) assemble a
+//! tuple.
 //! Sema has type-checked these calls.
 
 use zapc_syntax::ast;
@@ -97,18 +98,28 @@ fn lower(
             let fns = ["zap_linalg_svd_u", "zap_linalg_svd_s", "zap_linalg_svd_vt"];
             Ok(Some(tuple_of_outputs(lowerer, &[a], &elems, &fns)))
         }
-        // eigvals (#928): general matrix -> eigenvalues as a `list[complex]`
-        // (a new value kind, `Elem::Complex`). `eig` (the complex eigenvector
-        // matrix) stays deferred: no complex array dtype yet.
+        // eigvals (#928, migrated #928-eig): general matrix -> eigenvalues as a
+        // 1-D `array[complex]` (the complex array dtype, #938).
         "eigvals" => {
             if args.len() != 1 {
                 return Err(err("linalg.eigvals expects (a)"));
             }
             let (a, _) = lowerer.expr(&args[0].value)?;
-            let out = Ty::List(Elem::Complex);
+            let out = Ty::Array(Dtype::Complex, 1);
             let d = lowerer.new_value(out);
             lowerer.throwing_call(Some(d), "zap_linalg_eigvals", vec![a]);
             Ok(Some((d, out)))
+        }
+        // eig (#928-eig): general matrix -> (w, v), the eigenvalues (1-D) and the
+        // complex eigenvector matrix (2-D, columns = eigenvectors), both complex.
+        "eig" => {
+            if args.len() != 1 {
+                return Err(err("linalg.eig expects (a)"));
+            }
+            let (a, _) = lowerer.expr(&args[0].value)?;
+            let elems = vec![Ty::Array(Dtype::Complex, 1), Ty::Array(Dtype::Complex, 2)];
+            let fns = ["zap_linalg_eig_w", "zap_linalg_eig_v"];
+            Ok(Some(tuple_of_outputs(lowerer, &[a], &elems, &fns)))
         }
         // eigh (#928): symmetric matrix -> (w ascending real, v real eigenvectors).
         "eigh" => {

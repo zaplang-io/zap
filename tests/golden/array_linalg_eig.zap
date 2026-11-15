@@ -11,12 +11,25 @@ import linalg
 import math
 
 def main():
-    # eigvals (general): the rotation matrix [[0,-1],[1,0]] has eigenvalues ±i.
-    # They come back as a list[complex] (a new element kind). LAPACK orders a
-    # conjugate pair with the +imag member first, so the order is deterministic.
+    # eigvals (general): the rotation matrix [[0,-1],[1,0]] has eigenvalues ±i,
+    # returned as a 1-D array[complex]. LAPACK orders a conjugate pair with the
+    # +imag member first, so the order is deterministic.
     auto ev = linalg.eigvals(array[f64]([[0.0, -1.0], [1.0, 0.0]]))
-    print("eigvals", str(ev), len(ev))  # [(0+1j), (0-1j)] 2
-    print("eig0", str(ev[0]))  # (0+1j)
+    print("eigvals", str(ev[0]), str(ev[1]), len(ev))  # (0+1j) (0-1j) 2
+
+    # eig (general) -> (w, v): eigenvalues (1-D) + the complex eigenvector matrix
+    # (columns = eigenvectors). A diagonal matrix gives exact eigenvalues and the
+    # standard-basis eigenvectors (imag 0).
+    auto ew, evec = linalg.eig(array[f64]([[2.0, 0.0], [0.0, 3.0]]))
+    print("eigw", str(ew[0]), str(ew[1]))  # (2+0j) (3+0j)
+    print(
+        "eigv",
+        str(evec[0, 0]),
+        str(evec[0, 1]),
+        str(evec[1, 0]),
+        str(evec[1, 1]),
+        evec.ndim,
+    )  # (1+0j) (0+0j) (0+0j) (1+0j) 2
 
     # eigh / eigvalsh (symmetric): real eigenvalues, ascending. A diagonal matrix
     # gives exact eigenvalues (the diagonal, sorted); the eigenvector signs are

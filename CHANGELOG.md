@@ -25,6 +25,12 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`linalg.eig` + `eigvals` → `array[complex]`** (#928-eig, D-0188). Completes
+  the deferred general-matrix eigenproblem now that `array[complex]` exists:
+  `eig(a)` → `(w, v)` (eigenvalues + the complex eigenvector matrix, columns =
+  eigenvectors, via `dgeev`), matching `numpy.linalg.eig`. `eigvals` is migrated
+  from the `list[complex]` stopgap (D-0185) to a 1-D `array[complex]`, consistent
+  with `eig`'s `w` and NumPy. (Pre-1.0 signature change to `eigvals`.)
 - **`import fft` — FFTs over arrays (vendored PocketFFT)** (#929, D-0187). Second
   Phase 3 track (#512): `fft`/`ifft`, `rfft`/`irfft`, `fft2`/`ifft2`,
   `fftn`/`ifftn`, and `fftfreq`/`rfftfreq`, matching `numpy.fft`, returning

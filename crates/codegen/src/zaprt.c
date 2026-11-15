@@ -5170,12 +5170,11 @@ static void *zap_linalg_svd_vt_impl(ZapArray *a, int64_t m, int64_t n) {
     return Vt;
 }
 
-/* eigvals (#928), general real matrix via `dgeev` (no eigenvectors): returns the
- * eigenvalues as a `list[complex]`. Eigenvalues of a real matrix are real or come
- * in conjugate pairs; LAPACK yields each pair consecutively with the +imag member
- * first. Order is otherwise LAPACK's (not sorted — matches numpy.linalg.eigvals).
- * Eigenvectors (a complex *matrix*) have no representation yet, so `eig` itself is
- * deferred (tracked separately) until a complex array dtype exists. */
+/* eigvals (#928, migrated in #928-eig): general real matrix eigenvalues via
+ * `dgeev` (no eigenvectors), as an `array[complex]` (1-D). Eigenvalues of a real
+ * matrix are real or come in conjugate pairs; LAPACK yields each pair
+ * consecutively with the +imag member first. Order is otherwise LAPACK's (not
+ * sorted — matches numpy.linalg.eigvals). */
 static void *zap_linalg_eigvals_impl(ZapArray *a, int64_t n) {
     double *A = zap_linalg_colmajor(a, n); /* dgeev overwrites A */
     double *wr = (double *)zap_buf((size_t)(n > 0 ? n : 1) * sizeof(double));
@@ -5188,10 +5187,50 @@ static void *zap_linalg_eigvals_impl(ZapArray *a, int64_t n) {
     dgeev_("N", "N", &ni, A, &ni, wr, wi, NULL, &ni, NULL, &ni, work, &lw, &info);
     if (info != 0)
         zap_linalg_err("linalg.eigvals: eigenvalue iteration did not converge");
-    void *lst = zap_list_new();
+    ZapArray *res = (ZapArray *)zap_array_new(DTYPE_COMPLEX, n);
     for (int64_t i = 0; i < n; i++)
-        zap_list_push_ptr(lst, zap_complex_new(wr[i], wi[i]));
-    return lst;
+        zap_cx_store(res, i, wr[i], wi[i]);
+    return res;
+}
+
+/* eig eigenvectors (#928-eig), general matrix via `dgeev` JOBVR='V'. The right
+ * eigenvectors come back REAL-packed in `vr` (column-major): a real eigenvalue's
+ * eigenvector is that column; a complex conjugate pair (wi[j] > 0, wi[j+1] < 0)
+ * has eigenvectors vr[:,j] ± i·vr[:,j+1]. Returns the complex eigenvector matrix
+ * whose COLUMNS are the eigenvectors, matching numpy.linalg.eig's `v`. (The
+ * eigenvalues `w` reuse `eigvals_impl`.) */
+static void *zap_linalg_eig_v_impl(ZapArray *a, int64_t n) {
+    double *A = zap_linalg_colmajor(a, n);
+    double *wr = (double *)zap_buf((size_t)(n > 0 ? n : 1) * sizeof(double));
+    double *wi = (double *)zap_buf((size_t)(n > 0 ? n : 1) * sizeof(double));
+    double *vr = (double *)zap_buf((size_t)(n * n > 0 ? n * n : 1) * sizeof(double));
+    int ni = (int)n, info = 0, lw = -1;
+    double wq = 0;
+    dgeev_("N", "V", &ni, A, &ni, wr, wi, NULL, &ni, vr, &ni, &wq, &lw, &info);
+    lw = (int)wq;
+    double *work = (double *)zap_buf((size_t)(lw > 0 ? lw : 1) * sizeof(double));
+    dgeev_("N", "V", &ni, A, &ni, wr, wi, NULL, &ni, vr, &ni, work, &lw, &info);
+    if (info != 0)
+        zap_linalg_err("linalg.eig: eigenvalue iteration did not converge");
+    ZapArray *res = (ZapArray *)zap_array_new_nd(DTYPE_COMPLEX, 2, n * n);
+    zap_array_set_dim(res, 0, n);
+    zap_array_set_dim(res, 1, n);
+    for (int64_t col = 0; col < n; col++) {
+        if (wi[col] > 0.0 && col + 1 < n) {
+            /* columns col, col+1 are a conjugate pair */
+            for (int64_t row = 0; row < n; row++) {
+                double re = vr[row + col * n];
+                double im = vr[row + (col + 1) * n];
+                zap_cx_store(res, row * n + col, re, im);
+                zap_cx_store(res, row * n + (col + 1), re, -im);
+            }
+        } else if (wi[col] == 0.0) {
+            for (int64_t row = 0; row < n; row++)
+                zap_cx_store(res, row * n + col, vr[row + col * n], 0.0);
+        }
+        /* wi[col] < 0: the second of a pair, already filled above. */
+    }
+    return res;
 }
 
 /* eigh / eigvalsh (#928), symmetric matrix via `dsyevd` (lower triangle, UPLO=L —
@@ -5680,6 +5719,30 @@ void *zap_linalg_eigvals(void *ap) {
     int64_t n = zap_linalg_square(a);
 #if defined(ZAP_HAVE_BLAS)
     return zap_linalg_eigvals_impl(a, n);
+#else
+    (void)n;
+    zap_linalg_need_provider();
+    return NULL;
+#endif
+}
+/* eig -> (w, v): the eigenvalues (reusing eigvals) and the complex eigenvector
+ * matrix (#928-eig). Two entry points assembled into a tuple by the lowering. */
+void *zap_linalg_eig_w(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t n = zap_linalg_square(a);
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_eigvals_impl(a, n);
+#else
+    (void)n;
+    zap_linalg_need_provider();
+    return NULL;
+#endif
+}
+void *zap_linalg_eig_v(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t n = zap_linalg_square(a);
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_eig_v_impl(a, n);
 #else
     (void)n;
     zap_linalg_need_provider();
