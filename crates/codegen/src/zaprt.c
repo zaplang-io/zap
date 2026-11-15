@@ -3932,6 +3932,12 @@ int64_t zap_array_sum_bool(void *ap) {
     return s;
 }
 
+/* Forward declarations: the generic element load/store are defined further down
+ * (with the matmul kernels), but the complex-array helpers below read a real
+ * operand through `mm_load_f` and store an f64 magnitude through `arr_store_f`. */
+static double mm_load_f(const ZapArray *a, int64_t i);
+static void arr_store_f(ZapArray *a, int64_t i, double v);
+
 /* --- complex128 arrays (#938) --------------------------------------------
  * A complex element is 16 bytes: two contiguous f64 lanes (re, im). Unlike the
  * scalar dtypes, a complex element is not a single SIMD lane, so the lowering
