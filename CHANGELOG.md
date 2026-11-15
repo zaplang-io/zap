@@ -25,6 +25,16 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Complex arrays — `array[complex]`** (#938, D-0186). A dense `complex128` array
+  dtype (each element a 16-byte `(re, im)` f64 pair; `a[i]` is a `complex`
+  scalar). Constructed from `complex` literals or from promoted real/int literals;
+  element-wise `+`/`-`/`*`/`/` (array⊗array of equal shape, or array⊗scalar, real
+  or complex), unary neg, `a.conj()` (→ complex array) and `a.abs()` (→ f64
+  magnitudes), whole-array `sum`, and real⊗complex promotion all operate
+  element-wise. Unblocks NumPy-shaped complex results in the numeric epic (#512) —
+  `fft` (#929) and the general-matrix `linalg.eig`. First cut: complex element-wise
+  ops require equal shapes (broadcasting is a follow-up), and `complex` is a value
+  element / array dtype but not a dict/set key.
 - **`linalg` eigensolvers / least squares / norms / pinv / matrix_power** (#928,
   D-0185). Third `linalg` slice (Phase 3 epic #512), f64: `eigvals(a)` (general,
   returning a `list[complex]`), `eigh(a)` → `(w, v)` and `eigvalsh(a)` → `w`

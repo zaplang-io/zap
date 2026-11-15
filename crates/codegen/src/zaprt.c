@@ -3092,7 +3092,8 @@ enum {
     DTYPE_I16 = 7,
     DTYPE_U16 = 8,
     DTYPE_U32 = 9,
-    DTYPE_U64 = 10
+    DTYPE_U64 = 10,
+    DTYPE_COMPLEX = 11 /* complex128: two contiguous f64 lanes (re, im), 16 bytes */
 };
 
 typedef struct {
@@ -3135,6 +3136,8 @@ static size_t zap_array_elem_size(int64_t dtype) {
     case DTYPE_I32:
     case DTYPE_U32:
         return 4;
+    case DTYPE_COMPLEX: /* two f64 lanes (re, im) */
+        return 16;
     default: /* f64 / i64 / u64 */
         return 8;
     }
@@ -3927,6 +3930,180 @@ int64_t zap_array_sum_bool(void *ap) {
         s += d[i] ? 1 : 0;
     }
     return s;
+}
+
+/* --- complex128 arrays (#938) --------------------------------------------
+ * A complex element is 16 bytes: two contiguous f64 lanes (re, im). Unlike the
+ * scalar dtypes, a complex element is not a single SIMD lane, so the lowering
+ * routes EVERY complex-array operation here rather than through the inline
+ * element-wise kernel. get/set are stride-aware (the physical element index from
+ * `zap_array_phys` selects a 2-double slot); `a[i]` materialises a heap
+ * `ZapComplex`. */
+void *zap_array_get_complex(void *ap, int64_t i) {
+    ZapArray *a = (ZapArray *)ap;
+    zap_array_bounds(a, i);
+    int64_t p = zap_array_phys(a, i);
+    const double *d = (const double *)a->data;
+    return zap_complex_new(d[2 * p], d[2 * p + 1]);
+}
+void zap_array_set_complex(void *ap, int64_t i, void *zp) {
+    ZapArray *a = (ZapArray *)ap;
+    zap_array_bounds(a, i);
+    int64_t p = zap_array_phys(a, i);
+    const ZapComplex *z = (const ZapComplex *)zp;
+    double *d = (double *)a->data;
+    d[2 * p] = z->re;
+    d[2 * p + 1] = z->im;
+}
+/* Read element `i` (flat; caller has contiguated) of ANY numeric array as a
+ * complex pair: a real dtype yields (value, 0); a complex dtype reads both
+ * lanes. Lets element-wise ops mix a real and a complex operand. */
+static void zap_cx_load(const ZapArray *a, int64_t i, double *re, double *im) {
+    if (a->dtype == DTYPE_COMPLEX) {
+        const double *d = (const double *)a->data + 2 * a->off;
+        *re = d[2 * i];
+        *im = d[2 * i + 1];
+    } else {
+        *re = mm_load_f(a, i);
+        *im = 0.0;
+    }
+}
+/* Store into a freshly allocated (contiguous, off == 0) complex result. */
+static void zap_cx_store(ZapArray *res, int64_t i, double re, double im) {
+    double *d = (double *)res->data;
+    d[2 * i] = re;
+    d[2 * i + 1] = im;
+}
+static void zap_cx_op(int64_t op, double ar, double ai, double br, double bi,
+                      double *rr, double *ri) {
+    switch (op) {
+    case 0: /* add */
+        *rr = ar + br;
+        *ri = ai + bi;
+        break;
+    case 1: /* sub */
+        *rr = ar - br;
+        *ri = ai - bi;
+        break;
+    case 2: /* mul */
+        *rr = ar * br - ai * bi;
+        *ri = ar * bi + ai * br;
+        break;
+    default: { /* div */
+        double den = br * br + bi * bi;
+        *rr = (ar * br + ai * bi) / den;
+        *ri = (ai * br - ar * bi) / den;
+    }
+    }
+}
+static ZapArray *zap_cx_alloc_like(const ZapArray *a, int64_t dtype) {
+    int64_t n = zap_array_count_of(a);
+    ZapArray *res = (ZapArray *)zap_array_new_nd(dtype, a->ndim, n);
+    for (int64_t k = 0; k < a->ndim; k++)
+        zap_array_set_dim(res, k, a->dims[k]);
+    return res;
+}
+static int zap_cx_same_shape(const ZapArray *a, const ZapArray *b) {
+    if (a->ndim != b->ndim)
+        return 0;
+    for (int64_t k = 0; k < a->ndim; k++)
+        if (a->dims[k] != b->dims[k])
+            return 0;
+    return 1;
+}
+/* array ⊗ array -> complex array; either operand may be a real dtype (promotes
+ * to complex) or complex. First cut: equal shapes only — the lowering's
+ * `zap_array_broadcast_check` has rejected rank/axis incompatibility, and this
+ * refuses an unequal (dim-stretch) shape rather than miscompute (complex
+ * broadcasting is a follow-up). op: 0 add, 1 sub, 2 mul, 3 div. */
+void *zap_array_cbinop(void *ap, void *bp, int64_t op) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    ZapArray *b = (ZapArray *)zap_array_contig(bp);
+    if (!zap_cx_same_shape(a, b))
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("complex array element-wise op requires equal "
+                                    "shapes (broadcasting is not supported yet)",
+                                    75));
+    int64_t n = zap_array_count_of(a);
+    ZapArray *res = zap_cx_alloc_like(a, DTYPE_COMPLEX);
+    for (int64_t i = 0; i < n; i++) {
+        double ar, ai, br, bi, rr, ri;
+        zap_cx_load(a, i, &ar, &ai);
+        zap_cx_load(b, i, &br, &bi);
+        zap_cx_op(op, ar, ai, br, bi, &rr, &ri);
+        zap_cx_store(res, i, rr, ri);
+    }
+    return res;
+}
+/* array ⊗ complex-scalar -> complex array. `scalar_lhs` computes `scalar op
+ * a[i]` (the non-commutative - and /); else `a[i] op scalar`. A real scalar is
+ * passed as a `ZapComplex` with a zero imaginary part by the lowering. */
+void *zap_array_cbinop_cs(void *ap, void *zp, int64_t op, int64_t scalar_lhs) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    const ZapComplex *z = (const ZapComplex *)zp;
+    int64_t n = zap_array_count_of(a);
+    ZapArray *res = zap_cx_alloc_like(a, DTYPE_COMPLEX);
+    for (int64_t i = 0; i < n; i++) {
+        double ar, ai, rr, ri;
+        zap_cx_load(a, i, &ar, &ai);
+        if (scalar_lhs)
+            zap_cx_op(op, z->re, z->im, ar, ai, &rr, &ri);
+        else
+            zap_cx_op(op, ar, ai, z->re, z->im, &rr, &ri);
+        zap_cx_store(res, i, rr, ri);
+    }
+    return res;
+}
+/* conj(a) -> complex array (negates the imaginary lane; a real input lifts to a
+ * complex array with a zero imaginary part). */
+void *zap_array_conj(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t n = zap_array_count_of(a);
+    ZapArray *res = zap_cx_alloc_like(a, DTYPE_COMPLEX);
+    for (int64_t i = 0; i < n; i++) {
+        double re, im;
+        zap_cx_load(a, i, &re, &im);
+        zap_cx_store(res, i, re, -im);
+    }
+    return res;
+}
+/* abs(a) -> f64 array of magnitudes sqrt(re^2 + im^2). */
+void *zap_array_cabs(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t n = zap_array_count_of(a);
+    ZapArray *res = zap_cx_alloc_like(a, DTYPE_F64);
+    for (int64_t i = 0; i < n; i++) {
+        double re, im;
+        zap_cx_load(a, i, &re, &im);
+        arr_store_f(res, i, sqrt(re * re + im * im));
+    }
+    return res;
+}
+/* -a (unary negation) -> complex array (negate both lanes; a real input lifts to
+ * complex with a zero imaginary part). */
+void *zap_array_cneg(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t n = zap_array_count_of(a);
+    ZapArray *res = zap_cx_alloc_like(a, DTYPE_COMPLEX);
+    for (int64_t i = 0; i < n; i++) {
+        double re, im;
+        zap_cx_load(a, i, &re, &im);
+        zap_cx_store(res, i, -re, -im);
+    }
+    return res;
+}
+/* Whole-array complex sum -> a complex scalar. */
+void *zap_array_sum_complex(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t n = zap_array_count_of(a);
+    double sr = 0.0, si = 0.0;
+    for (int64_t i = 0; i < n; i++) {
+        double re, im;
+        zap_cx_load(a, i, &re, &im);
+        sr += re;
+        si += im;
+    }
+    return zap_complex_new(sr, si);
 }
 /* bool reductions (#507): min/max/prod stay 0/1 (prod = logical "all"); mean is
  * the fraction of True, a float. Elements are normalized 0/1 bytes. */

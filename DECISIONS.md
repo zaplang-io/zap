@@ -9207,3 +9207,43 @@ This finishes the `numpy.linalg` surface for this epic (bar the complex-matrix
 `eig`). Relates to #928 / #512 (Phase 3 epic), #926/D-0183 + #927/D-0184 (the
 earlier linalg slices), #912/D-0179 (the seam), #904/D-0181 (matmul, for
 matrix_power).
+
+## D-0186 — the dense complex array dtype `array[complex]` (#938)
+**Status:** implemented
+A dense `complex128` array dtype, `array[complex]` (`Dtype::Complex`). Unblocks
+NumPy-shaped complex results in the numeric epic (#512) — `fft` (#929) and the
+eigenvectors of a general matrix (`linalg.eig`, #938's sibling gap). Chosen over
+the two stopgaps (a 1-D `list[complex]`, or interleaved real arrays) because the
+N-D complex array is the only representation that composes (fft2/fftn, complex
+`@`, element-wise spectra).
+- **Layout.** Each element is 16 bytes: two contiguous `f64` lanes (real, imag),
+  NumPy `complex128`. `elem_size` = 16, dtype code 11, suffix `complex`. Unlike
+  every scalar dtype a complex element is not a single SIMD lane, so it never
+  flows through the inline element-wise kernel or the generic get/set path.
+- **Runtime-routed.** The lowering routes every complex-array operation to a
+  dedicated `zap_array_*` runtime helper: `get_complex`/`set_complex` (a
+  stride-aware 2-lane slot; `a[i]` materialises a heap `ZapComplex`),
+  `cbinop`/`cbinop_cs` (element-wise `+`/`-`/`*`/`/`, op code 0/1/2/3, for
+  array⊗array and array⊗complex-scalar — a real scalar is boxed to a complex with
+  imag 0), `cneg` (unary neg), `conj`, `cabs` (→ f64 magnitudes), `sum_complex`.
+  `Dtype::storage_ty` for complex is a never-used placeholder; the codegen SIMD
+  kernel is untouched (it only ever sees scalar dtypes).
+- **Promotion.** `complex` dominates every real dtype (`Dtype::promote` /
+  `promote_scalar`): a real array / scalar against a complex one promotes to
+  complex. A real operand is read as `(value, 0)`.
+- **Construction.** `array[complex]([...])` from `complex` literals, or from real
+  / integer literals promoted to complex (imag 0), matching
+  `np.array([1, 2], dtype=complex)`.
+- **First-cut scope.** Element-wise ops require **equal shapes** (dim-stretch
+  broadcasting for complex arrays is a follow-up; the runtime refuses an unequal
+  shape rather than miscompute). `complex` is admitted as a **value** element and
+  an **array dtype**, not a dict/set key (a hashed complex key is a follow-up,
+  continuing the #928 element-kind rule). Whole-array min/max/prod/mean and the
+  `axis=` reductions are not defined for complex (sum is).
+- **Observed via indexing.** Arrays are not printed whole anywhere in the surface;
+  a complex array is observed through `a[i]` (a complex scalar, rendered
+  `(re±imj)`), `.abs()`, `sum`, and shape — so no array-of-complex Display path is
+  needed.
+Relates to #938 / #512 (Phase 3 epic), #928/D-0185 (the `list[complex]` element
+kind and the `eig`/fft complex dependency this lifts), #503/#890/D-0166 (the array
+dtype matrix this extends).
