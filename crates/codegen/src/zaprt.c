@@ -17043,6 +17043,13 @@ void zap_random_shuffle(void *l) {
  * xoshiro block (`zap_os_entropy_u64`), so both are in scope. */
 #include "zaprandom.inc.c"
 
+/* CPU-feature detection (#943, ISA-acceleration epic #139, D-0192). The shared
+ * bit-taxonomy header + the malloc-free, compute-once detector every future
+ * multiversioning resolver (#944) and arch intrinsic reads. Included here, after
+ * the string helpers (`zap_str_new` / `zap_sys_cstr`) its `sys.cpu_*` wrappers
+ * build on are in scope. */
+#include "zapcpu.inc.c"
+
 /* ===========================================================================
  * json — JSON tokenizer cursor (ticket #100 / #131, D-0059)
  *

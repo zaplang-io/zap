@@ -2,7 +2,7 @@
 
 use zapc_syntax::ast;
 
-use super::support::{call_ret, call_void, lower_args};
+use super::support::{call_bool, call_ret, call_void, lower_args};
 use super::ModuleLower;
 use crate::ir::*;
 use crate::lower::{FnLower, LowerError};
@@ -29,6 +29,11 @@ fn lower(
         "argv" => call_ret(lowerer, "zap_sys_argv", a, Ty::List(Elem::Ptr), false),
         "exit" => call_void(lowerer, "zap_sys_exit", a, false),
         "platform" => call_ret(lowerer, "zap_sys_platform", a, Ty::Ptr, false),
+        // CPU-feature introspection (#943, epic #139). `cpu_has(name)` returns a
+        // C int64 0/1 normalized to i1 via call_bool; the others are infallible.
+        "cpu_has" => call_bool(lowerer, "zap_sys_cpu_has", a),
+        "cpu_source" => call_ret(lowerer, "zap_sys_cpu_source", a, Ty::Ptr, false),
+        "cpu_sve_vl" => call_ret(lowerer, "zap_sys_cpu_sve_vl", a, Ty::I64, false),
         _ => return Ok(None),
     }))
 }

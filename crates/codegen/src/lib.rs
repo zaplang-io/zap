@@ -39,6 +39,10 @@ use zapc_syntax::ast::Module as AstModule;
 /// declarations live in `modules/<name>.rs`, grouped by module instead of a
 /// single hand-maintained `declare_rt` cluster, so new modules are conflict-free
 /// parallel-addable. See [`modules`] for the seam contract.
+/// CPU-feature taxonomy — the Rust mirror of `zap_cpu_features.h`, locked to the
+/// C header by an agreement test (#943, ISA-acceleration epic #139, D-0192).
+/// Consumed by the function-multiversioning cloner/resolvers (#944).
+pub mod cpu_features;
 mod modules;
 
 /// The REPL JIT engine (I#159): executes typed Zap incrementally in one
@@ -673,6 +677,15 @@ const RUNTIME_BLAS_C: &str = include_str!("zapblas.inc.c");
 /// compiled into the runtime like the rest of `random`.
 const RUNTIME_RANDOM_C: &str = include_str!("zaprandom.inc.c");
 const ZIGGURAT_H: &str = include_str!("ziggurat_constants.h");
+/// The `cpu_features` runtime detector (#943, ISA-acceleration epic #139,
+/// D-0192) and the shared feature-bit taxonomy header it `#include`s. Both are
+/// `#include`d unconditionally by `zaprt.c` and written next to it so the
+/// relative include resolves. The detector is malloc-free/reentrant (it may run
+/// in an ifunc resolver before libc init, #944) and process-lifetime-constant;
+/// the header is the single source of truth for the feature indices, mirrored in
+/// Rust by `crate::cpu_features` and locked by its agreement test.
+const RUNTIME_CPU_C: &str = include_str!("zapcpu.inc.c");
+const CPU_FEATURES_H: &str = include_str!("zap_cpu_features.h");
 /// The Windows x86_64 coroutine context switch (ticket #195 / A1): the asm
 /// backend for the `zap_ctx_swap`/`zap_ctx_make` seam, a separate translation
 /// unit so it links into the Windows program build AND compiles standalone in
@@ -1025,6 +1038,10 @@ pub fn build_executable(
         .map_err(|e| format!("failed to write random runtime: {e}"))?;
     std::fs::write(build_dir.join("ziggurat_constants.h"), ZIGGURAT_H)
         .map_err(|e| format!("failed to write ziggurat constants: {e}"))?;
+    std::fs::write(build_dir.join("zap_cpu_features.h"), CPU_FEATURES_H)
+        .map_err(|e| format!("failed to write cpu-features header: {e}"))?;
+    std::fs::write(build_dir.join("zapcpu.inc.c"), RUNTIME_CPU_C)
+        .map_err(|e| format!("failed to write cpu-features runtime: {e}"))?;
 
     // Target-aware link step (ticket #199, platform epic #158 / Area A5). Today
     // codegen emits for the host triple only, so "Windows target" means "running

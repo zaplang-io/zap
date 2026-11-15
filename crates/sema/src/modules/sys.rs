@@ -27,6 +27,21 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "sys", method, args, 0, span);
             Ty::Int64
         }
+        // CPU-feature introspection (#943, epic #139). Read-only, keyed by stable
+        // documented NAMES — the internal bit taxonomy and dispatch stay hidden
+        // (#920 c4). `cpu_has(name)` is false for an unknown or arch-foreign name.
+        "cpu_has" => {
+            expect_argc(checker, "sys", method, args, 1, span);
+            Ty::Bool
+        }
+        "cpu_source" => {
+            expect_argc(checker, "sys", method, args, 0, span);
+            Ty::Str
+        }
+        "cpu_sve_vl" => {
+            expect_argc(checker, "sys", method, args, 0, span);
+            Ty::Int64
+        }
         _ => return None,
     })
 }

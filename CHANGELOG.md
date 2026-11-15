@@ -25,6 +25,18 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`cpu_features` runtime detection** (#943, epic #139, D-0192). The shared
+  CPU-capability layer the ISA-acceleration facility (Discussion #920) is built
+  on: a malloc-free, compute-once, read-only `zap_cpu()` probe in the C runtime
+  (x86 CPUID **+ XCR0** gating, aarch64 Linux HWCAP + SVE VL, macOS sysctl,
+  Windows, baseline fallback) feeding a curated per-arch feature taxonomy whose
+  bit indices live in one shared header mirrored in Rust and locked by an
+  agreement test. Downgrade-only env overrides (`ZAP_CPU=generic`,
+  `ZAP_NO_AVX512`, `ZAP_DISABLE_CPU_FEATURES`) exercise the baseline path.
+  Programmer surface (**Experimental**): read-only `sys.cpu_has(name)` /
+  `sys.cpu_source()` / `sys.cpu_sve_vl()` keyed by stable feature names. Foundation
+  for function multiversioning (#944) and SIMD kernels (#945); dispatch stays
+  internal.
 - **Numeric-array searching / selection — own kernels** (#934, D-0191). Fifth
   Phase 3 track (#512): `searchsorted(a, v, side=)`, `unique(a, return_index=/
   return_inverse=/return_counts=)`, `argmin`/`argmax(a, axis=)` and `partition`/
