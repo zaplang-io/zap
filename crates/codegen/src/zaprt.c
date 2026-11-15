@@ -4571,7 +4571,7 @@ void zap_array_axis_check(void *ap, int64_t axis) {
  * rejected upstream (no total order here). ======================================= */
 
 /* total-order float compare: NaN greatest (to the end), -0.0 == +0.0. */
-static int zap_sort_fcmp(double x, double y) {
+static int zap_asort_fcmp(double x, double y) {
     if (x < y) return -1;
     if (x > y) return 1;
     int nx = isnan(x), ny = isnan(y);
@@ -4580,15 +4580,15 @@ static int zap_sort_fcmp(double x, double y) {
     if (ny) return -1;
     return 0;
 }
-static double zap_sort_rdf(const void *b, int64_t k, int64_t dt) {
+static double zap_asort_rdf(const void *b, int64_t k, int64_t dt) {
     return dt == DTYPE_F64 ? ((const double *)b)[k] : (double)((const float *)b)[k];
 }
 /* compare elements i,j of a contiguous typed lane buffer by dtype. */
-static int zap_sort_cmp(const void *b, int64_t i, int64_t j, int64_t dt) {
+static int zap_asort_cmp(const void *b, int64_t i, int64_t j, int64_t dt) {
     switch (dt) {
     case DTYPE_F64:
     case DTYPE_F32:
-        return zap_sort_fcmp(zap_sort_rdf(b, i, dt), zap_sort_rdf(b, j, dt));
+        return zap_asort_fcmp(zap_asort_rdf(b, i, dt), zap_asort_rdf(b, j, dt));
     case DTYPE_I64: {
         int64_t a = ((const int64_t *)b)[i], c = ((const int64_t *)b)[j];
         return a < c ? -1 : a > c ? 1 : 0;
@@ -4624,7 +4624,7 @@ static int zap_sort_cmp(const void *b, int64_t i, int64_t j, int64_t dt) {
     }
 }
 /* order-preserving uint64 radix key for an integer dtype element. */
-static uint64_t zap_sort_ikey(const void *b, int64_t k, int64_t dt) {
+static uint64_t zap_asort_ikey(const void *b, int64_t k, int64_t dt) {
     switch (dt) {
     case DTYPE_I64: return (uint64_t)((const int64_t *)b)[k] ^ 0x8000000000000000ULL;
     case DTYPE_I32: return (uint64_t)(int64_t)((const int32_t *)b)[k] ^ 0x8000000000000000ULL;
@@ -4636,63 +4636,63 @@ static uint64_t zap_sort_ikey(const void *b, int64_t k, int64_t dt) {
     default:        return ((const uint8_t *)b)[k]; /* U8 / BOOL */
     }
 }
-static void zap_sort_swap(int64_t *p, int64_t a, int64_t b) {
+static void zap_asort_swap(int64_t *p, int64_t a, int64_t b) {
     int64_t t = p[a]; p[a] = p[b]; p[b] = t;
 }
-static void zap_sort_insertion(int64_t *p, int64_t lo, int64_t hi, const void *b, int64_t dt) {
+static void zap_asort_insertion(int64_t *p, int64_t lo, int64_t hi, const void *b, int64_t dt) {
     for (int64_t i = lo + 1; i <= hi; i++) {
         int64_t v = p[i], j = i - 1;
-        while (j >= lo && zap_sort_cmp(b, p[j], v, dt) > 0) { p[j + 1] = p[j]; j--; }
+        while (j >= lo && zap_asort_cmp(b, p[j], v, dt) > 0) { p[j + 1] = p[j]; j--; }
         p[j + 1] = v;
     }
 }
-static void zap_sort_siftdown(int64_t *p, int64_t lo, int64_t n, int64_t i, const void *b, int64_t dt) {
+static void zap_asort_siftdown(int64_t *p, int64_t lo, int64_t n, int64_t i, const void *b, int64_t dt) {
     for (;;) {
         int64_t l = 2 * i + 1, r = l + 1, m = i;
-        if (l < n && zap_sort_cmp(b, p[lo + l], p[lo + m], dt) > 0) m = l;
-        if (r < n && zap_sort_cmp(b, p[lo + r], p[lo + m], dt) > 0) m = r;
+        if (l < n && zap_asort_cmp(b, p[lo + l], p[lo + m], dt) > 0) m = l;
+        if (r < n && zap_asort_cmp(b, p[lo + r], p[lo + m], dt) > 0) m = r;
         if (m == i) break;
-        zap_sort_swap(p, lo + i, lo + m);
+        zap_asort_swap(p, lo + i, lo + m);
         i = m;
     }
 }
-static void zap_sort_heap(int64_t *p, int64_t lo, int64_t hi, const void *b, int64_t dt) {
+static void zap_asort_heap(int64_t *p, int64_t lo, int64_t hi, const void *b, int64_t dt) {
     int64_t n = hi - lo + 1;
-    for (int64_t i = n / 2 - 1; i >= 0; i--) zap_sort_siftdown(p, lo, n, i, b, dt);
-    for (int64_t e = n - 1; e > 0; e--) { zap_sort_swap(p, lo, lo + e); zap_sort_siftdown(p, lo, e, 0, b, dt); }
+    for (int64_t i = n / 2 - 1; i >= 0; i--) zap_asort_siftdown(p, lo, n, i, b, dt);
+    for (int64_t e = n - 1; e > 0; e--) { zap_asort_swap(p, lo, lo + e); zap_asort_siftdown(p, lo, e, 0, b, dt); }
 }
 /* introsort on the index permutation p[lo..hi] (unstable). */
-static void zap_sort_intro(int64_t *p, int64_t lo, int64_t hi, int depth, const void *b, int64_t dt) {
+static void zap_asort_intro(int64_t *p, int64_t lo, int64_t hi, int depth, const void *b, int64_t dt) {
     while (hi - lo > 16) {
-        if (depth == 0) { zap_sort_heap(p, lo, hi, b, dt); return; }
+        if (depth == 0) { zap_asort_heap(p, lo, hi, b, dt); return; }
         depth--;
         int64_t mid = lo + (hi - lo) / 2;
-        if (zap_sort_cmp(b, p[mid], p[lo], dt) < 0) zap_sort_swap(p, lo, mid);
-        if (zap_sort_cmp(b, p[hi], p[lo], dt) < 0) zap_sort_swap(p, lo, hi);
-        if (zap_sort_cmp(b, p[hi], p[mid], dt) < 0) zap_sort_swap(p, mid, hi);
-        zap_sort_swap(p, mid, hi - 1);
+        if (zap_asort_cmp(b, p[mid], p[lo], dt) < 0) zap_asort_swap(p, lo, mid);
+        if (zap_asort_cmp(b, p[hi], p[lo], dt) < 0) zap_asort_swap(p, lo, hi);
+        if (zap_asort_cmp(b, p[hi], p[mid], dt) < 0) zap_asort_swap(p, mid, hi);
+        zap_asort_swap(p, mid, hi - 1);
         int64_t pivot = p[hi - 1], i = lo, j = hi - 1;
         for (;;) {
-            while (zap_sort_cmp(b, p[++i], pivot, dt) < 0) {}
-            while (zap_sort_cmp(b, pivot, p[--j], dt) < 0) {}
+            while (zap_asort_cmp(b, p[++i], pivot, dt) < 0) {}
+            while (zap_asort_cmp(b, pivot, p[--j], dt) < 0) {}
             if (i >= j) break;
-            zap_sort_swap(p, i, j);
+            zap_asort_swap(p, i, j);
         }
-        zap_sort_swap(p, i, hi - 1);
-        if (i - lo < hi - i) { zap_sort_intro(p, lo, i - 1, depth, b, dt); lo = i + 1; }
-        else { zap_sort_intro(p, i + 1, hi, depth, b, dt); hi = i - 1; }
+        zap_asort_swap(p, i, hi - 1);
+        if (i - lo < hi - i) { zap_asort_intro(p, lo, i - 1, depth, b, dt); lo = i + 1; }
+        else { zap_asort_intro(p, i + 1, hi, depth, b, dt); hi = i - 1; }
     }
-    zap_sort_insertion(p, lo, hi, b, dt);
+    zap_asort_insertion(p, lo, hi, b, dt);
 }
 /* stable bottom-up mergesort on the permutation p[0..n) by comparator. */
-static void zap_sort_merge(int64_t *p, int64_t n, const void *b, int64_t dt) {
+static void zap_asort_merge(int64_t *p, int64_t n, const void *b, int64_t dt) {
     int64_t *tmp = (int64_t *)malloc((size_t)n * sizeof(int64_t));
     for (int64_t w = 1; w < n; w *= 2)
         for (int64_t lo = 0; lo < n; lo += 2 * w) {
             int64_t mid = lo + w < n ? lo + w : n, hi = lo + 2 * w < n ? lo + 2 * w : n;
             int64_t i = lo, j = mid, k = lo;
             while (i < mid && j < hi) {
-                if (zap_sort_cmp(b, p[j], p[i], dt) < 0) tmp[k++] = p[j++];
+                if (zap_asort_cmp(b, p[j], p[i], dt) < 0) tmp[k++] = p[j++];
                 else tmp[k++] = p[i++];
             }
             while (i < mid) tmp[k++] = p[i++];
@@ -4702,9 +4702,9 @@ static void zap_sort_merge(int64_t *p, int64_t n, const void *b, int64_t dt) {
     free(tmp);
 }
 /* stable LSD radix on the permutation p[0..n) by uint64 integer key. */
-static void zap_sort_radix(int64_t *p, int64_t n, const void *b, int64_t dt) {
+static void zap_asort_radix(int64_t *p, int64_t n, const void *b, int64_t dt) {
     uint64_t *key = (uint64_t *)malloc((size_t)n * sizeof(uint64_t));
-    for (int64_t k = 0; k < n; k++) { p[k] = k; key[k] = zap_sort_ikey(b, k, dt); }
+    for (int64_t k = 0; k < n; k++) { p[k] = k; key[k] = zap_asort_ikey(b, k, dt); }
     int64_t *src = p, *dst = (int64_t *)malloc((size_t)n * sizeof(int64_t));
     for (int pass = 0; pass < 8; pass++) {
         int sh = pass * 8;
@@ -4721,20 +4721,20 @@ static void zap_sort_radix(int64_t *p, int64_t n, const void *b, int64_t dt) {
     free(key);
 }
 /* permutation of [0,L) that sorts the contiguous lane buffer `b`. */
-static void zap_sort_perm(int64_t *perm, const void *b, int64_t L, int64_t dt, int stable) {
+static void zap_asort_perm(int64_t *perm, const void *b, int64_t L, int64_t dt, int stable) {
     for (int64_t k = 0; k < L; k++) perm[k] = k;
     if (L < 2) return;
     if (!stable) {
         int depth = 2 * (63 - __builtin_clzll((unsigned long long)L));
-        zap_sort_intro(perm, 0, L - 1, depth, b, dt);
+        zap_asort_intro(perm, 0, L - 1, depth, b, dt);
     } else if (dt == DTYPE_F64 || dt == DTYPE_F32) {
-        zap_sort_merge(perm, L, b, dt);
+        zap_asort_merge(perm, L, b, dt);
     } else {
-        zap_sort_radix(perm, L, b, dt);
+        zap_asort_radix(perm, L, b, dt);
     }
 }
 /* physical element stride of `axis` (honours a view's explicit strides). */
-static int64_t zap_sort_axis_stride(const ZapArray *a, int64_t axis) {
+static int64_t zap_asort_axis_stride(const ZapArray *a, int64_t axis) {
     if (a->strides) return a->strides[axis];
     int64_t s = 1;
     for (int64_t k = axis + 1; k < a->ndim; k++) s *= a->dims[k];
@@ -4747,7 +4747,7 @@ static int64_t zap_sort_axis_stride(const ZapArray *a, int64_t axis) {
  * applied to `a`'s elements in place (stride-aware, so a view aliases its
  * parent). Lanes are gathered into a contiguous buffer so the kernels stay
  * contiguous. */
-static void zap_sort_run(ZapArray *a, int64_t axis, int flatten, int stable, ZapArray *out) {
+static void zap_asort_run(ZapArray *a, int64_t axis, int flatten, int stable, ZapArray *out) {
     int64_t dt = a->dtype;
     size_t esz = zap_array_elem_size(dt);
     int64_t count = zap_array_count_of(a);
@@ -4761,7 +4761,7 @@ static void zap_sort_run(ZapArray *a, int64_t axis, int flatten, int stable, Zap
         for (int64_t f = 0; f < count; f++)
             memcpy(lane + (size_t)f * esz, adata + (size_t)zap_array_phys_nd(a, f) * esz, esz);
         int64_t *perm = (int64_t *)malloc((size_t)count * sizeof(int64_t));
-        zap_sort_perm(perm, lane, count, dt, stable);
+        zap_asort_perm(perm, lane, count, dt, stable);
         if (out) {
             int64_t *od = (int64_t *)out->data;
             for (int64_t k = 0; k < count; k++) od[k] = perm[k];
@@ -4780,25 +4780,25 @@ static void zap_sort_run(ZapArray *a, int64_t axis, int flatten, int stable, Zap
         return;
     }
     int64_t L = a->dims[axis];
-    int64_t sax = zap_sort_axis_stride(a, axis);
+    int64_t sax = zap_asort_axis_stride(a, axis);
     int64_t nlanes = L ? count / L : 0;
     char *lane = (char *)malloc((size_t)L * esz);
     int64_t *perm = (int64_t *)malloc((size_t)L * sizeof(int64_t));
     int64_t nd = a->ndim;
     /* Odometer over every axis except `axis`, giving each lane's physical base. */
     int64_t *idx = (int64_t *)calloc((size_t)nd, sizeof(int64_t));
-    int64_t osax = out ? zap_sort_axis_stride(out, axis) : 0;
+    int64_t osax = out ? zap_asort_axis_stride(out, axis) : 0;
     for (int64_t ln = 0; ln < nlanes; ln++) {
         int64_t base = a->off;
         for (int64_t k = 0; k < nd; k++)
-            if (k != axis) base += idx[k] * zap_sort_axis_stride(a, k);
+            if (k != axis) base += idx[k] * zap_asort_axis_stride(a, k);
         for (int64_t m = 0; m < L; m++)
             memcpy(lane + (size_t)m * esz, adata + (size_t)(base + m * sax) * esz, esz);
-        zap_sort_perm(perm, lane, L, dt, stable);
+        zap_asort_perm(perm, lane, L, dt, stable);
         if (out) {
             int64_t obase = out->off;
             for (int64_t k = 0; k < nd; k++)
-                if (k != axis) obase += idx[k] * zap_sort_axis_stride(out, k);
+                if (k != axis) obase += idx[k] * zap_asort_axis_stride(out, k);
             int64_t *od = (int64_t *)out->data;
             for (int64_t m = 0; m < L; m++) od[obase + m * osax] = perm[m];
         } else {
@@ -4822,7 +4822,7 @@ static void zap_sort_run(ZapArray *a, int64_t axis, int flatten, int stable, Zap
 void zap_array_sort_inplace(void *ap, int64_t axis, int64_t stable) {
     ZapArray *a = (ZapArray *)ap;
     int64_t ax = zap_array_axis_norm(axis, a->ndim);
-    zap_sort_run(a, ax, 0, (int)stable, NULL);
+    zap_asort_run(a, ax, 0, (int)stable, NULL);
 }
 /* `sort(a, axis=-1|None, kind=)` — a new sorted copy. `flatten` (axis=None)
  * sorts the flattened array into a 1-D result; otherwise same shape along `axis`. */
@@ -4835,7 +4835,7 @@ void *zap_array_sorted(void *ap, int64_t axis, int64_t flatten, int64_t stable) 
         for (int64_t f = 0; f < count; f++)
             memcpy((char *)res->data + (size_t)f * esz,
                    (char *)a->data + (size_t)zap_array_phys_nd(a, f) * esz, esz);
-        zap_sort_run(res, 0, 0, (int)stable, NULL);
+        zap_asort_run(res, 0, 0, (int)stable, NULL);
         return res;
     }
     int64_t ax = zap_array_axis_norm(axis, a->ndim);
@@ -4846,7 +4846,7 @@ void *zap_array_sorted(void *ap, int64_t axis, int64_t flatten, int64_t stable) 
     for (int64_t f = 0; f < count; f++)
         memcpy((char *)res->data + (size_t)f * esz,
                (char *)a->data + (size_t)zap_array_phys_nd(a, f) * esz, esz);
-    zap_sort_run(res, ax, 0, (int)stable, NULL);
+    zap_asort_run(res, ax, 0, (int)stable, NULL);
     return res;
 }
 /* `argsort(a, axis=-1|None, kind=)` / `a.argsort(...)` — a new i64 index array
@@ -4856,13 +4856,13 @@ void *zap_array_argsort(void *ap, int64_t axis, int64_t flatten, int64_t stable)
     int64_t count = zap_array_count_of(a);
     if (flatten) {
         ZapArray *out = (ZapArray *)zap_array_new(DTYPE_I64, count);
-        zap_sort_run(a, 0, 1, (int)stable, out);
+        zap_asort_run(a, 0, 1, (int)stable, out);
         return out;
     }
     int64_t ax = zap_array_axis_norm(axis, a->ndim);
     ZapArray *out = (ZapArray *)zap_array_new_nd(DTYPE_I64, a->ndim, count);
     for (int64_t k = 0; k < a->ndim; k++) zap_array_set_dim(out, k, a->dims[k]);
-    zap_sort_run(a, ax, 0, (int)stable, out);
+    zap_asort_run(a, ax, 0, (int)stable, out);
     return out;
 }
 
