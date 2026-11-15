@@ -1462,6 +1462,17 @@ element-wise. In this first increment complex element-wise ops require equal
 shapes (dim-stretch broadcasting is a follow-up), and the per-axis reductions and
 `min`/`max`/`prod`/`mean` are real-only.
 
+`import fft` provides fast Fourier transforms over numeric arrays (#929), backed
+by vendored PocketFFT (the transform NumPy/SciPy use; arbitrary sizes), matching
+`numpy.fft`. `fft(a)`/`ifft(a)` transform the last axis, `fft2`/`ifft2` the last
+two, and `fftn`/`ifftn` all axes, each returning an `array[complex]`; `rfft(a)`
+returns the complex half spectrum of a real 1-D signal and `irfft(a, n=…)` the
+inverse real signal; `fftfreq(n, d=…)` / `rfftfreq(n, d=…)` return the `f64`
+sample frequencies. An optional `norm=` (`"backward"` default, `"ortho"`,
+`"forward"`) sets the normalization. Results match NumPy within floating-point
+tolerance; a bad shape, or a build without the FFT backend, raises a catchable
+`ValueError`.
+
 The `@` operator (PEP 465) and `dot(a, b)` are matrix multiplication on 1-D and
 2-D arrays: 1-D · 1-D is a scalar dot product, 2-D · 2-D a matrix product, and a
 mixed 1-D/2-D operand is promoted to a row/column with its singleton axis

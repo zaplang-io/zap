@@ -24,6 +24,7 @@ mod concurrent;
 mod crypto;
 mod datetime;
 mod deque;
+mod fft;
 mod fs;
 mod gc;
 mod gzip;
@@ -83,6 +84,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     base64::MODULE,
     hex::MODULE,
     math::MODULE,
+    fft::MODULE,
     linalg::MODULE,
     random::MODULE,
     time::MODULE,

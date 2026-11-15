@@ -26,6 +26,10 @@ fn main() {
         "src/zap_win_a3.c",
         "src/zap_np_iocp.c",
         "src/zap_np_iocp.h",
+        // FFT backend (#929): the C++ wrapper and the vendored PocketFFT header
+        // it includes, both embedded and written out at compile time.
+        "src/zapfft.cpp",
+        "../../third_party/pocketfft/pocketfft_hdronly.h",
     ];
     for f in EMBEDDED_RUNTIME_FILES {
         println!("cargo:rerun-if-changed={f}");
