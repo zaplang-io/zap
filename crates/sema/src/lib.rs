@@ -468,6 +468,8 @@ const BUILTINS: &[&str] = &[
     "concatenate",
     "stack",
     "where",
+    "sort",
+    "argsort",
     "sorted",
     // String / char builtins (ticket #284, D-0025).
     "ord",
@@ -6212,6 +6214,15 @@ impl Checker {
                     // where(cond, x, y) selects element-wise; where(cond) returns
                     // a tuple of index arrays (#510). Arrays type loosely, so the
                     // result is loose; the lowering derives the real shape/tuple.
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                    return Ty::Unknown;
+                }
+                "sort" | "argsort" => {
+                    // Array sort/argsort (#932): a new sorted array / i64 index
+                    // array. Arrays type loosely, so the result is loose; the
+                    // lowering derives the real dtype/rank and rejects non-arrays.
                     for a in args {
                         self.infer(&a.value);
                     }

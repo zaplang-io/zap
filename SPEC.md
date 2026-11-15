@@ -1492,6 +1492,18 @@ operations are free functions on the handle rather than methods: `random.random
 for poisson/binomial, Floyd sampling for `choice`), with the ziggurat tables
 vendored from NumPy (BSD-3).
 
+Numeric arrays sort with `a.sort()` / `sort(a)` and `a.argsort()` / `argsort(a)`
+(#932), matching `numpy.sort` / `numpy.argsort` (this is the array sort, not
+`list.sort`). `a.sort()` sorts in place (returning nothing); `sort(a)` returns a
+sorted copy; `argsort` returns an `array[i64]` of indices. An `axis=` keyword
+selects the axis (default the last; `None` flattens to a 1-D result), and a
+`kind=` keyword chooses the algorithm: the default is an **unstable** own
+introsort (`"quicksort"` / `"heapsort"`), and `"stable"` / `"mergesort"` select a
+**stable** sort (LSD radix for integer dtypes, mergesort for floats). NaNs sort
+to the end and `-0.0 == +0.0`. The sorted values match NumPy for any kind; the
+argsort index order among equal keys matches NumPy only for the stable kind
+(ties keep input order). Complex arrays have no ordering and are rejected.
+
 The `@` operator (PEP 465) and `dot(a, b)` are matrix multiplication on 1-D and
 2-D arrays: 1-D · 1-D is a scalar dot product, 2-D · 2-D a matrix product, and a
 mixed 1-D/2-D operand is promoted to a row/column with its singleton axis

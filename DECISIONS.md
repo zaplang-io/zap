@@ -9360,3 +9360,42 @@ so this is a durable contract.
   vendored but unused) and `g.method()` method sugar are follow-ups.
 Relates to #930 / #931 / #512 (Phase 3 epic), D-0056 (the pre-existing xoshiro
 `random`), D-0164 (N-D arrays the `size=` results use).
+
+## D-0190 — numeric-array `sort` / `argsort`: own floor + stable/unstable kind (#932)
+**Status:** implemented
+NumPy-compatible sort over unboxed numeric arrays (NOT `list.sort`, the boxed
+general path, which is unchanged). The **own floor** (always linked, the
+`native` tier); the SIMD accelerator (#933) is a separate ceiling.
+- **Surface (NumPy semantics).** `a.sort(axis=-1, kind=)` sorts **in place**
+  (returns nothing); `sort(a, axis=-1|None, kind=)` returns a **sorted copy**;
+  `a.argsort(...)` / `argsort(a, ...)` return a new **`array[i64]`** of indices.
+  `a.sort()` is a method; `sort(a)`/`argsort(a)` are builtins (like
+  `where`/`concatenate`), distinct from the `sorted()` list builtin. `axis=`
+  defaults to the last axis and sorts each 1-D lane; `axis=None` sorts the
+  flattened array into a 1-D result (not allowed for the in-place `a.sort()`,
+  matching NumPy).
+- **`kind` — the stable/unstable contract (recorded per the issue).** The
+  default is **unstable** (own introsort: median-of-3 quicksort with a heapsort
+  depth guard and an insertion-sort base case; `kind="quicksort"`/`"heapsort"`).
+  `kind="stable"` / `kind="mergesort"` selects the **stable** floor: an **LSD
+  radix** for integer dtypes (order-preserving uint64 key, sign bit flipped) and
+  a **bottom-up mergesort** for floats. Sorted **values** match NumPy for every
+  kind (a sorted array is a sorted array); **argsort tie-order** matches NumPy
+  only for the **stable** kind (ties keep input order) — an unstable argsort's
+  order among equal keys is unspecified and need not match NumPy. (Radix for the
+  int-stable value path is implemented now per the issue; a SIMD-accelerated
+  unstable path is #933.)
+- **NaN / signed zero.** NaNs sort to the **end** and compare equal to each
+  other; `-0.0 == +0.0` (both NumPy's order). The comparator is a total order
+  with NaN greatest; ties resolve by stability.
+- **Implementation.** A unified core computes a permutation of each 1-D lane
+  (introsort / radix / mergesort over an index array); value sort applies the
+  permutation (gather), argsort emits it. Lanes are gathered **stride-aware**, so
+  a slice view sorts correctly and the in-place form aliases its parent. Dtype-
+  generic over the full numeric matrix (f64/f32, signed/unsigned int widths,
+  bool); **complex is rejected** (no total order). The kernels were verified
+  bit-for-bit against NumPy host-side (`zaprt.c` `zap_array_sort_*`).
+Relates to #932 / #512 (Phase 3 epic), D-0164 (N-D arrays / axis), D-0167
+(the array dtype matrix). The SIMD sort accelerator (#933, behind the Discussion
+#920 dispatch facility) and searching/selection — `searchsorted` / `unique` /
+`partition` / `argmin` / `argmax` (#934) — build on this floor.
