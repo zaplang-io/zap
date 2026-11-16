@@ -67,6 +67,233 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("http", "req_body", &["req"]),
     ("http", "req_version", &["req"]),
     ("http", "respond", &["conn", "status", "body", "headers"]),
+    // ---- datetime (ticket #99/#338): timestamp conversions + format/parse ----
+    ("datetime", "from_timestamp", &["timestamp"]),
+    ("datetime", "from_timestamp_local", &["timestamp"]),
+    ("datetime", "to_timestamp", &["dt"]),
+    // `format(dt)` is ISO-8601; `format(dt, fmt)` is the strftime overload — so
+    // `fmt` is the trailing optional.
+    ("datetime", "format", &["dt", "fmt"]),
+    ("datetime", "strftime", &["dt", "fmt"]),
+    ("datetime", "parse", &["s"]),
+    ("datetime", "strptime", &["s", "fmt"]),
+    // ---- random (ticket #98): only the non-numpy-overloaded verbs ----
+    // `random`/`uniform`/`choice`/`shuffle` are overloaded with the NumPy
+    // `Generator` surface (a distinct second signature keyed on an arg-0
+    // `Generator` handle); a single module-form row cannot represent both and
+    // would wrongly reject a NumPy keyword call, so they are deferred until the
+    // registry grows a per-overload model. `seed`/`randint` are unambiguous.
+    ("random", "seed", &["n"]),
+    ("random", "randint", &["a", "b"]),
+    // ---- base64 / hex / hash (tickets #337/#106): single data argument ----
+    ("base64", "encode", &["data"]),
+    ("base64", "encode_nopad", &["data"]),
+    ("base64", "urlsafe_encode", &["data"]),
+    ("base64", "urlsafe_encode_nopad", &["data"]),
+    ("base64", "decode", &["data"]),
+    ("base64", "urlsafe_decode", &["data"]),
+    ("hex", "encode", &["data"]),
+    ("hex", "decode", &["data"]),
+    ("hash", "crc32c", &["data"]),
+    // ---- json / yaml (tickets #100/#149): serialize / deserialize ----
+    // Only the public surface; the `_`-prefixed lexer/encoder helpers are
+    // internal and keep the legacy positional path.
+    ("json", "loads", &["s"]),
+    ("json", "scan", &["s"]),
+    ("json", "dumps", &["v"]),
+    ("yaml", "load", &["s"]),
+    ("yaml", "dump", &["v"]),
+    // ---- logging (ticket #101): level-tagged record emitters ----
+    ("logging", "debug", &["msg"]),
+    ("logging", "info", &["msg"]),
+    ("logging", "warning", &["msg"]),
+    ("logging", "error", &["msg"]),
+    ("logging", "critical", &["msg"]),
+    ("logging", "log", &["level", "msg"]),
+    ("logging", "set_level", &["level"]),
+    ("logging", "set_stream", &["stream"]),
+    ("logging", "set_format", &["fmt"]),
+    // ---- crypto (tickets #105/#762): KDFs + AEAD + constant-time compare ----
+    // Parameter names and the trailing optionals are taken verbatim from each
+    // function's own signature (its arity-error message), so they match the
+    // documented surface; `dklen`/`salt`/`info`/`aad` are the trailing optionals.
+    (
+        "crypto",
+        "pbkdf2_hmac",
+        &["hash_name", "password", "salt", "iterations", "dklen"],
+    ),
+    (
+        "crypto",
+        "scrypt",
+        &["password", "salt", "n", "r", "p", "dklen"],
+    ),
+    (
+        "crypto",
+        "hkdf",
+        &["hash_name", "ikm", "length", "salt", "info"],
+    ),
+    ("crypto", "constant_time_eq", &["a", "b"]),
+    (
+        "crypto",
+        "aes256gcm_encrypt",
+        &["key", "nonce", "data", "aad"],
+    ),
+    (
+        "crypto",
+        "aes256gcm_decrypt",
+        &["key", "nonce", "data", "aad"],
+    ),
+    (
+        "crypto",
+        "chacha20poly1305_encrypt",
+        &["key", "nonce", "data", "aad"],
+    ),
+    (
+        "crypto",
+        "chacha20poly1305_decrypt",
+        &["key", "nonce", "data", "aad"],
+    ),
+    // ---- os (ticket #97): environment + filesystem path helpers ----
+    // (getpid/getcwd take no args, so no row.) These keyword names are newly
+    // introduced (the seam checker used positional arity only) — reviewable.
+    ("os", "getenv", &["name"]),
+    ("os", "hasenv", &["name"]),
+    ("os", "setenv", &["name", "value"]),
+    ("os", "chdir", &["path"]),
+    ("os", "mkdir", &["path"]),
+    ("os", "remove", &["path"]),
+    ("os", "rmdir", &["path"]),
+    ("os", "listdir", &["path"]),
+    ("os", "path_join", &["a", "b"]),
+    ("os", "path_exists", &["path"]),
+    ("os", "path_basename", &["path"]),
+    ("os", "path_dirname", &["path"]),
+    // ---- fs (ticket #97): file read/write + stat ----
+    // (mkdtemp takes no args, so no row.)
+    ("fs", "read_file", &["path"]),
+    ("fs", "write_file", &["path", "data"]),
+    ("fs", "exists", &["path"]),
+    ("fs", "is_dir", &["path"]),
+    ("fs", "is_file", &["path"]),
+    ("fs", "size", &["path"]),
+    ("fs", "listdir", &["path"]),
+    // ---- time (ticket #99): sleeps + Duration constructors/accessors ----
+    // (monotonic/monotonic_ns/time/time_ns take no args, so no row.)
+    ("time", "sleep", &["seconds"]),
+    ("time", "sleep_ns", &["ns"]),
+    ("time", "seconds", &["n"]),
+    ("time", "millis", &["n"]),
+    ("time", "micros", &["n"]),
+    ("time", "nanos", &["n"]),
+    ("time", "to_seconds", &["d"]),
+    ("time", "to_millis", &["d"]),
+    ("time", "to_micros", &["d"]),
+    // ---- process (ticket #97) ----
+    ("process", "run", &["cmd"]),
+    // ---- sys (ticket #97): the single-argument verbs (argv/platform/*_fd/
+    // cpu_source/cpu_sve_vl take no args, so no row) ----
+    ("sys", "exit", &["code"]),
+    ("sys", "cpu_has", &["name"]),
+    // ---- url (ticket #335): percent-encoding + query builders ----
+    ("url", "quote", &["s"]),
+    ("url", "quote_path", &["s"]),
+    ("url", "unquote", &["s"]),
+    ("url", "unquote_plus", &["s"]),
+    ("url", "encode_query", &["d"]),
+    ("url", "canonical_query", &["d"]),
+    // ---- io (ticket #97): raw fd I/O ----
+    ("io", "open", &["path", "mode"]),
+    ("io", "read", &["fd", "n"]),
+    ("io", "write", &["fd", "data"]),
+    ("io", "close_fd", &["fd"]),
+    // ---- signal (ticket #77): subscribe to a Signal ----
+    ("signal", "notify", &["sig"]),
+    // ---- math (ticket #98): scalar transcendentals + 2/3-arg forms ----
+    // The 1-arg funcs each take `x` (a scalar, or element-wise over an array —
+    // same arity/param, so one row covers both). gc/runtime take no args.
+    ("math", "sqrt", &["x"]),
+    ("math", "exp", &["x"]),
+    ("math", "log", &["x"]),
+    ("math", "log2", &["x"]),
+    ("math", "log10", &["x"]),
+    ("math", "sin", &["x"]),
+    ("math", "cos", &["x"]),
+    ("math", "tan", &["x"]),
+    ("math", "asin", &["x"]),
+    ("math", "acos", &["x"]),
+    ("math", "atan", &["x"]),
+    ("math", "floor", &["x"]),
+    ("math", "ceil", &["x"]),
+    ("math", "round", &["x"]),
+    ("math", "trunc", &["x"]),
+    ("math", "fabs", &["x"]),
+    ("math", "isnan", &["x"]),
+    ("math", "isinf", &["x"]),
+    ("math", "pow", &["x", "y"]),
+    ("math", "atan2", &["y", "x"]), // Python order: atan2(y, x)
+    ("math", "hypot", &["x", "y"]),
+    ("math", "fmod", &["x", "y"]),
+    ("math", "fma", &["x", "y", "z"]),
+    // ---- net (ticket #104): plaintext TCP over opaque socket handles ----
+    // (connect_ip_deadline is left on the legacy path pending a settled name
+    // for its deadline parameter.)
+    ("net", "listen", &["host", "port"]),
+    ("net", "connect", &["host", "port"]),
+    ("net", "accept", &["listener"]),
+    ("net", "recv", &["conn", "n"]),
+    ("net", "send", &["conn", "data"]),
+    ("net", "port", &["listener"]),
+    ("net", "set_deadline_ns", &["conn", "ns"]),
+    ("net", "set_read_timeout", &["conn", "ms"]),
+    ("net", "set_read_deadline", &["conn", "ms"]),
+    ("net", "close_conn", &["conn"]),
+    ("net", "close_listener", &["listener"]),
+    // ---- linalg (tickets #926-#928): LAPACK-backed linear algebra (NumPy names) ----
+    ("linalg", "solve", &["a", "b"]),
+    ("linalg", "inv", &["a"]),
+    ("linalg", "det", &["a"]),
+    ("linalg", "cholesky", &["a"]),
+    ("linalg", "qr", &["a"]),
+    ("linalg", "svd", &["a"]),
+    ("linalg", "eigvals", &["a"]),
+    ("linalg", "eig", &["a"]),
+    ("linalg", "eigh", &["a"]),
+    ("linalg", "eigvalsh", &["a"]),
+    ("linalg", "lstsq", &["a", "b"]),
+    ("linalg", "pinv", &["a"]),
+    ("linalg", "matrix_power", &["a", "n"]),
+    ("linalg", "norm", &["x", "ord"]),
+    // ---- tls (tickets #147/#488/#560): client/server TLS; ctx/capath/keyfile ----
+    // optional trailing (Python `ssl` names; host/port/conn/n/data as in `net`).
+    ("tls", "connect", &["host", "port", "ctx"]),
+    ("tls", "connect_insecure", &["host", "port"]),
+    ("tls", "load_verify_locations", &["ctx", "cafile", "capath"]),
+    ("tls", "load_cert_chain", &["ctx", "certfile", "keyfile"]),
+    ("tls", "listen", &["host", "port", "cert_path", "key_path"]),
+    ("tls", "recv", &["conn", "n"]),
+    ("tls", "send", &["conn", "data"]),
+    // ---- argparse (ticket #101): global singleton parser; `default` trailing ----
+    ("argparse", "set_prog", &["prog"]),
+    ("argparse", "set_description", &["description"]),
+    ("argparse", "add_flag", &["name"]),
+    ("argparse", "add_positional", &["name"]),
+    ("argparse", "add_option", &["name", "default"]),
+    ("argparse", "add_int", &["name", "default"]),
+    ("argparse", "parse", &["argv"]),
+    ("argparse", "get", &["name"]),
+    ("argparse", "get_int", &["name"]),
+    ("argparse", "get_flag", &["name"]),
+    // ---- xml (ticket #351): DOM parse / serialize / construct ----
+    ("xml", "parse", &["s"]),
+    ("xml", "dumps", &["e"]),
+    ("xml", "element", &["name"]),
+    // ---- concurrent (ticket #184): lock-free Counter; `start` optional ----
+    ("concurrent", "Counter", &["start"]),
+    // ---- bisect (ticket #102): binary search over a sorted list (Python names) ----
+    ("bisect", "bisect_left", &["a", "x"]),
+    ("bisect", "bisect_right", &["a", "x"]),
+    ("bisect", "insort_left", &["a", "x"]),
+    ("bisect", "insort_right", &["a", "x"]),
 ];
 
 /// The declared positional parameter names of a seam method, or `None` when the
