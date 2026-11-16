@@ -12233,15 +12233,15 @@ typedef struct {
     uint64_t sendval;
 } ZapSelCase;
 
-/* Cheap per-thread PRNG for case fairness (scheduling, not security). */
-static uint64_t sel_rng(void) {
-    static __thread uint64_t s = 0;
-    if (s == 0) {
-        s = (uint64_t)(uintptr_t)&s * 0x9e3779b97f4a7c15ull + 1;
-    }
+/* Cheap xorshift PRNG for case fairness (scheduling, not security). The state
+ * is a caller-owned stack local — never a `static`/`__thread`, which a migrating
+ * coroutine could carry to the wrong OS thread (I#891). */
+static uint64_t sel_rng_next(uint64_t *state) {
+    uint64_t s = *state;
     s ^= s << 13;
     s ^= s >> 7;
     s ^= s << 17;
+    *state = s;
     return s;
 }
 
@@ -12358,9 +12358,12 @@ int64_t zap_select(uint64_t *outval, int64_t *outok, int64_t n, int64_t has_defa
     for (int64_t i = 0; i < n; i++) {
         order[i] = (int)i;
     }
+    /* Seed the shuffle from stack + coroutine identity — varied per call, no
+     * static state to migrate across OS threads (I#891). */
+    uint64_t rng = ((uint64_t)(uintptr_t)order ^ ((uint64_t)(uintptr_t)from * 0x9e3779b97f4a7c15ull)) | 1;
     for (int64_t i = n; i > 1;) {
         i--;
-        int j = (int)(sel_rng() % (uint64_t)(i + 1));
+        int j = (int)(sel_rng_next(&rng) % (uint64_t)(i + 1));
         int t = order[i];
         order[i] = order[j];
         order[j] = t;
