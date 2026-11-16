@@ -13,6 +13,7 @@ pub mod genanalysis;
 pub mod lexer;
 pub mod parser;
 pub mod seam;
+pub mod seam_sigs;
 pub mod span;
 pub mod token;
 pub mod trivia;

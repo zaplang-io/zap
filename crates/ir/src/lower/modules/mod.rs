@@ -142,7 +142,21 @@ pub(super) fn lower_builtin_module_call(
     args: &[ast::Arg],
 ) -> Result<Option<(Value, Ty)>, LowerError> {
     match MODULES.iter().find(|m| m.name == module) {
-        Some(desc) => (desc.lower)(lowerer, method, args),
+        Some(desc) => {
+            // Seam calling convention (#998, D-0204): reorder keyword arguments
+            // into declared positional order (from the shared signature
+            // registry) so the per-method lowering, which reads positionally,
+            // emits the runtime call with arguments in the right slots. Sema has
+            // already validated the binding; this is a pure reorder. A method
+            // with no registry row keeps legacy positional behavior.
+            match zapc_syntax::seam_sigs::seam_method_params(module, method) {
+                Some(params) => {
+                    let reordered = reorder_seam_args(params, args);
+                    (desc.lower)(lowerer, method, &reordered)
+                }
+                None => (desc.lower)(lowerer, method, args),
+            }
+        }
         None => Ok(None),
     }
 }

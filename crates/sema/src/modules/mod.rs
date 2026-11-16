@@ -151,6 +151,19 @@ pub(crate) fn check_builtin_module_call(
     span: Span,
 ) -> Option<Ty> {
     let desc = MODULES.iter().find(|m| m.name == module)?;
+    // Seam calling convention (#998, D-0204): if this method has a declared
+    // signature in the registry, bind keyword arguments by name (reorder, fill
+    // omitted trailing optionals, reject an unknown keyword with ZAP4023) and
+    // hand the per-method checker the arguments normalized to positional order.
+    // A method with no row keeps the legacy positional-only behavior.
+    let bound;
+    let args = match zapc_syntax::seam_sigs::seam_method_params(module, method) {
+        Some(params) => {
+            bound = bind_seam_args(checker, module, method, params, args, span);
+            &bound[..]
+        }
+        None => args,
+    };
     Some(
         (desc.check)(checker, method, args, span).unwrap_or_else(|| {
             checker.error(

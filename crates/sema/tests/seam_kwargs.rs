@@ -156,3 +156,49 @@ fn wrong_type_keyword_still_type_checks() {
         "ZAP4024",
     );
 }
+
+// ---------------------------------------------------------------------------
+// The framework generalizes: `http` is driven by the same central registry
+// (#998, D-0204). The client verbs' optional trailing `headers` dict is the
+// former "n or n+1 args" overload, now a named optional parameter.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn http_get_keyword_headers() {
+    assert_ok(&prog(
+        "    auto h = {\"a\": \"b\"}\n    auto r = http.get(\"http://x\", headers=h)\n",
+    ));
+}
+
+#[test]
+fn http_get_url_by_name_headers_omitted() {
+    assert_ok(&prog("    auto r = http.get(url=\"http://x\")\n"));
+}
+
+#[test]
+fn http_get_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto r = http.get(\"http://x\", timeout=5)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn http_post_reordered_keywords() {
+    assert_ok(&prog(
+        "    auto r = http.post(body=\"n=zap\", url=\"http://x\")\n",
+    ));
+}
+
+#[test]
+fn http_request_keywords_and_optional_headers() {
+    assert_ok(&prog(
+        "    auto h = {\"a\": \"b\"}\n    auto r = http.request(method=\"GET\", url=\"http://x\", body=\"\", headers=h)\n",
+    ));
+}
+
+#[test]
+fn http_positional_calls_unchanged() {
+    assert_ok(&prog("    auto r = http.get(\"http://x\")\n"));
+    assert_ok(&prog("    auto r = http.post(\"http://x\", \"n=zap\")\n"));
+}

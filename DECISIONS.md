@@ -10176,3 +10176,75 @@ byte-identically to the positional form.
 Relates to epic #967 (language gaps), Discussion #965 (language-feature §, L-5),
 #298/#481 (user-fn defaults & keyword args), #601 (`**kwargs`), and the #966
 stdlib redesign.
+
+## D-0204 — seam calling convention as a framework: a shared signature registry (`zapc_syntax::seam_sigs`) + central binding (#998 / epic #967)
+
+**Builds on D-0203.** D-0203 shipped the seam keyword/default binder and proved
+it on one method by calling it *inside* `zlib`'s `check_compress`. This decision
+generalizes that into a framework so **every** seam method can opt in with a
+single line of data, keeping the per-method code pure. Design doc:
+`design/0037-seam-calling-convention.md`.
+
+**Decision.** The declared parameter names of seam methods live in **one shared
+registry**, `zapc_syntax::seam_sigs` (its own file), consulted centrally by both
+facets:
+
+- **Registry.** `SEAM_METHOD_SIGS: &[(module, method, &[param_name])]` with a
+  `seam_method_params(module, method)` lookup. It is kept **separate** from the
+  per-module check/lower `.rs` files (which stay pure type/arity logic) and from
+  `zapc_syntax::seam` (the unrelated generic-construction sugar of D-0202). It
+  lives in `zapc_syntax` because both `zapc_sema` and `zapc_ir` depend on it and
+  neither depends on the other — the same twin-facet home D-0202 established.
+- **Sema.** `modules::check_builtin_module_call` looks up the signature and, when
+  present, runs `bind_seam_args` (reorder keywords, fill omitted trailing
+  optionals, reject unknown keyword → `ZAP4023`, duplicate / positional-after-
+  keyword → `ZAP4023`, interior hole → `ZAP4025`) before dispatching to the
+  per-method `check`, which then runs **unchanged** on the normalized positional
+  args.
+- **Lowering.** `lower::modules::lower_builtin_module_call` looks up the same
+  signature and runs `reorder_seam_args` (a pure reorder; sema already
+  validated) before the per-method `lower`, so a reordered keyword call emits the
+  runtime call with arguments in the right slots.
+
+Adding keyword/default support to a seam method is therefore **one registry
+row**; the ~200 per-method `check`/`lower` bodies are not touched. The D-0203
+per-method bind calls inside `zlib` are removed and replaced by the central path
++ registry rows, so `zlib.rs` is back to pure type/arity logic.
+
+**Convention for rows (and its one limit).** Parameters are listed in declared
+positional order with optionals **last**: the binder rejects an omitted
+parameter that is followed by a supplied one (an interior hole), so only trailing
+parameters may be dropped. This matches every current seam method (trailing
+`level`/`headers`); a method with an *interior* optional would need a
+per-parameter `required` model, which is a documented follow-up (none exists
+today). Names are the user-facing keyword surface; for Experimental modules
+(`http`) they may still be renamed before a Stable promise.
+
+**Opt-in, incremental, no regressions.** A method with **no** row keeps legacy
+positional-only behavior (names ignored), so keyword-taking seam calls that rely
+on positional binding today (`fft.irfft(r, n=4)`, `threading.Thread(target=…)`)
+are untouched until their method gets a row. Migrated here: `zlib`/`gzip`
+`compress`/`decompress`, `zlib.crc32`/`adler32`, and **all of `http`** (client
+verbs — the former "n or n+1 args" `headers` overload is now a named trailing
+optional — plus accessors). Remaining modules migrate row-by-row; the end state
+**flips the no-row default to reject unknown keywords**, killing the silent-
+accept footgun everywhere, once every keyword-taking method has a row. This
+converges with #966 (seam methods becoming real Zap/prelude functions, which
+inherit the user calling convention for free and drop their rows).
+
+**No new grammar, no new diagnostic codes** (reuses `ZAP4023` name-binding /
+`ZAP4025` arity). Positional seam calls are byte-for-byte unchanged (the binder
+fast-paths a no-keyword call and passes `*`/`**` spreads through).
+
+**Tests.** Host: `zapc_syntax::seam_sigs` unit tests (lookup, unique rows,
+distinct param names); `crates/sema/tests/seam_kwargs.rs` extended to 19 cases
+across `zlib`/`gzip`/`http` (bind-by-name, reorder, mix, unknown/duplicate/
+missing rejected, default-by-name, `http` client verbs with optional `headers`,
+positional unchanged, wrong-typed keyword still `ZAP4024`); lowering reorder
+re-verified on host through the central path. CI (full/arm64): the existing
+`zlib_gzip_kwargs` golden (now driven centrally) still round-trips byte-
+identically.
+
+Relates to D-0203 (the one-method proof this generalizes), D-0202 (the
+`zapc_syntax::seam` twin-facet home pattern), epic #967, Discussion #965, and the
+#966 stdlib redesign.
