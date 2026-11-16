@@ -85,6 +85,34 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     // registry grows a per-overload model. `seed`/`randint` are unambiguous.
     ("random", "seed", &["n"]),
     ("random", "randint", &["a", "b"]),
+    // ---- base64 / hex / hash (tickets #337/#106): single data argument ----
+    ("base64", "encode", &["data"]),
+    ("base64", "encode_nopad", &["data"]),
+    ("base64", "urlsafe_encode", &["data"]),
+    ("base64", "urlsafe_encode_nopad", &["data"]),
+    ("base64", "decode", &["data"]),
+    ("base64", "urlsafe_decode", &["data"]),
+    ("hex", "encode", &["data"]),
+    ("hex", "decode", &["data"]),
+    ("hash", "crc32c", &["data"]),
+    // ---- json / yaml (tickets #100/#149): serialize / deserialize ----
+    // Only the public surface; the `_`-prefixed lexer/encoder helpers are
+    // internal and keep the legacy positional path.
+    ("json", "loads", &["s"]),
+    ("json", "scan", &["s"]),
+    ("json", "dumps", &["v"]),
+    ("yaml", "load", &["s"]),
+    ("yaml", "dump", &["v"]),
+    // ---- logging (ticket #101): level-tagged record emitters ----
+    ("logging", "debug", &["msg"]),
+    ("logging", "info", &["msg"]),
+    ("logging", "warning", &["msg"]),
+    ("logging", "error", &["msg"]),
+    ("logging", "critical", &["msg"]),
+    ("logging", "log", &["level", "msg"]),
+    ("logging", "set_level", &["level"]),
+    ("logging", "set_stream", &["stream"]),
+    ("logging", "set_format", &["fmt"]),
 ];
 
 /// The declared positional parameter names of a seam method, or `None` when the

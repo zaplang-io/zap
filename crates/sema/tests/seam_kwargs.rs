@@ -272,3 +272,69 @@ fn random_unknown_keyword_rejected() {
 fn random_positional_unchanged() {
     assert_ok(&prog("    auto n = random.randint(1, 10)\n"));
 }
+
+// ---------------------------------------------------------------------------
+// base64 / hex / hash / json / yaml — single-argument encoders/serializers:
+// keyword binding is validation (an unknown keyword is now caught).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn encoders_keyword_data() {
+    assert_ok(&prog("    auto a = base64.encode(data=\"hi\")\n"));
+    assert_ok(&prog("    auto b = hex.encode(data=\"hi\")\n"));
+    assert_ok(&prog("    auto c = hash.crc32c(data=\"hi\")\n"));
+}
+
+#[test]
+fn encoders_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto a = base64.encode(bogus=\"hi\")\n"),
+        "ZAP4023",
+    );
+    assert_code(&prog("    auto b = hex.encode(bogus=\"hi\")\n"), "ZAP4023");
+}
+
+#[test]
+fn json_yaml_keyword_and_unknown() {
+    // json.dumps/yaml.dump take a JsonValue (produced by loads/load).
+    assert_ok(&prog(
+        "    auto jv = json.loads(s=\"42\")\n    auto s = json.dumps(v=jv)\n",
+    ));
+    assert_ok(&prog(
+        "    auto jv = yaml.load(s=\"42\")\n    auto y = yaml.dump(v=jv)\n",
+    ));
+    assert_code(
+        &prog("    auto jv = json.loads(\"42\")\n    auto s = json.dumps(value=jv)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn encoders_positional_unchanged() {
+    assert_ok(&prog("    auto a = base64.encode(\"hi\")\n"));
+    assert_ok(&prog(
+        "    auto jv = json.loads(\"42\")\n    auto s = json.dumps(jv)\n",
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// logging — level emitters + the two-arg `log(level, msg)` (reorder).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn logging_keyword_and_reorder() {
+    assert_ok(&prog("    logging.info(msg=\"hello\")\n"));
+    assert_ok(&prog("    logging.log(level=2, msg=\"hello\")\n"));
+    assert_ok(&prog("    logging.log(msg=\"hello\", level=2)\n"));
+}
+
+#[test]
+fn logging_unknown_keyword_rejected() {
+    assert_code(&prog("    logging.info(message=\"hello\")\n"), "ZAP4023");
+}
+
+#[test]
+fn logging_positional_unchanged() {
+    assert_ok(&prog("    logging.info(\"hello\")\n"));
+    assert_ok(&prog("    logging.log(2, \"hello\")\n"));
+}
