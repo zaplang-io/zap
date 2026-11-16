@@ -1481,6 +1481,12 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **Tuple-typed declarations now parse** (#1003, D-0206). A statement-level
+  `(int64, str) t = (1, "a")` — a `tuple_type` in leading declaration position,
+  which the grammar always allowed and which already worked as a parameter,
+  return, or alias type — no longer fails to parse (it was mistaken for a
+  parenthesized destructuring target). Destructuring (`(a, b) = t`) and grouped
+  expressions are unchanged.
 - **`MAXPROCS` is now container-aware** (#905, D-0176). When `MAXPROCS` is unset,
   the default worker-M count clamps the online-core count DOWN to the cgroup CFS
   CPU quota (`min(online, affinity, ceil(cfs_quota/period))`), so a Zap service

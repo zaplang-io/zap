@@ -334,10 +334,8 @@ def f():
     int64 x = 0
     x += 1
 "#),
-    cov("tuple_type",        Compiles , r#"def g() -> (int64, str):
-    return 1, "a"
-def f():
-    auto t = g()
+    cov("tuple_type",        Compiles , r#"def f():
+    (int64, str) t = (1, "a")
     print("ok")
 "#),
     cov("func_type",         Compiles , r#"def g(int64 a) -> int64:
