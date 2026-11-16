@@ -777,9 +777,12 @@ parks its G and frees its M.
 
 ## Open issues
 
-- **`select` details.**
-  Confirm uniform-random fairness, the `default` non-blocking form, and whether
-  send cases may appear alongside receive cases in the first implementation.
+- **`select` details.** RESOLVED (#1002, D-0205): implemented end-to-end with
+  uniform-random fairness among ready cases, the optional `default` non-blocking
+  form, and send cases alongside receive cases (a Go-style `selectgo` in
+  `zap_select`, reusing the `copark`/`coready` park primitive). A closed channel
+  is ready for receive (comma-ok `ok == False`); a send case on a closed channel
+  raises.
 - **Preemption.** RESOLVED (ticket #172): async, signal-based preemption
   (Go 1.14 model), reusing the precise-GC safepoint machinery under the precise
   collector and a direct in-handler switch under Boehm. See "Scheduling points".

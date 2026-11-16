@@ -14277,15 +14277,19 @@ impl<'a> FnLower<'a> {
                 ast::SelectOp::Default => {
                     default_body = Some(&case.body);
                 }
-                ast::SelectOp::Recv { value, ok, chan: ch } => {
+                ast::SelectOp::Recv {
+                    value,
+                    ok,
+                    chan: ch,
+                } => {
                     let (cv, cty) = self.expr(ch)?;
                     let Ty::Chan(elem) = cty else {
                         return Err(err("a select receive case needs a channel operand"));
                     };
                     let ety = self.elem_ty(elem);
-                    let dir = 0i64
-                        | ((elem.val_suffix() == "ptr") as i64) << 1
-                        | ((elem.val_suffix() == "f64") as i64) << 2;
+                    // dir bits: bit0 = send (0 here), bit1 = ptr elem, bit2 = f64.
+                    let dir = (((elem.val_suffix() == "ptr") as i64) << 1)
+                        | (((elem.val_suffix() == "f64") as i64) << 2);
                     args.push(cv);
                     args.push(self.iconst(Ty::I64, dir));
                     args.push(self.iconst(Ty::I64, 0)); // recv: no send value (dummy)
@@ -14301,9 +14305,10 @@ impl<'a> FnLower<'a> {
                     };
                     let ety = self.elem_ty(elem);
                     let vv = self.expr_coerced(value, ety, zapc_diag::ErrorCode::ZAP4032)?;
-                    let dir = 1i64
-                        | ((elem.val_suffix() == "ptr") as i64) << 1
-                        | ((elem.val_suffix() == "f64") as i64) << 2;
+                    // dir bits: bit0 = send, bit1 = ptr elem, bit2 = f64 elem.
+                    let dir = 1
+                        | (((elem.val_suffix() == "ptr") as i64) << 1)
+                        | (((elem.val_suffix() == "f64") as i64) << 2);
                     args.push(cv);
                     args.push(self.iconst(Ty::I64, dir));
                     args.push(vv);
