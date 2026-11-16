@@ -12238,6 +12238,12 @@ impl<'a> FnLower<'a> {
             if is_name(base, "set") {
                 return self.lower_set_new(index, args);
             }
+            if is_name(base, "list") {
+                return self.lower_list_new(index, args);
+            }
+            if is_name(base, "dict") {
+                return self.lower_dict_new(index, args);
+            }
             if is_name(base, "AtomicArray") {
                 return self.lower_atomicarray_new(index, args);
             }
@@ -16503,6 +16509,65 @@ impl<'a> FnLower<'a> {
                 "set[T](...) takes at most one positional iterable argument",
             )),
         }
+    }
+
+    /// Empty `list[T]()` construction (#1004): the generic-context synonym for
+    /// the `[]` literal — same `zap_list_new` the literal lowers to — so code
+    /// whose element type is a type parameter can build an empty list without a
+    /// literal. Takes no arguments (a populated list uses `[...]`).
+    fn lower_list_new(
+        &mut self,
+        elem_expr: &Expr,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let ety = resolve_ty(&expr_to_type(elem_expr)?, &self.ctx.tyenv())?;
+        let elem = list_elem_kind(ety, &self.ctx.nested)?;
+        if !args.is_empty() {
+            return Err(err(
+                "list[T]() takes no arguments; build a populated list with a `[...]` literal",
+            ));
+        }
+        let list = self.new_value(Ty::List(elem));
+        self.emit(Inst::Call {
+            dest: Some(list),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        Ok((list, Ty::List(elem)))
+    }
+
+    /// Empty `dict[K, V]()` construction (#1004): the generic-context synonym for
+    /// the `{}` literal — same `zap_dict_new` the literal lowers to. The subscript
+    /// carries the two type arguments (`Expr::Tuple`). Takes no arguments.
+    fn lower_dict_new(
+        &mut self,
+        index: &Expr,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let (k_expr, v_expr) = match index {
+            Expr::Tuple(elems, _) if elems.len() == 2 => (&elems[0], &elems[1]),
+            _ => {
+                return Err(err(
+                    "dict[K, V]() needs two type arguments (e.g. dict[str, int64]())",
+                ))
+            }
+        };
+        let kt = resolve_ty(&expr_to_type(k_expr)?, &self.ctx.tyenv())?;
+        let vt = resolve_ty(&expr_to_type(v_expr)?, &self.ctx.tyenv())?;
+        let kk = elem_kind(kt, &self.ctx.nested)?;
+        let vk = value_elem_kind(vt, &self.ctx.nested)?;
+        if !args.is_empty() {
+            return Err(err(
+                "dict[K, V]() takes no arguments; build a populated dict with a `{...}` literal",
+            ));
+        }
+        let dict = self.new_value(Ty::Dict(kk, vk));
+        self.emit(Inst::Call {
+            dest: Some(dict),
+            func: "zap_dict_new".to_string(),
+            args: vec![],
+        });
+        Ok((dict, Ty::Dict(kk, vk)))
     }
 
     /// Build a set from an iterable (D17 #609): `set(iterable)` and the

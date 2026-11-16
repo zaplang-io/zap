@@ -6453,6 +6453,57 @@ impl Checker {
                 self.check_numeric_container_value(&ty, span);
                 return ty;
             }
+            // Empty list / dict construction `list[T]()` / `dict[K, V]()` (#1004):
+            // the generic-context synonyms for the `[]` / `{}` empty literals,
+            // parity with `set[T]()`. The element (list) or key/value (dict)
+            // types come from the subscript; they take no arguments — a populated
+            // collection is built with a `[...]` / `{...}` literal.
+            if matches!(base.as_ref(), Expr::Name(n, _) if n == "list") {
+                let elem = self.chan_elem_from_expr(index);
+                if !args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "list[T]() takes no arguments; build a populated list with a \
+                         `[...]` literal"
+                            .to_string(),
+                        span,
+                    );
+                }
+                let ty = Ty::List(Box::new(elem));
+                self.check_numeric_container_value(&ty, span);
+                return ty;
+            }
+            if matches!(base.as_ref(), Expr::Name(n, _) if n == "dict") {
+                let (k, v) = match index.as_ref() {
+                    Expr::Tuple(elems, _) if elems.len() == 2 => (
+                        self.chan_elem_from_expr(&elems[0]),
+                        self.chan_elem_from_expr(&elems[1]),
+                    ),
+                    _ => {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "dict[K, V]() needs two type arguments \
+                             (e.g. dict[str, int64]())"
+                                .to_string(),
+                            span,
+                        );
+                        (Ty::Unknown, Ty::Unknown)
+                    }
+                };
+                if !args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "dict[K, V]() takes no arguments; build a populated dict with a \
+                         `{...}` literal"
+                            .to_string(),
+                        span,
+                    );
+                }
+                self.warn_struct_key(&k, span);
+                let ty = Ty::Dict(Box::new(k), Box::new(v));
+                self.check_numeric_container_value(&ty, span);
+                return ty;
+            }
             // Call-site explicit type arguments on a generic callee (I#161,
             // Fork S): `f[T](...)`, `Type[T](...)`, or `recv.m[T](...)`. The
             // `index` here is type arguments, not a value subscript, so it is NOT
