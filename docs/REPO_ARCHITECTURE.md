@@ -164,10 +164,13 @@ unknown entries fail lowering. Count coercion precedes the shared emitter.
 `tests/golden/crypto_byte_results.zap` checks binary operations and known answers.
 
 **Current modules** (file is `<name>.rs` in each facet above):
-`argparse`, `bisect`, `concurrent`, `crypto`, `datetime`, `deque`, `fs`, `gc`,
-`gzip`, `http`, `io`, `json`, `logging`, `math`, `net`, `os`, `oset`, `process`,
+`argparse`, `bisect`, `concurrent`, `crypto`, `datetime`, `fs`, `gc`,
+`gzip`, `http`, `io`, `json`, `logging`, `math`, `net`, `os`, `process`,
 `random`, `runtime`, `signal`, `sync`, `sys`, `threading`, `time`, `tls`,
-`yaml`, `zlib`.
+`yaml`, `zlib`. (`deque` and `oset` were re-skinned from seam modules into
+built-in generic collection *types* — `deque[T]` / `oset[T]`, alongside
+`list`/`set`/`heap` — in #983/D-0208, so they are no longer module facets;
+`bisect` stays a module, now generic over any `Comparable` list element.)
 
 Per-surface stability tiering (Stable / Experimental / Internal) is **not** here —
 it lives in [`docs/STABILITY.md`](STABILITY.md) (D-0076).

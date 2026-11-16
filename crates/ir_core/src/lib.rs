@@ -429,6 +429,14 @@ pub enum Ty {
     /// runtime compares `i64` words numerically and pointer words as `ZapStr`
     /// bytes.
     Heap(Elem),
+    /// A pointer to a `deque` object (#983): a double-ended ring buffer over the
+    /// given element representation. The element kind selects the `_i64`/`_ptr`/
+    /// `_f64` runtime entry point. Maps to `ptr` in codegen, like [`Ty::Heap`].
+    Deque(Elem),
+    /// A pointer to an `oset` object (#983): an insertion-ordered set over the
+    /// given element representation (hashed like a `set`, so [`Elem::key_suffix`]).
+    /// Maps to `ptr` in codegen.
+    OSet(Elem),
     /// A pointer to a numeric `array` object with the given element dtype and
     /// **static rank** (`ndim`, ticket #24 / #500, D-0164). The rank is part of
     /// the type so indexing can be typed statically: a full index (one per axis)
@@ -1362,6 +1370,8 @@ impl fmt::Display for Ty {
             Ty::Dict(k, v) => return write!(f, "dict[{}, {}]", k.key_suffix(), v.val_suffix()),
             Ty::Set(e) => return write!(f, "set[{}]", e.key_suffix()),
             Ty::Heap(e) => return write!(f, "heap[{}]", e.val_suffix()),
+            Ty::Deque(e) => return write!(f, "deque[{}]", e.val_suffix()),
+            Ty::OSet(e) => return write!(f, "oset[{}]", e.key_suffix()),
             Ty::Array(d, n) => {
                 return if *n <= 1 {
                     write!(f, "array[{}]", d.suffix())

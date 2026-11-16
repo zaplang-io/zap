@@ -2113,6 +2113,24 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
                 };
                 Ok(Ty::Chan(e))
             }
+            // `deque[T]` (#983): a value position (any storable element, like
+            // `list`), so `f64` is admitted.
+            "deque" => {
+                let e = match args.first() {
+                    Some(a) => value_elem_of(a, env)?,
+                    None => Elem::I64,
+                };
+                Ok(Ty::Deque(e))
+            }
+            // `oset[T]` (#983): a hashed position (element must be `Hashable`,
+            // like `set`), so `elem_of` rejects a float element.
+            "oset" => {
+                let e = match args.first() {
+                    Some(a) => elem_of(a, env)?,
+                    None => Elem::I64,
+                };
+                Ok(Ty::OSet(e))
+            }
             "AtomicArray" => {
                 // AtomicArray[T] (#844): a reference element lowers to a pointer
                 // slot, `int64` to a word slot. The element kind picks the typed
@@ -2450,9 +2468,14 @@ fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError
         // interned so read-back (`rows[i]`, iteration) recovers the precise
         // `list`/`dict`/`set`/... type instead of defaulting a bare pointer to
         // `str`. Dedup makes structurally-equal nestings compare equal.
-        Ty::List(_) | Ty::Dict(..) | Ty::Set(_) | Ty::Heap(_) | Ty::Chan(_) | Ty::AtomicArray(_) => {
-            Ok(Elem::Nested(nested.borrow_mut().intern(t)))
-        }
+        Ty::List(_)
+        | Ty::Dict(..)
+        | Ty::Set(_)
+        | Ty::Heap(_)
+        | Ty::Chan(_)
+        | Ty::AtomicArray(_)
+        | Ty::Deque(_)
+        | Ty::OSet(_) => Ok(Elem::Nested(nested.borrow_mut().intern(t))),
         Ty::Ptr | Ty::Bytes | Ty::Array(..) | Ty::Match | Ty::Func(_) | Ty::Py => Ok(Elem::Ptr),
         Ty::Bigint | Ty::Complex => Err(err(
             "collections of bigint or complex values are not supported yet",
@@ -2499,6 +2522,27 @@ fn value_elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, Lowe
 /// `float`/`f64` element is admitted. An alias of [`value_elem_kind`].
 fn list_elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError> {
     value_elem_kind(t, nested)
+}
+
+/// The `DEQUE_ELEM_*` runtime tag for a deque element kind (#983): 0 = i64 word
+/// (integers/bool/char/enum), 1 = pointer (str), 2 = f64. Mirrors the `heap`
+/// element-kind tag; it drives both the typed entry points and GC tracing.
+fn deque_elem_tag(elem: Elem) -> i64 {
+    match elem {
+        Elem::I64 | Elem::Bool | Elem::Char | Elem::Enum(_) => 0,
+        Elem::F64 => 2,
+        _ => 1,
+    }
+}
+
+/// The `OSET_ELEM_*` runtime tag for an oset element kind (#983): 0 = i64 word,
+/// 1 = pointer (str). v1 admits only these (floats are not `Hashable`; structs
+/// are a follow-up), enforced by [`FnLower::reject_nonprimitive_elem`].
+fn oset_elem_tag(elem: Elem) -> i64 {
+    match elem {
+        Elem::I64 | Elem::Bool | Elem::Char | Elem::Enum(_) => 0,
+        _ => 1,
+    }
 }
 
 /// The integer-word element family: `i64`, `bool` (`Elem::Bool`), and `char`
@@ -10317,6 +10361,26 @@ impl<'a> FnLower<'a> {
                 });
                 self.iterate_list(items, elem, body)
             }
+            // `deque`/`oset` (#983): iterate a left-to-right / insertion-order
+            // snapshot list, exactly like `set`/`heap`.
+            Ty::Deque(elem) => {
+                let items = self.new_value(Ty::List(elem));
+                self.emit(Inst::Call {
+                    dest: Some(items),
+                    func: "zap_deque_items".to_string(),
+                    args: vec![val],
+                });
+                self.iterate_list(items, elem, body)
+            }
+            Ty::OSet(elem) => {
+                let items = self.new_value(Ty::List(elem));
+                self.emit(Inst::Call {
+                    dest: Some(items),
+                    func: "zap_oset_items".to_string(),
+                    args: vec![val],
+                });
+                self.iterate_list(items, elem, body)
+            }
             // A `str` (a pointer handle in ZIR) iterates its codepoints as
             // `char`s (D-0025), walking the UTF-8 buffer once — so comprehensions
             // and `set(...)`/`set[T](...)` accept a string operand.
@@ -12243,6 +12307,12 @@ impl<'a> FnLower<'a> {
             if is_name(base, "heap") {
                 return self.lower_heap_new(index, args);
             }
+            if is_name(base, "deque") {
+                return self.lower_deque_new(index, args);
+            }
+            if is_name(base, "oset") {
+                return self.lower_oset_new(index, args);
+            }
             if is_name(base, "set") {
                 return self.lower_set_new(index, args);
             }
@@ -13077,6 +13147,12 @@ impl<'a> FnLower<'a> {
             }
             if let Ty::Heap(elem) = bty {
                 return self.lower_heap_method(recv, elem, name, args);
+            }
+            if let Ty::Deque(elem) = bty {
+                return self.lower_deque_method(recv, elem, name, args);
+            }
+            if let Ty::OSet(elem) = bty {
+                return self.lower_oset_method(recv, elem, name, args);
             }
             if let Ty::AtomicArray(elem) = bty {
                 return self.lower_atomicarray_method(recv, elem, name, args);
@@ -17268,6 +17344,266 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    /// Lower `deque[T]()` / `deque[T](maxlen=n)` (#983) to `zap_deque_new(kind)` /
+    /// `zap_deque_bounded(maxlen, kind)` where `kind` tags the element word
+    /// representation (0 = i64, 1 = ptr/str, 2 = f64) for GC tracing and the typed
+    /// entry points. A deque is a value sequence (like `list`), so an `f64`
+    /// element is admitted; struct/tuple elements are a documented follow-up (as
+    /// for `heap`).
+    fn lower_deque_new(
+        &mut self,
+        elem_expr: &Expr,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let ety = resolve_ty(&expr_to_type(elem_expr)?, &self.ctx.tyenv())?;
+        let elem = value_elem_kind(ety, &self.ctx.nested)?;
+        Self::reject_nonprimitive_elem(elem, "deque")?;
+        let mut maxlen: Option<Value> = None;
+        for a in args {
+            match a.name.as_deref() {
+                Some("maxlen") => {
+                    let (m, mt) = self.expr(&a.value)?;
+                    maxlen = Some(self.coerce(m, mt, Ty::I64));
+                }
+                Some(other) => {
+                    return Err(err(format!(
+                        "deque[T](...) has no keyword argument '{other}' (only 'maxlen')"
+                    )))
+                }
+                None => {
+                    return Err(err(
+                        "deque[T](...) takes only the keyword argument 'maxlen' (e.g. maxlen=8)",
+                    ))
+                }
+            }
+        }
+        let kind = self.iconst(Ty::I64, deque_elem_tag(elem));
+        let d = self.new_value(Ty::Deque(elem));
+        match maxlen {
+            Some(m) => self.emit(Inst::Call {
+                dest: Some(d),
+                func: "zap_deque_bounded".to_string(),
+                args: vec![m, kind],
+            }),
+            None => self.emit(Inst::Call {
+                dest: Some(d),
+                func: "zap_deque_new".to_string(),
+                args: vec![kind],
+            }),
+        }
+        Ok((d, Ty::Deque(elem)))
+    }
+
+    /// Lower a `deque[T]` method (#983): `append`/`appendleft` (-> unit),
+    /// `pop`/`popleft`/`get` (-> T), `clear` (-> unit). Each maps to the
+    /// element-kind-suffixed runtime entry point, like `heap`.
+    fn lower_deque_method(
+        &mut self,
+        recv: Value,
+        elem: Elem,
+        name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let suffix = elem.val_suffix();
+        match name {
+            "append" | "appendleft" => {
+                if args.len() != 1 {
+                    return Err(err(format!("{name}() takes exactly one argument")));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                if value_elem_kind(vt, &self.ctx.nested)? != elem {
+                    return Err(err(format!("{name}() value has the wrong element type")));
+                }
+                let v = self.coerce(v, vt, elem.ty());
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_deque_{name}_{suffix}"),
+                    args: vec![recv, v],
+                });
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
+            "pop" | "popleft" => {
+                if !args.is_empty() {
+                    return Err(err(format!("{name}() takes no arguments")));
+                }
+                let d = self.new_value(elem.ty());
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: format!("zap_deque_{name}_{suffix}"),
+                    args: vec![recv],
+                });
+                Ok((d, elem.ty()))
+            }
+            "get" => {
+                if args.len() != 1 {
+                    return Err(err("get() takes exactly one argument"));
+                }
+                let (i, it) = self.expr(&args[0].value)?;
+                let i = self.coerce(i, it, Ty::I64);
+                let d = self.new_value(elem.ty());
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: format!("zap_deque_get_{suffix}"),
+                    args: vec![recv, i],
+                });
+                Ok((d, elem.ty()))
+            }
+            "clear" => {
+                if !args.is_empty() {
+                    return Err(err("clear() takes no arguments"));
+                }
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_deque_clear".to_string(),
+                    args: vec![recv],
+                });
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
+            other => Err(err(format!(
+                "deque has no method '{other}' (supported: append, appendleft, pop, \
+                 popleft, get, clear)"
+            ))),
+        }
+    }
+
+    /// Lower `oset[T]()` / `oset[T](iterable)` (#983) to `zap_oset_new(kind)` plus,
+    /// for the iterable form, an `add` per element. v1 supports `i64` and `str`
+    /// elements (`kind` 0/1); struct/other-pointer elements are a documented
+    /// follow-up (as for `heap`/`set`-fn keys).
+    fn lower_oset_new(
+        &mut self,
+        elem_expr: &Expr,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let ety = resolve_ty(&expr_to_type(elem_expr)?, &self.ctx.tyenv())?;
+        let elem = elem_kind(ety, &self.ctx.nested)?;
+        Self::reject_nonprimitive_elem(elem, "oset")?;
+        if matches!(elem, Elem::F64) {
+            return Err(err(
+                "oset does not support a float element yet (use int64 or str); \
+                 this is a documented follow-up",
+            ));
+        }
+        let s = self.new_value(Ty::OSet(elem));
+        let kind = self.iconst(Ty::I64, oset_elem_tag(elem));
+        self.emit(Inst::Call {
+            dest: Some(s),
+            func: "zap_oset_new".to_string(),
+            args: vec![kind],
+        });
+        match args.len() {
+            0 => {}
+            1 if args[0].name.is_none() => {
+                let suffix = elem.val_suffix();
+                self.iterate(&args[0].value, |st, v, t| {
+                    if value_elem_kind(t, &st.ctx.nested)? != elem {
+                        return Err(err("oset elements must all have the same representation"));
+                    }
+                    let v = st.coerce(v, t, elem.ty());
+                    st.emit(Inst::Call {
+                        dest: None,
+                        func: format!("zap_oset_add_{suffix}"),
+                        args: vec![s, v],
+                    });
+                    Ok(())
+                })?;
+            }
+            _ => {
+                return Err(err(
+                    "oset[T](...) takes at most one positional iterable argument",
+                ))
+            }
+        }
+        Ok((s, Ty::OSet(elem)))
+    }
+
+    /// Lower an `oset[T]` method (#983): `add` (-> unit), `contains` (-> bool),
+    /// `get` (-> T). Membership `x in s` lowers separately.
+    fn lower_oset_method(
+        &mut self,
+        recv: Value,
+        elem: Elem,
+        name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let suffix = elem.val_suffix();
+        match name {
+            "add" => {
+                if args.len() != 1 {
+                    return Err(err("add() takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                if value_elem_kind(vt, &self.ctx.nested)? != elem {
+                    return Err(err("add() value has the wrong element type"));
+                }
+                let v = self.coerce(v, vt, elem.ty());
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_oset_add_{suffix}"),
+                    args: vec![recv, v],
+                });
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
+            "contains" => {
+                if args.len() != 1 {
+                    return Err(err("contains() takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                if value_elem_kind(vt, &self.ctx.nested)? != elem {
+                    return Err(err("contains() value has the wrong element type"));
+                }
+                let v = self.coerce(v, vt, elem.ty());
+                let r = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(r),
+                    func: format!("zap_oset_contains_{suffix}"),
+                    args: vec![recv, v],
+                });
+                // The runtime returns 1/0 as i64; normalize to a bool.
+                let zero = self.iconst(Ty::I64, 0);
+                let b = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: b,
+                    pred: CmpPred::Ne,
+                    lhs: r,
+                    rhs: zero,
+                });
+                Ok((b, Ty::I1))
+            }
+            "get" => {
+                if args.len() != 1 {
+                    return Err(err("get() takes exactly one argument"));
+                }
+                let (i, it) = self.expr(&args[0].value)?;
+                let i = self.coerce(i, it, Ty::I64);
+                let d = self.new_value(elem.ty());
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: format!("zap_oset_get_{suffix}"),
+                    args: vec![recv, i],
+                });
+                Ok((d, elem.ty()))
+            }
+            other => Err(err(format!(
+                "oset has no method '{other}' (supported: add, contains, get)"
+            ))),
+        }
+    }
+
+    /// Reject a non-primitive (struct/tuple/nested/complex) element for the v1
+    /// `deque`/`oset` collections (#983): like `heap`, only the primitive element
+    /// kinds (integers/bool/char, `str`, and — for a value sequence — `f64`) are
+    /// supported for now; aggregate elements are a documented follow-up.
+    fn reject_nonprimitive_elem(elem: Elem, what: &str) -> Result<(), LowerError> {
+        match elem {
+            Elem::Struct(_) | Elem::Nested(_) | Elem::Complex => Err(err(format!(
+                "a {what} of a struct/tuple/complex element is not supported yet \
+                 (only integers, str, and — for deque — float64); this is a follow-up"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// Lower a tuple literal (D-0049): a by-value anonymous-struct aggregate. The
     /// element-type sequence interns to a struct id, then `StructNew` + one
     /// `FieldSet` per element build the value — exactly the struct path, so
@@ -20815,6 +21151,31 @@ impl<'a> FnLower<'a> {
 
                 self.position(end_bb);
                 let d = self.load(result, Ty::I1);
+                return Ok((d, Ty::I1));
+            }
+        }
+
+        // Membership: `x in <oset>` (#983) -> `zap_oset_contains_*`, bool.
+        if matches!(op, In) {
+            if let Ty::OSet(elem) = rt {
+                if value_elem_kind(lt, &self.ctx.nested)? != elem {
+                    return Err(err("'in' element has the wrong type for this oset"));
+                }
+                let l = self.coerce(l, lt, elem.ty());
+                let word = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(word),
+                    func: format!("zap_oset_contains_{}", elem.val_suffix()),
+                    args: vec![r, l],
+                });
+                let zero = self.iconst(Ty::I64, 0);
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred: CmpPred::Ne,
+                    lhs: word,
+                    rhs: zero,
+                });
                 return Ok((d, Ty::I1));
             }
         }

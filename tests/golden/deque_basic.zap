@@ -1,25 +1,25 @@
-# Golden fixture: deque both-end ops (ticket #102).
+# Golden fixture: deque both-end ops as a generic collection type (#983).
 #
 # append/appendleft push at the two ends; pop/popleft remove from them; get(i)
-# indexes from the left (0 == leftmost). Exercises a grow (cap doubles past the
-# initial 4) is not needed here — a small deque suffices to cover both ends.
+# indexes from the left (0 == leftmost). `deque[int64]()` is the generic
+# constructor; the old int64-only `deque.new()` module API is gone (D-0208).
 def main():
-    auto d = deque.new()
-    deque.append(d, 1)
-    deque.append(d, 2)
-    deque.appendleft(d, 0)
+    auto d = deque[int64]()
+    d.append(1)
+    d.append(2)
+    d.appendleft(0)
     # d == [0, 1, 2]
-    print(deque.len(d))
-    print(deque.get(d, 0))
-    print(deque.get(d, 2))
-    print(deque.popleft(d))
-    print(deque.pop(d))
-    print(deque.len(d))
-    print(deque.get(d, 0))
-    deque.appendleft(d, 9)
-    deque.append(d, 8)
+    print(len(d))
+    print(d.get(0))
+    print(d.get(2))
+    print(d.popleft())
+    print(d.pop())
+    print(len(d))
+    print(d.get(0))
+    d.appendleft(9)
+    d.append(8)
     # d == [9, 1, 8]
-    print(deque.popleft(d))
-    print(deque.pop(d))
-    print(deque.pop(d))
-    print(deque.len(d))
+    print(d.popleft())
+    print(d.pop())
+    print(d.pop())
+    print(len(d))

@@ -10454,3 +10454,80 @@ elements, and the extended-slice length-mismatch `ValueError`.
 
 Relates to D-0030 (slicing), D-0201 (the coverage gate that demanded this), epic
 #967, and #469/#374.
+
+## D-0208 — re-skin `deque`/`oset`/`bisect` as capability-bounded generic collections (#983)
+
+**Status:** Locked (ratified by the user 2026-11-16). Epic #967 (language gaps),
+Discussion #965. Extends [[D-0139]] (the capability/bounds model for collection
+elements); supersedes, for these three, the stale clause in [[D-0064]]'s I#170
+update that declined a built-in-collection re-skin.
+
+**Problem.** `deque`, `oset`, and `bisect` were **`int64`-only**. They shipped
+(#102, D-0056) as hand-written opaque C handles (`ZapDeque`/`ZapOset` in
+`zaprt.c`) exposed through flat seam-module functions (`deque.new()`,
+`deque.pop(d) -> int64`, …) whose value was typed as opaque `bytes`. There was
+no element type parameter, so a `deque[str]`, an ordered set of strings, or
+`bisect` over a `list[str]` were impossible — the non-`int64` collections
+ordinary code needs (referenced from #966).
+
+**The issue's premise was wrong, and is corrected here.** #983 framed the fix as
+"re-skin to monomorphized user-generic structs, like `heap[T]`." But `heap` is
+**not** a monomorphized user generic: it is a **type-erased built-in collection**
+(`ZapHeap` with a `kind` field) with element-kind dispatch (i64/ptr/f64), exactly
+like `list`/`dict`/`set`/`channel`. D-0064's I#170 update *declined* pushing the
+built-ins through monomorphization (a heap-object + indirection regression, and
+*more* special-casing) — but that predates the capability model. Under the
+current **D-0139** model the built-ins already **are** capability-bounded generics
+over their element type (`set[T]`/`dict[K,_]` require `Hashable`, `heap[T]`
+`Comparable`) with a tuned type-erased runtime underneath. So the right move is to
+make `deque`/`oset` **more built-in collections of the same kind**, not user
+structs — no monomorphization, no ABI regression.
+
+**Decision.**
+- **Surface.** `deque[T]` and `oset[T]` become **bare built-in collection types**
+  (new `Ty::Deque`/`Ty::OSet` in sema and `zir::Ty::Deque`/`OSet` in the IR),
+  spelled and used like `heap`/`set`:
+  - `deque[T]()` / `deque[T](maxlen=n)`; methods `append`/`appendleft`/`pop`/
+    `popleft`/`get`/`clear`, plus `len(d)`, `d[i]` indexing, and `for x in d`.
+  - `oset[T]()` / `oset[T](iterable)`; methods `add`/`contains`/`get`, plus
+    `len(s)`, `x in s` membership, and `for x in s` (insertion order).
+  The old `deque.*`/`oset.*` **seam-module functions are removed** — pre-1.0, no
+  alias (the Option→Optional precedent). `bisect` **stays a module** of free
+  functions; its list argument relaxes from `list[int64]` to any `list[T]` whose
+  element is `Comparable`.
+- **Bounds (extends D-0139).** `deque[T]` — no element bound (any storable
+  element, like `list`); `oset[T]` — `Hashable` (like `set`); `bisect` over
+  `list[T]` — `Comparable` (like `heap`).
+- **Runtime unchanged in shape.** The handles stay type-erased with a `kind`
+  field (i64/ptr/f64) driving element-kind dispatch, the `_i64`/`_ptr`/`_f64`
+  entry-point suffixing, and GC. A `deque`'s ring buffer is traced by a new
+  `ZAP_TD_DEQUE` collector arm (cloned from `ZAP_TD_CHAN`: it walks
+  `[head..head+len) mod cap` and traces each element word for a pointer-element
+  deque); `oset` stays a plain two-pointer `{order: list, member: set}` struct
+  (`ZAP_TD_PRECISE`) whose sub-containers trace their own elements, so it needs no
+  new collector arm. Iteration lowers through a snapshot `list[elem]`
+  (`zap_deque_items`/`zap_oset_items`), exactly like `set`/`heap`.
+- **v1 element scope (follow-ups).** `deque` supports `int64`/`str`/`float64`;
+  `oset` supports `int64`/`str`. Aggregate (struct/tuple) elements, and a
+  `float64` `oset` element (hashable under D-0139/#803 but needing the backing
+  set's `_f64` path), are **documented follow-ups** — the same incremental
+  element scope `heap` has (it rejects tuple/struct elements too).
+
+**Why not monomorphize (the issue's literal approach).** It would wrap a tuned
+type-erased handle in a per-instantiation struct — a heap-object + pointer
+indirection on every operation (the regression D-0064 identified) — and add, not
+remove, special-casing. The type-erased-with-capability-bounds model gives the
+same generic surface at no runtime cost, and `heap` is the existence proof.
+
+**Tests.** Host: `crates/sema/tests/deque_oset.rs` (constructor forms, `maxlen`,
+element bounds, method/`for`/membership typing, the removed-module-API
+rejections) and a `zapc_mono` test that `deque[T]()`/`oset[T]()` in a generic
+body substitute the element type (the #1013 path). CI (full/arm64) goldens:
+rewritten `deque_basic`/`deque_maxlen`/`oset` on the new surface (output
+unchanged), plus new `deque_str`, `oset_str`, `bisect_generic` (str + float64),
+and `deque_generic_body`. `bisect`'s keyword binding (`bisect_kwargs`, D-0204) is
+unchanged.
+
+Relates to [[D-0139]] (#801/#812 capability model), [[D-0057]] (`heap[T]`, the
+template), [[D-0056]] (the original seam collections), D-0204 (seam kwargs), epic
+#967, Discussion #965, and #966 (stdlib consumers).

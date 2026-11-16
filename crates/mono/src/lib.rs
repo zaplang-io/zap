@@ -1130,11 +1130,13 @@ impl Mono<'_> {
                 cap.name()
             )]),
             // Mutable collections have no stable identity, hash, or order.
-            "list" | "dict" | "set" | "heap" | "channel" | "array" => Err(vec![format!(
-                "a mutable collection ('{name}') does not implement '{}' (it has no stable hash \
-                 or ordering)",
-                cap.name()
-            )]),
+            "list" | "dict" | "set" | "heap" | "channel" | "array" | "deque" | "oset" => {
+                Err(vec![format!(
+                    "a mutable collection ('{name}') does not implement '{}' (it has no stable \
+                     hash or ordering)",
+                    cap.name()
+                )])
+            }
             other => {
                 if let Some(e) = self.enums.get(other) {
                     self.enum_has_capability(other, e, cap, visited)
@@ -3109,7 +3111,10 @@ impl Mono<'_> {
                 // Re-materialise the subscript from the substituted concrete
                 // types; for a concrete call this reproduces the identical
                 // subscript, so there is no change on the non-generic path.
-                if matches!(g.as_str(), "list" | "dict" | "set" | "heap" | "channel") {
+                if matches!(
+                    g.as_str(),
+                    "list" | "dict" | "set" | "heap" | "channel" | "deque" | "oset"
+                ) {
                     if let Some(cargs) = self.type_args_from_index(index) {
                         if let Some(new_index) = self.ctor_subscript_from_types(&cargs, *nspan) {
                             let node = Expr::Call {
@@ -4342,6 +4347,44 @@ mod tests {
             rendered.contains("int64") && !rendered.contains("[T]"),
             "list[T]() subscript was not substituted: {rendered}"
         );
+    }
+
+    #[test]
+    fn generic_body_deque_oset_ctor_substitutes_element_type() {
+        // #983: `deque[T]()` / `oset[T]()` inside a generic body must monomorphise
+        // to the concrete element type (the same path as `list[T]()`, #1013), not
+        // leave a bare `T` for codegen to reject.
+        let m = mono_ok(
+            "def collect[T](T x) -> int64:\n    \
+             auto d = deque[T]()\n    \
+             auto s = oset[T]()\n    \
+             d.append(x)\n    \
+             s.add(x)\n    \
+             return len(d) + len(s)\n\
+             def main():\n    \
+             print(str(collect[int64](5)))\n",
+        );
+        let f = m
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Function(f) if f.name == "collect$int64" => Some(f),
+                _ => None,
+            })
+            .expect("collect$int64 specialization present");
+        for (idx, want) in [(0usize, "deque"), (1usize, "oset")] {
+            let Stmt::Let { value, .. } = &f.body.stmts[idx] else {
+                panic!(
+                    "expected a `let` at stmt {idx}, got {:?}",
+                    f.body.stmts[idx]
+                );
+            };
+            let rendered = zapc_syntax::ast::render_expr(value);
+            assert!(
+                rendered.contains("int64") && !rendered.contains("[T]"),
+                "{want}[T]() subscript was not substituted: {rendered}"
+            );
+        }
     }
 
     #[test]

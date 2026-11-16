@@ -993,6 +993,25 @@ static void zap_trace_children(void *payload) {
          * chain, so they need no marking here. */
         return;
     }
+    case ZAP_TD_DEQUE: {
+        /* Ring buffer (#983): the `len` live words sit at [head .. head+len) mod
+         * cap. Forward the buffer slot, then — for a pointer-element deque — mark
+         * and forward each live element word (exactly like a `list[T]` of
+         * pointers, walked in ring order like ZAP_TD_CHAN). An i64/f64 deque has
+         * no pointer elements, so only the buffer itself is forwarded. */
+        ZapDeque *d = (ZapDeque *)payload;
+        if (d->data) {
+            zap_process_slot((void **)&d->data);
+            if (d->kind == DEQUE_ELEM_PTR && d->cap > 0) {
+                int64_t *data = d->data;
+                for (int64_t k = 0; k < d->len; k++) {
+                    int64_t idx = (d->head + k) % d->cap;
+                    zap_process_word(&data[idx]);
+                }
+            }
+        }
+        return;
+    }
     case ZAP_TD_ARRAY: {
         ZapArray *a = (ZapArray *)payload;
         if (a->dims) {

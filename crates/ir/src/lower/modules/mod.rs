@@ -24,7 +24,6 @@ mod bisect;
 mod concurrent;
 mod crypto;
 mod datetime;
-mod deque;
 mod fft;
 mod fs;
 mod gc;
@@ -39,7 +38,6 @@ mod logging;
 mod math;
 mod net;
 mod os;
-mod oset;
 mod process;
 mod random;
 mod runtime;
@@ -96,9 +94,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     yaml::MODULE,
     logging::MODULE,
     argparse::MODULE,
-    deque::MODULE,
     bisect::MODULE,
-    oset::MODULE,
     zlib::MODULE,
     gzip::MODULE,
     sync::MODULE,
