@@ -47,23 +47,40 @@ __attribute__((target("sse4.2"))) uint64_t zap_arch_x86_crc32c_u64(int64_t crc,
 #endif /* x86-64 */
 
 #if defined(__aarch64__) || defined(_M_ARM64)
-__attribute__((target("crc"))) uint32_t zap_arch_aarch64_crc32c_u8(int64_t crc,
-                                                                   int64_t v) {
-    return __builtin_arm_crc32cb((uint32_t)crc, (uint8_t)v);
+/* The CRC32C-extension builtins and the feature target attribute spell
+ * differently across compilers: GCC uses `__builtin_aarch64_crc32c{b,h,w,x}`
+ * (the 64-bit form is `cx`, the X register) and requires the arch extension
+ * prefixed with `+` (`target("+crc")`); clang uses `__builtin_arm_crc32c{b,h,w,d}`.
+ * Both builtins are always available (no header / `__ARM_FEATURE_CRC32` guard),
+ * gated by the function's target attribute, so a per-function attribute emits the
+ * CRC instruction without making the whole runtime assume the feature. */
+#if defined(__clang__)
+#define ZAP_A64_CRC_TARGET __attribute__((target("crc")))
+#define ZAP_A64_CRC32CB __builtin_arm_crc32cb
+#define ZAP_A64_CRC32CH __builtin_arm_crc32ch
+#define ZAP_A64_CRC32CW __builtin_arm_crc32cw
+#define ZAP_A64_CRC32CD __builtin_arm_crc32cd
+#else /* GCC */
+#define ZAP_A64_CRC_TARGET __attribute__((target("+crc")))
+#define ZAP_A64_CRC32CB __builtin_aarch64_crc32cb
+#define ZAP_A64_CRC32CH __builtin_aarch64_crc32ch
+#define ZAP_A64_CRC32CW __builtin_aarch64_crc32cw
+#define ZAP_A64_CRC32CD __builtin_aarch64_crc32cx
+#endif
+
+ZAP_A64_CRC_TARGET uint32_t zap_arch_aarch64_crc32c_u8(int64_t crc, int64_t v) {
+    return ZAP_A64_CRC32CB((uint32_t)crc, (uint8_t)v);
 }
-__attribute__((target("crc"))) uint32_t zap_arch_aarch64_crc32c_u16(int64_t crc,
-                                                                    int64_t v) {
-    return __builtin_arm_crc32ch((uint32_t)crc, (uint16_t)v);
+ZAP_A64_CRC_TARGET uint32_t zap_arch_aarch64_crc32c_u16(int64_t crc, int64_t v) {
+    return ZAP_A64_CRC32CH((uint32_t)crc, (uint16_t)v);
 }
-__attribute__((target("crc"))) uint32_t zap_arch_aarch64_crc32c_u32(int64_t crc,
-                                                                    int64_t v) {
-    return __builtin_arm_crc32cw((uint32_t)crc, (uint32_t)v);
+ZAP_A64_CRC_TARGET uint32_t zap_arch_aarch64_crc32c_u32(int64_t crc, int64_t v) {
+    return ZAP_A64_CRC32CW((uint32_t)crc, (uint32_t)v);
 }
-/* aarch64 `crc32cd` returns the 32-bit accumulator; widen to a u64 word so the
- * value ABI matches x86 `crc32q` (low 32 bits carry the CRC32C on both). */
-__attribute__((target("crc"))) uint64_t zap_arch_aarch64_crc32c_u64(int64_t crc,
-                                                                    int64_t v) {
-    return (uint64_t)__builtin_arm_crc32cd((uint32_t)crc, (uint64_t)v);
+/* The aarch64 CRC32CX/CD builtin returns the 32-bit accumulator; widen to a u64
+ * word so the value ABI matches x86 `crc32q` (low 32 bits carry the CRC32C). */
+ZAP_A64_CRC_TARGET uint64_t zap_arch_aarch64_crc32c_u64(int64_t crc, int64_t v) {
+    return (uint64_t)ZAP_A64_CRC32CD((uint32_t)crc, (uint64_t)v);
 }
 #endif /* aarch64 */
 
