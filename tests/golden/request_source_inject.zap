@@ -62,7 +62,14 @@ struct App:
         print(path + " -> " + r.body)
 
 @app.get("/items/{id}")
-def get_item(Request req, str id = Path(), int64 page = Num(), str sort = Query("asc"), str opt = Query("fallback"), DB db = Depends(get_db)) -> Response:
+def get_item(
+    Request req,
+    str id = Path(),
+    int64 page = Num(),
+    str sort = Query("asc"),
+    str opt = Query("fallback"),
+    DB db = Depends(get_db),
+) -> Response:
     return Response(id + "|" + str(page) + "|" + sort + "|" + opt + "|" + db.name)
 
 def main():
