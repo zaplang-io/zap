@@ -208,6 +208,46 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("io", "close_fd", &["fd"]),
     // ---- signal (ticket #77): subscribe to a Signal ----
     ("signal", "notify", &["sig"]),
+    // ---- math (ticket #98): scalar transcendentals + 2/3-arg forms ----
+    // The 1-arg funcs each take `x` (a scalar, or element-wise over an array —
+    // same arity/param, so one row covers both). gc/runtime take no args.
+    ("math", "sqrt", &["x"]),
+    ("math", "exp", &["x"]),
+    ("math", "log", &["x"]),
+    ("math", "log2", &["x"]),
+    ("math", "log10", &["x"]),
+    ("math", "sin", &["x"]),
+    ("math", "cos", &["x"]),
+    ("math", "tan", &["x"]),
+    ("math", "asin", &["x"]),
+    ("math", "acos", &["x"]),
+    ("math", "atan", &["x"]),
+    ("math", "floor", &["x"]),
+    ("math", "ceil", &["x"]),
+    ("math", "round", &["x"]),
+    ("math", "trunc", &["x"]),
+    ("math", "fabs", &["x"]),
+    ("math", "isnan", &["x"]),
+    ("math", "isinf", &["x"]),
+    ("math", "pow", &["x", "y"]),
+    ("math", "atan2", &["y", "x"]), // Python order: atan2(y, x)
+    ("math", "hypot", &["x", "y"]),
+    ("math", "fmod", &["x", "y"]),
+    ("math", "fma", &["x", "y", "z"]),
+    // ---- net (ticket #104): plaintext TCP over opaque socket handles ----
+    // (connect_ip_deadline is left on the legacy path pending a settled name
+    // for its deadline parameter.)
+    ("net", "listen", &["host", "port"]),
+    ("net", "connect", &["host", "port"]),
+    ("net", "accept", &["listener"]),
+    ("net", "recv", &["conn", "n"]),
+    ("net", "send", &["conn", "data"]),
+    ("net", "port", &["listener"]),
+    ("net", "set_deadline_ns", &["conn", "ns"]),
+    ("net", "set_read_timeout", &["conn", "ms"]),
+    ("net", "set_read_deadline", &["conn", "ms"]),
+    ("net", "close_conn", &["conn"]),
+    ("net", "close_listener", &["listener"]),
 ];
 
 /// The declared positional parameter names of a seam method, or `None` when the

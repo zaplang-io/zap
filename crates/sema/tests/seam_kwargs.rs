@@ -505,3 +505,43 @@ fn url_io_signal_positional_unchanged() {
     assert_ok(&prog("    auto fd = io.open(\"/tmp/x\", \"r\")\n"));
     assert_ok(&prog("    auto ch = signal.notify(Signal.SIGINT)\n"));
 }
+
+// ---------------------------------------------------------------------------
+// math / net.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn math_keyword_and_reorder() {
+    assert_ok(&prog("    auto y = math.sqrt(x=2.0)\n"));
+    assert_ok(&prog("    auto p = math.pow(x=2.0, y=10.0)\n"));
+    assert_ok(&prog("    auto p = math.pow(y=10.0, x=2.0)\n"));
+    assert_ok(&prog("    auto a = math.atan2(y=1.0, x=1.0)\n"));
+}
+
+#[test]
+fn math_unknown_keyword_rejected() {
+    assert_code(&prog("    auto y = math.sqrt(value=2.0)\n"), "ZAP4023");
+}
+
+#[test]
+fn net_keyword_reorder_and_unknown() {
+    assert_ok(&prog(
+        "    auto l = net.listen(host=\"0.0.0.0\", port=8080)\n",
+    ));
+    assert_ok(&prog(
+        "    auto l = net.listen(port=8080, host=\"0.0.0.0\")\n",
+    ));
+    assert_ok(&prog(
+        "    auto c = net.connect(\"h\", 80)\n    auto s = net.recv(conn=c, n=10)\n",
+    ));
+    assert_code(
+        &prog("    auto l = net.listen(host=\"0.0.0.0\", porta=8080)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn math_net_positional_unchanged() {
+    assert_ok(&prog("    auto p = math.pow(2.0, 10.0)\n"));
+    assert_ok(&prog("    auto l = net.listen(\"0.0.0.0\", 8080)\n"));
+}
