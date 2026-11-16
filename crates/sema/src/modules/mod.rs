@@ -163,6 +163,140 @@ pub(crate) fn check_builtin_module_call(
     )
 }
 
+/// Bind a seam call's arguments to a declared positional parameter list so a
+/// built-in module function can be called with **keyword arguments**, in any
+/// order, with omitted trailing optionals (#998). This is the opt-in half of
+/// the seam calling convention: a per-method checker that wants Python-shaped
+/// keyword/default binding calls this first with its parameter names (in
+/// declared order) and then type-checks the returned, normalized-to-positional
+/// argument list exactly as before — `args[0]`, `args.get(1)`, the arity check,
+/// all unchanged. A method that does not call this keeps the legacy
+/// positional-only behavior (names ignored), so migration is incremental and
+/// risk-free.
+///
+/// Binding rules mirror the user-function convention (and Python): positionals
+/// fill parameters left to right, each keyword binds to the parameter of that
+/// name, and the result is the supplied arguments in declared order with their
+/// `name`s stripped (so downstream positional reads just work) and any omitted
+/// trailing parameters simply absent. Diagnostics mirror the user-function
+/// path — an unknown keyword is the same `ZAP4023` a user function emits.
+///
+/// On any binding error the original `args` are returned unchanged (after the
+/// diagnostic) so the per-method checker still infers every argument and no
+/// cascade of confusing follow-on errors appears. Spread arguments (`*`/`**`,
+/// #597) are left entirely to the legacy path: if any argument is a spread, the
+/// original list is returned untouched.
+pub(super) fn bind_seam_args(
+    checker: &mut Checker,
+    module: &str,
+    method: &str,
+    params: &[&str],
+    args: &[Arg],
+    span: Span,
+) -> Vec<Arg> {
+    use zapc_syntax::ast::ArgSpread;
+
+    // Nothing to reorder, or a spread is present → legacy positional path.
+    if args.iter().all(|a| a.name.is_none())
+        || args.iter().any(|a| !matches!(a.spread, ArgSpread::None))
+    {
+        return args.to_vec();
+    }
+
+    let mut slots: Vec<Option<Arg>> = vec![None; params.len()];
+    // Positionals beyond the declared arity: keep them so the per-method arity
+    // check still fires its own `ZAP4025`/`ZAP4020`, rather than hiding the
+    // overflow here.
+    let mut overflow: Vec<Arg> = Vec::new();
+    let mut next_pos = 0usize;
+    let mut seen_keyword = false;
+
+    for a in args {
+        match &a.name {
+            None => {
+                if seen_keyword {
+                    checker.error(
+                        ErrorCode::ZAP4023,
+                        format!(
+                            "positional argument follows keyword argument in the call to \
+                             '{module}.{method}'"
+                        ),
+                        a.span,
+                    );
+                    return args.to_vec();
+                }
+                if next_pos < slots.len() {
+                    slots[next_pos] = Some(a.clone());
+                } else {
+                    overflow.push(a.clone());
+                }
+                next_pos += 1;
+            }
+            Some(name) => {
+                seen_keyword = true;
+                match params.iter().position(|p| p == name) {
+                    None => {
+                        checker.error(
+                            ErrorCode::ZAP4023,
+                            format!("'{module}.{method}' has no parameter named '{name}'"),
+                            a.span,
+                        );
+                        return args.to_vec();
+                    }
+                    Some(idx) => {
+                        if slots[idx].is_some() {
+                            checker.error(
+                                ErrorCode::ZAP4023,
+                                format!(
+                                    "'{module}.{method}' got multiple values for parameter \
+                                     '{name}'"
+                                ),
+                                a.span,
+                            );
+                            return args.to_vec();
+                        }
+                        let mut bound = a.clone();
+                        bound.name = None; // normalize to positional for the checker
+                        slots[idx] = Some(bound);
+                    }
+                }
+            }
+        }
+    }
+
+    // Flatten declared order; a filled parameter after an omitted earlier one is
+    // a hole (e.g. `compress(level=9)` with `data` missing) — reject it rather
+    // than silently shifting `level` into the `data` slot (the old footgun).
+    let mut out: Vec<Arg> = Vec::new();
+    let mut first_omitted: Option<usize> = None;
+    for (i, slot) in slots.into_iter().enumerate() {
+        match slot {
+            Some(a) => {
+                if let Some(missing) = first_omitted {
+                    checker.error(
+                        ErrorCode::ZAP4025,
+                        format!(
+                            "'{module}.{method}' is missing a value for parameter '{}' \
+                             (supplied later parameter '{}')",
+                            params[missing], params[i]
+                        ),
+                        span,
+                    );
+                    return args.to_vec();
+                }
+                out.push(a);
+            }
+            None => {
+                if first_omitted.is_none() {
+                    first_omitted = Some(i);
+                }
+            }
+        }
+    }
+    out.extend(overflow);
+    out
+}
+
 /// Type a built-in `module.CONST` attribute access (e.g. `math.pi`), or return
 /// `None` if `module` is not a registered constant-bearing module or has no such
 /// constant (so the caller falls through to ordinary attribute resolution).

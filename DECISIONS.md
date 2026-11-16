@@ -10105,3 +10105,74 @@ dotted spelling work, without touching the monomorphizer's keying.
 Relates to epic #967 (language gaps), Discussion #965, D-0078 (`concurrent`),
 #184 (lock-free collections). Sibling #983 (re-skin `deque`/`oset`/`bisect` as
 real generics) is separate and unaffected.
+
+## D-0203 — seam calling convention: opt-in keyword / default argument binding for built-in module functions (#998 / epic #967)
+
+**Problem.** Built-in (seam) module functions — the hand-written check/lower
+pairs in `crates/sema/src/modules/*.rs` and `crates/ir/src/lower/modules/*.rs` —
+were **positional-only**. They read `args[i].value` by position and never
+consulted `args[i].name`, so a seam call *tolerated* keyword syntax but **ignored
+the names**: `zlib.compress("hi", bogus=9)` was silently accepted (the keyword
+bound positionally, the typo lost — a quiet correctness footgun), and keyword
+reordering (`compress(level=9, data="hi")`) bound by position and mistyped. User
+functions, by contrast, already do full name-based binding, defaults, and
+validation (unknown keyword → `ZAP4023`). This is why the stdlib fakes optionality
+with arity overloads (`zlib.compress(data, level?)` via `args.get(1)`) instead of
+Python-shaped signatures.
+
+**Decision.** Give seam methods an **opt-in** declared parameter list and a shared
+binder that brings them the user-function calling convention. A migrated check
+function calls `zapc_sema::modules::bind_seam_args(checker, module, method,
+&["p0", "p1", …], args, span)` with its parameter names in declared order; the
+helper:
+
+- binds positionals left-to-right and each keyword to the parameter of that name;
+- **rejects an unknown keyword with the same `ZAP4023`** a user function emits
+  (`'<module>.<method>' has no parameter named '<name>'`), plus a duplicate-value
+  (`ZAP4023`), positional-after-keyword (`ZAP4023`), and missing-earlier-parameter
+  (`ZAP4025`) diagnostic;
+- returns the supplied arguments **normalized to declared positional order** with
+  their `name`s stripped and omitted trailing optionals simply absent, so the
+  existing per-method body (`args[0]`, `args.get(1)`, the arity/type checks) runs
+  **unchanged**;
+- passes spread (`*`/`**`) and all-positional calls straight through, and on any
+  binding error returns the arguments untouched (after the diagnostic) so every
+  argument is still inferred and no cascade follows.
+
+The lowering side has a twin, `reorder_seam_args(&["p0", …], args)` in
+`crates/ir/src/lower/modules/mod.rs`: a pure, defensive reorder (sema has already
+validated) so the emitted runtime call gets the arguments in the right slots —
+without it, a sema-accepted reordered keyword call would miscompile. Both facets
+read one declared parameter list per method, mirroring the existing twin-facet
+idiom.
+
+**Opt-in / incremental, by design.** A method that does **not** call the binder
+keeps the legacy positional-only behavior (names ignored), so there is **no
+blanket change** and no risk to the seam calls that pass keywords today but rely
+on positional binding (e.g. `fft.irfft(r, n=4)`, `threading.Thread(target=…)`) —
+those are migrated method-by-method as each gains a declared signature. The first
+migrated methods are `zlib`/`gzip` `compress`/`decompress` and `zlib.crc32`/
+`adler32` (the motivating examples); migrating the rest, and eventually flipping
+the default so an un-migrated method *rejects* unknown keywords rather than
+ignoring them, is tracked follow-up under #998/#967. As modules move from
+hand-written seam Rust to real Zap/prelude functions (the #966 stdlib redesign),
+they inherit the user-function convention for free and need no seam signature.
+
+**No new grammar, no new diagnostic codes.** Keyword arguments on a call are
+already grammatical (`arg ::= [IDENT "="] expr`); this assigns a meaning to the
+names on a seam call. It reuses the user-function binding codes (`ZAP4023`
+name-binding, `ZAP4025` arity) so a seam call and a user call report a keyword
+mistake identically.
+
+**Tests.** Host (parse+sema): `crates/sema/tests/seam_kwargs.rs` — keyword binds
+by name, reorders, mixes with positionals; unknown keyword / duplicate / missing
+rejected; default `level` omitted and filled by name; `gzip` shares the path;
+positional calls unchanged; a wrong-typed keyword still hits the existing
+`ZAP4024`. Lowering reorder verified on host (the reordered call lowers to
+`zap_zlib_compress(data, level)`). CI (full/arm64): the `zlib_gzip_kwargs` golden
+round-trips keyword, reordered, defaulted, and keyword-`decompress` calls
+byte-identically to the positional form.
+
+Relates to epic #967 (language gaps), Discussion #965 (language-feature §, L-5),
+#298/#481 (user-fn defaults & keyword args), #601 (`**kwargs`), and the #966
+stdlib redesign.
