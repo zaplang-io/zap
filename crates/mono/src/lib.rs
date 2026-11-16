@@ -1815,6 +1815,35 @@ impl Mono<'_> {
                     span: *span,
                 }
             }
+            Stmt::Select { cases, span } => {
+                let mut ncases = Vec::with_capacity(cases.len());
+                for case in cases {
+                    env.push();
+                    let op = match &case.op {
+                        ast::SelectOp::Recv { value, ok, chan } => ast::SelectOp::Recv {
+                            value: value.clone(),
+                            ok: ok.clone(),
+                            chan: self.rw(chan, env)?,
+                        },
+                        ast::SelectOp::Send { chan, value } => ast::SelectOp::Send {
+                            chan: self.rw(chan, env)?,
+                            value: self.rw(value, env)?,
+                        },
+                        ast::SelectOp::Default => ast::SelectOp::Default,
+                    };
+                    let body = self.rewrite_block(&case.body, env)?;
+                    env.pop();
+                    ncases.push(ast::SelectCase {
+                        op,
+                        body,
+                        span: case.span,
+                    });
+                }
+                Stmt::Select {
+                    cases: ncases,
+                    span: *span,
+                }
+            }
             Stmt::Return { value, span } => {
                 let expected = self.cur_ret.clone();
                 let value = match value {

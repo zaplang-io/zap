@@ -802,6 +802,7 @@ impl<'a> Printer<'a> {
                 arms,
                 span,
             } => self.emit_match(scrutinee, arms, span.end),
+            Stmt::Select { cases, span } => self.emit_select(cases, span.end),
             Stmt::Try {
                 body,
                 excepts,
@@ -971,6 +972,43 @@ impl<'a> Printer<'a> {
             self.push_line(&format!("case {}{guard}:", pattern_str(&arm.pattern)));
             self.take_header_trailing(arm.body.span.start);
             self.emit_block(&arm.body);
+        }
+        self.flush_dangling(body_end);
+        self.indent -= 1;
+        self.block_fresh = false;
+    }
+
+    /// Render a `select:` block (D-0031): the header, then one `case <op>:` /
+    /// `default:` per case over a statement block. Mirrors [`Self::emit_match`].
+    /// Canonical spelling follows the grammar: receive `v = <-ch` (no space
+    /// after `<-`), comma-ok `v, ok = <-ch`, send `ch <- v` (spaces both sides).
+    fn emit_select(&mut self, cases: &[SelectCase], body_end: u32) {
+        self.push_line("select:");
+        let first = cases.first().map_or(body_end, |c| c.span.start);
+        self.take_header_trailing(first);
+        self.indent += 1;
+        self.block_fresh = true;
+        for case in cases {
+            self.advance_to(case.span.start, 1);
+            let head = match &case.op {
+                SelectOp::Recv {
+                    value,
+                    ok: Some(ok),
+                    chan,
+                } => format!("case {value}, {ok} = <-{}:", pexpr(chan, 0)),
+                SelectOp::Recv {
+                    value,
+                    ok: None,
+                    chan,
+                } => format!("case {value} = <-{}:", pexpr(chan, 0)),
+                SelectOp::Send { chan, value } => {
+                    format!("case {} <- {}:", pexpr(chan, 0), pexpr(value, 0))
+                }
+                SelectOp::Default => "default:".to_string(),
+            };
+            self.push_line(&head);
+            self.take_header_trailing(case.body.span.start);
+            self.emit_block(&case.body);
         }
         self.flush_dangling(body_end);
         self.indent -= 1;
@@ -1180,6 +1218,7 @@ fn stmt_span(s: &Stmt) -> Span {
         | Stmt::DoWhile { span, .. }
         | Stmt::For { span, .. }
         | Stmt::Match { span, .. }
+        | Stmt::Select { span, .. }
         | Stmt::Return { span, .. }
         | Stmt::Raise { span, .. }
         | Stmt::Assert { span, .. }

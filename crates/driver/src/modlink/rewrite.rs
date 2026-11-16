@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use zapc_diag::ErrorCode;
 use zapc_syntax::ast::{
     BindTarget, Block, CompClause, DictItem, EnumDef, Expr, Function, InterfaceDef, Item, Pattern,
-    Stmt, StructDef, Type, TypeAliasDef, TypeParam,
+    SelectOp, Stmt, StructDef, Type, TypeAliasDef, TypeParam,
 };
 use zapc_syntax::span::Span;
 
@@ -256,6 +256,19 @@ impl Rewriter<'_> {
                         self.expr(g, locals);
                     }
                     self.block(&mut arm.body, locals, tl);
+                }
+            }
+            Stmt::Select { cases, .. } => {
+                for case in cases {
+                    match &mut case.op {
+                        SelectOp::Recv { chan, .. } => self.expr(chan, locals),
+                        SelectOp::Send { chan, value } => {
+                            self.expr(chan, locals);
+                            self.expr(value, locals);
+                        }
+                        SelectOp::Default => {}
+                    }
+                    self.block(&mut case.body, locals, tl);
                 }
             }
             Stmt::Return { value, .. } | Stmt::Raise { value, .. } => {
@@ -705,6 +718,25 @@ fn collect_stmt_bindings(st: &Stmt, s: &mut HashSet<String>) {
             collect_target_names(target, s);
             collect_expr_bindings(iter, s);
             collect_block_bindings(body, s);
+        }
+        Stmt::Select { cases, .. } => {
+            for case in cases {
+                match &case.op {
+                    SelectOp::Recv { value, ok, chan } => {
+                        s.insert(value.clone());
+                        if let Some(okn) = ok {
+                            s.insert(okn.clone());
+                        }
+                        collect_expr_bindings(chan, s);
+                    }
+                    SelectOp::Send { chan, value } => {
+                        collect_expr_bindings(chan, s);
+                        collect_expr_bindings(value, s);
+                    }
+                    SelectOp::Default => {}
+                }
+                collect_block_bindings(&case.body, s);
+            }
         }
         Stmt::Match {
             scrutinee, arms, ..

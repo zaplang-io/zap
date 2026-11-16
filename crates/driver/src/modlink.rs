@@ -712,6 +712,7 @@ fn stmt_span(st: &Stmt) -> Span {
         | Stmt::DoWhile { span, .. }
         | Stmt::For { span, .. }
         | Stmt::Match { span, .. }
+        | Stmt::Select { span, .. }
         | Stmt::Return { span, .. }
         | Stmt::Raise { span, .. }
         | Stmt::Assert { span, .. }

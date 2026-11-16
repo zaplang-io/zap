@@ -4233,6 +4233,99 @@ impl Checker {
                     }
                 }
             }
+            Stmt::Select { cases, span } => {
+                // D-0031: at least one case, at most one `default`; each case is a
+                // single channel op whose operand must be a channel. A receive
+                // binds fresh case-local name(s) (value, and optional comma-ok
+                // bool); a send checks the value against the element type. Each
+                // case body is checked in its own scope so the bindings are
+                // visible only inside that case.
+                if cases.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP4035,
+                        "a 'select' must have at least one case".to_string(),
+                        *span,
+                    );
+                }
+                let mut default_count = 0;
+                for case in cases {
+                    self.push_scope();
+                    match &case.op {
+                        SelectOp::Recv { value, ok, chan } => {
+                            let elem = match self.infer(chan) {
+                                Ty::Chan(e) => *e,
+                                Ty::Unknown => Ty::Unknown,
+                                other => {
+                                    self.error(
+                                        ErrorCode::ZAP4030,
+                                        format!(
+                                            "the operand of '<-' (receive) must be a channel, \
+                                             found {}",
+                                            other.display()
+                                        ),
+                                        expr_span(chan),
+                                    );
+                                    Ty::Unknown
+                                }
+                            };
+                            if value == "_" || ok.as_deref() == Some("_") {
+                                self.error(
+                                    ErrorCode::ZAP4035,
+                                    "a select receive case must bind a plain name, not '_'"
+                                        .to_string(),
+                                    case.span,
+                                );
+                            } else {
+                                self.declare(value, elem, case.span);
+                                if let Some(okn) = ok {
+                                    self.declare(okn, Ty::Bool, case.span);
+                                }
+                            }
+                        }
+                        SelectOp::Send { chan, value } => {
+                            let ct = self.infer(chan);
+                            let vt = self.infer(value);
+                            match ct {
+                                Ty::Chan(elem) => {
+                                    if !assignable(&vt, &elem) {
+                                        self.error(
+                                            ErrorCode::ZAP4032,
+                                            format!(
+                                                "cannot send a value of type {} on a channel[{}]",
+                                                vt.display(),
+                                                elem.display()
+                                            ),
+                                            case.span,
+                                        );
+                                    }
+                                }
+                                Ty::Unknown => {}
+                                other => self.error(
+                                    ErrorCode::ZAP4031,
+                                    format!(
+                                        "the left operand of '<-' (send) must be a channel, \
+                                         found {}",
+                                        other.display()
+                                    ),
+                                    expr_span(chan),
+                                ),
+                            }
+                        }
+                        SelectOp::Default => default_count += 1,
+                    }
+                    for st in &case.body.stmts {
+                        self.check_stmt(st);
+                    }
+                    self.pop_scope();
+                }
+                if default_count > 1 {
+                    self.error(
+                        ErrorCode::ZAP4035,
+                        "a 'select' may have at most one 'default' case".to_string(),
+                        *span,
+                    );
+                }
+            }
             Stmt::Return { value, span } if self.in_generator => {
                 // A generator ends by falling off the end or a bare `return`
                 // (D-0048/PEP 479); `return value` (which would set a

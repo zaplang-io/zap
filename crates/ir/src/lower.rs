@@ -7861,6 +7861,13 @@ impl<'a> FnLower<'a> {
                 "internal error: unresolved `when target.*` block reached \
                  lowering (expected cfg resolution first)",
             )),
+            // `select` (D-0031, #1002): parsing + sema are in place; ZIR
+            // lowering and the `zap_select` runtime op are the remaining stage,
+            // so lowering is deliberately NYI for now (keeps the grammar-coverage
+            // gate's `select_stmt` entry a tracked gap until codegen lands).
+            Stmt::Select { .. } => Err(err(
+                "`select` statement lowering is not yet implemented (#1002, D-0031)",
+            )),
             Stmt::Let {
                 ty, name, value, ..
             } => {

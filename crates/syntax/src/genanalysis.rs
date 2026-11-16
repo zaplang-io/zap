@@ -10,7 +10,7 @@
 //! enclosing function — a lambda is its own (single-expression) scope — so the
 //! walkers never descend into lambda bodies.
 
-use crate::ast::{Block, CompClause, DictItem, Expr, Function, Stmt};
+use crate::ast::{Block, CompClause, DictItem, Expr, Function, SelectOp, Stmt};
 
 /// The synthetic name of the compiler-generated **state struct** for a
 /// generator function `fn_name` (I#67). Prefixed with `$gen:` so it can never
@@ -96,6 +96,19 @@ fn each_yield_in_stmt<'a>(st: &'a Stmt, visit: &mut dyn FnMut(&'a Expr)) {
                     each_yield_in_expr(g, visit);
                 }
                 each_yield_in_block(&arm.body, visit);
+            }
+        }
+        Stmt::Select { cases, .. } => {
+            for case in cases {
+                match &case.op {
+                    SelectOp::Recv { chan, .. } => each_yield_in_expr(chan, visit),
+                    SelectOp::Send { chan, value } => {
+                        each_yield_in_expr(chan, visit);
+                        each_yield_in_expr(value, visit);
+                    }
+                    SelectOp::Default => {}
+                }
+                each_yield_in_block(&case.body, visit);
             }
         }
         Stmt::Return { value, .. } | Stmt::Raise { value, .. } => {

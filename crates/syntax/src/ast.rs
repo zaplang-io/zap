@@ -528,6 +528,15 @@ pub enum Stmt {
         arms: Vec<MatchArm>,
         span: Span,
     },
+    /// `select: case ... / default: ...` (D-0031). CSP channel multiplexing:
+    /// wait on several channel operations and proceed with the first that is
+    /// ready (uniform-random choice among several ready, like Go). A `default`
+    /// case makes the select a non-blocking poll. Sema enforces at least one
+    /// case and at most one `default`.
+    Select {
+        cases: Vec<SelectCase>,
+        span: Span,
+    },
     /// A compile-time `when target.*:` conditional-compilation block in
     /// statement position (I#139, D-0079). Resolved exactly like the item-level
     /// form: the matching arm's statements are spliced into the enclosing block
@@ -658,6 +667,33 @@ pub struct MatchArm {
     pub guard: Option<Expr>,
     pub body: Block,
     pub span: Span,
+}
+
+/// One `case <select_op>:` / `default:` clause of a [`Stmt::Select`] (D-0031).
+#[derive(Clone, Debug)]
+pub struct SelectCase {
+    pub op: SelectOp,
+    pub body: Block,
+    pub span: Span,
+}
+
+/// The channel operation of a [`SelectCase`] (D-0031), matching the three
+/// `select_op` grammar forms. Receive cases bind fresh case-local name(s)
+/// (like a `match` arm capture), never an existing lvalue — the grammar admits
+/// only `IDENT` targets.
+#[derive(Clone, Debug)]
+pub enum SelectOp {
+    /// `case v = <-ch:` (receive, binds `value`) or
+    /// `case v, ok = <-ch:` (comma-ok receive, also binds `ok`).
+    Recv {
+        value: String,
+        ok: Option<String>,
+        chan: Expr,
+    },
+    /// `case ch <- v:` — send `value` on `chan`.
+    Send { chan: Expr, value: Expr },
+    /// `default:` — the non-blocking fall-through (at most one per select).
+    Default,
 }
 
 #[derive(Clone, Debug)]

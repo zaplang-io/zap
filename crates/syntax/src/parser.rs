@@ -2566,6 +2566,7 @@ impl Parser {
                     | Keyword::With
                     | Keyword::Scope
                     | Keyword::Unsafe
+                    | Keyword::Select
                     | Keyword::When
             )
         )
@@ -2582,6 +2583,7 @@ impl Parser {
             TokenKind::Keyword(Keyword::With) => self.parse_with(),
             TokenKind::Keyword(Keyword::Scope) => self.parse_scope(),
             TokenKind::Keyword(Keyword::Unsafe) => self.parse_unsafe(),
+            TokenKind::Keyword(Keyword::Select) => self.parse_select(),
             TokenKind::Keyword(Keyword::When) => Stmt::Cfg(self.parse_cfg_stmt()),
             _ => unreachable!("parse_compound called on non-compound token"),
         }
@@ -2919,6 +2921,76 @@ impl Parser {
             arms,
             span: self.span_from(start),
         }
+    }
+
+    /// `select: { case <select_op> block | default block }` (D-0031). CSP
+    /// channel multiplexing; `default` (a contextual word, not a keyword) is the
+    /// non-blocking fall-through. The at-least-one-case / at-most-one-default
+    /// rules are enforced in sema, so the parser stays permissive.
+    fn parse_select(&mut self) -> Stmt {
+        let start = self.peek_span().start;
+        self.expect_kw(Keyword::Select, "'select'");
+        self.expect(&TokenKind::Colon, "':'");
+        self.expect(&TokenKind::Newline, "newline");
+        self.expect(&TokenKind::Indent, "indented block");
+        let mut cases = Vec::new();
+        loop {
+            let cstart = self.peek_span().start;
+            if self.is_kw(Keyword::Case) {
+                self.bump();
+                let op = self.parse_select_op();
+                let body = self.parse_block();
+                cases.push(SelectCase {
+                    op,
+                    body,
+                    span: self.span_from(cstart),
+                });
+            } else if matches!(self.peek(), TokenKind::Ident(n) if n == "default") {
+                self.bump();
+                let body = self.parse_block();
+                cases.push(SelectCase {
+                    op: SelectOp::Default,
+                    body,
+                    span: self.span_from(cstart),
+                });
+            } else {
+                break;
+            }
+        }
+        self.expect(&TokenKind::Dedent, "end of select block");
+        Stmt::Select {
+            cases,
+            span: self.span_from(start),
+        }
+    }
+
+    /// Parse one `select_op` after `case` (D-0031):
+    ///   IDENT "=" "<-" postfix            (receive, binds IDENT)
+    ///   IDENT "," IDENT "=" "<-" postfix  (comma-ok receive)
+    ///   postfix "<-" expr                 (send)
+    ///
+    /// A receive begins with an IDENT immediately followed by `=` or `,`;
+    /// anything else is a send, whose channel operand may itself start with an
+    /// identifier (`ch <- v`), so the one-token lookahead is what disambiguates.
+    fn parse_select_op(&mut self) -> SelectOp {
+        if matches!(self.peek(), TokenKind::Ident(_))
+            && matches!(self.peek2(), TokenKind::Assign | TokenKind::Comma)
+        {
+            let value = self.ident("receive target name");
+            let ok = if self.eat(&TokenKind::Comma) {
+                Some(self.ident("comma-ok target name"))
+            } else {
+                None
+            };
+            self.expect(&TokenKind::Assign, "'=' in receive case");
+            self.expect(&TokenKind::LArrow, "'<-' in receive case");
+            let chan = self.parse_postfix();
+            return SelectOp::Recv { value, ok, chan };
+        }
+        let chan = self.parse_postfix();
+        self.expect(&TokenKind::LArrow, "'<-' in send case");
+        let value = self.parse_expr();
+        SelectOp::Send { chan, value }
     }
 
     fn parse_try(&mut self) -> Stmt {
@@ -6549,5 +6621,50 @@ def main():
             type_names(&m).iter().any(|n| n == "Counter"),
             "the prelude Counter struct must be present without a collision"
         );
+    }
+
+    #[test]
+    fn select_all_case_forms_parse() {
+        // The three `select_op` forms + `default` (D-0031, #1002).
+        let src = "def f():\n    select:\n\
+                   \x20       case v = <-ch:\n            a()\n\
+                   \x20       case x, ok = <-done:\n            b()\n\
+                   \x20       case out <- 1:\n            c()\n\
+                   \x20       default:\n            d()\n";
+        let m = parse_ok(src);
+        let Item::Function(f) = &m.items[0] else {
+            panic!("fn");
+        };
+        let Stmt::Select { cases, .. } = &f.body.stmts[0] else {
+            panic!("select");
+        };
+        assert_eq!(cases.len(), 4);
+        let SelectOp::Recv { value, ok, .. } = &cases[0].op else {
+            panic!("receive");
+        };
+        assert_eq!(value, "v");
+        assert!(ok.is_none());
+        let SelectOp::Recv { value, ok, .. } = &cases[1].op else {
+            panic!("comma-ok receive");
+        };
+        assert_eq!(value, "x");
+        assert_eq!(ok.as_deref(), Some("ok"));
+        assert!(matches!(&cases[2].op, SelectOp::Send { .. }));
+        assert!(matches!(&cases[3].op, SelectOp::Default));
+    }
+
+    #[test]
+    fn select_send_channel_starting_with_ident_is_not_a_receive() {
+        // `ch <- 1`: the one-token lookahead must route a bare-identifier channel
+        // to the send form, not mis-read it as a receive target.
+        let m = parse_ok("def f():\n    select:\n        case ch <- 1:\n            a()\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!("fn");
+        };
+        let Stmt::Select { cases, .. } = &f.body.stmts[0] else {
+            panic!("select");
+        };
+        assert_eq!(cases.len(), 1);
+        assert!(matches!(&cases[0].op, SelectOp::Send { .. }));
     }
 }

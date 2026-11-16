@@ -438,6 +438,9 @@ define_codes! {
     ZAP4034 = 4034 : "positional-only argument supplied by name",
         "A parameter declared before the bare `/` separator is positional-only \
          (#602) and must be passed positionally, not by name (`name=value`).";
+    ZAP4035 = 4035 : "invalid select statement",
+        "A `select` must have at least one case, at most one `default`, and \
+         each receive case must bind plain name(s) (D-0031).";
     ZAP4040 = 4040 : "match operand must be a string",
         "The left operand of `=~` / `!~` must be a `str`.";
     ZAP4041 = 4041 : "substitution operand must be a string",

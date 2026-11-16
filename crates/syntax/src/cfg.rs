@@ -260,6 +260,11 @@ fn resolve_in_stmt(stmt: &mut Stmt, target: &Target) {
                 resolve_stmts(&mut arm.body.stmts, target);
             }
         }
+        Stmt::Select { cases, .. } => {
+            for case in cases.iter_mut() {
+                resolve_stmts(&mut case.body.stmts, target);
+            }
+        }
         Stmt::Try {
             body,
             excepts,
