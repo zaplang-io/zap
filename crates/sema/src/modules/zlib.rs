@@ -43,12 +43,10 @@ pub(super) fn expect_data(checker: &mut Checker, module: &str, func: &str, arg: 
 /// argument and an optional numeric compression level. Shared by `zlib` and
 /// `gzip` (see [`gzip`](super::gzip)).
 pub(super) fn check_compress(checker: &mut Checker, module: &str, args: &[Arg], span: Span) {
-    // Keyword/default binding (#998): `compress(data, level?)` may be called
-    // `compress(data=..., level=...)` in any order; an unknown keyword is a
-    // `ZAP4023`. The normalized positional list is then checked exactly as
-    // before. Shared by `zlib` and `gzip`.
-    let bound = super::bind_seam_args(checker, module, "compress", &["data", "level"], args, span);
-    let args = &bound[..];
+    // Keyword/default binding (`compress(data=..., level=...)`, reordered, with
+    // `level` omitted) is applied centrally from the seam signature registry
+    // (#998, D-0204) before this runs, so `args` is already normalized to
+    // positional order. Shared by `zlib` and `gzip`.
     if args.is_empty() || args.len() > 2 {
         checker.error(
             ErrorCode::ZAP4025,
@@ -82,9 +80,7 @@ pub(super) fn check_compress(checker: &mut Checker, module: &str, args: &[Arg], 
 /// Type-check a `module.decompress(data)` call: a single `str`/`bytes` argument.
 /// Shared by `zlib` and `gzip`.
 pub(super) fn check_decompress(checker: &mut Checker, module: &str, args: &[Arg], span: Span) {
-    // Keyword binding (#998): `decompress(data=...)`; unknown keyword → ZAP4023.
-    let bound = super::bind_seam_args(checker, module, "decompress", &["data"], args, span);
-    let args = &bound[..];
+    // Keyword binding applied centrally (#998, D-0204); `args` is normalized.
     if args.len() != 1 {
         checker.error(
             ErrorCode::ZAP4025,
@@ -117,8 +113,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         // zlib.crc32(data) / zlib.adler32(data) -> int (the running checksum of
         // `data` from the standard initial value), 0..2^32-1.
         "crc32" | "adler32" => {
-            let bound = super::bind_seam_args(checker, "zlib", method, &["data"], args, span);
-            let args = &bound[..];
+            // Keyword binding applied centrally (#998, D-0204).
             if args.len() != 1 {
                 checker.error(
                     ErrorCode::ZAP4025,

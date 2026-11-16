@@ -29,10 +29,8 @@ pub(super) fn lower_compress(
     func: &str,
     args: &[ast::Arg],
 ) -> Result<(Value, Ty), LowerError> {
-    // Reorder keyword args into (data, level) order (#998) so the positional
-    // reads below are correct; sema already validated the binding.
-    let args = super::reorder_seam_args(&["data", "level"], args);
-    let args = &args[..];
+    // Keyword args are reordered to positional order centrally (#998, D-0204)
+    // from the seam signature registry before this runs.
     if args.is_empty() || args.len() > 2 {
         return Err(err("compress takes one or two arguments"));
     }
@@ -60,8 +58,6 @@ pub(super) fn lower_decompress(
     func: &str,
     args: &[ast::Arg],
 ) -> Result<(Value, Ty), LowerError> {
-    let args = super::reorder_seam_args(&["data"], args);
-    let args = &args[..];
     if args.len() != 1 {
         return Err(err("decompress takes exactly one argument"));
     }
@@ -89,8 +85,6 @@ fn lower(
         )?)),
         // crc32/adler32(data) -> i64 checksum.
         "crc32" | "adler32" => {
-            let args = super::reorder_seam_args(&["data"], args);
-            let args = &args[..];
             if args.len() != 1 {
                 return Err(err("crc32/adler32 takes exactly one argument"));
             }
