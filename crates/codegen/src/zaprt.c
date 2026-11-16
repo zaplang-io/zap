@@ -24475,6 +24475,109 @@ void *zap_http_req_header(void *req_, void *name_) {
     return v;
 }
 
+/* http.req_headers(req) enumeration backing (#960, D-0197). The raw request
+ * header block is a GC `ZapStr` of the bytes between the request line and the
+ * blank line; each header is one CR?LF-terminated `Name: value` line. These
+ * three infallible accessors drive the `list[(str, str)]` the lowering
+ * assembles: the count of header lines, and the name / value of the idx-th one
+ * (0-based, in received order, duplicate names preserved as separate pairs).
+ *
+ * A header line is a non-empty line whose first `:` is preceded by at least one
+ * byte (a non-empty field name); a blank or colon-less line is skipped. The
+ * value is the bytes after the first `:` with leading spaces/tabs trimmed —
+ * exactly the trimming `zap_http_header_value` applies to the by-name lookup.
+ * Names are returned verbatim (original case); case-insensitive discovery is the
+ * separate by-name `zap_http_req_header`.
+ *
+ * GC note: like `zap_http_header_value`, each call does all of its pointer
+ * arithmetic over `req->headers->data` BEFORE its single `zap_str_new`, and the
+ * caller re-derives the block pointer on every call, so no raw interior pointer
+ * is ever held across an allocation (safe under a moving collector). */
+static int zap_http_next_header_line(const char *hbuf, size_t hlen, size_t *i,
+                                     size_t *line, size_t *colon, size_t *end) {
+    if (*i >= hlen) {
+        return 0;
+    }
+    *line = *i;
+    while (*i < hlen && hbuf[*i] != '\n') {
+        (*i)++;
+    }
+    size_t e = *i;
+    if (e > *line && hbuf[e - 1] == '\r') {
+        e--;
+    }
+    *end = e;
+    size_t c = *line;
+    while (c < e && hbuf[c] != ':') {
+        c++;
+    }
+    *colon = c;
+    if (*i < hlen) {
+        (*i)++; /* step over the '\n' */
+    }
+    return 1;
+}
+
+/* A field line is one with a non-empty name (colon strictly after the start)
+ * and a colon within the line. */
+static int zap_http_is_field_line(size_t line, size_t colon, size_t end) {
+    return colon < end && colon > line;
+}
+
+int64_t zap_http_req_header_count(void *req_) {
+    const ZapHttpReq *req = (const ZapHttpReq *)req_;
+    const char *hbuf = req->headers->data;
+    size_t hlen = (size_t)req->headers->len;
+    int64_t n = 0;
+    size_t i = 0, line, colon, end;
+    while (zap_http_next_header_line(hbuf, hlen, &i, &line, &colon, &end)) {
+        if (zap_http_is_field_line(line, colon, end)) {
+            n++;
+        }
+    }
+    return n;
+}
+
+void *zap_http_req_header_name(void *req_, int64_t idx) {
+    const ZapHttpReq *req = (const ZapHttpReq *)req_;
+    const char *hbuf = req->headers->data;
+    size_t hlen = (size_t)req->headers->len;
+    int64_t k = 0;
+    size_t i = 0, line, colon, end;
+    while (zap_http_next_header_line(hbuf, hlen, &i, &line, &colon, &end)) {
+        if (!zap_http_is_field_line(line, colon, end)) {
+            continue;
+        }
+        if (k == idx) {
+            return zap_str_new(hbuf + line, (int64_t)(colon - line));
+        }
+        k++;
+    }
+    return zap_str_new("", 0);
+}
+
+void *zap_http_req_header_val(void *req_, int64_t idx) {
+    const ZapHttpReq *req = (const ZapHttpReq *)req_;
+    const char *hbuf = req->headers->data;
+    size_t hlen = (size_t)req->headers->len;
+    int64_t k = 0;
+    size_t i = 0, line, colon, end;
+    while (zap_http_next_header_line(hbuf, hlen, &i, &line, &colon, &end)) {
+        if (!zap_http_is_field_line(line, colon, end)) {
+            continue;
+        }
+        if (k == idx) {
+            size_t v = colon + 1;
+            while (v < end && (hbuf[v] == ' ' || hbuf[v] == '\t')) {
+                v++;
+            }
+            return zap_str_new(hbuf + v, (int64_t)(end - v));
+        }
+        k++;
+    }
+    return zap_str_new("", 0);
+}
+
 /* Reason phrase for a status code (a small common set; "OK" otherwise). */
 static const char *zap_http_reason(int64_t status) {
     switch (status) {

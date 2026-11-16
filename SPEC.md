@@ -1928,7 +1928,11 @@ request off a connection into an opaque handle read back with
 `http.method(req) -> str`, `http.path(req) -> str`,
 `http.req_version(req) -> str` (the request-line HTTP version token, e.g.
 `"HTTP/1.1"`; `""` for an HTTP/0.9-style line with no version — #486),
-`http.req_header(req, name) -> str` (case-insensitive, `""` when absent) and
+`http.req_header(req, name) -> str` (case-insensitive, `""` when absent),
+`http.req_headers(req) -> list[(str, str)]` (every received header as a
+`(name, value)` pair in received order, duplicate names preserved as separate
+pairs, names verbatim — the enumeration counterpart of the case-insensitive
+by-name `req_header`, #960) and
 `http.req_body(req) -> str`. Both `http.read_request` and `http.respond` accept
 **either** a plaintext `net` connection **or** a TLS connection from
 `tls.accept` (both are the one opaque connection handle) — the request parser and

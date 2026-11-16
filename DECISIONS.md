@@ -9695,3 +9695,48 @@ it, and the explicit `fma()` operation. Orthogonal to the ISA-dispatch facility
 Threaded driver → codegen as `FpPolicy` (in `zapc_ir_core`, re-exported from
 `zapc_ir`). Relates to Discussion #920 (5 & 6); clients #896/#911/#913. NOT a
 sub-issue of #139 (float semantics, not dispatch).
+
+## D-0197 — `http.req_headers`: enumerate the raw request header block (#960)
+**Status:** implemented
+The stdlib `http` server surface exposed request headers only by name
+(`http.req_header(req, name)`), so an arbitrary / custom header (e.g.
+`X-Custom-Thing`) could never be *discovered* — only fetched when its name was
+already known. This blocked full request-header access in the fastzap web
+framework (zaplang-io/fastzap#25, which otherwise snapshots only a fixed standard
+subset). Per the language-first rule the capability belongs in the stdlib, not in
+a fastzap workaround. New accessor:
+
+```
+http.req_headers(req) -> list[(str, str)]
+```
+
+- **Shape — a `list[(str, str)]` of `(name, value)` pairs**, not a `dict`. A dict
+  cannot represent a repeated header name without folding, and its iteration order
+  is unspecified; a list of pairs preserves both duplicates and order. It is the
+  exact shape and lowering of `dict[str, str].items()`, so it iterates naturally
+  with `for name, value in http.req_headers(req):`.
+- **Ordering — received (wire) order**, preserved. The parser walks the raw header
+  block (the bytes between the request line and the terminating blank line) top to
+  bottom, so the Nth pair is the Nth header line as received.
+- **Duplicates — preserved as separate pairs**, never combined. Two
+  `X-Custom-Thing:` lines yield two pairs. (Folding duplicates into a single
+  comma-joined value per RFC 9110 §5.3 is a lossy, caller-specific policy; the raw
+  enumeration keeps the information and lets the caller decide.)
+- **Case — names returned verbatim** (original wire case). Case-insensitive
+  *discovery* stays with the existing `http.req_header(req, name)`, which is
+  unchanged (and, for a duplicated name, still returns the FIRST occurrence). A
+  field line is one with a non-empty name before its first `:`; a blank or
+  colon-less line is skipped; the value is the bytes after the first `:` with
+  leading spaces/tabs trimmed — the same trimming the by-name lookup applies.
+- **No new `Ty` / no grammar change.** Pure module call, like the rest of the
+  `http`/`net` surface (D-0056). Backed by three infallible runtime accessors on
+  the parsed handle (`zap_http_req_header_count` + positional
+  `zap_http_req_header_name` / `zap_http_req_header_val`); the `list[(str, str)]`
+  is assembled in IR lowering (`FnLower::lower_http_req_headers`, mirroring
+  `lower_dict_items`) so the `(str, str)` tuple's GC/field layout is the
+  compiler's own, not hand-built in C. Empty header block ⇒ empty list.
+- **Scope.** The server-side read/enumerate side only. Setting *response* headers
+  (#279), client *request* headers (#280) and the request-line version (#486) are
+  separate, already-shipped, and untouched. `http` stays **Experimental**
+  (STABILITY.md §4.4), so this is an additive surface change under the pre-1.0
+  regime. Unblocks zaplang-io/fastzap#25.

@@ -16768,6 +16768,111 @@ impl<'a> FnLower<'a> {
         Ok((out, Ty::List(out_elem)))
     }
 
+    /// Lower `http.req_headers(req) -> list[(str, str)]` (#960, D-0197): enumerate
+    /// the full received request header block as `(name, value)` pairs.
+    ///
+    /// Mirrors [`lower_dict_items`]: three infallible runtime accessors on the
+    /// parsed request handle — `zap_http_req_header_count` and the positional
+    /// `zap_http_req_header_name` / `zap_http_req_header_val` — drive a counted
+    /// loop that assembles each pair with the compiler's own tuple path (intern +
+    /// `StructNew` + `FieldSet`). Received order is preserved and duplicate header
+    /// names stay as separate pairs; the runtime returns names verbatim (original
+    /// case), leaving case-insensitive discovery to the by-name `req_header`.
+    ///
+    /// Building the tuples in lowering (not the runtime) keeps the GC/field layout
+    /// agreement codegen's `FieldGet` relies on: a `str` flows as a [`Ty::Ptr`] in
+    /// ZIR, so the interned fields are `(Ptr, Ptr)` — byte-identical to a
+    /// `dict[str, str].items()` element, which is also iterated as `for name,
+    /// value in ...`.
+    fn lower_http_req_headers(&mut self, req: Value) -> (Value, Ty) {
+        let tuple_sid = self.ctx.tuples.borrow_mut().intern(vec![Ty::Ptr, Ty::Ptr]);
+        let out_elem = Elem::Struct(tuple_sid);
+        let out = self.new_value(Ty::List(out_elem));
+        self.emit(Inst::Call {
+            dest: Some(out),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        // n = zap_http_req_header_count(req): loop-invariant, computed once.
+        let count = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(count),
+            func: "zap_http_req_header_count".to_string(),
+            args: vec![req],
+        });
+
+        // for i in 0..n: out.push((name(req, i), val(req, i)))
+        let idx = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let end_bb = self.new_block();
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let c = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: c,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: count,
+        });
+        self.set_term(Term::BrIf {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let name = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(name),
+            func: "zap_http_req_header_name".to_string(),
+            args: vec![req, i],
+        });
+        let val = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(val),
+            func: "zap_http_req_header_val".to_string(),
+            args: vec![req, i],
+        });
+        let tup = self.new_value(Ty::Struct(tuple_sid));
+        self.emit(Inst::StructNew {
+            dest: tup,
+            sid: tuple_sid,
+        });
+        self.emit(Inst::FieldSet {
+            base: tup,
+            sid: tuple_sid,
+            idx: 0,
+            val: name,
+        });
+        self.emit(Inst::FieldSet {
+            base: tup,
+            sid: tuple_sid,
+            idx: 1,
+            val,
+        });
+        self.emit(Inst::Call {
+            dest: None,
+            func: "zap_list_push_ptr".to_string(),
+            args: vec![out, tup],
+        });
+        let next = self.new_value(Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: i,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+        self.position(end_bb);
+        (out, Ty::List(out_elem))
+    }
+
     /// Lower `heap[T]()` / `heap[T](cmp="max")` (D-0057). The element kind is the
     /// subscript; the only argument is the keyword `cmp` selecting direction
     /// (`"min"` is the default min-heap, `"max"` a max-heap). Lowers to a
