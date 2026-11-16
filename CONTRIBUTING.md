@@ -33,6 +33,7 @@ There is no CLA and no separate sign-off step.
 | `crates/` | The compiler workspace (`syntax`, `sema`, `ir`, `codegen`, `driver`, …) and the runtime |
 | `tests/golden/` | Golden end-to-end programs: `name.zap` + `name.expected` (+ optional `.exit`/`.stderr`/`.env`) |
 | `tests/conformance/` | Spec-conformance goldens (I#376): each case cites the `SPEC.md` claim it pins; `CLAIMS.md` is the claim index |
+| `crates/driver/tests/grammar_coverage.rs` | Grammar-production coverage gate (#469 / D-0201): every `docs/GRAMMAR.ebnf` production needs a compiling host example or a tracked gap |
 | [`docs/DIVERGENCE_CHECKLIST.md`](docs/DIVERGENCE_CHECKLIST.md) | Python-divergence checklist, required for every language PR / `D-00xx` |
 | [`docs/OFFICIAL_PACKAGE_GUIDELINES.md`](docs/OFFICIAL_PACKAGE_GUIDELINES.md) | Best practices for official non-core packages (security, limits, testing, docs, release) |
 
@@ -132,6 +133,15 @@ Notes that have bitten people:
   checklist](docs/DIVERGENCE_CHECKLIST.md) (epic #374 / I#376). A case cites the
   `SPEC.md` claim it pins; `tests/conformance/CLAIMS.md` is the claim index that
   makes coverage measurable. See `tests/conformance/README.md`.
+- **Grammar coverage** (`crates/driver/tests/grammar_coverage.rs`, #469 /
+  D-0201). Adding a production to `docs/GRAMMAR.ebnf` — or changing one's name —
+  requires a matching coverage entry: either a minimal `Compiles` example that
+  passes the whole host front end (parse + `when` resolution + sema + AST->ZIR
+  lowering), or, if the construct is specified but not yet implemented, a
+  `TrackedGap` entry with a reason. The gate fails CI when a reachable
+  production has neither, so the grammar can never silently outrun the parser,
+  sema, or lowering. This is the production-indexed complement to the
+  claim-indexed conformance suite above.
 - Unit tests live next to the code in each crate; the `driver` crate also has
   integration suites (`golden.rs`, `conformance.rs`, `diff_cpython.rs`, `gc.rs`,
   `signals.rs`, `profiling.rs`, `zap_cli.rs`).
