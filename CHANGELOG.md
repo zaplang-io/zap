@@ -1481,6 +1481,12 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **Collection constructors with a type-parameter element** (#1013). `list[T]()`
+  / `dict[K, V]()` / `set[T]()` (and `heap`/`channel`) inside a **generic body**
+  now monomorphise to the concrete element type instead of reaching codegen as a
+  bare `T` (*type 'T' not supported*); the monomorphiser now substitutes a
+  collection constructor's type-argument subscript, as it already did for type
+  annotations. Completes the generic-body half of #1004.
 - **Sliced assignment `xs[lo:hi:step] = ys`** (#1005, D-0207). A slice
   assignment target — grammatical, and the single-element `xs[i] = v` already
   worked — no longer fails at lowering. A step-1 slice splices (replace / grow /

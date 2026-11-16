@@ -3045,6 +3045,32 @@ impl Mono<'_> {
                         return Ok((node, ret_cty));
                     }
                 }
+                // Builtin collection constructors with a type-argument subscript
+                // — `list[T]()`, `dict[K,V]()`, `set[T]()`, `heap[T]()`,
+                // `channel[T]()` (#1013). Unlike user generics these are not in
+                // `gstructs`/`gfuncs`, so without this the monomorphiser leaves
+                // the subscript's type parameters unsubstituted and a
+                // type-parameter element (e.g. `list[T]()` in a generic body)
+                // reaches codegen as a bare `T` ("type 'T' not supported").
+                // Re-materialise the subscript from the substituted concrete
+                // types; for a concrete call this reproduces the identical
+                // subscript, so there is no change on the non-generic path.
+                if matches!(g.as_str(), "list" | "dict" | "set" | "heap" | "channel") {
+                    if let Some(cargs) = self.type_args_from_index(index) {
+                        if let Some(new_index) = types_to_index_expr(&cargs, *nspan) {
+                            let node = Expr::Call {
+                                callee: Box::new(Expr::Index {
+                                    base: Box::new(Expr::Name(g.clone(), *nspan)),
+                                    index: Box::new(new_index),
+                                    span: *nspan,
+                                }),
+                                args: nargs,
+                                span,
+                            };
+                            return Ok((node, CTy::Unknown));
+                        }
+                    }
+                }
             }
             // Generic method call with explicit type args `recv.m[args](...)`.
             if let Expr::Attr {
@@ -3402,6 +3428,51 @@ fn expr_to_type(e: &Expr) -> Option<Type> {
             })
         }
         _ => None,
+    }
+}
+
+/// Rebuild a type-argument subscript **expression** from concrete types — the
+/// inverse of [`expr_to_type`] for the forms that appear in a collection
+/// constructor's `[...]` (#1013). Used to re-materialise `list[T]()` /
+/// `dict[K,V]()` etc. after the type parameters have been substituted, so the
+/// monomorphised body carries the concrete element types rather than a bare `T`.
+/// A single type is the bare index; several (a `dict`'s `K, V`) become a tuple.
+/// Returns `None` for a function-typed argument (left to the structural
+/// fallback — it carries no type parameter a collection element would need).
+fn types_to_index_expr(args: &[Type], span: Span) -> Option<Expr> {
+    let exprs = args
+        .iter()
+        .map(|t| type_to_expr(t, span))
+        .collect::<Option<Vec<_>>>()?;
+    if exprs.len() == 1 {
+        Some(exprs.into_iter().next().unwrap())
+    } else {
+        Some(Expr::Tuple(exprs, span))
+    }
+}
+
+fn type_to_expr(t: &Type, span: Span) -> Option<Expr> {
+    match t {
+        Type::Named { name, args, .. } => {
+            if args.is_empty() {
+                Some(Expr::Name(name.clone(), span))
+            } else {
+                let index = types_to_index_expr(args, span)?;
+                Some(Expr::Index {
+                    base: Box::new(Expr::Name(name.clone(), span)),
+                    index: Box::new(index),
+                    span,
+                })
+            }
+        }
+        Type::Tuple { elems, .. } => {
+            let exprs = elems
+                .iter()
+                .map(|e| type_to_expr(e, span))
+                .collect::<Option<Vec<_>>>()?;
+            Some(Expr::Tuple(exprs, span))
+        }
+        Type::Func { .. } => None,
     }
 }
 
@@ -4228,6 +4299,39 @@ mod tests {
         assert!(
             names.iter().any(|n| n == "new_queue$int64"),
             "expected a new_queue$int64 specialization, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn generic_body_collection_ctor_substitutes_element_type() {
+        // #1013: `list[T]()` inside a generic body must monomorphise to the
+        // concrete element type, not leave a bare `T` for codegen to reject.
+        let m = mono_ok(
+            "def collect[T](T x) -> int64:\n    \
+             auto xs = list[T]()\n    \
+             xs.append(x)\n    \
+             return len(xs)\n\
+             def main():\n    \
+             print(str(collect[int64](5)))\n",
+        );
+        let f = m
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Function(f) if f.name == "collect$int64" => Some(f),
+                _ => None,
+            })
+            .expect("collect$int64 specialization present");
+        let Stmt::Let { value, .. } = &f.body.stmts[0] else {
+            panic!(
+                "expected `auto xs = list[...]()`, got {:?}",
+                f.body.stmts[0]
+            );
+        };
+        let rendered = zapc_syntax::ast::render_expr(value);
+        assert!(
+            rendered.contains("int64") && !rendered.contains("[T]"),
+            "list[T]() subscript was not substituted: {rendered}"
         );
     }
 }
