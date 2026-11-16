@@ -8,9 +8,12 @@
 //! this hook stays a thin shim and the monomorphizer handles the inner
 //! `Atomic[int64]` instance as usual. `start` defaults to 0.
 //!
-//! The MPSC `Queue[T]` is generic and therefore NOT module-qualified: it is a
-//! bare prelude type (like `Atomic[T]`/`Optional[T]`) built with the prelude
-//! `new_queue[T]()` free function, so it needs no entry here.
+//! The MPSC `Queue[T]` is generic; its constructor is the bare prelude
+//! `new_queue[T]()` free function. The natural module-qualified spelling
+//! `concurrent.Queue[T]()` is pure front-end sugar rewritten to `new_queue` long
+//! before this facet (in sema + monomorphization, via `zapc_syntax::seam`;
+//! I#996, D-0202), so `Queue` never reaches this lowering hook under the
+//! `concurrent.` namespace and needs no entry here.
 //!
 //! No runtime-C / GC code backs any of this — the types are pure Zap over the
 //! existing `Atomic[T]` lowering (the central finding of the design, §4).

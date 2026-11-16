@@ -10031,3 +10031,77 @@ scan's production × minimal-example sweep and is maintained by hand thereafter.
 Relates to #469 (close Stable spec↔impl gaps), epic #374 (correctness
 hardening), I#396 (load-bearing grammar), I#376 (spec-conformance suite), I#375
 (CPython differential suite).
+
+## D-0202 — module-qualified construction of seam-exposed prelude generics: `concurrent.Queue[T]()` (#996)
+**Status:** implemented
+Follow-up to [[D-0078]] (the `concurrent` lock-free collections). D-0078 shipped
+the MPSC `Queue[T]` as a bare prelude generic built with the free function
+`new_queue[T]()`, and ruled module-qualified *generic* construction
+(`concurrent.Queue[T]()`) out of scope because a module-qualified constructor
+call carries no type argument and the monomorphizer keys on **bare** names. #996
+revisits exactly that ergonomic gap (Option 2 of the issue): make the natural
+dotted spelling work, without touching the monomorphizer's keying.
+
+- **The two natural forms now work**, alongside the unchanged bare form:
+  ```
+  concurrent.Queue[int64] q = concurrent.Queue[int64]()   # explicit T
+  concurrent.Queue[int64] q = concurrent.Queue()          # T from the annotation
+  Queue[int64]            q = new_queue()                 # bare (unchanged)
+  Queue[str]              q = new_queue[str]()            # bare (unchanged)
+  ```
+- **Mechanism: pure front-end sugar, not a new monomorphizer capability
+  (minimal Option 1-flavoured realization of Option 2).** A single shared table
+  (`zapc_syntax::seam`) maps a seam generic `(module, Type)` to the bare prelude
+  free constructor the monomorphizer already knows — today the one row
+  `("concurrent", "Queue") -> "new_queue"`. From it, two rewrites:
+  1. the **type-annotation head** `concurrent.Queue[T]` is normalized to the bare
+     prelude `Queue[T]` (sema `resolve_type`, mono `apply_subst`);
+  2. the **constructor callee** `concurrent.Queue[T](...)` / `concurrent.Queue(...)`
+     is rewritten to `new_queue[T](...)` / `new_queue(...)` in constructor-call
+     position (sema `check_call`, mono `rewrite_call`).
+  Everything downstream — the generic-call type-check, the monomorphizer's
+  explicit-type-arg and inferred-from-expected paths, and lowering — then runs
+  **unchanged** on the bare names. The monomorphizer still keys only on bare
+  names (the D-0078 constraint is preserved, not relaxed); `concurrent.Queue[int64]()`
+  and `new_queue[int64]()` produce the *same* `new_queue$int64` specialization,
+  and distinct element types never collapse. This mirrors the existing twin-facet
+  idiom (the `concurrent` sema/lowering facets): the recognition logic lives in
+  one place and is consulted by both front-ends.
+- **No new grammar.** The expression `concurrent.Queue[int64]()` and the type
+  `concurrent.Queue[int64]` are both already admitted by the grammar (a dotted
+  `type_name`, a `[type_args]` subscript, a call); D-0078 declined them only as a
+  *meaning*, not a *syntax*. This decision assigns the meaning, so `GRAMMAR.ebnf`
+  needs only a clarifying note on `named_type`, not a production change.
+- **`new_queue[T]()` stays the underlying constructor (back-compat).** It is not
+  deprecated; the dotted form is the ergonomic surface over it. Existing code and
+  goldens (`concurrent_basic`, the MPSC stress fixtures) are untouched.
+- **Scope: `Queue` only, this change.** The siblings `ConcurrentSet[K]` /
+  `ConcurrentStack[T]` (built by `new_concurrent_set()` / `new_concurrent_stack()`)
+  fit the same table in one row each, but their natural dotted spelling is itself
+  an open naming question (`concurrent.ConcurrentSet` reads redundantly; whether
+  the surface should instead be `concurrent.Set` / `concurrent.Stack` is a
+  maintainer call) — so they are a **documented follow-up**, not silently folded
+  in here. `concurrent.Counter()` is non-generic and unaffected (it keeps its
+  existing module-constructor path, D-0078); the dotted-generic sugar deliberately
+  does **not** fire for it.
+- **Ill-formed forms diagnose exactly as the bare form.** Because the sugar is a
+  pure callee/head rewrite, every spelling produces byte-identical diagnostics to
+  the `new_queue` it desugars to (locked by a sema equivalence test). Arity misuse
+  (`concurrent.Queue[int64](5)`) is rejected in lowering (ZAP6001) exactly as
+  `new_queue[int64](5)` is; a bare `concurrent.Queue` used as a value is rejected
+  in sema (ZAP3001) since the sugar fires only in call position. An unknown/extra
+  element type (`concurrent.Queue[Nope]()`, `concurrent.Queue[int64, str]()`) is a
+  pre-existing property of the bare generic-free-function path (not caught before
+  codegen for `new_queue` either) and is out of scope for #996 — the equivalence
+  test pins that dotted never diverges from bare here.
+- **Tests.** Host: `zapc_syntax::seam` unit tests (table + callee desugar); sema
+  (explicit / inferred / str payload / distinct instances / bare back-compat /
+  dotted≡bare diagnostics / `Counter` is not a seam generic); mono (dotted explicit
+  & inferred desugar to the bare `new_queue$T` instance, distinct `int64`/`str`/`bool`
+  instances, bare back-compat). CI (full/arm64): the `concurrent_qualified_queue`
+  golden (explicit + inferred + str + bool + bare, FIFO + comma-ok + drain) and two
+  compile-fail goldens (`_arity`, `_not_constructible`).
+
+Relates to epic #967 (language gaps), Discussion #965, D-0078 (`concurrent`),
+#184 (lock-free collections). Sibling #983 (re-skin `deque`/`oset`/`bisect` as
+real generics) is separate and unaffected.

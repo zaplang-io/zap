@@ -706,7 +706,9 @@ struct QNode[T]:
 # consumer calls pop(). A permanent stub node keeps _head/_tail non-null, so a
 # drained queue refills correctly. There is intentionally no len()/iteration: a
 # lock-free queue has no consistent snapshot, so exposing either would be a
-# Python-faithful lie (D-0078). Construct with new_queue[T]().
+# Python-faithful lie (D-0078). Construct with new_queue[T]() — or, equivalently,
+# the natural module-qualified form concurrent.Queue[T]() (sugar for new_queue,
+# I#996/D-0202; T may instead be inferred from the binding's annotation).
 #
 # The queue allocates a GC-managed node per element whatever the payload type, so
 # node liveness rides the collector's root scan. The multicore hang + queue-node

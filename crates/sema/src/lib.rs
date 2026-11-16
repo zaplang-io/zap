@@ -2594,6 +2594,22 @@ impl Checker {
 
     fn resolve_type(&self, t: &Type) -> Ty {
         match t {
+            // A module-qualified seam generic `concurrent.Queue[T]` is the bare
+            // prelude type `Queue[T]` (I#996, D-0202): resolve the dotted head as
+            // its bare prelude name, so the annotation resolves exactly as the
+            // bare spelling does.
+            Type::Named { name, args, span }
+                if zapc_syntax::seam::seam_generic_bare_type(name).is_some() =>
+            {
+                let bare = zapc_syntax::seam::seam_generic_bare_type(name)
+                    .unwrap()
+                    .to_string();
+                self.resolve_type(&Type::Named {
+                    name: bare,
+                    args: args.clone(),
+                    span: *span,
+                })
+            }
             Type::Named { name, args, .. } => match name.as_str() {
                 // `int` is the Python-facing name for the 64-bit signed integer
                 // (I#581); `float` is likewise the name for the 64-bit double.
@@ -5979,6 +5995,14 @@ impl Checker {
     }
 
     fn check_call(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Ty {
+        // Module-qualified construction of a seam-exposed prelude generic —
+        // `concurrent.Queue[T](...)` / `concurrent.Queue(...)` — is front-end
+        // sugar for the bare prelude constructor `new_queue[T](...)` /
+        // `new_queue(...)` (I#996, D-0202). Rewrite the callee up front so the
+        // ordinary generic-call type-check below runs on the bare name; the
+        // monomorphizer applies the twin rewrite on the lowering path.
+        let desugared = zapc_syntax::seam::desugar_seam_ctor_callee(callee);
+        let callee = desugared.as_ref().unwrap_or(callee);
         // Spread call arguments (`*expr` / `**expr`, #597) are supported in this
         // version only for a call to a named free function (the variadic /
         // `**kwargs` forwarding path). Any other callee — construction, a
@@ -8691,6 +8715,119 @@ mod tests {
             auto d = m.delete(\"a\")\n    \
             auto n = m.length()\n    \
             auto g = m.get_or(\"b\", 9)\n");
+    }
+
+    // --- module-qualified Queue construction (I#996, D-0202) -------------------
+
+    #[test]
+    fn qualified_queue_explicit_type_arg_type_checks() {
+        // `concurrent.Queue[int64]()` — explicit type argument on the dotted
+        // constructor — type-checks exactly like the bare `new_queue[int64]()`.
+        ok("import concurrent\ndef main():\n    \
+            Queue[int64] q = concurrent.Queue[int64]()\n    \
+            q.push(10)\n    \
+            auto v, ok = q.pop()\n");
+    }
+
+    #[test]
+    fn qualified_queue_inferred_from_annotation_type_checks() {
+        // `concurrent.Queue[int64] q = concurrent.Queue()` — the dotted type
+        // annotation resolves to the bare prelude `Queue[int64]`, and the
+        // arg-less dotted constructor infers T from that annotation sink.
+        ok("import concurrent\ndef main():\n    \
+            concurrent.Queue[int64] q = concurrent.Queue()\n    \
+            q.push(1)\n    \
+            auto v, ok = q.pop()\n");
+    }
+
+    #[test]
+    fn qualified_queue_str_payload_type_checks() {
+        // A reference (str) payload, dotted annotation + explicit dotted ctor.
+        ok("import concurrent\ndef main():\n    \
+            concurrent.Queue[str] qs = concurrent.Queue[str]()\n    \
+            qs.push(\"alpha\")\n    \
+            auto s, ok = qs.pop()\n");
+    }
+
+    #[test]
+    fn qualified_queue_distinct_instances_type_check() {
+        // Two different element types in one program — distinct monomorphization,
+        // both via the dotted form, mixed with the bare form.
+        ok("import concurrent\ndef main():\n    \
+            concurrent.Queue[int64] qi = concurrent.Queue[int64]()\n    \
+            concurrent.Queue[str] qs = concurrent.Queue()\n    \
+            Queue[bool] qb = new_queue[bool]()\n    \
+            qi.push(1)\n    \
+            qs.push(\"x\")\n    \
+            qb.push(True)\n");
+    }
+
+    #[test]
+    fn bare_new_queue_still_type_checks() {
+        // Back-compat: the bare `new_queue[T]()` / inferred forms are unchanged.
+        ok("def main():\n    \
+            Queue[int64] q = new_queue()\n    \
+            Queue[str] qs = new_queue[str]()\n    \
+            q.push(7)\n    \
+            qs.push(\"y\")\n");
+    }
+
+    #[test]
+    fn qualified_queue_diagnoses_exactly_like_bare() {
+        // The sugar is a pure callee rewrite, so every form of the dotted
+        // constructor must produce byte-identical sema diagnostics to the bare
+        // `new_queue` it desugars to — the single invariant that keeps the two
+        // spellings interchangeable. (The *content* of bad-arg/arity rejection is
+        // produced downstream in monomorphization; the end-to-end goldens cover
+        // that. Here we lock in that dotted never diverges from bare.)
+        let pairs = [
+            // (dotted form, bare form) — well-formed and ill-formed alike.
+            (
+                "Queue[int64] q = concurrent.Queue[int64]()",
+                "Queue[int64] q = new_queue[int64]()",
+            ),
+            (
+                "Queue[int64] q = concurrent.Queue()",
+                "Queue[int64] q = new_queue()",
+            ),
+            (
+                "auto q = concurrent.Queue[Nope]()",
+                "auto q = new_queue[Nope]()",
+            ),
+            (
+                "Queue[int64] q = concurrent.Queue[int64](5)",
+                "Queue[int64] q = new_queue[int64](5)",
+            ),
+        ];
+        for (dotted, bare) in pairs {
+            let d = errors(&format!("import concurrent\ndef main():\n    {dotted}\n"));
+            let b = errors(&format!("import concurrent\ndef main():\n    {bare}\n"));
+            assert_eq!(
+                d.len(),
+                b.len(),
+                "dotted `{dotted}` must diagnose exactly like bare `{bare}` \
+                 (dotted: {d:?}, bare: {b:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn qualified_queue_counter_is_not_a_generic_ctor() {
+        // The non-generic `concurrent.Counter()` is unaffected by the seam-generic
+        // sugar (it stays a module constructor), and a bogus
+        // `concurrent.Counter[int64]()` is NOT silently accepted as a Queue-style
+        // generic construction.
+        ok("import concurrent\ndef main():\n    \
+            Counter c = concurrent.Counter()\n    \
+            print(c.get())\n");
+        assert!(
+            !errors(
+                "import concurrent\ndef main():\n    \
+                 auto c = concurrent.Counter[int64]()\n"
+            )
+            .is_empty(),
+            "Counter is not a seam generic; the dotted-generic form must not resolve"
+        );
     }
 
     #[test]
