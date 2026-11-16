@@ -141,7 +141,14 @@ Notes that have bitten people:
   `TrackedGap` entry with a reason. The gate fails CI when a reachable
   production has neither, so the grammar can never silently outrun the parser,
   sema, or lowering. This is the production-indexed complement to the
-  claim-indexed conformance suite above.
+  claim-indexed conformance suite above. The same file also carries a
+  **negative/boundary corpus** (`REJECTS`): malformed source, constructs the
+  grammar deliberately omits (`async`/`global`/`yield from`/`…`), and
+  grammar-ahead-of-impl forms still unimplemented each stay rejected by the
+  front end, with the `ZAP####`/message pinned where stable — so a form that
+  starts being *accepted* (silent impl-ahead-of-grammar drift, or a tracked gap
+  that got implemented) is caught too. Add a reject case when a PR changes what
+  the front end turns away.
 - Unit tests live next to the code in each crate; the `driver` crate also has
   integration suites (`golden.rs`, `conformance.rs`, `diff_cpython.rs`, `gc.rs`,
   `signals.rs`, `profiling.rs`, `zap_cli.rs`).

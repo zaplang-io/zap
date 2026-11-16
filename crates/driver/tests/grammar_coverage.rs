@@ -901,3 +901,142 @@ fn tracked_gaps_are_documented() {
          COVERAGE (stale after a graduation?): {stale:?}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Negative / boundary corpus.
+//
+// The `COVERAGE` corpus above proves every production is *accepted*; it says
+// nothing about what the front end *rejects*. This table pins the other side:
+// source that is either malformed, a construct the grammar deliberately does
+// **not** describe (so it must stay rejected — a regression that started
+// accepting it would be silent impl-ahead-of-grammar drift), or a form that is
+// grammatical per `docs/GRAMMAR.ebnf` yet the implementation rejects today
+// (a grammar-ahead-of-impl gap, tracked by an issue). Each entry must be
+// rejected somewhere in the host front end (parse, sema, or AST→ZIR lowering);
+// where the diagnostic is stable, `expect` pins a `ZAP####` code or message
+// fragment so the *reason* for rejection can't silently change either.
+//
+// This is the complement to `crates/syntax/tests/grammar.rs`, whose
+// accept/reject corpus covers pure parser boundaries; the cases here reach
+// sema and lowering too (the depths the parser-only corpus cannot see).
+// ---------------------------------------------------------------------------
+
+struct Reject {
+    /// What the snippet is (for failure messages).
+    label: &'static str,
+    src: &'static str,
+    /// A stable substring of the first front-end error (a `ZAP####` code or a
+    /// message fragment), or `None` where the diagnostic is deliberately not
+    /// pinned (e.g. an incidental/indirect message we don't want to freeze).
+    expect: Option<&'static str>,
+    /// Why it is rejected / where it is tracked.
+    reason: &'static str,
+}
+
+const fn rej(
+    label: &'static str,
+    src: &'static str,
+    expect: Option<&'static str>,
+    reason: &'static str,
+) -> Reject {
+    Reject {
+        label,
+        src,
+        expect,
+        reason,
+    }
+}
+
+#[rustfmt::skip]
+const REJECTS: &[Reject] = &[
+    // --- grammatical shape, but rejected by sema (deferred/deliberate) ---
+    rej("yield_bare",
+        "def gen():\n    yield\n",
+        Some("ZAP5064"),
+        "`yield` grammar is `\"yield\" [expr]`, but v1 requires an operand (I#67)."),
+    rej("mixed_except_and_except_star",
+        "def f():\n    try:\n        raise ValueError(\"x\")\n    except ValueError as e:\n        pass\n    except* KeyError as eg:\n        pass\n",
+        Some("mix"),
+        "a `try` cannot mix `except` and `except*` clauses (#605, D-0129)."),
+    rej("spawn_of_a_lambda",
+        "def f():\n    spawn (lambda: 1)()\n",
+        Some("ZAP5076"),
+        "spawn requires a named function / method call / fn-value, not a bare lambda call (D-0044)."),
+    rej("matmul_on_scalars",
+        "def f(int64 a, int64 b):\n    auto y = a @ b\n    print(str(y))\n",
+        Some("ZAP4012"),
+        "`@` (matrix multiply) is array-only; scalars are a type error (#509)."),
+    rej("mapping_pattern",
+        "def f(dict[str, int64] d):\n    match d:\n        case {\"k\": v}:\n            pass\n        case _:\n            pass\n",
+        None, // diagnostic is currently indirect ("unknown name 'v'"); do not freeze it
+        "mapping patterns `case {k: v}:` are not in the grammar (deferred, #617)."),
+
+    // --- absent from the grammar, so must not parse (impl-ahead-of-grammar guard) ---
+    rej("yield_from",
+        "def gen():\n    yield from range(3)\n",
+        None,
+        "`yield from` delegation is not in the grammar (deferred, #619)."),
+    rej("ellipsis_literal",
+        "def f():\n    auto x = ...\n    print(\"ok\")\n",
+        None,
+        "`...` (Ellipsis) is not a Zap literal (deferred, #616)."),
+    rej("tuple_numeric_attribute",
+        "def f():\n    auto t = (1, 2)\n    print(str(t.0))\n",
+        None,
+        "`t.0` positional tuple access is not in the grammar (`trailer` is `.` IDENT; tuples are destructured)."),
+    rej("async_def",
+        "async def f():\n    pass\n",
+        None,
+        "no `async`/`await`: concurrency is CSP coroutines + `spawn`/`scope` (SPEC §12, won't-do)."),
+    rej("global_stmt",
+        "def f():\n    global x\n    x = 1\n",
+        None,
+        "no `global`/`nonlocal`: static lexical scoping, no mutable-module-state rebind keyword (won't-do)."),
+    rej("lambda_with_default",
+        "def f():\n    fn(int64) -> int64 g = lambda x = 1: x + 1\n    print(str(g(1)))\n",
+        None,
+        "`lambda` params are bare IDENTs — no defaults/variadics (D-0026); promote to `def` for those."),
+
+    // --- grammatical per EBNF but the implementation rejects it today (tracked gap) ---
+    rej("sliced_assignment_target",
+        "def f(list[int64] xs, list[int64] ys):\n    xs[0:2] = ys\n    print(\"ok\")\n",
+        Some("only variable, field, and index assignment"),
+        "grammar-ahead-of-impl: a slice assignment target `xs[0:2] = ys` parses and type-checks \
+         but AST→ZIR lowering rejects it (index assignment `xs[i] = v` works). Tracked by #1005 — \
+         when implemented, this entry fails and graduates to a COVERAGE/positive case."),
+];
+
+/// Grammatical-but-malformed, grammar-absent, and grammar-ahead-of-impl forms
+/// all stay rejected by the host front end, with their reason (code/message)
+/// pinned where stable. A case that starts being *accepted* fails here — either
+/// a real regression (an absent construct now parses) or a tracked gap that got
+/// implemented (graduate it to `COVERAGE`).
+#[test]
+fn rejected_forms_stay_rejected() {
+    let mut failures: Vec<String> = Vec::new();
+    for r in REJECTS {
+        match front_end_first_error(r.src) {
+            None => failures.push(format!(
+                "[{}] expected the front end to REJECT it, but it was accepted. {}\n    src: {:?}",
+                r.label, r.reason, r.src,
+            )),
+            Some(err) => {
+                if let Some(expect) = r.expect {
+                    if !err.contains(expect) {
+                        failures.push(format!(
+                            "[{}] rejected (good) but the diagnostic changed: expected it to contain {:?}, \
+                             got {:?}. If this is an intended diagnostic change, update `expect`.",
+                            r.label, expect, err,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "negative/boundary corpus found {} problem(s):\n{}",
+        failures.len(),
+        failures.join("\n"),
+    );
+}
