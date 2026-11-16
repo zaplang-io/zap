@@ -462,3 +462,46 @@ fn time_process_sys_positional_unchanged() {
     assert_ok(&prog("    auto r = process.run([\"echo\"])\n"));
     assert_ok(&prog("    auto h = sys.cpu_has(\"avx2\")\n"));
 }
+
+// ---------------------------------------------------------------------------
+// url / io / signal.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn url_keyword_and_unknown() {
+    assert_ok(&prog("    auto q = url.quote(s=\"a b\")\n"));
+    assert_ok(&prog(
+        "    auto d = {\"k\": \"v\"}\n    auto q = url.encode_query(d=d)\n",
+    ));
+    assert_code(&prog("    auto q = url.quote(text=\"a b\")\n"), "ZAP4023");
+}
+
+#[test]
+fn io_keyword_reorder_and_unknown() {
+    assert_ok(&prog(
+        "    auto fd = io.open(path=\"/tmp/x\", mode=\"r\")\n",
+    ));
+    assert_ok(&prog(
+        "    auto fd = io.open(mode=\"r\", path=\"/tmp/x\")\n",
+    ));
+    assert_code(
+        &prog("    auto fd = io.open(path=\"/tmp/x\", flags=\"r\")\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn signal_notify_keyword_and_unknown() {
+    assert_ok(&prog("    auto ch = signal.notify(sig=Signal.SIGINT)\n"));
+    assert_code(
+        &prog("    auto ch = signal.notify(signum=Signal.SIGINT)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn url_io_signal_positional_unchanged() {
+    assert_ok(&prog("    auto q = url.quote(\"a b\")\n"));
+    assert_ok(&prog("    auto fd = io.open(\"/tmp/x\", \"r\")\n"));
+    assert_ok(&prog("    auto ch = signal.notify(Signal.SIGINT)\n"));
+}

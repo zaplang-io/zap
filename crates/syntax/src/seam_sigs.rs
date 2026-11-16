@@ -194,6 +194,20 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     // cpu_source/cpu_sve_vl take no args, so no row) ----
     ("sys", "exit", &["code"]),
     ("sys", "cpu_has", &["name"]),
+    // ---- url (ticket #335): percent-encoding + query builders ----
+    ("url", "quote", &["s"]),
+    ("url", "quote_path", &["s"]),
+    ("url", "unquote", &["s"]),
+    ("url", "unquote_plus", &["s"]),
+    ("url", "encode_query", &["d"]),
+    ("url", "canonical_query", &["d"]),
+    // ---- io (ticket #97): raw fd I/O ----
+    ("io", "open", &["path", "mode"]),
+    ("io", "read", &["fd", "n"]),
+    ("io", "write", &["fd", "data"]),
+    ("io", "close_fd", &["fd"]),
+    // ---- signal (ticket #77): subscribe to a Signal ----
+    ("signal", "notify", &["sig"]),
 ];
 
 /// The declared positional parameter names of a seam method, or `None` when the
