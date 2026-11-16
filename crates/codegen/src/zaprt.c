@@ -124,6 +124,7 @@ static void *GC_get_my_stackbottom(struct GC_stack_base *sb) {
 #include <ucontext.h>
 #endif
 #include <stdio.h>
+#include <stdarg.h> /* va_list for the variadic zap_select (D-0031) */
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>   /* clock_gettime for the scheduler idle wait (#47) */
@@ -9728,6 +9729,7 @@ typedef struct M {
  * waiter blocks on its own condvar. The waker fills `val`/`ok`/`closed` under
  * the channel lock *before* waking, so the woken waiter reads its outcome
  * without re-locking. */
+struct SelState; /* fwd: set on a waiter that belongs to a `select` (D-0031) */
 typedef struct Waiter {
     struct Waiter *next;
     G *g;                 /* NULL => native-thread (e.g. main) waiter          */
@@ -9736,6 +9738,13 @@ typedef struct Waiter {
     uint64_t val;         /* send: value offered; recv: value delivered        */
     int ok;               /* recv: 1 iff a real value was delivered            */
     int closed;           /* set iff the channel closed while this waiter slept */
+    /* `select` (D-0031, #1002): when non-NULL this waiter is one case of a
+     * `select`; a counterpart matching it must CLAIM the select (CAS its
+     * single-fire flag under `sel->mu`) before completing, and skip it if the
+     * select already fired on another channel. NULL (the `{0}` default at every
+     * plain send/recv site) means an ordinary single-op waiter. */
+    struct SelState *sel;
+    int sel_case;         /* which select case index this waiter represents */
 } Waiter;
 
 /* ---- scheduler globals ---------------------------------------------------- */
@@ -11917,6 +11926,118 @@ void *zap_chan_new(int64_t cap) {
     return c;
 }
 
+/* --- `select` (D-0031, #1002): one coroutine waiting on several channel ops.
+ *
+ * A `select` enqueues one per-case waiter (`w->sel == sel`, `w->sel_case == i`)
+ * on each case's channel queue and parks ONCE on `sel->pw` via `copark(&sel->mu,
+ * sel->pw)`. A counterpart on any one channel that pops such a waiter must CLAIM
+ * the select first: lock `sel->mu`, and if `sel->fired` is already set the
+ * waiter is a dead case from a select that completed on another channel — skip
+ * it and keep popping; otherwise set `fired`, record the chosen case + outcome,
+ * and wake `sel->pw`. Because `sel->mu` is the park mutex, the scheduler only
+ * releases it after the selecting G has fully switched out, so a counterpart
+ * cannot wake the select before it is parked (the same handoff invariant plain
+ * channel ops get from `copark`). Lock order is always channel-mu then sel-mu. */
+typedef struct SelState {
+    pthread_mutex_t mu;
+    int fired;        /* 0 until a case completes; claimed (0->1) under `mu` */
+    int chosen;       /* the completed case index */
+    uint64_t rval;    /* receive case: the delivered word */
+    int rok;          /* receive: real value (1) vs closed (0); send: 1 = sent */
+    int send_closed;  /* a send case fired because the channel was closed */
+    Waiter *pw;       /* the parking waiter (copark vehicle; carries the G) */
+} SelState;
+
+/* Deliver value word `v` to a receiver waiter `r` popped from a recvq. Returns
+ * 1 if `r` was woken (the send is complete), 0 if `r` was a dead `select` case
+ * (claimed elsewhere) and the caller should discard it and keep popping. */
+static int deliver_to_receiver(Waiter *r, uint64_t v, void *from) {
+    if (r->sel) {
+        SelState *sel = r->sel;
+        pthread_mutex_lock(&sel->mu);
+        if (sel->fired) {
+            pthread_mutex_unlock(&sel->mu);
+            return 0;
+        }
+        sel->fired = 1;
+        sel->chosen = r->sel_case;
+        sel->rval = v;
+        sel->rok = 1;
+        zap_race_chan_xfer(from, sel->pw->g);
+        coready(sel->pw);
+        pthread_mutex_unlock(&sel->mu);
+        return 1;
+    }
+    r->val = v;
+    r->ok = 1;
+    zap_race_chan_xfer(from, r->g);
+    coready(r);
+    return 1;
+}
+
+/* Take sender waiter `s`'s offered value into `*out` and wake it. Returns 1 if
+ * taken (recv complete), 0 if `s` was a dead `select` case (discard, keep
+ * popping). `to` is the receiving G for the --race rendezvous edge. */
+static int take_from_sender(Waiter *s, uint64_t *out, void *to) {
+    if (s->sel) {
+        SelState *sel = s->sel;
+        pthread_mutex_lock(&sel->mu);
+        if (sel->fired) {
+            pthread_mutex_unlock(&sel->mu);
+            return 0;
+        }
+        sel->fired = 1;
+        sel->chosen = s->sel_case;
+        sel->rok = 1; /* the send completed */
+        *out = s->val;
+        zap_race_chan_xfer(sel->pw->g, to);
+        coready(sel->pw);
+        pthread_mutex_unlock(&sel->mu);
+        return 1;
+    }
+    *out = s->val;
+    s->ok = 1;
+    zap_race_chan_xfer(s->g, to);
+    coready(s);
+    return 1;
+}
+
+/* After a receiver drains one buffered slot, move a parked sender's value into
+ * the freed slot and wake it (skipping dead `select` send-cases). Call with the
+ * channel locked and a slot just freed (`count < cap`). Shared by the buffered
+ * receive path and the `select` buffered-receive commit. */
+static void chan_buf_refill_from_sender(ZapChan *c) {
+    Waiter *s;
+    while ((s = q_pop(&c->sendq_head, &c->sendq_tail)) != NULL) {
+        SelState *sel = s->sel;
+        if (sel) {
+            pthread_mutex_lock(&sel->mu);
+            if (sel->fired) {
+                pthread_mutex_unlock(&sel->mu);
+                continue;
+            }
+            sel->fired = 1;
+            sel->chosen = s->sel_case;
+            sel->rok = 1;
+        }
+        int64_t tail_i = c->tail;
+        c->buf[tail_i] = s->val;
+        c->tail = (c->tail + 1) % c->cap;
+        c->count++;
+        /* --race: the refilled slot now carries the parked sender's value;
+         * stamp it with THAT sender's clock for its eventual receiver. */
+        zap_race_chan_buf_store(&c->buf[tail_i], sel ? sel->pw->g : s->g);
+        if (sel) {
+            coready(sel->pw);
+            pthread_mutex_unlock(&sel->mu);
+        } else {
+            s->ok = 1;
+            coready(s);
+        }
+        return;
+    }
+}
+
 static void chan_send_word(ZapChan *c, uint64_t v) {
     /* A channel op is a cancellation point (design/0005): if this coroutine's
      * scope was cancelled, raise `Cancelled` rather than proceeding/blocking. */
@@ -11927,18 +12048,19 @@ static void chan_send_word(ZapChan *c, uint64_t v) {
         zap_panic(zap_str_new("send on closed channel", 22));
         return;
     }
-    /* A waiting receiver takes the value directly (rendezvous / fast path). */
-    if (c->count == 0 && c->recvq_head) {
-        Waiter *r = q_pop(&c->recvq_head, &c->recvq_tail);
-        r->val = v;
-        r->ok = 1;
-        /* --race: rendezvous hand-off edge — this sender happens-before the
-         * receiver `r`. Publish BEFORE `coready(r)` so the edge is in place
-         * before `r` can resume on another M (#679). */
-        zap_race_chan_xfer(cur_m ? cur_m->current : NULL, r->g);
-        coready(r);
-        zap_np_unlock(&c->mu);
-        return;
+    /* A waiting receiver takes the value directly (rendezvous / fast path). The
+     * --race hand-off edge (this sender happens-before the receiver, published
+     * before the wake so it is in place before the receiver resumes on another
+     * M, #679) lives in `deliver_to_receiver`, which also skips any dead
+     * `select` receive-case already claimed on another channel (D-0031). */
+    if (c->count == 0) {
+        Waiter *r;
+        while ((r = q_pop(&c->recvq_head, &c->recvq_tail)) != NULL) {
+            if (deliver_to_receiver(r, v, cur_m ? cur_m->current : NULL)) {
+                zap_np_unlock(&c->mu);
+                return;
+            }
+        }
     }
     if (c->cap > 0 && c->count < c->cap) {
         int64_t slot_i = c->tail;
@@ -11976,38 +12098,28 @@ static uint64_t chan_recv_word(ZapChan *c, int *ok) {
         /* --race: buffered consume — acquire the clock the producer stamped on
          * this slot, ordering this receiver after that send (#679). */
         zap_race_chan_buf_load(&c->buf[head_i], cur_m ? cur_m->current : NULL);
-        Waiter *s = q_pop(&c->sendq_head, &c->sendq_tail);
-        if (s) {
-            int64_t tail_i = c->tail;
-            c->buf[tail_i] = s->val;
-            c->tail = (c->tail + 1) % c->cap;
-            c->count++;
-            /* --race: the refilled slot now carries the parked sender's value;
-             * stamp it with THAT sender's clock for its eventual receiver. */
-            zap_race_chan_buf_store(&c->buf[tail_i], s->g);
-            s->ok = 1;
-            coready(s);
-        }
+        chan_buf_refill_from_sender(c);
         zap_np_unlock(&c->mu);
         if (ok) {
             *ok = 1;
         }
         return v;
     }
-    /* A waiting sender hands its value over directly (rendezvous). */
-    if (c->sendq_head) {
-        Waiter *s = q_pop(&c->sendq_head, &c->sendq_tail);
-        uint64_t v = s->val;
-        /* --race: rendezvous hand-off edge — the parked sender happens-before
-         * this receiver (#679). */
-        zap_race_chan_xfer(s->g, cur_m ? cur_m->current : NULL);
-        s->ok = 1;
-        coready(s);
-        zap_np_unlock(&c->mu);
-        if (ok) {
-            *ok = 1;
+    /* A waiting sender hands its value over directly (rendezvous); skip dead
+     * `select` send-cases. The --race hand-off edge (sender happens-before this
+     * receiver, #679) lives in `take_from_sender`. */
+    {
+        Waiter *s;
+        while ((s = q_pop(&c->sendq_head, &c->sendq_tail)) != NULL) {
+            uint64_t v;
+            if (take_from_sender(s, &v, cur_m ? cur_m->current : NULL)) {
+                zap_np_unlock(&c->mu);
+                if (ok) {
+                    *ok = 1;
+                }
+                return v;
+            }
         }
-        return v;
     }
     if (c->closed) {
         zap_np_unlock(&c->mu);
@@ -12061,19 +12173,304 @@ void zap_chan_close(void *ch) {
     zap_np_lock(&c->mu);
     c->closed = 1;
     /* Waiting senders fail (send on closed); waiting receivers drain to the
-     * closed zero-value with ok == 0. */
+     * closed zero-value with ok == 0. A `select` case is claimed first (and a
+     * dead one — already fired elsewhere — is simply dropped, D-0031). */
     Waiter *w;
     while ((w = q_pop(&c->sendq_head, &c->sendq_tail)) != NULL) {
+        if (w->sel) {
+            SelState *sel = w->sel;
+            pthread_mutex_lock(&sel->mu);
+            if (!sel->fired) {
+                sel->fired = 1;
+                sel->chosen = w->sel_case;
+                sel->send_closed = 1; /* send case on a closed channel: raises */
+                coready(sel->pw);
+            }
+            pthread_mutex_unlock(&sel->mu);
+            continue;
+        }
         w->closed = 1;
         w->ok = 0;
         coready(w);
     }
     while ((w = q_pop(&c->recvq_head, &c->recvq_tail)) != NULL) {
+        if (w->sel) {
+            SelState *sel = w->sel;
+            pthread_mutex_lock(&sel->mu);
+            if (!sel->fired) {
+                sel->fired = 1;
+                sel->chosen = w->sel_case;
+                sel->rval = 0;
+                sel->rok = 0; /* closed receive: comma-ok false */
+                coready(sel->pw);
+            }
+            pthread_mutex_unlock(&sel->mu);
+            continue;
+        }
         w->ok = 0;
         w->val = 0;
         coready(w);
     }
     zap_np_unlock(&c->mu);
+}
+
+/* === `select` statement runtime (D-0031, #1002) ===========================
+ *
+ * `zap_select` waits on several channel operations and proceeds with the first
+ * that is ready, choosing uniformly at random among several ready cases
+ * (fairness, like Go). A `default` case (`has_default`) makes it non-blocking.
+ *
+ * The cases are passed as direct, per-call-site-fixed variadic arguments — n
+ * triples `(void* ch, int64_t dir, uint64_t sendval)`, `dir` bit0 = send,
+ * bit1 = element-is-pointer — so a pointer send value stays rooted by the
+ * COMPILED caller across the park, exactly as a plain `zap_chan_send_ptr(v)`
+ * argument does. For the chosen case, `*outval`/`*outok` carry a receive's
+ * delivered word + comma-ok flag (loaded straight-line by the caller, with no
+ * intervening park). Returns the chosen case index, or -1 for `default`. */
+typedef struct {
+    ZapChan *ch;
+    int is_send;
+    uint64_t sendval;
+} ZapSelCase;
+
+/* Cheap per-thread PRNG for case fairness (scheduling, not security). */
+static uint64_t sel_rng(void) {
+    static __thread uint64_t s = 0;
+    if (s == 0) {
+        s = (uint64_t)(uintptr_t)&s * 0x9e3779b97f4a7c15ull + 1;
+    }
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    return s;
+}
+
+/* Try to commit a receive on `c` (channel locked). Returns 1 and sets
+ * *rval/*rok on success; 0 if not ready. Mirrors `chan_recv_word`'s ready
+ * paths (skipping dead select senders). */
+static int sel_try_recv(ZapChan *c, uint64_t *rval, int *rok, void *to) {
+    if (c->count > 0) {
+        int64_t h = c->head;
+        uint64_t v = c->buf[h];
+        c->head = (c->head + 1) % c->cap;
+        c->count--;
+        zap_race_chan_buf_load(&c->buf[h], to);
+        chan_buf_refill_from_sender(c);
+        *rval = v;
+        *rok = 1;
+        return 1;
+    }
+    Waiter *s;
+    while ((s = q_pop(&c->sendq_head, &c->sendq_tail)) != NULL) {
+        uint64_t v;
+        if (take_from_sender(s, &v, to)) {
+            *rval = v;
+            *rok = 1;
+            return 1;
+        }
+    }
+    if (c->closed) {
+        *rval = 0;
+        *rok = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* Try to commit a send of `v` on `c` (channel locked). Returns 1 on success,
+ * -1 if the channel is closed (the caller raises), 0 if not ready. */
+static int sel_try_send(ZapChan *c, uint64_t v, void *from) {
+    if (c->closed) {
+        return -1;
+    }
+    Waiter *r;
+    while ((r = q_pop(&c->recvq_head, &c->recvq_tail)) != NULL) {
+        if (deliver_to_receiver(r, v, from)) {
+            return 1;
+        }
+    }
+    if (c->cap > 0 && c->count < c->cap) {
+        int64_t t = c->tail;
+        c->buf[t] = v;
+        c->tail = (c->tail + 1) % c->cap;
+        c->count++;
+        zap_race_chan_buf_store(&c->buf[t], from);
+        return 1;
+    }
+    return 0;
+}
+
+int64_t zap_select(uint64_t *outval, int64_t *outok, int64_t n, int64_t has_default, ...) {
+    zap_check_cancel(); /* a select is a cancellation point (design/0005) */
+    int64_t cap = n > 0 ? n : 1;
+    ZapSelCase cases[cap];
+    va_list ap;
+    va_start(ap, has_default);
+    for (int64_t i = 0; i < n; i++) {
+        cases[i].ch = (ZapChan *)va_arg(ap, void *);
+        int64_t dir = va_arg(ap, int64_t);
+        cases[i].is_send = (int)(dir & 1);
+        cases[i].sendval = (uint64_t)va_arg(ap, uint64_t);
+        if ((dir >> 1) & 1) {
+            /* A pointer-element channel: ensure the collector traces buffered
+             * elements (the typed `_ptr` entry points set this; `zap_select`
+             * is untyped, so the caller flags it in `dir`). */
+            cases[i].ch->elem_ptr = 1;
+        }
+    }
+    va_end(ap);
+
+    void *from = cur_m ? (void *)cur_m->current : NULL;
+
+    /* Distinct channels, address-sorted: a stable lock order (no deadlock when
+     * two selects share channels). Insertion sort — `n` is small. */
+    ZapChan *locks[cap];
+    int nl = 0;
+    for (int64_t i = 0; i < n; i++) {
+        ZapChan *c = cases[i].ch;
+        int seen = 0;
+        for (int j = 0; j < nl; j++) {
+            if (locks[j] == c) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen) {
+            locks[nl++] = c;
+        }
+    }
+    for (int a = 1; a < nl; a++) {
+        ZapChan *k = locks[a];
+        int b = a - 1;
+        while (b >= 0 && (uintptr_t)locks[b] > (uintptr_t)k) {
+            locks[b + 1] = locks[b];
+            b--;
+        }
+        locks[b + 1] = k;
+    }
+    for (int j = 0; j < nl; j++) {
+        zap_np_lock(&locks[j]->mu);
+    }
+
+    /* Pass 1: scan the cases in a shuffled order and take the first ready one
+     * (uniform fairness among ready cases). */
+    int order[cap];
+    for (int64_t i = 0; i < n; i++) {
+        order[i] = (int)i;
+    }
+    for (int64_t i = n; i > 1;) {
+        i--;
+        int j = (int)(sel_rng() % (uint64_t)(i + 1));
+        int t = order[i];
+        order[i] = order[j];
+        order[j] = t;
+    }
+
+    int chosen = -1, send_closed = 0, rok = 0;
+    uint64_t rval = 0;
+    for (int64_t k = 0; k < n; k++) {
+        int i = order[k];
+        ZapSelCase *sc = &cases[i];
+        if (sc->is_send) {
+            int r = sel_try_send(sc->ch, sc->sendval, from);
+            if (r == 1) {
+                chosen = i;
+                rok = 1;
+                break;
+            }
+            if (r == -1) {
+                chosen = i;
+                send_closed = 1;
+                break;
+            }
+        } else if (sel_try_recv(sc->ch, &rval, &rok, from)) {
+            chosen = i;
+            break;
+        }
+    }
+
+    if (chosen >= 0) {
+        for (int j = nl - 1; j >= 0; j--) {
+            zap_np_unlock(&locks[j]->mu);
+        }
+        if (send_closed) {
+            zap_panic(zap_str_new("send on closed channel", 22));
+        }
+        if (outval) {
+            *outval = rval;
+        }
+        if (outok) {
+            *outok = rok;
+        }
+        return chosen;
+    }
+    if (has_default) {
+        for (int j = nl - 1; j >= 0; j--) {
+            zap_np_unlock(&locks[j]->mu);
+        }
+        return -1;
+    }
+
+    /* Pass 2: no case ready and no default — enqueue one waiter per case and
+     * park once. `sel.mu` is the park mutex: a counterpart that pops one of our
+     * waiters must take `sel.mu` to claim the select, and the scheduler releases
+     * `sel.mu` only after we have fully switched out, so we cannot be woken
+     * before we are parked (the `copark` handoff invariant, now across many
+     * channels). */
+    SelState sel;
+    pthread_mutex_init(&sel.mu, NULL);
+    sel.fired = 0;
+    sel.chosen = -1;
+    sel.rval = 0;
+    sel.rok = 0;
+    sel.send_closed = 0;
+    Waiter pw = {0};
+    sel.pw = &pw;
+    Waiter wcases[cap];
+    for (int64_t i = 0; i < n; i++) {
+        Waiter *w = &wcases[i];
+        *w = (Waiter){0};
+        w->sel = &sel;
+        w->sel_case = (int)i;
+        w->val = cases[i].sendval;
+        if (cases[i].is_send) {
+            q_push(&cases[i].ch->sendq_head, &cases[i].ch->sendq_tail, w);
+        } else {
+            q_push(&cases[i].ch->recvq_head, &cases[i].ch->recvq_tail, w);
+        }
+    }
+    pthread_mutex_lock(&sel.mu);
+    for (int j = nl - 1; j >= 0; j--) {
+        zap_np_unlock(&locks[j]->mu);
+    }
+    copark(&sel.mu, &pw); /* releases sel.mu once fully parked */
+
+    /* Resumed: one case fired (sel.chosen/.rval/.rok/.send_closed are set).
+     * Unlink our remaining waiters from every other channel. A concurrent
+     * counterpart that pops a stale waiter sees `sel.fired` and discards it, so
+     * a double-removal here is harmless. */
+    for (int64_t i = 0; i < n; i++) {
+        if ((int)i == sel.chosen) {
+            continue;
+        }
+        ZapChan *c = cases[i].ch;
+        zap_np_lock(&c->mu);
+        scope_q_remove(&c->sendq_head, &c->sendq_tail, &wcases[i]);
+        scope_q_remove(&c->recvq_head, &c->recvq_tail, &wcases[i]);
+        zap_np_unlock(&c->mu);
+    }
+    pthread_mutex_destroy(&sel.mu);
+    zap_check_cancel(); /* a cancel may have severed us while parked */
+    if (sel.send_closed) {
+        zap_panic(zap_str_new("send on closed channel", 22));
+    }
+    if (outval) {
+        *outval = sel.rval;
+    }
+    if (outok) {
+        *outok = sel.rok;
+    }
+    return sel.chosen;
 }
 
 /* ===========================================================================
