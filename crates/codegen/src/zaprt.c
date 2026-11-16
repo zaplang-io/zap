@@ -1916,6 +1916,84 @@ void *zap_list_slice(void *lp, int64_t lo, int64_t hi, int64_t step, int64_t has
     return o;
 }
 
+/* Sliced assignment `xs[lo:hi:step] = ys` (#1005, Python semantics). The right-
+ * hand side `ys` is a list; its elements are snapshotted first so an aliasing
+ * assignment (`xs[:] = xs`) and the in-place tail shift are both safe. A step-1
+ * slice is a splice — the region [start, stop) is replaced by all of `ys`, so
+ * the list may grow or shrink. An extended slice (step != 1) requires the number
+ * of selected indices to equal `len(ys)` (else a catchable ValueError) and
+ * assigns element-wise. Element words are copied verbatim and the pointer-ness
+ * is inherited, so the op is element-kind-agnostic (int64 / ptr / float). No
+ * parking and allocation never collects mid-call, so the snapshot and the list's
+ * own element words stay valid throughout. */
+void zap_list_set_slice(void *lp, void *yp, int64_t lo, int64_t hi, int64_t step,
+                        int64_t has_lo, int64_t has_hi, int64_t has_step) {
+    ZapList *l = (ZapList *)lp;
+    ZapList *ys = (ZapList *)yp;
+    int64_t n = l->len;
+    int64_t st = has_step ? step : 1;
+    if (st == 0) {
+        zap_panic(zap_str_new("slice step cannot be zero", 25));
+    }
+    /* Snapshot the RHS elements up front (aliasing-safe). */
+    int64_t m = ys->len;
+    int64_t *src = NULL;
+    if (m > 0) {
+        src = (int64_t *)zap_ptrbuf(m * (int64_t)sizeof(int64_t));
+        memcpy(src, ys->data, (size_t)m * sizeof(int64_t));
+    }
+    if (st == 1) {
+        int64_t start = has_lo ? zap_slice_pos(lo, n) : 0;
+        int64_t stop = has_hi ? zap_slice_pos(hi, n) : n;
+        if (stop < start) {
+            stop = start; /* empty region: a pure insertion at `start` */
+        }
+        int64_t remove = stop - start;
+        int64_t newlen = n - remove + m;
+        while (l->cap < newlen) {
+            zap_list_grow(l);
+        }
+        /* Shift the tail [stop, n) to sit after the inserted block. */
+        if (n - stop > 0) {
+            memmove(&l->data[start + m], &l->data[stop],
+                    (size_t)(n - stop) * sizeof(int64_t));
+        }
+        if (m > 0) {
+            memcpy(&l->data[start], src, (size_t)m * sizeof(int64_t));
+        }
+        l->len = newlen;
+    } else {
+        int64_t start;
+        int64_t stop;
+        if (st > 0) {
+            start = has_lo ? zap_slice_pos(lo, n) : 0;
+            stop = has_hi ? zap_slice_pos(hi, n) : n;
+        } else {
+            start = has_lo ? zap_slice_neg(lo, n) : n - 1;
+            stop = has_hi ? zap_slice_neg(hi, n) : -1;
+        }
+        int64_t count = 0;
+        for (int64_t k = start; (st > 0) ? (k < stop) : (k > stop); k += st) {
+            count++;
+        }
+        if (count != m) {
+            char msg[128];
+            int msglen = snprintf(msg, sizeof(msg),
+                                  "attempt to assign sequence of size %lld to extended "
+                                  "slice of size %lld",
+                                  (long long)m, (long long)count);
+            zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(msg, msglen));
+        }
+        int64_t j = 0;
+        for (int64_t k = start; (st > 0) ? (k < stop) : (k > stop); k += st) {
+            l->data[k] = src[j++];
+        }
+    }
+    if (ys->elem_ptr && m > 0) {
+        l->elem_ptr = 1;
+    }
+}
+
 /* dict[K, V]: open-addressing hash table with linear probing.
  * Key kind (int64 vs str) is passed per call; a dict is homogeneous, so this is
  * stable across a given dict's lifetime. */

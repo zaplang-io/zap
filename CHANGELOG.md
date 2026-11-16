@@ -1481,6 +1481,12 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **Sliced assignment `xs[lo:hi:step] = ys`** (#1005, D-0207). A slice
+  assignment target — grammatical, and the single-element `xs[i] = v` already
+  worked — no longer fails at lowering. A step-1 slice splices (replace / grow /
+  shrink / insert, `xs[:] = ys` replaces all); an extended slice assigns
+  element-wise and raises `ValueError` on a length mismatch. `list` targets with
+  a `list` right-hand side (a general-iterable RHS is a follow-up).
 - **`list[T]()` / `dict[K, V]()` empty constructors** (#1004). The construction
   forms the `type_args` grammar note advertised now work, as synonyms for the
   `[]` / `{}` empty literals (parity with `set[T]()`); previously only `set[T]()`

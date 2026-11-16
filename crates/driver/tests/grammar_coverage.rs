@@ -991,13 +991,9 @@ const REJECTS: &[Reject] = &[
         None,
         "`lambda` params are bare IDENTs — no defaults/variadics (D-0026); promote to `def` for those."),
 
-    // --- grammatical per EBNF but the implementation rejects it today (tracked gap) ---
-    rej("sliced_assignment_target",
-        "def f(list[int64] xs, list[int64] ys):\n    xs[0:2] = ys\n    print(\"ok\")\n",
-        Some("only variable, field, and index assignment"),
-        "grammar-ahead-of-impl: a slice assignment target `xs[0:2] = ys` parses and type-checks \
-         but AST→ZIR lowering rejects it (index assignment `xs[i] = v` works). Tracked by #1005 — \
-         when implemented, this entry fails and graduates to a COVERAGE/positive case."),
+    // (The last grammar-ahead-of-impl reject, the sliced assignment target
+    // `xs[0:2] = ys`, graduated when lowering gained slice assignment — #1005.
+    // It is now exercised end-to-end by the `slice_assign` golden.)
 ];
 
 /// Grammatical-but-malformed, grammar-absent, and grammar-ahead-of-impl forms

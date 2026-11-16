@@ -7937,9 +7937,17 @@ impl<'a> FnLower<'a> {
                     Ok(())
                 } else if let Expr::Index { base, index, span } = target {
                     self.lower_index_set(base, index, value, *span)
+                } else if let Expr::Slice {
+                    base, lo, hi, step, ..
+                } = target
+                {
+                    // Sliced assignment target `xs[lo:hi:step] = ys` (#1005).
+                    let (rv, rt) = self.expr(value)?;
+                    self.store_slice(base, lo.as_deref(), hi.as_deref(), step.as_deref(), rv, rt)
                 } else {
                     Err(err(
-                        "only variable, field, and index assignment are supported by codegen yet",
+                        "only variable, field, index, and slice assignment are supported by \
+                         codegen yet",
                     ))
                 }
             }
@@ -18029,11 +18037,59 @@ impl<'a> FnLower<'a> {
             Ok(())
         } else if let Expr::Index { base, index, span } = target {
             self.store_index(base, index, v, vt, *span)
+        } else if let Expr::Slice {
+            base, lo, hi, step, ..
+        } = target
+        {
+            self.store_slice(base, lo.as_deref(), hi.as_deref(), step.as_deref(), v, vt)
         } else {
             Err(err(
-                "only variable, field, and index assignment are supported by codegen yet",
+                "only variable, field, index, and slice assignment are supported by codegen yet",
             ))
         }
+    }
+
+    /// Lower a sliced assignment `xs[lo:hi:step] = ys` (#1005): the list region
+    /// the slice selects is replaced by the already-evaluated right-hand list
+    /// `(rv, rt)`. A step-1 slice splices (grow/shrink); an extended slice
+    /// requires matching lengths (checked in the runtime, a catchable
+    /// ValueError). Element-kind-agnostic: the runtime copies words and inherits
+    /// pointer-ness, so this is one entry point for every `T`.
+    fn store_slice(
+        &mut self,
+        base: &Expr,
+        lo: Option<&Expr>,
+        hi: Option<&Expr>,
+        step: Option<&Expr>,
+        rv: Value,
+        rt: Ty,
+    ) -> Result<(), LowerError> {
+        let (bv, bty) = self.expr(base)?;
+        let Ty::List(elem) = bty else {
+            return Err(err(
+                "a sliced assignment target `xs[lo:hi] = ys` is only supported on a list",
+            ));
+        };
+        let Ty::List(relem) = rt else {
+            return Err(err(
+                "the right-hand side of a sliced assignment must be a list",
+            ));
+        };
+        if elem.val_suffix() != relem.val_suffix() {
+            return Err(err(
+                "a sliced assignment requires the right-hand list to have the same element type",
+            ));
+        }
+        let (lo_v, has_lo) = self.slice_bound(lo)?;
+        let (hi_v, has_hi) = self.slice_bound(hi)?;
+        let (st_v, has_st) = self.slice_bound(step)?;
+        // May raise (extended-slice length mismatch) -> throwing_call.
+        self.throwing_call(
+            None,
+            "zap_list_set_slice",
+            vec![bv, rv, lo_v, hi_v, st_v, has_lo, has_hi, has_st],
+        );
+        Ok(())
     }
 
     /// Store an already-evaluated value `(v, vt)` at `base[index]` (chained

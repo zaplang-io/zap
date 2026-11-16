@@ -10337,3 +10337,48 @@ the gate exercises it through parse → sema → lowering.
 
 Relates to D-0049 (tuple destructuring targets), D-0003 (type-first
 declarations), D-0201 (the coverage gate), epic #967, and #469/#374.
+
+## D-0207 — sliced assignment `xs[lo:hi:step] = ys` (#1005 / epic #967)
+
+**Context.** A sliced assignment target is grammatical (`target ::= atom {
+trailer }`, a `trailer` admits a slice `subscript`), parses and type-checks, but
+AST→ZIR lowering rejected it (*"only variable, field, and index assignment are
+supported"*) — the last grammar-ahead-of-implementation reject the coverage gate
+(D-0201) pinned. A single-element index store `xs[i] = v` already worked; only
+the slice form of the same target was unimplemented.
+
+**Decision — implement it** (option (a) in #1005), for `list[T]` targets, with
+Python semantics:
+
+- **Step-1 slice** `xs[lo:hi] = ys` **splices**: the region `[start, stop)` is
+  replaced by *all* of `ys`, so the list may grow, shrink, stay the same, or
+  (empty region) purely insert; `xs[:] = ys` replaces the whole list. Bounds are
+  normalized (negative / omitted) exactly as a slice *read*.
+- **Extended slice** (`step != 1`) assigns element-wise and requires the number
+  of selected indices to equal `len(ys)`, else a catchable `ValueError`.
+- The right-hand side is a **list** of the same element kind (v1); a non-list
+  RHS or a non-list target is a lowering error.
+
+**Mechanism.** A new `Expr::Slice` target branch in the assignment lowering (both
+the plain and chained-assignment paths) calls one runtime entry point
+`zap_list_set_slice(list, ys, lo, hi, step, has_lo, has_hi, has_step)`. It
+snapshots `ys`'s element words first (so `xs[:] = xs` and the in-place tail shift
+are safe), then splices or scatters. Element words are copied verbatim and the
+pointer-ness is inherited, so it is **element-kind-agnostic** (`int64` / pointer
+/ `float`) — one entry point for every `T` — mirroring the single `zap_list_slice`
+read. No new grammar, no new diagnostic code (the length mismatch reuses
+`ValueError`).
+
+**Not in v1 (follow-ups):** a general iterable (non-list) RHS — Python allows
+`xs[a:b] = <any iterable>`; today the RHS must be a list. Slice assignment on a
+strided `array[T]` view stays its own separate NYI (numeric arrays, #502).
+
+**Tests.** Host: `crates/sema/tests/slice_assign.rs` (step-1, full, open-bound,
+extended, and the unchanged single-index store); the coverage gate's
+`sliced_assignment_target` REJECTS entry graduated out (it now front-end
+compiles). CI (full/arm64): the `slice_assign` golden covers same-length replace,
+shrink, grow, pure insert, full `[:]`, an extended slice, pointer (`str`)
+elements, and the extended-slice length-mismatch `ValueError`.
+
+Relates to D-0030 (slicing), D-0201 (the coverage gate that demanded this), epic
+#967, and #469/#374.

@@ -2467,6 +2467,22 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             ],
             Some(p.into()),
         );
+        // Sliced assignment `xs[lo:hi:step] = ys` (#1005): (list, rhs-list, lo,
+        // hi, step, has_lo, has_hi, has_step) -> void. May raise ValueError.
+        self.declare_rt(
+            "zap_list_set_slice",
+            &[
+                p.into(),
+                p.into(),
+                i.into(),
+                i.into(),
+                i.into(),
+                i.into(),
+                i.into(),
+                i.into(),
+            ],
+            None,
+        );
         // list sort (ticket #336): `sorted()` copies first; `zap_list_sort_by`
         // sorts a list in place by a parallel key list (self for the no-key case).
         self.declare_rt("zap_list_copy", &[p.into()], Some(p.into()));
