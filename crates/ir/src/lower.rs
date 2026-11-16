@@ -10912,6 +10912,12 @@ impl<'a> FnLower<'a> {
                 if let Ty::Heap(elem) = lty {
                     return self.lower_for_heap(target, lst, elem, body);
                 }
+                if let Ty::Deque(elem) = lty {
+                    return self.lower_for_deque(target, lst, elem, body);
+                }
+                if let Ty::OSet(elem) = lty {
+                    return self.lower_for_oset(target, lst, elem, body);
+                }
                 // `for c in s` where `s : str` — iterate codepoints (`char`),
                 // walking the UTF-8 buffer once (D-0025).
                 if lty == Ty::Ptr {
@@ -11466,6 +11472,41 @@ impl<'a> FnLower<'a> {
             dest: Some(items),
             func: "zap_heap_items".to_string(),
             args: vec![heap_val],
+        });
+        self.lower_for_list(target, items, elem, body)
+    }
+
+    /// `for x in <deque>` (#983): iterate a left-to-right snapshot list, like
+    /// `heap`.
+    fn lower_for_deque(
+        &mut self,
+        target: &Expr,
+        deque_val: Value,
+        elem: Elem,
+        body: &ast::Block,
+    ) -> Result<(), LowerError> {
+        let items = self.new_value(Ty::List(elem));
+        self.emit(Inst::Call {
+            dest: Some(items),
+            func: "zap_deque_items".to_string(),
+            args: vec![deque_val],
+        });
+        self.lower_for_list(target, items, elem, body)
+    }
+
+    /// `for x in <oset>` (#983): iterate an insertion-order snapshot list.
+    fn lower_for_oset(
+        &mut self,
+        target: &Expr,
+        oset_val: Value,
+        elem: Elem,
+        body: &ast::Block,
+    ) -> Result<(), LowerError> {
+        let items = self.new_value(Ty::List(elem));
+        self.emit(Inst::Call {
+            dest: Some(items),
+            func: "zap_oset_items".to_string(),
+            args: vec![oset_val],
         });
         self.lower_for_list(target, items, elem, body)
     }
@@ -23073,6 +23114,8 @@ impl<'a> FnLower<'a> {
             Ty::Dict(..) => Some("zap_dict_len"),
             Ty::Set(_) => Some("zap_set_len"),
             Ty::Heap(_) => Some("zap_heap_len"),
+            Ty::Deque(_) => Some("zap_deque_len"),
+            Ty::OSet(_) => Some("zap_oset_len"),
             Ty::Array(..) => Some("zap_array_len"),
             _ => None,
         };
