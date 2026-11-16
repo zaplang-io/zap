@@ -1905,6 +1905,10 @@ impl Mono<'_> {
                     span: *span,
                 }
             }
+            Stmt::Unsafe { body, span } => Stmt::Unsafe {
+                body: self.rewrite_block(body, env)?,
+                span: *span,
+            },
             Stmt::LetTuple {
                 is_const,
                 ty,

@@ -15,7 +15,7 @@
 
 use zapc_syntax::ast;
 
-use super::support::{call_ret, call_void, lower_args};
+use super::support::{call_bool, call_ret, call_void, lower_args};
 use super::ModuleLower;
 use crate::ir::*;
 use crate::lower::{FnLower, LowerError};
@@ -31,6 +31,25 @@ pub(super) const MODULE_AARCH64: ModuleLower = ModuleLower {
     name: "arch.aarch64",
     lower: lower_aarch64,
 };
+
+/// `arch` facade — `cpu_has` reuses the #943 `zap_sys_cpu_has` runtime query.
+pub(super) const MODULE_FACADE: ModuleLower = ModuleLower {
+    name: "arch",
+    lower: lower_facade,
+};
+
+fn lower_facade(
+    lowerer: &mut FnLower,
+    method: &str,
+    args: &[ast::Arg],
+) -> Result<Option<(Value, Ty)>, LowerError> {
+    let a = lower_args(lowerer, args)?;
+    Ok(Some(match method {
+        // Reuse the detector exposed by #943 (sema validated the feature name).
+        "cpu_has" => call_bool(lowerer, "zap_sys_cpu_has", a),
+        _ => return Ok(None),
+    }))
+}
 
 fn lower_x86_64(
     lowerer: &mut FnLower,

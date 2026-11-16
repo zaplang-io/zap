@@ -542,8 +542,18 @@ impl<'t> Loader<'t> {
                 // `import <name>` is also a Zap `Import::Module` and is dropped
                 // (stdlib member access resolves by the literal base name, so
                 // the import line is not load-bearing — I#70/I#121).
-                if matches!(item, Item::Import(Import::Module { .. })) {
-                    continue;
+                //
+                // EXCEPTION: an `arch.x86_64` / `arch.aarch64` intrinsics import
+                // (I#139 Tier 2, D-0199) IS load-bearing — its alias is the
+                // receiver name a call dispatches on (`x86.crc32c_u64`), with no
+                // literal module name to fall back on — so it must survive to
+                // sema and lowering, which build the alias map from it
+                // (`zapc_syntax::arch::collect_arch_imports`). Lowering skips it
+                // like any import (it emits no code).
+                if let Item::Import(Import::Module { path, .. }) = item {
+                    if zapc_syntax::arch::arch_submodule(path).is_none() {
+                        continue;
+                    }
                 }
                 let mut it = item.clone();
                 rw.item(&mut it);
@@ -709,7 +719,8 @@ fn stmt_span(st: &Stmt) -> Span {
         | Stmt::With { span, .. }
         | Stmt::Spawn { span, .. }
         | Stmt::AssignTuple { span, .. }
-        | Stmt::Scope { span, .. } => *span,
+        | Stmt::Scope { span, .. }
+        | Stmt::Unsafe { span, .. } => *span,
         Stmt::Break(s) | Stmt::Continue(s) | Stmt::Pass(s) => *s,
         Stmt::Expr(e) => expr_span(e),
         Stmt::Cfg(b) => b.span,

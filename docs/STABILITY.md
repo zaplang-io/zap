@@ -305,8 +305,22 @@ not supported — it may change in **any** release, including a PATCH:
   NOT a covered surface (§1.5) — an observable program behaves identically
   whichever clone runs. The decorator name and its mandatory-`default` rule are
   expected to graduate to Stable; the standalone `@target_feature` building block
-  and its unsafe-to-call-directly rule are a later addition, Experimental until
-  the #139 facility's surface is finalized.
+  and its unsafe-to-call-directly rule now ship (#963, D-0200, below).
+- **`@target_feature` + `unsafe:` + `arch.cpu_has`** (#963, epic #139, D-0200) —
+  **Experimental**. `@target_feature("avx2")` on a free function compiles its body
+  with that CPU feature enabled; it is **unsafe to call directly** (a SIGILL risk)
+  and a direct call is rejected (**ZAP5134**) unless it is inside an `unsafe:`
+  block (a new compound statement / hard keyword — an ordinary block that permits
+  such a call; it does NOT widen memory safety and has no runtime effect). The
+  feature name is a stable `cpu_features` taxonomy name (not `"default"`).
+  `arch.cpu_has(name) -> bool` is the portable Zap-level CPU-feature query over
+  the #943 detector (same runtime semantics as `sys.cpu_has`), compiling on every
+  target, with a compile-time-validated string-literal name. For automatic *safe*
+  dispatch prefer `@multiversion` (its clones are never called unguarded). The
+  feature NAMES and the `@target_feature`/`unsafe:`/`cpu.has` surface are expected
+  to graduate to Stable; the clone/stamp/LTO mechanics stay internal (§1.5). The
+  `.feature` dotted-enum spelling and the over-reading SSE4.2 string ops that also
+  use `unsafe:` are later additions.
 - **`arch.x86_64` / `arch.aarch64` intrinsics modules** (#962, epic #139,
   D-0199) — **Experimental**. The curated Tier-2 escape hatch: `import
   arch.x86_64 as x86` / `import arch.aarch64 as a` exposes `crc32c_u8/u16/u32`

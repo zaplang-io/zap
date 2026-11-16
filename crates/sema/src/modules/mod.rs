@@ -109,6 +109,9 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     // registry names; dispatched via the import-alias map (see `Checker`).
     arch::MODULE_X86_64,
     arch::MODULE_AARCH64,
+    // The portable `arch` facade: the CPU-feature query `arch.cpu_has` (#963,
+    // D-0200). Compiles on every target (unlike the arch sub-modules).
+    arch::MODULE_FACADE,
 ];
 
 /// A built-in module's *constant* facet: the type of a `module.CONST` attribute

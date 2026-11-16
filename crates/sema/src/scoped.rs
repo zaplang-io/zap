@@ -162,6 +162,7 @@ impl Checker {
                 }
                 self.flag_arena_escapes(body, tainted);
             }
+            Stmt::Unsafe { body, .. } => self.flag_arena_escapes(body, tainted),
             Stmt::If {
                 branches,
                 else_block,
@@ -459,6 +460,8 @@ impl Checker {
                 // there is caught by the call-argument escape check in `scan_expr`.
                 self.walk_scoped_block(body, aliases);
             }
+            // `unsafe:` introduces no new scope (D-0200); aliases flow in.
+            Stmt::Unsafe { body, .. } => self.walk_scoped_block(body, aliases),
             Stmt::If {
                 branches,
                 else_block,
@@ -750,7 +753,8 @@ fn stmt_blocks<'a>(s: &'a Stmt, out: &mut Vec<&'a Block>) {
         | Stmt::While { body, .. }
         | Stmt::DoWhile { body, .. }
         | Stmt::For { body, .. }
-        | Stmt::Scope { body, .. } => out.push(body),
+        | Stmt::Scope { body, .. }
+        | Stmt::Unsafe { body, .. } => out.push(body),
         Stmt::If {
             branches,
             else_block,

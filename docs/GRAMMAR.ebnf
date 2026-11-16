@@ -372,6 +372,7 @@ compound_stmt ::= if_stmt
                 | try_stmt
                 | with_stmt
                 | scope_stmt
+                | unsafe_stmt        (* `unsafe:` target-feature-call gate (I#139, D-0200) *)
                 | cfg_stmt           (* `when target.*` conditional compilation (I#139) *)
                 | select_stmt ;
 
@@ -420,6 +421,17 @@ with_item     ::= expr [ "as" IDENT ] ;
 (* ---------- Structured concurrency (D-0044) ---------- *)
 
 scope_stmt    ::= "scope" [ "(" [ arg_list ] ")" ] block ;
+unsafe_stmt   ::= "unsafe" block ;
+                  (* I#139, D-0200. An ordinary block (its own lexical scope, no
+                     runtime effect) that additionally permits calling a
+                     `@target_feature` function — which is unsafe to call
+                     directly (a SIGILL risk) — typically after an
+                     `arch.cpu_has(...)` guard. It does NOT widen memory safety:
+                     the v1 `arch.*` intrinsics are memory-safe and need no
+                     `unsafe`. Hard keyword, additive/Experimental (D-0076). The
+                     user-facing `@target_feature("feat")` and `arch.cpu_has(name)`
+                     that pair with it add no new grammar — a function decorator
+                     and a qualified call respectively. *)
                   (* options are keyword args: on_error=OnError.Cancel|Wait;
                      timeout=<int-ms> — a relative deadline in a nonnegative integer
                      number of milliseconds (no unit suffix; D-0094). On expiry the

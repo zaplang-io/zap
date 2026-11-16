@@ -136,6 +136,7 @@ fn each_yield_in_stmt<'a>(st: &'a Stmt, visit: &mut dyn FnMut(&'a Expr)) {
             }
             each_yield_in_block(body, visit);
         }
+        Stmt::Unsafe { body, .. } => each_yield_in_block(body, visit),
         Stmt::LetTuple { value, .. } | Stmt::AssignTuple { value, .. } => {
             each_yield_in_expr(value, visit)
         }

@@ -9898,3 +9898,79 @@ Relates to epic #139, Discussion #920, design/0032 (D-0079), D-0192
 (`cpu_features`), D-0060 (ISO CRC32, kept distinct). Pairs with #963 (the
 user-facing `@target_feature` / `cpu.has` surface). The `unsafe` construct the
 over-reading Phase-4 ops need is reported as a prerequisite.
+
+## D-0200 — user-facing `@target_feature` + `arch.cpu_has` + the `unsafe:` block (ISA-acceleration epic #139 / #963)
+**Status:** implemented
+The programmer-facing language surface on top of the already-shipped
+`@multiversion` codegen (#944, D-0193) and `cpu_features` detector (#943,
+D-0192): a power user can now write their own feature-gated function, query CPU
+features from Zap, and call a feature-gated function safely through an explicit
+`unsafe:` block. The compile-time half (`when target.*` cfg) already shipped
+(D-0079 Phase 1). **Experimental** (STABILITY §3.1), additive, post-1.0.
+- **`unsafe:` block — a new compound statement (new keyword `unsafe`).** An
+  ordinary block (its own lexical scope, lowered exactly like a normal block, no
+  runtime effect) that additionally *permits* the operations which are "unsafe to
+  call directly". It is Rust's `unsafe { … }` model: a compile-time
+  acknowledgement that the programmer upholds an obligation the type system
+  cannot verify. **It does NOT widen memory safety** — the v1 `arch.*` intrinsics
+  (D-0199) are all memory-safe and need no `unsafe`; `unsafe:` exists to gate the
+  SIGILL-risking `@target_feature` calls (and, later, the over-reading SSE4.2
+  string ops of D-0079 Phase 4). `when`-style, Python-suite grammar
+  (`unsafe:` NEWLINE INDENT … DEDENT). Hard keyword (additive per D-0076; no
+  existing source used `unsafe` as an identifier).
+- **`@target_feature("feat")` — the building block.** On a free function, it
+  compiles the body with that CPU feature enabled (reusing the `Func.target_feature`
+  channel a `@multiversion` clone uses, so the LLVM `target-features` stamp +
+  `noinline` + LTO-survival all come for free). Exactly one positional feature
+  name from the `cpu_features` taxonomy (`MULTIVERSION_TIERS`); `"default"` is a
+  @multiversion tier, not a feature, and is rejected (**ZAP5134**).
+- **Unsafe-to-call-directly rule (same as Rust).** Calling a `@target_feature`
+  function on a CPU lacking the feature is a SIGILL the type system cannot rule
+  out, so a direct call is rejected (**ZAP5134**) unless it is inside an `unsafe:`
+  block — where the programmer asserts the feature is present, typically after an
+  `arch.cpu_has(...)` guard. The permission is lexically scoped to the block (it
+  does not leak past it). For automatic *safe* dispatch across CPUs, `@multiversion`
+  remains the answer (its clones are called only by the resolver, never
+  unguarded), so a `@multiversion` function stays safe to call with no `unsafe`.
+  The `cpu.has` guard is the programmer's *soundness* obligation inside `unsafe:`;
+  the compiler does not treat the guard as lifting the `unsafe` requirement (Rust's
+  model), which keeps the rule simple and free of fragile dominator analysis.
+- **`arch.cpu_has(name: str) -> bool` — the Zap-level CPU query.** Lives in the
+  portable `arch` facade (D-0079 §2), compiles on every target, and reuses the
+  #943 detector (`zap_sys_cpu_has`, same runtime semantics as `sys.cpu_has`). The
+  curation value-add over the raw `sys.cpu_has`: a **string-literal** feature name
+  is validated against the taxonomy at compile time (a typo is a compile error,
+  not a silently-`false` query); a non-literal name is accepted and checked at
+  runtime. Enables a manual guarded dispatch (`let f = if cpu.has(...): a else: b`)
+  and is the guard before an `unsafe:` `@target_feature` call. v1 takes a string
+  (consistent with the `@multiversion`/`@target_feature` string taxonomy); the
+  `.feature` dotted-enum spelling sketched in #139 is a possible future layer.
+- **Module-linker fix (load-bearing arch imports).** The linker drops ordinary
+  stdlib `import` lines from the merged module (stdlib members resolve by the
+  literal module name), but an `arch.x86_64 as x86` import's **alias is the
+  receiver a call dispatches on**, with no literal name to fall back on — so arch
+  imports are now preserved through the merge (`zapc_syntax::arch::arch_submodule`
+  gate) and reach sema and lowering, which build the alias map from them. Without
+  this an aliased `arch.*` call failed to resolve on the real build path (it
+  worked only on the import-preserving sema test path). This also makes the
+  D-0199 goldens pass end to end.
+- **Pipeline.** Parse (new `unsafe:` statement; `@target_feature` is an existing
+  decorator shape); sema (unsafe-depth context, `@target_feature` validation +
+  the unsafe-call rule, `arch.cpu_has` name validation); lowering stamps the
+  single feature onto the `Func` and the codegen `apply_tier_features` +
+  LTO-strip exception (a `zap-keep-target-features` sentinel marks a standalone
+  `@target_feature` function so its features survive the I#841 strip, since its
+  symbol has no `$mv$` marker). Validated under -O2/LTO, not just debug (#920 §7,
+  the #845 lesson), via the `target_feature_dispatch` golden.
+- **Tests.** Host: parser (`unsafe:` → `Stmt::Unsafe`), fmt round-trip, sema
+  (`@target_feature` validation incl. reject `"default"`/unknown/arity/wrong-target;
+  the unsafe-to-call rule — rejected outside `unsafe:`, allowed inside, does not
+  leak; `arch.cpu_has` typo/type rejection; `@multiversion` regression). CI
+  (full/arm64): the `cpu_has` golden (`ZAP_CPU=generic` → deterministic `False`s)
+  and the `target_feature_dispatch` golden (a `@target_feature` kernel called in
+  an `unsafe:` block behind a `cpu.has` guard, same result as the portable path,
+  no SIGILL, under LTO).
+Relates to epic #139, Discussion #920, design/0032 (D-0079), D-0192/D-0193
+(`cpu_features` / multiversioning it builds on), D-0199 (the `arch.*` intrinsics
+it pairs with). The over-reading SSE4.2 string ops that also need `unsafe:`
+(D-0079 §6.4, Phase 4) remain deferred; `unsafe:` is now in place for them.

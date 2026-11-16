@@ -1618,6 +1618,10 @@ impl Rewriter<'_> {
                 body: self.block(body),
                 span,
             },
+            Stmt::Unsafe { body, span } => Stmt::Unsafe {
+                body: self.block(body),
+                span,
+            },
             Stmt::LetTuple {
                 is_const,
                 ty,

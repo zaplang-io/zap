@@ -296,7 +296,17 @@ fn strip_target_attrs_bitcode(path: &Path) -> Result<(), String> {
             .to_str()
             .map(|n| n.contains("$mv$") || n.contains("_mvsimd_"))
             .unwrap_or(false);
-        if !is_mv_clone {
+        // A standalone `@target_feature` function (#963, D-0200) carries an
+        // ordinary name, so codegen marks it with the `zap-keep-target-features`
+        // sentinel; keep its `target-features` like a clone's, then drop the
+        // marker (it is internal and must not leak into the final object).
+        let is_target_feature = func
+            .get_string_attribute(AttributeLoc::Function, "zap-keep-target-features")
+            .is_some();
+        if is_target_feature {
+            func.remove_string_attribute(AttributeLoc::Function, "zap-keep-target-features");
+        }
+        if !is_mv_clone && !is_target_feature {
             for key in INLINE_BLOCKING_FN_ATTRS {
                 func.remove_string_attribute(AttributeLoc::Function, key);
             }
@@ -3674,6 +3684,16 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     .ctx
                     .create_string_attribute("target-features", spec.llvm_features);
                 fv.add_attribute(AttributeLoc::Function, attr);
+                // Mark this function so the LTO `target-features` strip keeps it
+                // (#963, D-0200). A `@multiversion` clone is kept by its `$mv$`
+                // name, but a standalone `@target_feature` user function has an
+                // ordinary name; without this marker its features would be
+                // stripped and the function silently demoted to baseline (the
+                // #845 broken-LTO failure mode). The strip removes the marker.
+                let keep = self
+                    .ctx
+                    .create_string_attribute("zap-keep-target-features", "");
+                fv.add_attribute(AttributeLoc::Function, keep);
             }
         }
     }

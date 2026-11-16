@@ -312,6 +312,18 @@ target.arch == .aarch64: … else: …`. For the common case the portable wrappe
 `arch.*` import. See
 [D-0199](DECISIONS.md#d-0199--archx86_64--archaarch64-curated-intrinsics-module--hashcrc32c-isa-acceleration-epic-139--962).
 
+The matching user-facing dispatch surface (#963, D-0200) lets a power user write
+their own feature-gated code: `@target_feature("avx2")` compiles a free function
+with a CPU feature enabled (it is **unsafe to call directly** — a SIGILL risk —
+so a direct call is allowed only inside an `unsafe:` block, a new compound
+statement, typically after an `arch.cpu_has("avx2")` guard); `arch.cpu_has(name)`
+is a portable Zap-level CPU-feature query over the `cpu_features` detector. For
+automatic, *safe* dispatch across CPUs prefer `@multiversion(...)` (its clones
+are resolved once at load and never called unguarded). The `unsafe:` block does
+not widen memory safety — the `arch.*` intrinsics above are memory-safe and need
+no `unsafe` — it exists to gate the SIGILL-risking target-feature calls. See
+[D-0200](DECISIONS.md#d-0200--user-facing-target_feature--archcpu_has--the-unsafe-block-isa-acceleration-epic-139--963).
+
 ## License
 
 Licensed under either of

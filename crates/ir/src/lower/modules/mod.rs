@@ -112,6 +112,8 @@ pub(super) const MODULES: &[ModuleLower] = &[
     // Architecture-specific low-level intrinsics (I#139 Tier 2, D-0199).
     arch::MODULE_X86_64,
     arch::MODULE_AARCH64,
+    // The portable `arch` facade: `cpu_has` (#963, D-0200).
+    arch::MODULE_FACADE,
 ];
 
 /// A module's *constant* lowering hook: lower `module.CONST` (an attribute, not

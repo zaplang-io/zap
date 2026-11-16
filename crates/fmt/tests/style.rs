@@ -342,3 +342,17 @@ fn generator_expression_round_trips(/* #596 */) {
         "def f():\n    t = sum((x * x for x in a))\n",
     );
 }
+
+#[test]
+fn unsafe_block_round_trips() {
+    // `unsafe:` formats canonically and is idempotent (D-0200).
+    check(
+        "def main():\n    unsafe:\n        print(1)\n",
+        "def main():\n    unsafe:\n        print(1)\n",
+    );
+    // Re-indentation normalizes a sloppy body without changing the keyword line.
+    check(
+        "def main():\n  unsafe:\n          f()\n",
+        "def main():\n    unsafe:\n        f()\n",
+    );
+}

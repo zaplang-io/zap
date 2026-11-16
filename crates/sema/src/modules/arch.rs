@@ -25,11 +25,11 @@
 //! never a bare `crc32` (D-0079 §6.6).
 
 use zapc_diag::ErrorCode;
-use zapc_syntax::ast::Arg;
+use zapc_syntax::ast::{Arg, Expr};
 use zapc_syntax::span::Span;
 
 use super::ModuleCheck;
-use crate::{expr_span, Checker, Ty};
+use crate::{assignable, expr_span, Checker, Ty, MULTIVERSION_TIERS};
 
 /// `arch.x86_64` — x86-64 intrinsics (SSE4.2 `crc32`, `POPCNT`, `PREFETCHh`).
 pub(super) const MODULE_X86_64: ModuleCheck = ModuleCheck {
@@ -42,6 +42,63 @@ pub(super) const MODULE_AARCH64: ModuleCheck = ModuleCheck {
     name: "arch.aarch64",
     check,
 };
+
+/// `arch` — the portable facade (the runtime CPU-feature query). Compiles on
+/// every target; `cpu_has` can only be `true` on a build whose arch defines the
+/// queried feature (#963, D-0200).
+pub(super) const MODULE_FACADE: ModuleCheck = ModuleCheck {
+    name: "arch",
+    check: check_facade,
+};
+
+/// `arch.cpu_has(name: str) -> bool` — the curated, portable CPU-feature query
+/// over `cpu_features` (#943). Unlike the raw `sys.cpu_has` it validates a
+/// string-literal feature name against the taxonomy at compile time (a typo is a
+/// compile error, not a silently-`false` query); a non-literal name is accepted
+/// and checked at runtime. Enables a manual guarded dispatch, and is the guard a
+/// programmer writes before an `unsafe:` call to a `@target_feature` function.
+fn check_facade(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Option<Ty> {
+    match method {
+        "cpu_has" => {
+            if args.len() != 1 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!("arch.cpu_has() takes 1 argument, found {}", args.len()),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                let t = checker.infer(&args[0].value);
+                if !assignable(&t, &Ty::Str) && t != Ty::Unknown {
+                    checker.error(
+                        ErrorCode::ZAP4024,
+                        format!(
+                            "arch.cpu_has() expects a str feature name, found {}",
+                            t.display()
+                        ),
+                        expr_span(&args[0].value),
+                    );
+                } else if let Expr::Str { value, .. } = &args[0].value {
+                    // A string literal is validated against the taxonomy now.
+                    if !MULTIVERSION_TIERS.contains(&value.as_str()) {
+                        checker.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "arch.cpu_has(): unknown CPU feature '{value}' (expected a \
+                                 cpu_features name like \"avx2\"/\"neon\")"
+                            ),
+                            expr_span(&args[0].value),
+                        );
+                    }
+                }
+            }
+            Some(Ty::Bool)
+        }
+        _ => None,
+    }
+}
 
 /// A 2-arg intrinsic whose arguments must both be integers (`crc`, `value`).
 fn int2(checker: &mut Checker, module: &str, method: &str, args: &[Arg], span: Span, result: Ty) {
@@ -302,5 +359,165 @@ def main():
     print(c)
 ";
         assert!(has(bad, ErrorCode::ZAP4024), "errors: {:?}", terrs(bad));
+    }
+}
+
+#[cfg(test)]
+mod facade_and_target_feature_tests {
+    use crate::check_str;
+    use zapc_diag::ErrorCode;
+
+    fn terrs(src: &str) -> Vec<crate::TypeError> {
+        let (terrs, perrs, lerrs) = check_str(src);
+        assert!(perrs.is_empty(), "parse errors: {perrs:?}");
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        terrs
+    }
+    fn has(src: &str, code: ErrorCode) -> bool {
+        terrs(src).iter().any(|e| e.code == code)
+    }
+
+    // ---- arch.cpu_has facade ----
+    #[test]
+    fn cpu_has_typechecks_known_name() {
+        let src = "\
+def main():
+    if arch.cpu_has(\"avx2\"):
+        print(1)
+    else:
+        print(0)
+";
+        assert!(terrs(src).is_empty(), "errors: {:?}", terrs(src));
+    }
+
+    #[test]
+    fn cpu_has_rejects_unknown_feature_and_bad_type() {
+        assert!(has(
+            "def main():\n    print(arch.cpu_has(\"bogus\"))\n",
+            ErrorCode::ZAP4024
+        ));
+        assert!(has(
+            "def main():\n    print(arch.cpu_has(42))\n",
+            ErrorCode::ZAP4024
+        ));
+        assert!(has(
+            "def main():\n    print(arch.cpu_has())\n",
+            ErrorCode::ZAP4025
+        ));
+    }
+
+    // ---- @target_feature decorator validation ----
+    #[test]
+    fn target_feature_accepts_one_taxonomy_name() {
+        let src = "\
+@target_feature(\"avx2\")
+def kernel(int64 n) -> int64:
+    return n + 1
+
+def main():
+    unsafe:
+        print(kernel(5))
+";
+        assert!(terrs(src).is_empty(), "errors: {:?}", terrs(src));
+    }
+
+    #[test]
+    fn target_feature_rejects_default_and_unknown_and_arity() {
+        assert!(has(
+            "@target_feature(\"default\")\ndef k() -> int64:\n    return 1\ndef main():\n    pass\n",
+            ErrorCode::ZAP5134
+        ));
+        assert!(has(
+            "@target_feature(\"bogus\")\ndef k() -> int64:\n    return 1\ndef main():\n    pass\n",
+            ErrorCode::ZAP5134
+        ));
+        assert!(has(
+            "@target_feature()\ndef k() -> int64:\n    return 1\ndef main():\n    pass\n",
+            ErrorCode::ZAP5134
+        ));
+        assert!(has(
+            "@target_feature(\"avx2\", \"sse4.2\")\ndef k() -> int64:\n    return 1\ndef main():\n    pass\n",
+            ErrorCode::ZAP5134
+        ));
+    }
+
+    #[test]
+    fn target_feature_on_non_function_is_rejected() {
+        // Wrong decorator target → ZAP5047 (require_target), not ZAP5134.
+        let src = "\
+@target_feature(\"avx2\")
+struct S:
+    int64 x
+
+def main():
+    pass
+";
+        assert!(
+            !terrs(src).is_empty(),
+            "expected an error for @target_feature on a struct"
+        );
+    }
+
+    // ---- the unsafe-to-call-directly rule ----
+    #[test]
+    fn direct_call_outside_unsafe_is_rejected() {
+        let src = "\
+@target_feature(\"avx2\")
+def kernel(int64 n) -> int64:
+    return n + 1
+
+def main():
+    print(kernel(5))
+";
+        assert!(has(src, ErrorCode::ZAP5134), "errors: {:?}", terrs(src));
+    }
+
+    #[test]
+    fn call_inside_unsafe_is_allowed() {
+        let src = "\
+@target_feature(\"avx2\")
+def kernel(int64 n) -> int64:
+    return n + 1
+
+def main():
+    if arch.cpu_has(\"avx2\"):
+        unsafe:
+            print(kernel(5))
+    else:
+        print(0)
+";
+        assert!(terrs(src).is_empty(), "errors: {:?}", terrs(src));
+    }
+
+    #[test]
+    fn unsafe_does_not_leak_past_its_block() {
+        // The permission is scoped to the unsafe block: a call after it is again
+        // rejected.
+        let src = "\
+@target_feature(\"avx2\")
+def kernel(int64 n) -> int64:
+    return n + 1
+
+def main():
+    unsafe:
+        print(kernel(1))
+    print(kernel(2))
+";
+        assert!(has(src, ErrorCode::ZAP5134), "errors: {:?}", terrs(src));
+    }
+
+    #[test]
+    fn multiversion_still_accepts_user_function() {
+        // Regression: the user-facing @multiversion (#944) remains valid and is
+        // safe to call directly (dispatch is resolved; no unsafe needed).
+        let src = "\
+@multiversion(\"avx2\", \"default\")
+def sum_sq(int64 n) -> int64:
+    return n * n
+
+def main():
+    print(sum_sq(5))
+";
+        assert!(terrs(src).is_empty(), "errors: {:?}", terrs(src));
     }
 }

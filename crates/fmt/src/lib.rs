@@ -833,6 +833,11 @@ impl<'a> Printer<'a> {
                 self.take_header_trailing(body.span.start);
                 self.emit_block(body);
             }
+            Stmt::Unsafe { body, .. } => {
+                self.push_line("unsafe:");
+                self.take_header_trailing(body.span.start);
+                self.emit_block(body);
+            }
             Stmt::Cfg(c) => self.emit_cfg_stmt(c),
         }
     }
@@ -1182,6 +1187,7 @@ fn stmt_span(s: &Stmt) -> Span {
         | Stmt::With { span, .. }
         | Stmt::Spawn { span, .. }
         | Stmt::Scope { span, .. }
+        | Stmt::Unsafe { span, .. }
         | Stmt::LetTuple { span, .. }
         | Stmt::AssignTuple { span, .. }
         | Stmt::Cfg(CfgStmtBlock { span, .. }) => *span,

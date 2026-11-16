@@ -350,6 +350,18 @@ struct Checker {
     /// are reachable only through an explicit `arch.*` import (off the default
     /// surface). Empty unless the file imports an `arch.*` module.
     arch_imports: HashMap<String, &'static str>,
+    /// Nesting depth of the `unsafe:` blocks currently being checked (I#139,
+    /// D-0200). A call to a `@target_feature` function (unsafe to call directly —
+    /// a SIGILL risk the type system cannot verify) is permitted only when this
+    /// is non-zero (inside an `unsafe:` block) or when it is a `@multiversion`
+    /// clone the dispatcher calls. Zero everywhere else.
+    unsafe_depth: u32,
+    /// Names of free functions carrying `@target_feature("feat")` (#963, D-0200).
+    /// Each is **unsafe to call directly** (a SIGILL risk the type system cannot
+    /// verify): a direct call resolving to one of these is rejected (ZAP5134)
+    /// unless it is inside an `unsafe:` block ([`Checker::unsafe_depth`] > 0).
+    /// Populated in [`Checker::collect_sigs`].
+    target_feature_fns: HashSet<String>,
     /// Functions and methods carrying `@deprecated` (I#472, D-0109), mapping the
     /// call key to the optional user message. A free function is keyed by its
     /// bare name; a method by `"Type.method"`. Each call site resolving to one of
@@ -654,6 +666,14 @@ const BUILTIN_DECORATORS: &[&str] = &[
     // per CPU-feature tier + a runtime resolver/dispatcher reading `cpu_features`
     // (#943). A mandatory `"default"` tier is the portable fallback.
     "multiversion",
+    // Target-feature building block (#963, ISA-acceleration epic #139, D-0200):
+    // `@target_feature("avx2")` on a free function compiles its body with that
+    // CPU feature enabled. It is UNSAFE TO CALL DIRECTLY (running it on a CPU
+    // without the feature is a SIGILL) — a direct call is permitted only inside
+    // an `unsafe:` block, where the programmer asserts the feature is present
+    // (e.g. after an `arch.cpu_has(...)` check). The feature NAMES are the stable
+    // `cpu_features` taxonomy (`MULTIVERSION_TIERS`); `"default"` is not a feature.
+    "target_feature",
     // Request-source resolver marker (#959, D-0198): `@request_source` on a
     // top-level function marks it a request-derived parameter resolver that the
     // reflection-driven handler adapter (D-0092) may inject. A handler parameter
@@ -980,6 +1000,8 @@ impl Checker {
             annotations: HashMap::new(),
             user_decorators: HashSet::new(),
             arch_imports: HashMap::new(),
+            unsafe_depth: 0,
+            target_feature_fns: HashSet::new(),
             deprecated: HashMap::new(),
             shareable_types: HashSet::new(),
             scoped_types: HashSet::new(),
@@ -2419,6 +2441,12 @@ impl Checker {
                     if let Some(msg) = deprecated_message(&f.decorators) {
                         self.deprecated.insert(f.name.clone(), msg);
                     }
+                    // `@target_feature` free functions are unsafe to call
+                    // directly (#963, D-0200): record the name so every call site
+                    // can require an `unsafe:` context (ZAP5134).
+                    if f.decorators.iter().any(|d| d.name == "target_feature") {
+                        self.target_feature_fns.insert(f.name.clone());
+                    }
                 }
                 Item::Struct(s) => {
                     // `@deprecated` on a method, keyed `"Type.method"`.
@@ -3006,6 +3034,47 @@ impl Checker {
                         ErrorCode::ZAP5133,
                         "@multiversion requires a \"default\" tier (the mandatory \
                          portable fallback), e.g. @multiversion(\"avx2\", \"default\")",
+                        d.span,
+                    );
+                }
+            }
+            "target_feature" => {
+                // `@target_feature("avx2")` on a free function (#963, D-0200):
+                // exactly one positional feature name, a stable `cpu_features`
+                // taxonomy name (not `"default"` — that is a @multiversion tier,
+                // not a feature). The function is then unsafe to call directly.
+                self.require_target(d, target, DecoTarget::Function);
+                if positionals != 1 || keywords != 0 {
+                    self.error(
+                        ErrorCode::ZAP5134,
+                        "@target_feature(\"feat\") takes exactly one positional CPU-feature \
+                         name, e.g. @target_feature(\"avx2\")",
+                        d.span,
+                    );
+                } else if let Expr::Str { value, .. } = &d.args[0].value {
+                    if value == "default" {
+                        self.error(
+                            ErrorCode::ZAP5134,
+                            "\"default\" is not a CPU feature; @target_feature names a real \
+                             feature (e.g. @target_feature(\"avx2\")). A portable fallback is \
+                             a @multiversion(\"default\") tier, not a @target_feature.",
+                            d.span,
+                        );
+                    } else if !MULTIVERSION_TIERS.contains(&value.as_str()) {
+                        self.error(
+                            ErrorCode::ZAP5134,
+                            format!(
+                                "unknown @target_feature '{value}' (expected a cpu_features \
+                                 name like \"avx2\"/\"neon\")"
+                            ),
+                            d.span,
+                        );
+                    }
+                } else {
+                    self.error(
+                        ErrorCode::ZAP5134,
+                        "@target_feature(\"feat\") takes a string-literal feature name, \
+                         e.g. @target_feature(\"avx2\")",
                         d.span,
                     );
                 }
@@ -4386,6 +4455,15 @@ impl Checker {
             Stmt::Scope { opts, body, span } => {
                 self.check_scope_opts(opts, *span);
                 self.check_block(body);
+            }
+            Stmt::Unsafe { body, .. } => {
+                // `unsafe:` (I#139, D-0200) adds no new scope and has no runtime
+                // effect; it only marks its body as a context where a
+                // `@target_feature` function may be called directly. It does not
+                // widen memory safety — the v1 arch intrinsics need no `unsafe`.
+                self.unsafe_depth += 1;
+                self.check_block(body);
+                self.unsafe_depth -= 1;
             }
             Stmt::LetTuple {
                 ty,
@@ -6925,6 +7003,19 @@ impl Checker {
                     if let Some(sig) = self.sigs.get(fname).cloned() {
                         // `@deprecated` free function (I#472, D-0109): warn here.
                         self.warn_deprecated_call(fname, span);
+                        // `@target_feature` free function (#963, D-0200): a direct
+                        // call is unsafe (SIGILL risk) unless in an `unsafe:` block.
+                        if self.unsafe_depth == 0 && self.target_feature_fns.contains(fname) {
+                            self.error(
+                                ErrorCode::ZAP5134,
+                                format!(
+                                    "'{fname}' is a @target_feature function and is unsafe to \
+                                     call directly; call it inside an `unsafe:` block (after a \
+                                     cpu.has guard), or use @multiversion for safe dispatch"
+                                ),
+                                span,
+                            );
+                        }
                         return self.check_user_call(&sig, fname, args, span);
                     }
                     // Tier-1 enum conversion `Color(x)` — the explicit int->enum

@@ -2563,6 +2563,7 @@ impl Parser {
                     | Keyword::Try
                     | Keyword::With
                     | Keyword::Scope
+                    | Keyword::Unsafe
                     | Keyword::When
             )
         )
@@ -2578,6 +2579,7 @@ impl Parser {
             TokenKind::Keyword(Keyword::Try) => self.parse_try(),
             TokenKind::Keyword(Keyword::With) => self.parse_with(),
             TokenKind::Keyword(Keyword::Scope) => self.parse_scope(),
+            TokenKind::Keyword(Keyword::Unsafe) => self.parse_unsafe(),
             TokenKind::Keyword(Keyword::When) => Stmt::Cfg(self.parse_cfg_stmt()),
             _ => unreachable!("parse_compound called on non-compound token"),
         }
@@ -2779,6 +2781,19 @@ impl Parser {
         let body = self.parse_block();
         Stmt::Scope {
             opts,
+            body,
+            span: self.span_from(start),
+        }
+    }
+
+    /// `unsafe: <suite>` (I#139, D-0200). A block that permits the operations
+    /// which are unsafe to call directly (a `@target_feature` function). No
+    /// options, no new scope — just a body whose statements may make such calls.
+    fn parse_unsafe(&mut self) -> Stmt {
+        let start = self.peek_span().start;
+        self.expect_kw(Keyword::Unsafe, "'unsafe'");
+        let body = self.parse_block();
+        Stmt::Unsafe {
             body,
             span: self.span_from(start),
         }
@@ -4631,6 +4646,19 @@ mod tests {
     fn empty_module() {
         let m = parse_ok("");
         assert!(m.items.is_empty());
+    }
+
+    #[test]
+    fn unsafe_block_parses_to_unsafe_stmt() {
+        // `unsafe:` is a compound statement with an ordinary suite body (D-0200).
+        let m = parse_ok("def main():\n    unsafe:\n        print(1)\n        print(2)\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!("expected function");
+        };
+        match &f.body.stmts[0] {
+            Stmt::Unsafe { body, .. } => assert_eq!(body.stmts.len(), 2),
+            other => panic!("expected an unsafe statement, got {other:?}"),
+        }
     }
 
     fn interface_of(m: &Module) -> &InterfaceDef {
