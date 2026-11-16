@@ -291,10 +291,18 @@ fn strip_target_attrs_bitcode(path: &Path) -> Result<(), String> {
         // `_mvsimd_` is a hand-written C runtime SIMD clone (#945, e.g.
         // `zap_memchr_mvsimd_avx2`). Every other function is stripped so the
         // I#841 cross-boundary inlining holds.
+        // `$mv$` is a #944 Zap-function clone, `_mvsimd_` a hand-written C SIMD
+        // clone (#945), and `zap_arch_` an `arch.*` intrinsic shim (#962, D-0199):
+        // a `target(...)`-attributed C runtime function (e.g.
+        // `zap_arch_x86_crc32c_u8` carries `+sse4.2`). All MUST keep their
+        // `target-features`: a crc32 shim stripped to baseline cannot select its
+        // `@llvm.x86.sse42.crc32.*` intrinsic under LTO ("Cannot select") — the
+        // #845-class failure. Keeping the feature also makes it correctly an
+        // inlining barrier into a caller that lacks the feature (no SIGILL).
         let is_mv_clone = func
             .get_name()
             .to_str()
-            .map(|n| n.contains("$mv$") || n.contains("_mvsimd_"))
+            .map(|n| n.contains("$mv$") || n.contains("_mvsimd_") || n.contains("zap_arch_"))
             .unwrap_or(false);
         // A standalone `@target_feature` function (#963, D-0200) carries an
         // ordinary name, so codegen marks it with the `zap-keep-target-features`
