@@ -1288,6 +1288,16 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Changed
 
+- **`DECISIONS.md` consistency pass: stale/amended decisions marked in place**
+  (docs-only). Every decision whose stated ruling was later reversed or superseded
+  now carries a `⚠️`/`⛔` status banner pointing at the governing decision, and a new
+  **"Amendments & supersessions index"** table near the top gives the whole override
+  map at a glance. Banners were added to D-0064 (point X / override #3 — the
+  built-in-collection re-skin was declined by the I#170 update in the same entry),
+  D-0120 (the "benign residual window" reasoning superseded by D-0128), D-0137 (the
+  Phase-2 float-key ruling landed as reject-`NaN` in D-0138, not the canonicalize-`NaN`
+  it tentatively recommended), and D-0185 (`eigvals` → `array[complex]` and `eig`
+  implemented by D-0188). No decision substance changed.
 - **Matrix multiply auto-dispatches between the own kernel and BLAS** (#904,
   D-0181, sharpening D-0173). `a @ b` now picks the fastest kernel for the
   `(dtype, size, CPU budget)`: the own blocked+SIMD floor (#913) by default, or a
