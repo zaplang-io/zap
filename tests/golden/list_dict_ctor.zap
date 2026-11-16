@@ -1,16 +1,11 @@
 # Golden fixture: list[T]() / dict[K, V]() empty constructors (#1004).
 #
-# The generic-context synonyms for the `[]` / `{}` empty literals (parity with
+# The construction synonyms for the `[]` / `{}` empty literals (parity with
 # `set[T]()`): they build the same empty collection and then behave like any
-# list/dict. `collect[T]` exercises the real motivation — an element type that
-# is a type parameter, where no `[]` literal can name the type — across two
-# monomorphizations.
-def collect[T](T x, T y) -> int64:
-    auto xs = list[T]()
-    xs.append(x)
-    xs.append(y)
-    return len(xs)
-
+# list / dict. (A type-parameter element — `list[T]()` inside a generic body —
+# is a documented follow-up; it needs the monomorphizer to substitute the
+# constructor's type-argument subscript, which it does not do for `set[T]()`
+# either.)
 def main():
     auto a = list[int64]()
     print(len(a))  # 0
@@ -27,6 +22,3 @@ def main():
     print(len(d))  # 2
     print(d["x"])  # 1
     print(d["y"])  # 2
-
-    print(collect[int64](1, 2))  # 2
-    print(collect[str]("a", "b"))  # 2

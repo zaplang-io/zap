@@ -1481,6 +1481,13 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **`list[T]()` / `dict[K, V]()` empty constructors** (#1004). The construction
+  forms the `type_args` grammar note advertised now work, as synonyms for the
+  `[]` / `{}` empty literals (parity with `set[T]()`); previously only `set[T]()`
+  had a constructor and `list[int64]()` / `dict[str, int64]()` were rejected with
+  *unknown name 'list'/'dict'*. Zero-arg only — a populated collection still uses
+  a `[...]` / `{...}` literal. (A type-parameter element in a generic body,
+  `list[T]()`, remains a follow-up, shared with `set[T]()`.)
 - **Tuple-typed declarations now parse** (#1003, D-0206). A statement-level
   `(int64, str) t = (1, "a")` — a `tuple_type` in leading declaration position,
   which the grammar always allowed and which already worked as a parameter,
