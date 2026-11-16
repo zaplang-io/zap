@@ -1762,6 +1762,27 @@ dependency injection is a framework concern, served by reflection-driven
 planned core `@inject`. It stays reserved and is rejected with a dedicated
 diagnostic (`ZAP5055`) that redirects to `Depends(...)`.
 
+**Request-source parameter injection (`@request_source`, #959/D-0198).** The
+reflection-driven handler adapter also injects **request-derived** parameters,
+the FastAPI-canonical way, without coupling the language to any one framework.
+A framework marks its extraction resolvers with the core `@request_source`
+annotation — a top-level `fn(Request, str, …) -> T` taking the framework value,
+the source key, and any extra marker arguments. A handler then declares a
+sourced parameter as a default that **calls** such a resolver —
+`str id = Path()`, `int64 n = Num()`, `str q = Query("default")`. At the
+`@app.get` decoration site the adapter resolves each by synthesizing
+`T p = Resolver(req, "p", <marker args…>)`, drops the parameter from the
+`fn(Request) -> Response` seam, and tail-calls the handler — composing with
+`Depends(...)` in the same signature. The core recognizes only the
+`@request_source` annotation (never the resolver names `Path`/`Query`/…), so the
+source vocabulary is entirely framework-defined. The parameter's declared type
+flows into the synthesized call, so a non-`str` source is typed and coerced by
+the resolver; a sourced parameter needs the handler's pass-through `Request`
+(else `ZAP5048`), and request-source injection is a **handler-adapter** facility
+— a `@request_source` parameter inside a `Depends` provider is rejected in v1
+(`ZAP5048`). No new grammar: a function decorator and an ordinary parameter
+default.
+
 ## 17. Toolchain & CLI (D-0053)
 
 One user-facing tool, **`zap`** (the `zapc` compiler becomes internal):

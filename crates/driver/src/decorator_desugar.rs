@@ -1,5 +1,13 @@
 //! Registering function-decorator desugaring + reflection-driven handler
-//! adapters (I#457/D-0087, I#466/D-0092).
+//! adapters (I#457/D-0087, I#466/D-0092, I#959/D-0198).
+//!
+//! The adapter also injects **request-derived** parameters (I#959, D-0198): a
+//! handler parameter whose default calls a `@request_source`-annotated resolver
+//! (e.g. `str id = Path()`) is resolved by synthesizing `str id = Path(req,
+//! "id")` and dropping the parameter from the seam, composing with `Depends`.
+//! The core recognizes only the annotation, never the resolver names, so the
+//! source vocabulary stays framework-defined. See `classify_param` /
+//! `synth_adapter` and the `ParamKind::Source` arm.
 //!
 //! A **dotted** decorator name on a free function — `@app.get("/x")` — is a
 //! *registering callable target*: the decorated function is handed to a method
@@ -93,6 +101,22 @@ pub fn desugar_registering_decorators(module: &mut Module) -> Vec<TypeError> {
         })
         .collect();
 
+    // Snapshot the request-source resolver functions (#959, D-0198): top-level
+    // `def`s carrying `@request_source`. A handler parameter whose default calls
+    // one of these is a request-sourced parameter the adapter injects, rather
+    // than a seam pass-through. Taken before any decorator stripping; the marker
+    // is a bare (non-registering) decorator, so the resolver is never rewritten.
+    let source_fns: HashSet<String> = module
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Function(f) if f.decorators.iter().any(|d| d.name == "request_source") => {
+                Some(f.name.clone())
+            }
+            _ => None,
+        })
+        .collect();
+
     // Adapters synthesized this pass, appended to the module after the strip
     // loop (we cannot push while iterating items mutably). Keyed by handler name
     // so a handler with several registering decorators (e.g. get + post) reuses
@@ -109,17 +133,20 @@ pub fn desugar_registering_decorators(module: &mut Module) -> Vec<TypeError> {
         }
         let fn_name = f.name.clone();
 
-        // Does this handler declare injected (`Depends`) parameters? If so, the
-        // thing we register is the adapter, not the handler. Synthesize it once.
-        let has_depends = f
-            .params
-            .iter()
-            .any(|p| matches!(classify_param(p), ParamKind::Depends { .. }));
-        let registered_name = if has_depends {
+        // Does this handler declare injected parameters — a `Depends(...)`
+        // provider, or a `@request_source` request-derived source (#959)? If so,
+        // the thing we register is the adapter, not the handler. Synthesize once.
+        let needs_adapter = f.params.iter().any(|p| {
+            matches!(
+                classify_param(p, &source_fns),
+                ParamKind::Depends { .. } | ParamKind::Source { .. } | ParamKind::BadSource { .. }
+            )
+        });
+        let registered_name = if needs_adapter {
             adapter_name
                 .entry(fn_name.clone())
                 .or_insert_with(|| {
-                    let (adapter, aname) = synth_adapter(f, &fn_sigs, &mut diags);
+                    let (adapter, aname) = synth_adapter(f, &fn_sigs, &source_fns, &mut diags);
                     adapters.push(adapter);
                     aname
                 })
@@ -216,12 +243,25 @@ enum ParamKind {
     Depends { provider: String },
     /// `Depends(...)` in a shape we cannot resolve; carries the diagnostic.
     BadDepends { message: String, span: Span },
+    /// `T x = Resolver(extra...)` where `Resolver` is a `@request_source` function
+    /// (#959, D-0198): injected by calling `Resolver(request, "x", extra...)`.
+    Source {
+        resolver: String,
+        /// The caller-supplied marker arguments (e.g. the fallback in
+        /// `Query("")`), forwarded after `(request, name)`.
+        extra_args: Vec<Arg>,
+    },
+    /// A `@request_source` marker in a shape we cannot resolve; the diagnostic.
+    BadSource { message: String, span: Span },
 }
 
-/// Classify a parameter by its default. A `Depends(provider)` default marks an
-/// injected parameter; the marker `Depends` is recognized here and consumed —
-/// it is never a runtime value (I#466, D-0092).
-fn classify_param(p: &Param) -> ParamKind {
+/// Classify a parameter by its default. A `Depends(provider)` default marks a
+/// dependency-injected parameter (`Depends` is a compiler-recognized marker,
+/// I#466/D-0092); a default that *calls a `@request_source` function* marks a
+/// request-sourced parameter (`source_fns`, #959/D-0198). Both markers are
+/// recognized here and consumed by the adapter — never runtime values. Any other
+/// default (or none) is an ordinary pass-through.
+fn classify_param(p: &Param, source_fns: &HashSet<String>) -> ParamKind {
     let Some(default) = &p.default else {
         return ParamKind::PassThrough;
     };
@@ -231,6 +271,26 @@ fn classify_param(p: &Param) -> ParamKind {
     let Expr::Name(name, _) = callee.as_ref() else {
         return ParamKind::PassThrough;
     };
+    // A request-source marker: the default calls a `@request_source` function.
+    // The marker's own arguments are forwarded after the synthesized
+    // `(request, "<param>")` prefix; a keyword marker argument is rejected (the
+    // forwarded call is positional), a clear error rather than a silent drop.
+    if source_fns.contains(name) {
+        if let Some(bad) = args.iter().find(|a| a.name.is_some()) {
+            return ParamKind::BadSource {
+                message: format!(
+                    "`@request_source` marker `{name}(...)` on parameter `{}` takes only \
+                     positional arguments (forwarded after the request and the parameter name)",
+                    p.name
+                ),
+                span: bad.span,
+            };
+        }
+        return ParamKind::Source {
+            resolver: name.clone(),
+            extra_args: args.clone(),
+        };
+    }
     if name != "Depends" {
         return ParamKind::PassThrough;
     }
@@ -269,13 +329,25 @@ fn classify_param(p: &Param) -> ParamKind {
 fn synth_adapter(
     handler: &Function,
     fn_sigs: &HashMap<String, Vec<Param>>,
+    source_fns: &HashSet<String>,
     diags: &mut Vec<TypeError>,
 ) -> (Function, String) {
     let sp = handler.span;
     let adapter_name = format!("{}$adapter", handler.name);
 
+    // The framework value a request source resolves against — the handler's first
+    // pass-through parameter (the Request). `@request_source` resolvers take it as
+    // their first argument. A handler that declares a source parameter but no
+    // pass-through parameter has nothing to resolve against (ZAP5048 below).
+    let request: Option<(String, Span)> = handler
+        .params
+        .iter()
+        .find(|p| matches!(classify_param(p, source_fns), ParamKind::PassThrough))
+        .map(|p| (p.name.clone(), p.span));
+
     let mut builder = DepBuilder {
         fn_sigs,
+        source_fns,
         diags,
         resolved: HashMap::new(),
         lets: Vec::new(),
@@ -286,7 +358,7 @@ fn synth_adapter(
     let mut call_args: Vec<Arg> = Vec::with_capacity(handler.params.len());
     let mut pass_through: Vec<Param> = Vec::new();
     for p in &handler.params {
-        match classify_param(p) {
+        match classify_param(p, source_fns) {
             ParamKind::PassThrough => {
                 // Flows straight through to the handler; also a parameter of the
                 // adapter (its contribution to the seam signature).
@@ -297,6 +369,56 @@ fn synth_adapter(
                 let mut stack = HashSet::new();
                 let local = builder.resolve(&provider, p.ty.clone(), p.span, &mut stack);
                 call_args.push(arg(Expr::Name(local, p.span)));
+            }
+            ParamKind::Source {
+                resolver,
+                extra_args,
+            } => {
+                // Inject `<ty> <name>$src = resolver(request, "<name>", extra...)`
+                // and pass that local. The source parameter is NOT a seam
+                // parameter — that is the whole point (it does not widen the
+                // `fn(Request) -> Response` seam). It carries the param's declared
+                // type so the resolver (often generic) is instantiated and sema
+                // coerces/validates the result, exactly like a `Depends` local.
+                match &request {
+                    Some((req, req_span)) => {
+                        let local = format!("{}$src", p.name);
+                        let mut rargs = vec![
+                            arg(Expr::Name(req.clone(), *req_span)),
+                            arg(str_lit(&p.name, p.span)),
+                        ];
+                        rargs.extend(extra_args);
+                        builder.lets.push(Stmt::Let {
+                            is_const: false,
+                            ty: p.ty.clone(),
+                            name: local.clone(),
+                            value: Expr::Call {
+                                callee: Box::new(Expr::Name(resolver, p.span)),
+                                args: rargs,
+                                span: p.span,
+                            },
+                            span: p.span,
+                        });
+                        call_args.push(arg(Expr::Name(local, p.span)));
+                    }
+                    None => {
+                        builder.diags.push(err(
+                            format!(
+                                "`@request_source` parameter `{}` needs the request value, but \
+                                 handler `{}` declares no plain (framework-supplied) parameter; \
+                                 add one, e.g. `Request req`",
+                                p.name, handler.name
+                            ),
+                            p.span,
+                        ));
+                        // Keep the arg count right; the ZAP5048 above is the failure.
+                        call_args.push(arg(Expr::Name(p.name.clone(), p.span)));
+                    }
+                }
+            }
+            ParamKind::BadSource { message, span } => {
+                builder.diags.push(err(message, span));
+                call_args.push(arg(Expr::Name(p.name.clone(), p.span)));
             }
             ParamKind::BadDepends { message, span } => {
                 builder.diags.push(err(message, span));
@@ -336,6 +458,8 @@ fn synth_adapter(
 /// provider (resolve-once-per-request), deps-first, with cycle detection.
 struct DepBuilder<'a> {
     fn_sigs: &'a HashMap<String, Vec<Param>>,
+    /// The `@request_source` resolver names (#959), to classify provider params.
+    source_fns: &'a HashSet<String>,
     diags: &'a mut Vec<TypeError>,
     /// provider name -> the local it was resolved into (`<provider>$dep`).
     resolved: HashMap<String, String>,
@@ -386,10 +510,29 @@ impl DepBuilder<'_> {
         stack.insert(provider.to_string());
         let mut provider_args: Vec<Arg> = Vec::with_capacity(pparams.len());
         for pp in &pparams {
-            match classify_param(pp) {
+            match classify_param(pp, self.source_fns) {
                 ParamKind::Depends { provider: inner } => {
                     let inner_local = self.resolve(&inner, pp.ty.clone(), pp.span, stack);
                     provider_args.push(arg(Expr::Name(inner_local, pp.span)));
+                }
+                ParamKind::Source { .. } => {
+                    // Request-source injection is a handler-adapter capability
+                    // (#959, D-0198): the per-request scope is the adapter body,
+                    // not a provider. A `@request_source` parameter inside a
+                    // provider has no request to resolve against here — a clear
+                    // error, not a silent miscompile.
+                    self.diags.push(err(
+                        format!(
+                            "`@request_source` parameter `{}` of `Depends(...)` provider \
+                             `{provider}` is not injected: request sources are resolved only in \
+                             the handler in v1 — make it `Depends(...)` or read it in the handler",
+                            pp.name
+                        ),
+                        pp.span,
+                    ));
+                }
+                ParamKind::BadSource { message, span } => {
+                    self.diags.push(err(message, span));
                 }
                 ParamKind::PassThrough => {
                     // A provider parameter that is not itself `Depends(...)` would
@@ -425,6 +568,19 @@ impl DepBuilder<'_> {
         });
         self.resolved.insert(provider.to_string(), local.clone());
         local
+    }
+}
+
+/// A plain (non-f, non-raw, non-bytes) string-literal expression — the source
+/// key (`"<param>"`) forwarded to a `@request_source` resolver (#959).
+fn str_lit(value: &str, span: Span) -> Expr {
+    Expr::Str {
+        value: value.to_string(),
+        raw: false,
+        bytes: false,
+        fstring: false,
+        span,
+        fstring_fields: Vec::new(),
     }
 }
 
@@ -849,6 +1005,230 @@ mod tests {
             func(&m, "hx$adapter").is_none(),
             "no adapter for a plain handler"
         );
+        let stmts = main_stmts(&m);
+        let trailing = match &stmts[1] {
+            Stmt::Expr(Expr::Call { args, .. }) => &args.last().unwrap().value,
+            _ => panic!(),
+        };
+        assert!(matches!(trailing, Expr::Name(n, _) if n == "hx"));
+    }
+
+    // ---- request-source parameter injection (I#959, D-0198) ----------------
+
+    // The call args of a `let <name> = <callee>(args...)`, if the stmt is one.
+    fn let_call<'a>(stmt: &'a Stmt, name: &str) -> Option<(&'a Expr, &'a [Arg])> {
+        let Stmt::Let {
+            name: n,
+            value: Expr::Call { callee, args, .. },
+            ..
+        } = stmt
+        else {
+            return None;
+        };
+        if n != name {
+            return None;
+        }
+        Some((callee.as_ref(), args.as_slice()))
+    }
+
+    fn is_name(e: &Expr, want: &str) -> bool {
+        matches!(e, Expr::Name(n, _) if n == want)
+    }
+
+    fn is_str(e: &Expr, want: &str) -> bool {
+        matches!(e, Expr::Str { value, .. } if value == want)
+    }
+
+    #[test]
+    fn request_source_injects_and_is_dropped_from_the_seam() {
+        // A `@request_source` resolver used as a parameter default makes that
+        // parameter request-sourced: the adapter injects it by calling the
+        // resolver with `(request, "<param>", <marker args...>)`, and the
+        // parameter is NOT part of the `fn(Req)->Resp` seam.
+        let mut m = module(
+            "struct Req:\n    str path\n\
+             struct Resp:\n    int64 status\n\
+             @request_source\ndef Query(Req r, str name, str fallback) -> str:\n    return fallback\n\
+             struct App:\n    def get(self, str p, fn(Req)->Resp h):\n        print(p)\n\
+             @app.get(\"/x\")\ndef hx(Req req, str tag = Query(\"def\")) -> Resp:\n    return Resp(0)\n\
+             def main():\n    auto app = App()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m);
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+
+        // Registration binds the adapter.
+        let stmts = main_stmts(&m);
+        let trailing = match &stmts[1] {
+            Stmt::Expr(Expr::Call { args, .. }) => &args.last().unwrap().value,
+            _ => panic!("expected registration"),
+        };
+        assert!(matches!(trailing, Expr::Name(n, _) if n == "hx$adapter"));
+
+        let adapter = func(&m, "hx$adapter").expect("adapter synthesized");
+        // Only the Request is a seam parameter; the source param is dropped.
+        assert_eq!(
+            adapter.params.len(),
+            1,
+            "source param must not widen the seam"
+        );
+        assert_eq!(adapter.params[0].name, "req");
+
+        let b = body(adapter);
+        // `str tag$src = Query(req, "tag", "def")` — request + key + forwarded arg.
+        let (callee, cargs) = let_call(&b[0], "tag$src").expect("source injection let");
+        assert!(is_name(callee, "Query"), "calls the resolver");
+        assert_eq!(cargs.len(), 3, "req + key + the marker's own arg");
+        assert!(is_name(&cargs[0].value, "req"), "first arg is the request");
+        assert!(
+            is_str(&cargs[1].value, "tag"),
+            "second arg is the param name"
+        );
+        assert!(
+            is_str(&cargs[2].value, "def"),
+            "marker args forwarded verbatim"
+        );
+
+        // Tail call: hx(req, tag$src).
+        let Stmt::Return {
+            value: Some(Expr::Call { callee, args, .. }),
+            ..
+        } = b.last().unwrap()
+        else {
+            panic!("expected tail return");
+        };
+        assert!(is_name(callee, "hx"));
+        assert_eq!(args.len(), 2);
+        assert!(is_name(&args[0].value, "req"));
+        assert!(is_name(&args[1].value, "tag$src"));
+    }
+
+    #[test]
+    fn request_source_composes_with_depends() {
+        let mut m = module(
+            "struct Req:\n    str path\n\
+             struct DB:\n    int64 conn\n\
+             struct Resp:\n    int64 status\n\
+             def get_db() -> DB:\n    return DB(1)\n\
+             @request_source\ndef Path(Req r, str name) -> str:\n    return r.path\n\
+             struct App:\n    def get(self, str p, fn(Req)->Resp h):\n        print(p)\n\
+             @app.get(\"/x\")\ndef hx(Req req, str id = Path(), DB db = Depends(get_db)) -> Resp:\n    return Resp(0)\n\
+             def main():\n    auto app = App()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m);
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let adapter = func(&m, "hx$adapter").expect("adapter");
+        assert_eq!(adapter.params.len(), 1, "only the Request is a seam param");
+        let b = body(adapter);
+        // Both a source injection and a Depends resolution are present.
+        assert!(
+            b.iter().any(|s| let_call(s, "id$src").is_some()),
+            "source let present"
+        );
+        assert!(
+            b.iter().any(|s| let_call(s, "get_db$dep").is_some()),
+            "depends let present"
+        );
+        // Tail call passes req, the source local, and the dep local, in order.
+        let Stmt::Return {
+            value: Some(Expr::Call { args, .. }),
+            ..
+        } = b.last().unwrap()
+        else {
+            panic!("expected tail return");
+        };
+        assert_eq!(args.len(), 3);
+        assert!(is_name(&args[0].value, "req"));
+        assert!(is_name(&args[1].value, "id$src"));
+        assert!(is_name(&args[2].value, "get_db$dep"));
+    }
+
+    #[test]
+    fn request_source_without_a_request_param_is_an_error() {
+        // No pass-through (framework) parameter: the resolver has no request to
+        // resolve against — a clear ZAP5048, not a silent miscompile.
+        let mut m = module(
+            "struct Req:\n    str path\n\
+             struct Resp:\n    int64 status\n\
+             @request_source\ndef Path(Req r, str name) -> str:\n    return r.path\n\
+             struct App:\n    def get(self, str p, fn(Req)->Resp h):\n        print(p)\n\
+             @app.get(\"/x\")\ndef hx(str id = Path()) -> Resp:\n    return Resp(0)\n\
+             def main():\n    auto app = App()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m);
+        assert_eq!(diags.len(), 1, "one diagnostic: {diags:?}");
+        assert_eq!(diags[0].code, ErrorCode::ZAP5048);
+        assert!(
+            diags[0].message.contains("needs the request value"),
+            "message: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn request_source_inside_a_provider_is_rejected() {
+        // A `@request_source` parameter inside a `Depends` provider has no request
+        // to resolve against (the per-request scope is the handler adapter, not a
+        // provider): rejected with a clear ZAP5048 in v1.
+        let mut m = module(
+            "struct Req:\n    str path\n\
+             struct DB:\n    int64 conn\n\
+             struct Resp:\n    int64 status\n\
+             @request_source\ndef Path(Req r, str name) -> str:\n    return r.path\n\
+             def get_db(str who = Path()) -> DB:\n    return DB(0)\n\
+             struct App:\n    def get(self, str p, fn(Req)->Resp h):\n        print(p)\n\
+             @app.get(\"/x\")\ndef hx(Req req, DB db = Depends(get_db)) -> Resp:\n    return Resp(0)\n\
+             def main():\n    auto app = App()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m);
+        assert!(
+            diags.iter().any(|d| d.code == ErrorCode::ZAP5048
+                && d.message.contains("resolved only in the handler")),
+            "expected a provider-source rejection: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn request_source_keyword_marker_argument_is_rejected() {
+        // The forwarded resolver call is positional; a keyword marker argument is
+        // a malformed source annotation — a clear ZAP5048, not a silent drop.
+        let mut m = module(
+            "struct Req:\n    str path\n\
+             struct Resp:\n    int64 status\n\
+             @request_source\ndef Query(Req r, str name, str fallback) -> str:\n    return fallback\n\
+             struct App:\n    def get(self, str p, fn(Req)->Resp h):\n        print(p)\n\
+             @app.get(\"/x\")\ndef hx(Req req, str tag = Query(fallback=\"d\")) -> Resp:\n    return Resp(0)\n\
+             def main():\n    auto app = App()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m);
+        assert_eq!(diags.len(), 1, "one diagnostic: {diags:?}");
+        assert_eq!(diags[0].code, ErrorCode::ZAP5048);
+        assert!(
+            diags[0].message.contains("positional"),
+            "message: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn ordinary_default_calling_a_non_source_fn_stays_pass_through() {
+        // Regression: a parameter default that calls a function which is NOT
+        // `@request_source` (and is not `Depends`) is an ordinary default — the
+        // parameter stays a pass-through seam parameter, no adapter, no error.
+        let mut m = module(
+            "struct Req:\n    str path\n\
+             struct Resp:\n    int64 status\n\
+             def mk() -> str:\n    return \"\"\n\
+             struct App:\n    def get(self, str p, fn(Req, str)->Resp h):\n        print(p)\n\
+             @app.get(\"/x\")\ndef hx(Req req, str tag = mk()) -> Resp:\n    return Resp(0)\n\
+             def main():\n    auto app = App()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m);
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        assert!(
+            func(&m, "hx$adapter").is_none(),
+            "a non-source default needs no adapter"
+        );
+        // The handler itself is registered directly.
         let stmts = main_stmts(&m);
         let trailing = match &stmts[1] {
             Stmt::Expr(Expr::Call { args, .. }) => &args.last().unwrap().value,
