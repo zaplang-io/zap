@@ -424,3 +424,41 @@ fn os_fs_positional_unchanged() {
     assert_ok(&prog("    auto v = os.getenv(\"PATH\")\n"));
     assert_ok(&prog("    fs.write_file(\"/tmp/x\", \"hi\")\n"));
 }
+
+// ---------------------------------------------------------------------------
+// time / process / sys.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn time_keyword_and_duration_helpers() {
+    assert_ok(&prog("    time.sleep(seconds=0.0)\n"));
+    assert_ok(&prog(
+        "    auto d = time.seconds(n=5)\n    auto s = time.to_seconds(d=d)\n",
+    ));
+}
+
+#[test]
+fn time_unknown_keyword_rejected() {
+    assert_code(&prog("    time.sleep(secs=0.0)\n"), "ZAP4023");
+}
+
+#[test]
+fn process_run_keyword() {
+    assert_ok(&prog("    auto r = process.run(cmd=[\"echo\"])\n"));
+}
+
+#[test]
+fn sys_keyword_and_unknown() {
+    assert_ok(&prog("    auto h = sys.cpu_has(name=\"avx2\")\n"));
+    assert_code(
+        &prog("    auto h = sys.cpu_has(feature=\"avx2\")\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn time_process_sys_positional_unchanged() {
+    assert_ok(&prog("    time.sleep(0.0)\n"));
+    assert_ok(&prog("    auto r = process.run([\"echo\"])\n"));
+    assert_ok(&prog("    auto h = sys.cpu_has(\"avx2\")\n"));
+}

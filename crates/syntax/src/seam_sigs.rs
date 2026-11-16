@@ -177,6 +177,23 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("fs", "is_file", &["path"]),
     ("fs", "size", &["path"]),
     ("fs", "listdir", &["path"]),
+    // ---- time (ticket #99): sleeps + Duration constructors/accessors ----
+    // (monotonic/monotonic_ns/time/time_ns take no args, so no row.)
+    ("time", "sleep", &["seconds"]),
+    ("time", "sleep_ns", &["ns"]),
+    ("time", "seconds", &["n"]),
+    ("time", "millis", &["n"]),
+    ("time", "micros", &["n"]),
+    ("time", "nanos", &["n"]),
+    ("time", "to_seconds", &["d"]),
+    ("time", "to_millis", &["d"]),
+    ("time", "to_micros", &["d"]),
+    // ---- process (ticket #97) ----
+    ("process", "run", &["cmd"]),
+    // ---- sys (ticket #97): the single-argument verbs (argv/platform/*_fd/
+    // cpu_source/cpu_sve_vl take no args, so no row) ----
+    ("sys", "exit", &["code"]),
+    ("sys", "cpu_has", &["name"]),
 ];
 
 /// The declared positional parameter names of a seam method, or `None` when the
