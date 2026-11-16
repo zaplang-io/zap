@@ -8,7 +8,36 @@ time sink in language projects.
 Status legend: **Locked** · **Proposed** (baked into docs, pending confirmation)
 · **Open** · **Superseded**
 
-_Last updated: 2026-10-25_
+_Last updated: 2026-11-16_
+
+---
+
+## Amendments & supersessions index
+
+A decision is **never deleted**; when a later decision changes it, the older entry is
+marked in place and the pair is listed here so the whole override map is visible at a
+glance. A reader on any single decision should also check this table for a newer
+governing decision. `★` = status banner added in the 2026-11-16 consistency pass
+(#359383); the rest were already marked inline in their entries.
+
+| Governing (newer) | What it changes | Affected (older) |
+|---|---|---|
+| D-0188 ★ | `eigvals` returns `array[complex]` (was `list[complex]`, a stopgap); general-matrix `eig` implemented (was deferred) | D-0185 |
+| D-0182 | drops the `ZAP_NO_BLAS` build opt-out | D-0179 |
+| D-0181 | implements the matmul own-vs-BLAS auto-dispatch policy | D-0173 |
+| D-0163 | extends "never hold a thread-local's address across a park" to **every** runtime thread-local (fresh accessors) | D-0160 |
+| D-0161 | supersedes the per-switch `set_bottom` mechanism (stack-bottom never moves; scan-time `sp` corrector) | D-0117 |
+| D-0160 | removes the `x86_64`-only gate on the `-O2` runtime default | D-0157 |
+| D-0157 | compiles the runtime TU at `-O2` by default (D-0152 left it `-O0`) | D-0152 |
+| D-0142 | scope-timeout **severs** a non-draining child; `_exit` is signal-only (supersedes the `grace` hard-exit / hang) | D-0094 |
+| D-0141 | specifies DRF-SC: the happens-before edge set + SC-only atomics (was "formal spec later") | D-0034 |
+| D-0140 | amends point 4 — a mutable non-`@shareable` module global is a hard error (`ZAP3019`) | D-0112 |
+| D-0138 ★ | Phase-2 float-key ruling is **reject-`NaN`**, not the canonicalize-`NaN` D-0137 tentatively recommended | D-0137 |
+| D-0128 ★ | the residual preempt window is closed at the source (monitor gates `SIGURG` on STW) — supersedes D-0120's "benign window" reasoning | D-0120 |
+| D-0115 | implements `@cache` (supersedes its deferral) | D-0109 |
+| D-0090 | rejects top-level executable statements (supersedes the original top-level execution wording) | D-0021 |
+| D-0065 | renames the prelude optional enum `Option[T]` → `Optional[T]` | D-0064 |
+| D-0064 (I#170 update) ★ | built-in-collection re-skin as user generics **DECLINED**; they stay special-cased (reverses point X / override #3's "re-skinned … not permanent") | D-0064 point X |
 
 ---
 
@@ -1302,6 +1331,18 @@ are the long tail of the spec; v1 targets the 95% config/data-file use.
 recommendation, see the product-calls section). Implements epic I#154 slices
 0–3. Builds on D-0017 (generics: yes, monomorphized, staged).
 
+> ⚠️ AMENDED by the **I#170 post-core update later in this same entry** (see
+> "Update — post-core slice (I#170)" below): **point X** and **open-call override #3**
+> — "built-in collections … are re-skinned as user-generic *surface* types in a
+> scheduled post-core-generics slice … Not 'special-cased permanently'" — were
+> **REVERSED**. The re-skin was investigated and **DECLINED**: built-in collections
+> stay special-cased (a genuine re-skin would regress performance and *increase*
+> special-casing). Read point X / override #3 below as superseded. The rest of this
+> decision (the M/S/I/O slices, the niche `Optional` layout, slices 4–6) still stands.
+> (The capability/bounds model **D-0139** later unified bound-checking across built-in
+> and user containers but likewise keeps built-ins special-cased, consistent with this
+> outcome.)
+
 Lands the first end-to-end vertical:
 
 - **M — monomorphization**, as a ZIR-stage AST→AST pass between sema and codegen
@@ -1352,6 +1393,9 @@ Lands the first end-to-end vertical:
   user-generic *surface* types in a scheduled post-core-generics slice** (methods
   lowering to the same tuned runtime entry points — a source-compatibility change,
   not a runtime rewrite). Not "special-cased permanently."
+  > ⚠️ SUPERSEDED — the re-skin was DECLINED by the I#170 post-core update below;
+  > built-in collections stay special-cased (permanently, by design). See the
+  > "Update — post-core slice (I#170)" section below and the top-of-entry banner.
 - **First end-to-end vertical = slices 0–3** (generic *types* + `Option[T]`).
 
 **Open product calls — resolved (two overriding the design's recommendation):**
@@ -5055,6 +5099,14 @@ only).
 Hardens a real latent hazard; folds in #213 for this one flag. Does not change
 the language or any observable behavior.
 
+> ⚠️ AMENDED by D-0128 (#710): this decision's conclusion that the residual
+> check→act preemption window is a **"benign fairness window"** (stated under "What
+> this does and does not close" below) was later proven wrong at scale and
+> **superseded** — D-0128 closes the window at the source by gating the fairness
+> monitor's `SIGURG` on the STW flag. The seq-cst `g_boehm_in_stw` access this
+> decision mandates still stands; only the "residual is benign, left deliberately"
+> reasoning is superseded. See D-0128.
+
 **Context.** Under gc-boehm the SIGURG fairness-preemption handler
 (`zap_preempt_handler`, `crates/codegen/src/zaprt.c`) performs an *in-signal*
 coroutine context switch (`copreempt`) on the interrupted worker. bdwgc stops the
@@ -6171,6 +6223,14 @@ the public PEM, plus malformed-component rejection). **Experimental**, like the
 rest of `crypto`. (Decided 2026-11-08.)
 
 ## D-0137 — `float64` as a collection VALUE: dict values, heap & channel elements (I#800, Phase 1)
+
+> ⚠️ AMENDED by D-0138 (2026-11-09): the Phase-2 float **dict-key / set-member**
+> ruling landed as **reject-`NaN`** (canonicalize `-0.0`→`+0.0`, raise a catchable
+> `ValueError` on `NaN`), **not** the canonicalize-`NaN` ruling tentatively
+> *recommended* in the "Still unsupported (deliberately)" note below (which also said
+> the ruling "will be recorded here" — it was recorded in D-0138 instead). The
+> value-position rules in this entry (dict values, heap/channel elements) still stand.
+> See D-0138.
 
 `float64`/`float` is now a first-class *value* in a dict value, a heap element,
 and a channel element — the value positions that need no hashing. This extends
@@ -9161,6 +9221,13 @@ linalg slice), #912/D-0179 (the seam).
 
 ## D-0185 — `import linalg`: eig / lstsq / norm / pinv / matrix_power (#928)
 **Status:** implemented (linalg eigensolvers / least squares / norms slice)
+
+> ⚠️ AMENDED by D-0188 (#928-eig): `eigvals` now returns a 1-D **`array[complex]`**
+> (this entry returned `list[complex]` only as an explicit stopgap before the complex
+> array dtype existed — a pre-1.0 signature change, superseded), and the general-matrix
+> **`eig`** this entry defers is now **implemented**. See D-0188. The
+> `lstsq` / `norm` / `pinv` / `matrix_power` surface in this entry is unchanged.
+
 Third `linalg` slice of the Phase 3 numeric-breadth epic (#512), continuing the
 Fortran-LAPACK + column-major-transpose approach of D-0183/D-0184.
 - **Surface** (NumPy-shaped, f64):
