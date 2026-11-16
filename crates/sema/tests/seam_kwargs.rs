@@ -338,3 +338,89 @@ fn logging_positional_unchanged() {
     assert_ok(&prog("    logging.info(\"hello\")\n"));
     assert_ok(&prog("    logging.log(2, \"hello\")\n"));
 }
+
+// ---------------------------------------------------------------------------
+// crypto — KDFs / AEAD with their documented trailing optionals (dklen, salt,
+// info, aad). The highest-value footgun: a typo'd `dklen`/`iterations` was
+// silently ignored before.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn crypto_pbkdf2_keyword_reorder_and_optional_dklen() {
+    assert_ok(&prog(
+        "    auto k = crypto.pbkdf2_hmac(hash_name=\"sha256\", password=\"pw\", salt=\"s\", iterations=1000)\n",
+    ));
+    // reordered, dklen omitted (optional)
+    assert_ok(&prog(
+        "    auto k = crypto.pbkdf2_hmac(iterations=1000, hash_name=\"sha256\", password=\"pw\", salt=\"s\")\n",
+    ));
+}
+
+#[test]
+fn crypto_scrypt_and_hkdf_optionals() {
+    assert_ok(&prog(
+        "    auto k = crypto.scrypt(password=\"pw\", salt=\"s\", n=16384, r=8, p=1)\n",
+    ));
+    assert_ok(&prog(
+        "    auto k = crypto.hkdf(hash_name=\"sha256\", ikm=\"k\", length=32)\n",
+    ));
+}
+
+#[test]
+fn crypto_aead_keyword_optional_aad() {
+    assert_ok(&prog(
+        "    auto c = crypto.aes256gcm_encrypt(key=\"k\", nonce=\"n\", data=\"d\")\n",
+    ));
+    assert_ok(&prog(
+        "    auto c = crypto.chacha20poly1305_encrypt(data=\"d\", key=\"k\", nonce=\"n\")\n",
+    ));
+}
+
+#[test]
+fn crypto_unknown_keyword_rejected() {
+    // a typo'd `dklen` is now caught, not silently dropped
+    assert_code(
+        &prog("    auto k = crypto.pbkdf2_hmac(\"sha256\", \"pw\", \"s\", 1000, dklenght=64)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn crypto_positional_unchanged() {
+    assert_ok(&prog(
+        "    auto k = crypto.pbkdf2_hmac(\"sha256\", \"pw\", \"s\", 1000, 64)\n",
+    ));
+    assert_ok(&prog(
+        "    auto b = crypto.constant_time_eq(\"a\", \"b\")\n",
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// os / fs — environment + filesystem helpers.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn os_setenv_keyword_and_reorder() {
+    assert_ok(&prog("    os.setenv(name=\"X\", value=\"1\")\n"));
+    assert_ok(&prog("    os.setenv(value=\"1\", name=\"X\")\n"));
+}
+
+#[test]
+fn os_unknown_keyword_rejected() {
+    assert_code(&prog("    auto v = os.getenv(key=\"PATH\")\n"), "ZAP4023");
+}
+
+#[test]
+fn fs_write_file_keyword_and_unknown() {
+    assert_ok(&prog("    fs.write_file(path=\"/tmp/x\", data=\"hi\")\n"));
+    assert_code(
+        &prog("    fs.write_file(path=\"/tmp/x\", contents=\"hi\")\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn os_fs_positional_unchanged() {
+    assert_ok(&prog("    auto v = os.getenv(\"PATH\")\n"));
+    assert_ok(&prog("    fs.write_file(\"/tmp/x\", \"hi\")\n"));
+}

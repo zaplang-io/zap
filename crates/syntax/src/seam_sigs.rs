@@ -113,6 +113,70 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("logging", "set_level", &["level"]),
     ("logging", "set_stream", &["stream"]),
     ("logging", "set_format", &["fmt"]),
+    // ---- crypto (tickets #105/#762): KDFs + AEAD + constant-time compare ----
+    // Parameter names and the trailing optionals are taken verbatim from each
+    // function's own signature (its arity-error message), so they match the
+    // documented surface; `dklen`/`salt`/`info`/`aad` are the trailing optionals.
+    (
+        "crypto",
+        "pbkdf2_hmac",
+        &["hash_name", "password", "salt", "iterations", "dklen"],
+    ),
+    (
+        "crypto",
+        "scrypt",
+        &["password", "salt", "n", "r", "p", "dklen"],
+    ),
+    (
+        "crypto",
+        "hkdf",
+        &["hash_name", "ikm", "length", "salt", "info"],
+    ),
+    ("crypto", "constant_time_eq", &["a", "b"]),
+    (
+        "crypto",
+        "aes256gcm_encrypt",
+        &["key", "nonce", "data", "aad"],
+    ),
+    (
+        "crypto",
+        "aes256gcm_decrypt",
+        &["key", "nonce", "data", "aad"],
+    ),
+    (
+        "crypto",
+        "chacha20poly1305_encrypt",
+        &["key", "nonce", "data", "aad"],
+    ),
+    (
+        "crypto",
+        "chacha20poly1305_decrypt",
+        &["key", "nonce", "data", "aad"],
+    ),
+    // ---- os (ticket #97): environment + filesystem path helpers ----
+    // (getpid/getcwd take no args, so no row.) These keyword names are newly
+    // introduced (the seam checker used positional arity only) — reviewable.
+    ("os", "getenv", &["name"]),
+    ("os", "hasenv", &["name"]),
+    ("os", "setenv", &["name", "value"]),
+    ("os", "chdir", &["path"]),
+    ("os", "mkdir", &["path"]),
+    ("os", "remove", &["path"]),
+    ("os", "rmdir", &["path"]),
+    ("os", "listdir", &["path"]),
+    ("os", "path_join", &["a", "b"]),
+    ("os", "path_exists", &["path"]),
+    ("os", "path_basename", &["path"]),
+    ("os", "path_dirname", &["path"]),
+    // ---- fs (ticket #97): file read/write + stat ----
+    // (mkdtemp takes no args, so no row.)
+    ("fs", "read_file", &["path"]),
+    ("fs", "write_file", &["path", "data"]),
+    ("fs", "exists", &["path"]),
+    ("fs", "is_dir", &["path"]),
+    ("fs", "is_file", &["path"]),
+    ("fs", "size", &["path"]),
+    ("fs", "listdir", &["path"]),
 ];
 
 /// The declared positional parameter names of a seam method, or `None` when the
