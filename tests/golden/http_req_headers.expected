@@ -1,0 +1,2 @@
+7 [Host=Example.com] [X-Custom-Thing=alpha] [X-Custom-Thing=beta] [Accept=text/plain] [X-Url=http://x:1/p] [X-Tight=tight] [Content-Length=0] byname=alpha host=Example.com
+0 byname= host=

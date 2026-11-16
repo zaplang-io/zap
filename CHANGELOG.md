@@ -25,6 +25,15 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`http.req_headers` — enumerate the raw request header block** (#960, D-0197).
+  A new server-side accessor `http.req_headers(req) -> list[(str, str)]` returns
+  every received request header as a `(name, value)` pair in received order, with
+  duplicate names preserved as separate pairs and names returned verbatim — so a
+  custom/arbitrary header (e.g. `X-Custom-Thing`) can be discovered, not only
+  fetched by a name known in advance. The existing by-name `http.req_header` is
+  unchanged (case-insensitive, first-of-duplicates). Iterates naturally with
+  `for name, value in http.req_headers(req):`. Unblocks fastzap request-header
+  access (zaplang-io/fastzap#25). **Experimental** (`http`, STABILITY §4.4).
 - **Floating-point determinism model — `--fp` policy + `math.fma`** (#946,
   D-0196). A compile-time `--fp=strict|default|fast` flag controls whether
   codegen may change FP rounding structure for speed: `default` (the default)

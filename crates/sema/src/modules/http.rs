@@ -5,7 +5,7 @@
 //! headers — #280 — and returning an opaque response handle with
 //! `status`/`body`/`header` accessors) and the server-side helpers (`read_request` parses a request off a
 //! connection into an opaque request handle with `method`/`path`/`req_version`/
-//! `req_header`/`req_body` accessors; `respond` writes a response). Response/request handles
+//! `req_header`/`req_headers`/`req_body` accessors; `respond` writes a response). Response/request handles
 //! are opaque GC objects typed as `bytes` (the `crypto`/`sync` pattern). `https`
 //! is rejected at runtime — TLS is a follow-up (out of scope for this PR).
 //! `import http` is accepted but not required.
@@ -105,6 +105,14 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "req_header" => {
             expect_argc(checker, "http", method, args, 2, span);
             Ty::Str
+        }
+        // http.req_headers(req) -> list[(str, str)]. Enumerates the full received
+        // request header block as (name, value) pairs in received order, with
+        // duplicate names preserved as separate pairs (#960, D-0197); by-name
+        // discovery stays with the case-insensitive `req_header`.
+        "req_headers" => {
+            expect_argc(checker, "http", method, args, 1, span);
+            Ty::List(Box::new(Ty::Tuple(vec![Ty::Str, Ty::Str])))
         }
         // http.req_body(req) -> str
         "req_body" => {

@@ -42,6 +42,12 @@ fn lower(
         "method" => call_ret(lowerer, "zap_http_req_method", a, Ty::Ptr, false),
         "path" => call_ret(lowerer, "zap_http_req_path", a, Ty::Ptr, false),
         "req_header" => call_ret(lowerer, "zap_http_req_header", a, Ty::Ptr, false),
+        // req_headers(req) -> list[(str, str)]: enumerate the raw header block
+        // (#960, D-0197). Assembled in lowering (a counted loop over the three
+        // `zap_http_req_header_{count,name,val}` accessors + the compiler's own
+        // tuple path) so the `(str, str)` GC layout matches codegen, exactly like
+        // `dict[str, str].items()`.
+        "req_headers" => lowerer.lower_http_req_headers(a[0]),
         "req_body" => call_ret(lowerer, "zap_http_req_body", a, Ty::Ptr, false),
         "req_version" => call_ret(lowerer, "zap_http_req_version", a, Ty::Ptr, false),
         // respond — the headers-bearing form (one extra `dict[str,str]` arg,

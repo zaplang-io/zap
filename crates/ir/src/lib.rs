@@ -165,6 +165,42 @@ mod tests {
         assert!(text.contains("@zap_atomicarray_cas_ptr"), "text:\n{text}");
     }
 
+    // --- http.req_headers enumeration (#960, D-0197) ---------------------------
+
+    #[test]
+    fn http_req_headers_lowers_to_count_name_val_and_a_tuple_list() {
+        // `http.req_headers(req)` enumerates the header block into a
+        // `list[(str, str)]`: the count + positional name/value runtime accessors
+        // feed a loop that assembles each pair with the compiler's own tuple path
+        // (StructNew + FieldSet + list_push_ptr), exactly like `dict.items()`. The
+        // result is iterable with tuple destructuring, binding `str` name/value.
+        let m = lower_ok(
+            "def main():\n    \
+             auto c = net.connect(\"127.0.0.1\", 1)\n    \
+             auto req = http.read_request(c)\n    \
+             auto hs = http.req_headers(req)\n    \
+             auto n = len(hs)\n    \
+             for name, value in hs:\n        \
+             print(name + \"=\" + value)\n",
+        );
+        let text = format!("{m}");
+        // The three infallible accessors back the enumeration.
+        assert!(text.contains("@zap_http_req_header_count"), "text:\n{text}");
+        assert!(text.contains("@zap_http_req_header_name"), "text:\n{text}");
+        assert!(text.contains("@zap_http_req_header_val"), "text:\n{text}");
+        // The list is built and each pair pushed as a pointer (tuple) element.
+        assert!(text.contains("@zap_list_new"), "text:\n{text}");
+        assert!(text.contains("@zap_list_push_ptr"), "text:\n{text}");
+        // Tuple assembly: one 2-field struct per pair.
+        assert!(text.contains("structnew"), "text:\n{text}");
+        // `read_request` can raise (invoke), but the pure enumeration accessors
+        // are plain calls — never invoked.
+        assert!(
+            !text.contains("invoke @zap_http_req_header_count"),
+            "the pure accessor must be a plain call, not an invoke; text:\n{text}"
+        );
+    }
+
     #[test]
     fn raw_crypto_results_support_inferred_bytes_operations() {
         // #647: compile the reduced repro for every affected API. No runtime or

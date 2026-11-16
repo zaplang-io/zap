@@ -598,8 +598,11 @@ The `http` client verbs `get`/`post`/`request` gained an **optional trailing
 `dict[str, str]` of request headers** (#280) and already expose response
 `status`/`header`/`body` accessors, and the server-side `http.respond` gained
 the matching **optional trailing `dict[str, str]` of response headers** (#279);
-because `http` is **Experimental**, both are additive surface changes requiring
-no stability promise.
+the server request handle additionally gained **`http.req_headers(req) ->
+list[(str, str)]`** (#960, D-0197), enumerating the raw received header block as
+ordered `(name, value)` pairs (duplicates preserved) alongside the unchanged
+case-insensitive by-name `http.req_header`. Because `http` is **Experimental**,
+all of these are additive surface changes requiring no stability promise.
 
 **CLI (`SPEC.md` §17, `crates/driver/src/cli.rs`).**
 
