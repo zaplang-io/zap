@@ -165,6 +165,67 @@ pub(super) fn lower_builtin_module_const(
 /// statement-position call (no result), yielding a throwaway `i32 0` so the call
 /// expression still has a value; any other `ret` yields a fresh typed value.
 /// Mirrors the pre-seam `call0` closure.
+/// Reorder a seam call's keyword arguments into declared positional order so the
+/// positional lowering below (`args[0]`, `args.get(1)`, …) emits the runtime
+/// call with the arguments in the right slots (#998). The twin of
+/// `zapc_sema::modules::bind_seam_args`: sema has already validated the binding
+/// (unknown keyword, duplicate, hole all rejected there), so this is a pure,
+/// defensive reorder — on anything unexpected it returns the arguments
+/// untouched. Spread arguments (`*`/`**`) and all-positional calls pass through
+/// unchanged. A migrated seam lowering calls this with its parameter names
+/// before reading arguments positionally.
+pub(super) fn reorder_seam_args(params: &[&str], args: &[ast::Arg]) -> Vec<ast::Arg> {
+    if args.iter().all(|a| a.name.is_none())
+        || args
+            .iter()
+            .any(|a| !matches!(a.spread, ast::ArgSpread::None))
+    {
+        return args.to_vec();
+    }
+    let mut slots: Vec<Option<ast::Arg>> = vec![None; params.len()];
+    let mut overflow: Vec<ast::Arg> = Vec::new();
+    let mut next_pos = 0usize;
+    for a in args {
+        match &a.name {
+            None => {
+                if next_pos < slots.len() {
+                    slots[next_pos] = Some(a.clone());
+                } else {
+                    overflow.push(a.clone());
+                }
+                next_pos += 1;
+            }
+            Some(name) => match params.iter().position(|p| p == name) {
+                Some(idx) if slots[idx].is_none() => {
+                    let mut bound = a.clone();
+                    bound.name = None;
+                    slots[idx] = Some(bound);
+                }
+                // Unknown keyword or duplicate — sema already rejected it, so we
+                // should never get here; stay faithful to the source order.
+                _ => return args.to_vec(),
+            },
+        }
+    }
+    let mut out: Vec<ast::Arg> = Vec::new();
+    let mut omitted = false;
+    for slot in slots {
+        match slot {
+            Some(a) => {
+                // A filled parameter after an omitted earlier one is a hole that
+                // sema rejects; be defensive and keep source order if seen.
+                if omitted {
+                    return args.to_vec();
+                }
+                out.push(a);
+            }
+            None => omitted = true,
+        }
+    }
+    out.extend(overflow);
+    out
+}
+
 pub(super) fn call0(lowerer: &mut FnLower, func: &str, ret: Ty) -> (Value, Ty) {
     if ret == Ty::Void {
         lowerer.emit(Inst::Call {
