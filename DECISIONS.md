@@ -9974,3 +9974,60 @@ Relates to epic #139, Discussion #920, design/0032 (D-0079), D-0192/D-0193
 (`cpu_features` / multiversioning it builds on), D-0199 (the `arch.*` intrinsics
 it pairs with). The over-reading SSE4.2 string ops that also need `unsafe:`
 (D-0079 §6.4, Phase 4) remain deferred; `unsafe:` is now in place for them.
+
+## D-0201 — grammar-production coverage gate: every `docs/GRAMMAR.ebnf` production needs a compiling example or a tracked gap (#469 / epic #374)
+
+**Problem.** `docs/GRAMMAR.ebnf` is hand-maintained and the compiler's parser,
+sema, and AST→ZIR lowering are separate hand-written stages. Nothing tied a
+production the grammar *advertises* to a construct the compiler actually
+*accepts end to end*, so the spec could silently outrun the implementation: a
+production could be added (or left untested) with no example anywhere, and a
+construct could parse yet be rejected by sema or fail lowering with nothing
+noticing. This is the exact failure mode behind recent spec↔impl surprises
+(e.g. zap#959, the fastzap-blocking #960), and #469 tracks closing it. I#396
+made the grammar *structurally* load-bearing (`crates/syntax/tests/grammar.rs`:
+EBNF well-formedness + an accept/reject corpus through the **parser**), but left
+two holes: no *completeness* requirement (more than half the ~119 productions
+had no corpus citation), and parser-only depth (no sema, no lowering).
+
+**Decision.** Add a second, production-indexed gate,
+`crates/driver/tests/grammar_coverage.rs`, that for **every** nonterminal
+reachable from the `module` start symbol requires exactly one coverage entry:
+
+- a **`Compiles`** example — a minimal, self-contained program exercising the
+  production that passes the whole **host front end**: lex → parse → `when
+  target.*` resolution (`zapc_syntax::cfg::resolve_cfg`) → sema
+  (`zapc_sema::check`) → AST→ZIR lowering (`zapc_ir::lower_module`). Everything
+  up to — but not including — LLVM codegen runs on the host with no toolchain
+  (crate `codegen` is the only LLVM-gated workspace member), so the gate rides
+  CI's existing host `cargo test` job alongside the conformance (I#376) and
+  differential (I#375) harnesses — no new CI job, and a `docs/GRAMMAR.ebnf` edit
+  already triggers that job (I#396 `changes` arm); or
+- a **`TrackedGap`** example — a program that is grammatical per the EBNF yet the
+  front end rejects *today*, pinned with a reason in `GAP_NOTES` and a tracking
+  reference. The gate asserts the gap still diverges, so when the implementation
+  catches up the test fails and the maintainer graduates it to `Compiles` (the
+  same ratchet as `grammar.rs`'s `KNOWN_DIVERGENCES`).
+
+So **adding a production to `docs/GRAMMAR.ebnf` now forces a matching coverage
+entry** (a compiling example or a tracked, reasoned gap) or CI goes red. The
+examples are inline Rust string literals, not `tests/conformance/` `.zap`
+fixtures, for the same reason I#396 chose inline: `TrackedGap` programs are
+deliberately unimplemented and must not be swept up by `zap test` / `zap fmt
+--check`, and keeping each production's status in one place documents the
+spec↔impl frontier.
+
+**Scope / limits (first cut).** The host bar is parse+sema+lowering, which
+catches parser gaps (e.g. `select`, still unimplemented — the sole family of
+`TrackedGap` entries), sema rejections, and lowering (AST→ZIR) rejections, but
+**not** pure LLVM-codegen gaps (ZIR→object), which need the dev container; those
+remain the job of the golden/conformance end-to-end runs in CI's `full`/`arm64`
+collectors. One example per production is required, not exhaustive per-production
+coverage — this is a floor against silent drift, not a replacement for the
+claim-indexed conformance suite (I#376) or the accept/reject parser corpus
+(I#396), which it complements. The corpus was seeded from the #469 grammar-gap
+scan's production × minimal-example sweep and is maintained by hand thereafter.
+
+Relates to #469 (close Stable spec↔impl gaps), epic #374 (correctness
+hardening), I#396 (load-bearing grammar), I#376 (spec-conformance suite), I#375
+(CPython differential suite).
