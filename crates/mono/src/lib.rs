@@ -2620,6 +2620,60 @@ impl Mono<'_> {
         Some(out)
     }
 
+    /// Re-materialise a collection constructor's type-argument subscript as an
+    /// expression from its (already type-parameter-substituted) concrete types
+    /// (#1013). A single type is the bare index; several (a `dict`'s `K, V`)
+    /// become a tuple. A **user-generic instantiation** element (e.g.
+    /// `Optional[int64]`) is requested and emitted by its mangled name — exactly
+    /// as the structural rewrite does via `try_type_instance` — so lowering
+    /// resolves it as a concrete type rather than the bare generic `Optional`.
+    /// `None` (a function-typed element) leaves the call to the structural
+    /// fallback.
+    fn ctor_subscript_from_types(&mut self, args: &[Type], span: Span) -> Option<Expr> {
+        let mut exprs = Vec::with_capacity(args.len());
+        for t in args {
+            exprs.push(self.type_to_ctor_arg(t, span)?);
+        }
+        Some(if exprs.len() == 1 {
+            exprs.pop().unwrap()
+        } else {
+            Expr::Tuple(exprs, span)
+        })
+    }
+
+    fn type_to_ctor_arg(&mut self, t: &Type, span: Span) -> Option<Expr> {
+        match t {
+            Type::Named { name, args, .. } => {
+                if !args.is_empty() && self.is_generic(name) {
+                    // A user generic instantiation: request the monomorphised
+                    // instance and use its mangled name, so lowering sees a
+                    // concrete type (not `Optional`/`Box`/… with a live subscript).
+                    let mangled = self.request(&name.clone(), args);
+                    Some(Expr::Name(mangled, span))
+                } else if args.is_empty() {
+                    Some(Expr::Name(name.clone(), span))
+                } else {
+                    // A builtin collection / nested type (`list[int64]`, …): rebuild
+                    // structurally so a nested type parameter is still substituted.
+                    let index = self.ctor_subscript_from_types(args, span)?;
+                    Some(Expr::Index {
+                        base: Box::new(Expr::Name(name.clone(), span)),
+                        index: Box::new(index),
+                        span,
+                    })
+                }
+            }
+            Type::Tuple { elems, .. } => {
+                let mut xs = Vec::with_capacity(elems.len());
+                for e in elems {
+                    xs.push(self.type_to_ctor_arg(e, span)?);
+                }
+                Some(Expr::Tuple(xs, span))
+            }
+            Type::Func { .. } => None,
+        }
+    }
+
     /// If `base[index]` is a user generic type instantiation used in value
     /// position, request it and return `(mangled, generic_name, concrete_args)`.
     fn try_type_instance(
@@ -3043,6 +3097,32 @@ impl Mono<'_> {
                             span,
                         };
                         return Ok((node, ret_cty));
+                    }
+                }
+                // Builtin collection constructors with a type-argument subscript
+                // — `list[T]()`, `dict[K,V]()`, `set[T]()`, `heap[T]()`,
+                // `channel[T]()` (#1013). Unlike user generics these are not in
+                // `gstructs`/`gfuncs`, so without this the monomorphiser leaves
+                // the subscript's type parameters unsubstituted and a
+                // type-parameter element (e.g. `list[T]()` in a generic body)
+                // reaches codegen as a bare `T` ("type 'T' not supported").
+                // Re-materialise the subscript from the substituted concrete
+                // types; for a concrete call this reproduces the identical
+                // subscript, so there is no change on the non-generic path.
+                if matches!(g.as_str(), "list" | "dict" | "set" | "heap" | "channel") {
+                    if let Some(cargs) = self.type_args_from_index(index) {
+                        if let Some(new_index) = self.ctor_subscript_from_types(&cargs, *nspan) {
+                            let node = Expr::Call {
+                                callee: Box::new(Expr::Index {
+                                    base: Box::new(Expr::Name(g.clone(), *nspan)),
+                                    index: Box::new(new_index),
+                                    span: *nspan,
+                                }),
+                                args: nargs,
+                                span,
+                            };
+                            return Ok((node, CTy::Unknown));
+                        }
                     }
                 }
             }
@@ -4228,6 +4308,70 @@ mod tests {
         assert!(
             names.iter().any(|n| n == "new_queue$int64"),
             "expected a new_queue$int64 specialization, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn generic_body_collection_ctor_substitutes_element_type() {
+        // #1013: `list[T]()` inside a generic body must monomorphise to the
+        // concrete element type, not leave a bare `T` for codegen to reject.
+        let m = mono_ok(
+            "def collect[T](T x) -> int64:\n    \
+             auto xs = list[T]()\n    \
+             xs.append(x)\n    \
+             return len(xs)\n\
+             def main():\n    \
+             print(str(collect[int64](5)))\n",
+        );
+        let f = m
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Function(f) if f.name == "collect$int64" => Some(f),
+                _ => None,
+            })
+            .expect("collect$int64 specialization present");
+        let Stmt::Let { value, .. } = &f.body.stmts[0] else {
+            panic!(
+                "expected `auto xs = list[...]()`, got {:?}",
+                f.body.stmts[0]
+            );
+        };
+        let rendered = zapc_syntax::ast::render_expr(value);
+        assert!(
+            rendered.contains("int64") && !rendered.contains("[T]"),
+            "list[T]() subscript was not substituted: {rendered}"
+        );
+    }
+
+    #[test]
+    fn concrete_generic_element_ctor_mangles_not_leaves_bare_generic() {
+        // Regression (#1015): a *concrete* generic element — `set[Optional[int64]]()`
+        // — must have its ctor subscript rewritten to the mangled instance
+        // (`Optional$int64`), exactly as the structural rewrite did before, so
+        // lowering resolves it; the earlier reconstruction left a bare generic
+        // `Optional` and broke the `optional_set_elem` golden.
+        // Prelude-loaded so `Optional` is a known generic enum (as in the driver).
+        let m = mono_prelude(
+            "def main():\n    \
+             auto s = set[Optional[int64]]()\n    \
+             s.add(Optional.Some(5))\n",
+        );
+        let f = m
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Function(f) if f.name == "main" => Some(f),
+                _ => None,
+            })
+            .expect("main present");
+        let Stmt::Let { value, .. } = &f.body.stmts[0] else {
+            panic!("expected `auto s = set[...]()`, got {:?}", f.body.stmts[0]);
+        };
+        let rendered = zapc_syntax::ast::render_expr(value);
+        assert!(
+            rendered.contains("Optional$") && !rendered.contains("Optional[int64]"),
+            "set[Optional[int64]]() subscript not mangled: {rendered}"
         );
     }
 }
