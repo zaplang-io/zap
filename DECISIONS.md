@@ -10307,3 +10307,33 @@ deterministically.
 
 Relates to D-0031 (the concurrency design), D-0201 (the coverage gate that
 demanded this), epic #967, and #469/#374.
+
+## D-0206 — tuple-typed declarations `(T, U) name = expr` parse (#1003 / epic #967)
+
+**Context.** `docs/GRAMMAR.ebnf` makes `decl`'s leading type any `type`, and
+`tuple_type` is a `type` that already works in every other type position
+(parameter, return, alias). But a statement-level `(int64, str) t = (1, "a")`
+failed to parse — the leading `(` was taken as a parenthesized destructuring
+target (`target_tuple`, D-0049) / grouped expression, so the grammar and parser
+disagreed (grammar-vs-impl scan, Discussion #1000).
+
+**Decision — make the parser conform to the grammar** (option (a) in #1003), not
+restrict the grammar. A leading `(` now also starts the speculative
+declaration attempt in `try_declaration`: it parses a `type` (a `tuple_type` for
+`(int64, str)`) then a `bind_target`, and **commits only on a clean parse that
+reaches the declaration `=`**. A parenthesized destructuring target (`(a, b) =
+t`) has no name between `)` and `=`, so the bind-target parse errors and the
+attempt rolls back (errors truncated, position reset) to the
+expression/destructuring path — which is why `(a, b) = (y, x)` and grouped
+expression statements are unchanged. `tuple_type` in a declaration is thus the
+*type*, resolved and coerced exactly as in any other position; a single-name
+binding stays a plain `Let`, so sema/lowering are unchanged. No grammar edit:
+the EBNF was already correct.
+
+**Tests.** Parser: `(T, U) name`, `const (T, U) name`, nested
+`((T, T), U) name`, plus a regression that destructuring/grouping still parse.
+The `grammar_coverage.rs` `tuple_type` example is now the declaration form, so
+the gate exercises it through parse → sema → lowering.
+
+Relates to D-0049 (tuple destructuring targets), D-0003 (type-first
+declarations), D-0201 (the coverage gate), epic #967, and #469/#374.

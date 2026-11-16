@@ -3485,6 +3485,14 @@ impl Parser {
         match self.peek() {
             TokenKind::Keyword(k) => k.is_type(),
             TokenKind::Ident(_) => true,
+            // A leading `(` MAY begin a tuple-typed declaration, `(T, U) name =
+            // expr` (#1003): `tuple_type` is a `type` and `decl` accepts any type
+            // in leading position. This is speculative — `try_declaration` parses
+            // a type + bind target and commits only on a clean parse that reaches
+            // `=`, so a parenthesized destructuring target (`(a, b) = t`) or a
+            // grouped/tuple expression statement fails at the bind target (no
+            // name before the `=`) and rolls back to the expression path.
+            TokenKind::LParen => true,
             _ => false,
         }
     }
@@ -6470,6 +6478,57 @@ def main():
     fn single_lvalue_assignment_stays_plain_assign() {
         let s = body("def f():\n    x = 1\n");
         assert!(matches!(&s[0], Stmt::Assign { .. }));
+    }
+
+    #[test]
+    fn tuple_typed_decl_parses_as_typed_let() {
+        // `(T, U) name = expr` (#1003): the leading `(...)` is a tuple TYPE, not
+        // a destructuring target; a single-name binding makes it a plain `Let`.
+        let s = body("def f():\n    (int64, str) t = (1, \"a\")\n");
+        let Stmt::Let {
+            ty: Some(ty), name, ..
+        } = &s[0]
+        else {
+            panic!("expected a typed Let, got {:?}", s[0]);
+        };
+        assert_eq!(name, "t");
+        assert!(matches!(ty, Type::Tuple { elems, .. } if elems.len() == 2));
+    }
+
+    #[test]
+    fn const_tuple_typed_decl_parses() {
+        let s = body("def f():\n    const (int64, f64) p = (1, 2.0)\n");
+        assert!(matches!(
+            &s[0],
+            Stmt::Let {
+                is_const: true,
+                ty: Some(Type::Tuple { .. }),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn nested_tuple_typed_decl_parses() {
+        let s = body("def f():\n    ((int64, int64), str) q = ((1, 2), \"a\")\n");
+        let Stmt::Let {
+            ty: Some(Type::Tuple { elems, .. }),
+            ..
+        } = &s[0]
+        else {
+            panic!("expected a typed Let with a tuple type, got {:?}", s[0]);
+        };
+        assert!(matches!(&elems[0], Type::Tuple { .. }));
+    }
+
+    #[test]
+    fn tuple_typed_decl_does_not_break_destructuring_or_grouping() {
+        // Regression (#1003): the speculative tuple-type attempt must roll back
+        // for a parenthesized destructuring target and a grouped expression.
+        let s = body("def f():\n    (x, y) = (y, x)\n");
+        assert!(matches!(&s[0], Stmt::AssignTuple { .. }));
+        let s = body("def f():\n    (a + b)\n");
+        assert!(matches!(&s[0], Stmt::Expr(_)));
     }
 
     #[test]
