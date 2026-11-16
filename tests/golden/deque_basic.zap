@@ -10,8 +10,8 @@ def main():
     d.appendleft(0)
     # d == [0, 1, 2]
     print(len(d))
-    print(d.get(0))
-    print(d.get(2))
+    print(d[0])
+    print(d[2])
     print(d.popleft())
     print(d.pop())
     print(len(d))

@@ -12695,6 +12695,8 @@ impl<'a> FnLower<'a> {
                     Ty::Dict(..) => "zap_dict_len",
                     Ty::Set(_) => "zap_set_len",
                     Ty::Heap(_) => "zap_heap_len",
+                    Ty::Deque(_) => "zap_deque_len",
+                    Ty::OSet(_) => "zap_oset_len",
                     Ty::Array(..) => "zap_array_len",
                     // `len(str)` is the Unicode **codepoint** count (D-0025,
                     // #284/#374/B6), consistent with codepoint indexing/slicing/
@@ -12707,7 +12709,8 @@ impl<'a> FnLower<'a> {
                     Ty::Bytes => "zap_str_len",
                     _ => {
                         return Err(err(
-                            "len() expects a list, dict, set, heap, array, str, or bytes",
+                            "len() expects a list, dict, set, heap, deque, oset, array, str, \
+                             or bytes",
                         ))
                     }
                 };
@@ -17776,6 +17779,22 @@ impl<'a> FnLower<'a> {
                     &format!("zap_list_get_{}", elem.val_suffix()),
                     vec![bv, iv],
                 );
+                Ok((d, ety))
+            }
+            // `deque[T]` indexing (#983): `d[i]` yields the element at left-index
+            // `i` (0 == leftmost), the method-free form of `d.get(i)`. Out-of-
+            // range aborts (like a list before #383's catchable path), so a plain
+            // call suffices.
+            Ty::Deque(elem) => {
+                let (iv, it) = self.expr(index)?;
+                let iv = self.coerce_index(iv, it);
+                let ety = self.elem_ty(elem);
+                let d = self.new_value(ety);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: format!("zap_deque_get_{}", elem.val_suffix()),
+                    args: vec![bv, iv],
+                });
                 Ok((d, ety))
             }
             Ty::Dict(kk, vk) => {
