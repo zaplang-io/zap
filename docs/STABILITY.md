@@ -203,6 +203,17 @@ not supported — it may change in **any** release, including a PATCH:
   concern, provided by reflection-driven `Depends(...)` adapters (D-0089/D-0092),
   not a core decorator — there is no planned core `@inject`. The name stays
   reserved and is rejected with `ZAP5055`, a redirect to `Depends(...)`.
+- **`@request_source` request-source injection** (#959, D-0198) — **Experimental**.
+  Extends the reflection-driven handler adapter (D-0092): a top-level function
+  marked `@request_source` is a request-derived parameter resolver, and a handler
+  parameter whose default calls one (e.g. `str id = Path()`) is injected by the
+  adapter — coerced from the named request source — rather than being a seam
+  pass-through, composing with `Depends(...)`. The core recognizes only the
+  `@request_source` annotation (not the resolver names), so the source vocabulary
+  stays framework-defined. Additive over the Experimental reflection/adapter
+  surface, so no stability promise; the resolver-call protocol
+  (`Resolver(request, "name", marker-args…)`) and the handler-only scope may
+  still change pre-1.0.
 - **Module-level persistent state** (epic #661, D-0112) — **Experimental**. The
   module-level `const` form (#658 Phase 1) and the **mutable** form (#662 Phase
   2 — `T NAME = expr`, reassignable and mutable, a permanent GC root when

@@ -645,6 +645,13 @@ const BUILTIN_DECORATORS: &[&str] = &[
     // per CPU-feature tier + a runtime resolver/dispatcher reading `cpu_features`
     // (#943). A mandatory `"default"` tier is the portable fallback.
     "multiversion",
+    // Request-source resolver marker (#959, D-0198): `@request_source` on a
+    // top-level function marks it a request-derived parameter resolver that the
+    // reflection-driven handler adapter (D-0092) may inject. A handler parameter
+    // whose default calls such a function (e.g. `int id = Path()`) is resolved by
+    // the adapter — coerce-from-the-named-request-source — instead of being a
+    // seam pass-through. Pure metadata: the function body lowers unchanged.
+    "request_source",
     // Test framework (D-0054, issue #73). These mark functions for `zap test`;
     // normal builds strip the annotated functions, so they never reach codegen.
     "test",
@@ -3173,6 +3180,20 @@ impl Checker {
                      decorator (I#472, D-0109); see STABILITY.md",
                     d.span,
                 );
+            }
+            "request_source" => {
+                // `@request_source` (#959, D-0198): marks a top-level function as a
+                // request-derived parameter resolver for the handler adapter
+                // (D-0092). A bare marker — target a function, take no arguments.
+                self.require_target(d, target, DecoTarget::Function);
+                if !d.args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP5048,
+                        "@request_source takes no arguments; put it on the resolver \
+                         function, e.g. `@request_source\\ndef Path[T](Request r, str name) -> T`",
+                        d.span,
+                    );
+                }
             }
             "deprecated" => {
                 // A function/method decorator (I#472, D-0109): every call site
@@ -11529,6 +11550,34 @@ def main():
     #[test]
     fn known_annotation_and_decorator_accepted() {
         ok("annotation Tag:\n    str name = \"\"\n\n@Tag(name=\"x\")\nstruct S:\n    int64 x\n");
+    }
+
+    // --- @request_source marker (#959, D-0198) ---
+
+    #[test]
+    fn request_source_on_a_function_is_accepted() {
+        // A bare marker on a top-level resolver function: no ZAP5032, no args.
+        ok("struct Req:\n    str path\n\
+            @request_source\ndef Path(Req r, str name) -> str:\n    return r.path\n");
+    }
+
+    #[test]
+    fn request_source_with_arguments_is_rejected() {
+        let e = errors(
+            "struct Req:\n    str path\n\
+             @request_source(\"x\")\ndef Path(Req r, str name) -> str:\n    return r.path\n",
+        );
+        assert_eq!(e.len(), 1, "got {e:?}");
+        assert_eq!(e[0].code, ErrorCode::ZAP5048, "{e:?}");
+        assert!(e[0].message.contains("no arguments"), "{e:?}");
+    }
+
+    #[test]
+    fn request_source_on_a_struct_is_rejected() {
+        let e = errors("@request_source\nstruct S:\n    int64 x\n");
+        assert_eq!(e.len(), 1, "got {e:?}");
+        assert_eq!(e[0].code, ErrorCode::ZAP5047, "{e:?}");
+        assert!(e[0].message.contains("applies to a function"), "{e:?}");
     }
 
     #[test]

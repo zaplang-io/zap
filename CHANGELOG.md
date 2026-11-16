@@ -25,6 +25,17 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`@request_source` — framework-declared request-derived parameter injection**
+  (#959, D-0198). Extends the reflection-driven handler adapter (D-0092): a
+  top-level function marked `@request_source` is a request-derived parameter
+  resolver (`fn(Request, str, …) -> T`), and a handler parameter whose default
+  calls one — the FastAPI-canonical `int id = Path()`, `str q = Query("")` — is
+  injected by the adapter (`Resolver(req, "id", …)`), dropped from the
+  `fn(Request) -> Response` seam, and composed with `Depends(...)`. The core
+  recognizes only the `@request_source` annotation, never the resolver names, so
+  the source vocabulary stays framework-defined (no language↔framework coupling).
+  No new grammar. Unblocks typed per-parameter path/query/body injection in
+  fastzap (zaplang-io/fastzap#24). **Experimental.**
 - **`http.req_headers` — enumerate the raw request header block** (#960, D-0197).
   A new server-side accessor `http.req_headers(req) -> list[(str, str)]` returns
   every received request header as a `(name, value)` pair in received order, with

@@ -9740,3 +9740,97 @@ http.req_headers(req) -> list[(str, str)]
   separate, already-shipped, and untouched. `http` stays **Experimental**
   (STABILITY.md §4.4), so this is an additive surface change under the pre-1.0
   regime. Unblocks zaplang-io/fastzap#25.
+
+## D-0198 — `@request_source`: framework-declared request-derived parameter injection (#959)
+**Status:** Locked — extends [[D-0092]] (reflection-driven handler adapters) with
+the per-parameter source injection D-0092 explicitly deferred. Builds on [[D-0089]]
+(signature reflection) and [[D-0087]] (`@app.get` registering decorators). Unblocks
+zaplang-io/fastzap#24 (the open half of D-FZ-0008).
+
+D-0092 bound `Depends(...)` injection plus positional pass-through of the
+handler's framework value (the Request), and deferred path/query/body extraction
+to the framework, warning that binding them in the compiler "would require a
+compiler-known Request extraction protocol, coupling the language to one
+framework's API." This decision adds that capability **without** the coupling: the
+compiler learns a generic *source-resolver* protocol; the framework supplies the
+resolvers and names the sources.
+
+### Decision — `@request_source` resolvers + a marker-default on the parameter
+A framework marks its extraction resolvers with a new core annotation,
+`@request_source`, on a top-level function whose shape is
+`fn(Request, str, …) -> T` — the framework value, the source **key**, then any
+extra marker arguments. A handler declares a request-sourced parameter the
+FastAPI-canonical way: a **default that calls such a resolver**.
+
+```zap
+@request_source
+def Path[T](Request req, str name) -> T: ...
+@request_source
+def Query[T](Request req, str name, T fallback) -> T: ...
+
+@app.get("/items/{id}")
+def get_item(Request req, int id = Path(), str q = Query("")) -> Response:
+    return Response.json({"id": id, "q": q})
+```
+
+At the `@app.get` decoration site the adapter desugar (`crates/driver/
+decorator_desugar.rs`, the same pre-sema pass that handles `Depends`) rewrites each
+sourced parameter into an injected local and **drops it from the seam**:
+
+```zap
+def get_item$adapter(Request req) -> Response:       # still the fn(Request)->Response seam
+    int id$src = Path(req, "id")                      # Resolver(request, "name", marker-args…)
+    str q$src  = Query(req, "q", "")
+    return get_item(req, id$src, q$src)
+```
+
+### Why this surface (the design decision, user-chosen)
+Three mechanisms were weighed — a default-marker `Path()`/`Query()`, a param
+decorator `@source(resolver)`, and an annotation-type `Path[int]`. The
+default-marker form was chosen because it is **byte-for-byte FastAPI's canonical
+style** (`id: int = Path(...)`), reuses the existing `Depends`-style param-default
+classifier (smallest, most consistent change), and needs **no new grammar** (a
+function decorator + an ordinary parameter default both already parse). The
+annotation-type form (`Path[int]`) was rejected as the heaviest and the closest to
+the coupling D-0092 warned against (the core would need marker generic types + a
+type→resolver registry).
+
+### Framework-agnostic by construction
+The core recognizes only the **`@request_source` annotation**, never the resolver
+names (`Path`/`Query`/`Body`/…). The source vocabulary, the extraction logic, and
+the coercion all live in the framework's resolvers. The compiler contributes only
+the wiring: find the resolver call in the default, forward `(request, "<param>",
+<marker args…>)`, and bind the result at the parameter's declared type (so a
+generic resolver is instantiated and a non-`str` source is typed/coerced by normal
+inference — a generic return type is inferred from the binding type).
+
+### Mechanism
+- `@request_source` is a **compiler-recognized built-in** annotation
+  (`BUILTIN_DECORATORS`): target a function, no arguments (else `ZAP5048`/`ZAP5047`).
+  Pure metadata — `DECORATED_NO_CODE`, so the resolver body lowers unchanged.
+- The desugar snapshots the set of `@request_source` functions, then classifies a
+  handler parameter whose default **calls** one as `Source`. A handler with any
+  `Source` (or `Depends`) parameter is registered via the synthesized adapter.
+- The resolver is called with the handler's first **pass-through** parameter (the
+  Request), the parameter name as the key, and the marker's own positional args.
+  The `Source` parameter is **not** an adapter/seam parameter.
+
+### Scope boundary (v1)
+- A `Source` parameter needs a pass-through Request to resolve against; a handler
+  that declares none is a clear `ZAP5048` (implicit-Request synthesis is a
+  follow-up).
+- Request-source injection is a **handler-adapter** facility: a `@request_source`
+  parameter inside a `Depends` **provider** has no per-request scope to resolve in
+  and is rejected (`ZAP5048`), as is a keyword marker argument (the forwarded call
+  is positional). A default that calls a non-`@request_source` function is an
+  ordinary default (unchanged pass-through), not an error.
+
+### No grammar change
+`GRAMMAR.ebnf` is untouched: the surface is an existing function decorator plus an
+ordinary parameter default (D-0038). Coverage: six `decorator_desugar` host tests
+(injection + seam-drop + forwarded args, `Depends` composition, missing-Request,
+source-in-provider, keyword-marker, and the non-source regression), three `sema`
+tests (`@request_source` accepted / args-rejected / wrong-target), and the
+`request_source_inject` golden (CI full-LLVM + arm64) proving `str`/`int64`
+sources, a forwarded `Query` fallback, and `Depends` composition inject and run
+end to end.

@@ -2644,8 +2644,10 @@ const DEFERRED_BUILTINS: &[&str] = &["default", "validate", "range"];
 /// so the lowering decorator scan must silently ignore them rather than fall
 /// through to a "not implemented" error. `@deprecated` (I#472, D-0109) is a
 /// sema-only use-site warning; the decorated function/method body lowers
-/// unchanged.
-const DECORATED_NO_CODE: &[&str] = &["deprecated"];
+/// unchanged. `@request_source` (#959, D-0198) is a pure marker consumed by the
+/// pre-sema handler-adapter desugar; the resolver function it marks lowers
+/// unchanged, so there is likewise nothing to generate here.
+const DECORATED_NO_CODE: &[&str] = &["deprecated", "request_source"];
 
 /// A trait requested via `@derive(...)`.
 #[derive(Clone, Copy, PartialEq)]
