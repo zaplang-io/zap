@@ -1297,7 +1297,11 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   D-0120 (the "benign residual window" reasoning superseded by D-0128), D-0137 (the
   Phase-2 float-key ruling landed as reject-`NaN` in D-0138, not the canonicalize-`NaN`
   it tentatively recommended), and D-0185 (`eigvals` → `array[complex]` and `eig`
-  implemented by D-0188). No decision substance changed.
+  implemented by D-0188). The pass also synced one drifted classification: D-0076's
+  summary still listed `set` as Experimental, but `set` graduated to Stable (#608/#609)
+  and `docs/STABILITY.md` §4.4 already records it as Stable — D-0076 is corrected to
+  match. No decision substance changed by this pass (the `set` graduation itself
+  landed earlier under #608/#609).
 - **Matrix multiply auto-dispatches between the own kernel and BLAS** (#904,
   D-0181, sharpening D-0173). `a @ b` now picks the fastest kernel for the
   `(dtype, size, CPU budget)`: the own blocked+SIMD floor (#913) by default, or a

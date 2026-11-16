@@ -32,6 +32,7 @@ governing decision. `★` = status banner added in the 2026-11-16 consistency pa
 | D-0142 | scope-timeout **severs** a non-draining child; `_exit` is signal-only (supersedes the `grace` hard-exit / hang) | D-0094 |
 | D-0141 | specifies DRF-SC: the happens-before edge set + SC-only atomics (was "formal spec later") | D-0034 |
 | D-0140 | amends point 4 — a mutable non-`@shareable` module global is a hard error (`ZAP3019`) | D-0112 |
+| #608/#609 (epic #614 D16/D17) ★ | `set` graduated Experimental→Stable (DECISIONS §4.4 summary synced to `docs/STABILITY.md`) | D-0076 |
 | D-0138 ★ | Phase-2 float-key ruling is **reject-`NaN`**, not the canonicalize-`NaN` D-0137 tentatively recommended | D-0137 |
 | D-0128 ★ | the residual preempt window is closed at the source (monitor gates `SIGURG` on STW) — supersedes D-0120's "benign window" reasoning | D-0120 |
 | D-0115 | implements `@cache` (supersedes its deferral) | D-0109 |
@@ -2080,7 +2081,11 @@ frozen prematurely.
   managers (D-0069), modules/imports/visibility, regex, decorators core +
   `@derive(Json)`, **generics incl. bounds** (D-0064), coroutines/channels/
   `select`/`scope:`/`spawn detached`, sync primitives + **`Atomic[T]`** (D-0066),
-  `Optional[T]` (D-0065). **Experimental:** numeric arrays/SIMD, `set`, C-style
+  `Optional[T]` (D-0065), and **`set`** — literals `{1, 2, 3}`, comprehensions,
+  `.add`/`in`/`len`/iteration, and the `set[T]()` / `set(iterable)` constructors —
+  **graduated Experimental→Stable** per #608/#609 (epic #614 D16/D17; recorded in
+  `docs/STABILITY.md` §4.4, which this line is synced to). **Experimental:** numeric
+  arrays/SIMD, C-style
   bitfields (D-0068), Python interop, `@derive(Yaml)`/`@derive(Csv)`;
   `__iadd__`-family in-place ops remain **not-yet**. **Internal:** value/memory
   layout, representation, GC/scheduler (§1.5).
