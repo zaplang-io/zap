@@ -156,8 +156,8 @@ use zapc_diag::ErrorCode;
 use zapc_sema::TypeError;
 use zapc_syntax::ast::{
     Arg, ArgSpread, BinOp, Block, CompClause, Decorator, DecoratorDef, DecoratorMember, DictItem,
-    ExceptClause, Expr, Field, Function, Item, MatchArm, Module, Param, Stmt, StructDef, Type,
-    WithItem,
+    ExceptClause, Expr, Field, Function, Item, MatchArm, Module, Param, SelectCase, SelectOp, Stmt,
+    StructDef, Type, WithItem,
 };
 use zapc_syntax::span::Span;
 use zapc_syntax::SHAREABLE_MARKER;
@@ -1550,6 +1550,28 @@ impl Rewriter<'_> {
             } => Stmt::Match {
                 scrutinee: self.expr(scrutinee),
                 arms: arms.into_iter().map(|a| self.arm(a)).collect(),
+                span,
+            },
+            Stmt::Select { cases, span } => Stmt::Select {
+                cases: cases
+                    .into_iter()
+                    .map(|c| SelectCase {
+                        op: match c.op {
+                            SelectOp::Recv { value, ok, chan } => SelectOp::Recv {
+                                value,
+                                ok,
+                                chan: self.expr(chan),
+                            },
+                            SelectOp::Send { chan, value } => SelectOp::Send {
+                                chan: self.expr(chan),
+                                value: self.expr(value),
+                            },
+                            SelectOp::Default => SelectOp::Default,
+                        },
+                        body: self.block(c.body),
+                        span: c.span,
+                    })
+                    .collect(),
                 span,
             },
             Stmt::Return { value, span } => Stmt::Return {

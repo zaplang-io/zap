@@ -10248,3 +10248,62 @@ identically.
 Relates to D-0203 (the one-method proof this generalizes), D-0202 (the
 `zapc_syntax::seam` twin-facet home pattern), epic #967, Discussion #965, and the
 #966 stdlib redesign.
+
+## D-0205 — the `select` statement: CSP channel multiplexing (#1002 / epic #967)
+
+**Context.** `select` (D-0031, `design/0005-concurrency.md`) was fully specified
+in `docs/GRAMMAR.ebnf` and reachable from `module`, but unimplemented — the one
+grammar-ahead-of-parser gap the coverage gate (D-0201) pinned, and the last
+`KNOWN_DIVERGENCES` entry in `crates/syntax/tests/grammar.rs`. This decision
+implements it end-to-end.
+
+**Surface.** `select:` with one or more `case <op>:` clauses and an optional
+`default:` (a non-blocking poll). Per the EBNF, a `case` op is a receive binding
+one name (`case v = <-ch:`), a comma-ok receive (`case v, ok = <-ch:`), or a
+send (`case ch <- v:`); receive cases bind **fresh case-local names** (like a
+`match` arm capture), never an existing lvalue. `default` is a contextual word,
+not a keyword. Semantics mirror Go: wait on all cases, proceed with the first
+ready, **choose uniformly at random** among several ready, and with a `default`
+run it immediately when none is ready. A closed channel counts as ready for
+receive (comma-ok `ok == False`); a send case on a closed channel raises.
+
+**Sema.** New `Stmt::Select` + `SelectCase`/`SelectOp`. Each operand must be a
+channel; a receive binds `value` to the element type and the optional `ok` to
+`bool`; a send checks the value against the element type. At least one case, at
+most one `default`, and no `_`/dotted receive target. Reuses the channel
+diagnostics `ZAP4030`/`ZAP4031`/`ZAP4032`; **one new code `ZAP4035`** for the
+structural rules (empty select / two defaults / non-name receive target).
+
+**Runtime (`zap_select`, `crates/codegen/src/zaprt.c`).** A Go-style `selectgo`:
+lock every case channel in **address order** (a stable order — no deadlock when
+two selects share channels), take the first ready case in a shuffled scan
+(fairness), fall through to `default`, else enqueue one per-case waiter and park
+**once**. The park mutex is a per-`select` `SelState.mu`: a counterpart that pops
+one of our waiters must take it to CLAIM the select (a single-fire flag), and
+the scheduler releases it only after the selecting coroutine has fully switched
+out — so, exactly as a plain channel op gets from `copark`, a select cannot be
+woken before it is parked, now across many channels. `chan_send_word`/
+`chan_recv_word`/`chan_close` gained select-aware pop loops that claim a live
+case or discard a dead one (already fired on another channel). Lock order is
+always channel-mu then `SelState.mu`.
+
+**Codegen / ABI.** `Stmt::Select` lowers to a **variadic** `zap_select` call
+whose per-case channel pointers and send values are passed as **individual
+arguments** (fixed arity per call site) — so a pointer send value is a direct
+pointer argument and stays rooted by the calling frame across the park, exactly
+as a plain `ch <- v` roots `v`; a `dir` bitfield (send / pointer / float) tells
+the runtime which `va_arg` type to read. The chosen case's received word + ok
+flag return through two out-slots, loaded straight-line (no intervening park)
+with the element's own type, so no int↔pointer cast IR is needed. The call is a
+`throwing_call` (it can raise send-on-closed or a scope cancellation).
+
+**Tests.** Host: parser (`crates/syntax/src/parser.rs`) + 9 sema cases
+(`crates/sema/tests/select.rs`); the `grammar.rs` corpus graduates the three
+`select_*` productions to `Accept` and the coverage gate (D-0201) moves them from
+`TrackedGap` to `Compiles`. CI (full/arm64): the `select_stmt` golden exercises a
+`default` fall-through, ready send/receive picks, a comma-ok receive on a closed
+channel, and a blocking receive woken by a spawned sender (the park/wake path),
+deterministically.
+
+Relates to D-0031 (the concurrency design), D-0201 (the coverage gate that
+demanded this), epic #967, and #469/#374.

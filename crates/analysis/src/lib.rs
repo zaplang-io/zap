@@ -1319,6 +1319,19 @@ impl Walk {
                     self.block(&arm.body);
                 }
             }
+            Stmt::Select { cases, .. } => {
+                for case in cases {
+                    match &case.op {
+                        SelectOp::Recv { chan, .. } => self.expr(chan),
+                        SelectOp::Send { chan, value } => {
+                            self.expr(chan);
+                            self.expr(value);
+                        }
+                        SelectOp::Default => {}
+                    }
+                    self.block(&case.body);
+                }
+            }
             Stmt::Return { value, .. } | Stmt::Raise { value, .. } => {
                 if let Some(e) = value {
                     self.expr(e);

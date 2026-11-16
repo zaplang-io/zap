@@ -7861,6 +7861,8 @@ impl<'a> FnLower<'a> {
                 "internal error: unresolved `when target.*` block reached \
                  lowering (expected cfg resolution first)",
             )),
+            // `select` (D-0031, #1002): channel multiplexing via `zap_select`.
+            Stmt::Select { cases, .. } => self.lower_select(cases),
             Stmt::Let {
                 ty, name, value, ..
             } => {
@@ -14241,6 +14243,134 @@ impl<'a> FnLower<'a> {
     /// compares the backing integer (tier-1 enum / literal) or the tag field
     /// (tier-3 enum); a matching arm binds its captures/payload fields, checks
     /// any guard, and runs its body. Exhaustiveness is already enforced by sema.
+    /// Lower a `select` statement (D-0031, #1002). Each channel case's operand
+    /// (and a send value) is evaluated once, in source order; the per-case data
+    /// is passed to the variadic `zap_select` as individual arguments — a
+    /// pointer send value is thus a direct pointer argument, kept rooted by this
+    /// frame across the park, exactly as a plain `ch <- v` roots `v`. The call
+    /// returns the chosen case index (or -1 for `default`); a dispatch chain
+    /// branches to each case body, binding a receive's value (and comma-ok flag)
+    /// from the out-slots.
+    fn lower_select(&mut self, cases: &[ast::SelectCase]) -> Result<(), LowerError> {
+        // Out-slots for the chosen receive's delivered word + comma-ok flag.
+        let outval = self.alloca(Ty::I64);
+        let outok = self.alloca(Ty::I64);
+
+        // Evaluate the channel cases (source order) and build the call args.
+        // Each channel case records (is_recv, value_name, ok_name, elem_ty) for
+        // the dispatch; the `default` body is remembered separately.
+        struct ChanCase<'a> {
+            recv: Option<(&'a str, Option<&'a str>, Ty)>, // (value, ok, elem) for recv
+            body: &'a ast::Block,
+        }
+        let mut chan: Vec<ChanCase> = Vec::new();
+        let mut default_body: Option<&ast::Block> = None;
+
+        let mut args: Vec<Value> = vec![outval, outok];
+        // `n` and `has_default` are filled once the counts are known.
+        let n_idx = args.len();
+        args.push(self.iconst(Ty::I64, 0));
+        args.push(self.iconst(Ty::I64, 0));
+
+        for case in cases {
+            match &case.op {
+                ast::SelectOp::Default => {
+                    default_body = Some(&case.body);
+                }
+                ast::SelectOp::Recv {
+                    value,
+                    ok,
+                    chan: ch,
+                } => {
+                    let (cv, cty) = self.expr(ch)?;
+                    let Ty::Chan(elem) = cty else {
+                        return Err(err("a select receive case needs a channel operand"));
+                    };
+                    let ety = self.elem_ty(elem);
+                    // dir bits: bit0 = send (0 here), bit1 = ptr elem, bit2 = f64.
+                    let dir = (((elem.val_suffix() == "ptr") as i64) << 1)
+                        | (((elem.val_suffix() == "f64") as i64) << 2);
+                    args.push(cv);
+                    args.push(self.iconst(Ty::I64, dir));
+                    args.push(self.iconst(Ty::I64, 0)); // recv: no send value (dummy)
+                    chan.push(ChanCase {
+                        recv: Some((value, ok.as_deref(), ety)),
+                        body: &case.body,
+                    });
+                }
+                ast::SelectOp::Send { chan: ch, value } => {
+                    let (cv, cty) = self.expr(ch)?;
+                    let Ty::Chan(elem) = cty else {
+                        return Err(err("a select send case needs a channel operand"));
+                    };
+                    let ety = self.elem_ty(elem);
+                    let vv = self.expr_coerced(value, ety, zapc_diag::ErrorCode::ZAP4032)?;
+                    // dir bits: bit0 = send, bit1 = ptr elem, bit2 = f64 elem.
+                    let dir = 1
+                        | (((elem.val_suffix() == "ptr") as i64) << 1)
+                        | (((elem.val_suffix() == "f64") as i64) << 2);
+                    args.push(cv);
+                    args.push(self.iconst(Ty::I64, dir));
+                    args.push(vv);
+                    chan.push(ChanCase {
+                        recv: None,
+                        body: &case.body,
+                    });
+                }
+            }
+        }
+
+        // Patch n / has_default now that both are known.
+        let n = chan.len() as i64;
+        let has_default = default_body.is_some() as i64;
+        args[n_idx] = self.iconst(Ty::I64, n);
+        args[n_idx + 1] = self.iconst(Ty::I64, has_default);
+
+        let chosen = self.new_value(Ty::I64);
+        self.throwing_call(Some(chosen), "zap_select", args);
+
+        // Dispatch on the chosen index: 0..n for channel cases, -1 for default.
+        let merge = self.new_block();
+        for (ci, cc) in chan.iter().enumerate() {
+            let want = self.iconst(Ty::I64, ci as i64);
+            let (cond, _) = self.binop(AstBin::Eq, chosen, Ty::I64, want, Ty::I64)?;
+            let then_bb = self.new_block();
+            let next_bb = self.new_block();
+            self.set_term(Term::BrIf {
+                cond,
+                then_bb,
+                else_bb: next_bb,
+            });
+            self.position(then_bb);
+            self.push_scope();
+            if let Some((value, ok, ety)) = cc.recv {
+                let w = self.load(outval, ety);
+                let slot = self.decl_slot(value, ety);
+                self.store(slot, w);
+                if let Some(okn) = ok {
+                    let okb = self.load(outok, Ty::I1);
+                    let okslot = self.decl_slot(okn, Ty::I1);
+                    self.store(okslot, okb);
+                }
+            }
+            self.lower_block(cc.body)?;
+            self.ensure_br(merge);
+            self.pop_scope();
+            self.position(next_bb);
+        }
+        // Reached only when no channel case matched (chosen == -1): the
+        // `default` body, if any. A blocking select always returns a valid
+        // index, so with no default this block is unreachable.
+        if let Some(def) = default_body {
+            self.push_scope();
+            self.lower_block(def)?;
+            self.pop_scope();
+        }
+        self.ensure_br(merge);
+        self.position(merge);
+        Ok(())
+    }
+
     fn lower_match(&mut self, scrutinee: &Expr, arms: &[ast::MatchArm]) -> Result<(), LowerError> {
         let (sv, sty) = self.expr(scrutinee)?;
         let merge = self.new_block();

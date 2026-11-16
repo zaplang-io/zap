@@ -25,6 +25,14 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **The `select` statement** (#1002, D-0205). CSP channel multiplexing:
+  `select:` waits on several channel `case`s and proceeds with the first ready,
+  choosing uniformly at random among ties; an optional `default:` makes it a
+  non-blocking poll. Cases are a receive (`case v = <-ch:`), a comma-ok receive
+  (`case v, ok = <-ch:`), or a send (`case ch <- v:`); a closed channel is ready
+  for receive (`ok == False`). Backed by a Go-style `selectgo` that parks the
+  coroutine (freeing its M) when no case is ready. Completes the one
+  grammar-ahead-of-parser gap the coverage gate tracked (D-0201).
 - **Module-qualified construction of the lock-free `Queue[T]`** (#996, D-0202).
   The natural dotted spelling now works — `concurrent.Queue[int64] q =
   concurrent.Queue[int64]()` (explicit T) and `concurrent.Queue[int64] q =

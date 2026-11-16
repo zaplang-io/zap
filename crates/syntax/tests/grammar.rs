@@ -471,6 +471,13 @@ const CORPUS: &[Case] = &[
     case("atom", Accept, "def f():\n    auto v = <-ch\n"),                      // channel receive
     case("simple_stmt", Accept, "def f():\n    spawn detached g()\n"),          // spawn, D-0044
     case("scope_stmt", Accept, "scope(on_error=e):\n    spawn f()\n"),
+    // `select` (D-0031, #1002): receive / comma-ok receive / send / default cases.
+    case("select_stmt", Accept,
+        "select:\n    case v = <-ch:\n        return\n    default:\n        return\n"),
+    case("select_case", Accept,
+        "def f():\n    select:\n        case v, ok = <-ch:\n            return\n"),
+    case("select_op", Accept,
+        "def f():\n    select:\n        case ch <- 1:\n            return\n"),
 
     // ---- generators (I#67) ----
     case("yield_expr", Accept, "def gen():\n    yield 1\n"),
@@ -486,16 +493,11 @@ const CORPUS: &[Case] = &[
 /// than silent: when the parser gains support, [`known_divergences_still_diverge`]
 /// fails, and the maintainer graduates the case into [`CORPUS`] as `Accept`.
 ///
-/// Current entries:
-/// * `select`/`select_stmt`/`select_case`/`select_op` (D-0031) — channel send
-///   (`ch <- v`) and receive (`<-ch`) parse (see CORPUS), but the `select`
-///   multiplexing statement has no dispatch arm in `parse_compound` and no
-///   `Stmt::Select` AST node. Tracked as an EBNF-ahead-of-parser gap.
+/// Current entries: none. The last entry, the `select` statement (D-0031), was
+/// graduated into [`CORPUS`] as `Accept` when the parser gained a `Stmt::Select`
+/// dispatch arm (#1002); the whole channel/`select` surface now parses.
 #[rustfmt::skip]
-const KNOWN_DIVERGENCES: &[Case] = &[
-    case("select_stmt", Reject,
-        "select:\n    case v = <-ch:\n        return\n    default:\n        return\n"),
-];
+const KNOWN_DIVERGENCES: &[Case] = &[];
 
 #[test]
 fn known_divergences_still_diverge() {

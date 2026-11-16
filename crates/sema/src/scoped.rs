@@ -501,6 +501,19 @@ impl Checker {
                     self.walk_scoped_block(&arm.body, aliases);
                 }
             }
+            Stmt::Select { cases, .. } => {
+                for case in cases {
+                    match &case.op {
+                        SelectOp::Recv { chan, .. } => self.scan_expr(chan, aliases),
+                        SelectOp::Send { chan, value } => {
+                            self.scan_expr(chan, aliases);
+                            self.scan_expr(value, aliases);
+                        }
+                        SelectOp::Default => {}
+                    }
+                    self.walk_scoped_block(&case.body, aliases);
+                }
+            }
             Stmt::Try {
                 body,
                 excepts,
