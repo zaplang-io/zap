@@ -202,3 +202,73 @@ fn http_positional_calls_unchanged() {
     assert_ok(&prog("    auto r = http.get(\"http://x\")\n"));
     assert_ok(&prog("    auto r = http.post(\"http://x\", \"n=zap\")\n"));
 }
+
+// ---------------------------------------------------------------------------
+// datetime — timestamp conversions + format/parse (#99/#338).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn datetime_strftime_keyword_and_reordered() {
+    assert_ok(&prog(
+        "    auto d = datetime.now()\n    auto s = datetime.strftime(dt=d, fmt=\"%Y\")\n",
+    ));
+    assert_ok(&prog(
+        "    auto d = datetime.now()\n    auto s = datetime.strftime(fmt=\"%Y\", dt=d)\n",
+    ));
+}
+
+#[test]
+fn datetime_format_optional_fmt_by_name() {
+    // `format(dt)` is ISO-8601; the strftime `fmt` is the trailing optional.
+    assert_ok(&prog(
+        "    auto d = datetime.now()\n    auto s = datetime.format(dt=d)\n",
+    ));
+}
+
+#[test]
+fn datetime_from_timestamp_keyword() {
+    assert_ok(&prog("    auto d = datetime.from_timestamp(timestamp=0)\n"));
+}
+
+#[test]
+fn datetime_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto d = datetime.now()\n    auto s = datetime.strftime(dt=d, bogus=\"x\")\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn datetime_positional_unchanged() {
+    assert_ok(&prog(
+        "    auto d = datetime.now()\n    auto s = datetime.strftime(d, \"%Y\")\n",
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// random — the non-numpy-overloaded verbs (seed, randint).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn random_randint_keyword_and_reordered() {
+    assert_ok(&prog("    auto n = random.randint(a=1, b=10)\n"));
+    assert_ok(&prog("    auto n = random.randint(b=10, a=1)\n"));
+}
+
+#[test]
+fn random_seed_keyword() {
+    assert_ok(&prog("    random.seed(n=42)\n"));
+}
+
+#[test]
+fn random_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto n = random.randint(1, bogus=10)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn random_positional_unchanged() {
+    assert_ok(&prog("    auto n = random.randint(1, 10)\n"));
+}

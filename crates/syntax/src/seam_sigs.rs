@@ -67,6 +67,24 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("http", "req_body", &["req"]),
     ("http", "req_version", &["req"]),
     ("http", "respond", &["conn", "status", "body", "headers"]),
+    // ---- datetime (ticket #99/#338): timestamp conversions + format/parse ----
+    ("datetime", "from_timestamp", &["timestamp"]),
+    ("datetime", "from_timestamp_local", &["timestamp"]),
+    ("datetime", "to_timestamp", &["dt"]),
+    // `format(dt)` is ISO-8601; `format(dt, fmt)` is the strftime overload — so
+    // `fmt` is the trailing optional.
+    ("datetime", "format", &["dt", "fmt"]),
+    ("datetime", "strftime", &["dt", "fmt"]),
+    ("datetime", "parse", &["s"]),
+    ("datetime", "strptime", &["s", "fmt"]),
+    // ---- random (ticket #98): only the non-numpy-overloaded verbs ----
+    // `random`/`uniform`/`choice`/`shuffle` are overloaded with the NumPy
+    // `Generator` surface (a distinct second signature keyed on an arg-0
+    // `Generator` handle); a single module-form row cannot represent both and
+    // would wrongly reject a NumPy keyword call, so they are deferred until the
+    // registry grows a per-overload model. `seed`/`randint` are unambiguous.
+    ("random", "seed", &["n"]),
+    ("random", "randint", &["a", "b"]),
 ];
 
 /// The declared positional parameter names of a seam method, or `None` when the
