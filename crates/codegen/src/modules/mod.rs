@@ -13,6 +13,7 @@
 
 use super::Cg;
 
+mod arch;
 mod argparse;
 mod base64;
 mod bisect;
@@ -22,6 +23,7 @@ mod deque;
 mod fs;
 mod gc;
 mod gzip;
+mod hash;
 mod hex;
 mod http;
 mod io;
@@ -60,6 +62,8 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     crypto::declare_rt(cg);
     base64::declare_rt(cg);
     hex::declare_rt(cg);
+    arch::declare_rt(cg);
+    hash::declare_rt(cg);
     math::declare_rt(cg);
     random::declare_rt(cg);
     time::declare_rt(cg);

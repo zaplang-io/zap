@@ -267,6 +267,12 @@ struct StructCtx {
     /// (`import python "numpy" as np` → `np`) mapped to the CPython module name
     /// (`numpy`). A reference to one of these names lowers to a `zap_py_import`.
     py: HashMap<String, String>,
+    /// Receiver name → canonical `arch.*` module registry name (I#139 Tier 2,
+    /// D-0199), from `import arch.x86_64 [as name]` / `import arch.aarch64 [as
+    /// name]`. A call `x86.crc32c_u64(..)` lowers by resolving its receiver
+    /// (`x86`) through this map to the registry name (`arch.x86_64`), matching
+    /// the sema dispatch. Empty unless the file imports an `arch.*` module.
+    arch_imports: HashMap<String, &'static str>,
     /// Interned anonymous tuple layouts (D-0049), appended to [`Module::structs`]
     /// after lowering.
     tuples: RefCell<TupleInterner>,
@@ -1357,6 +1363,13 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
             py.insert(name, module.clone());
         }
     }
+    // Architecture-specific intrinsics imports (I#139 Tier 2, D-0199): receiver
+    // name → canonical `arch.*` registry name, mirroring the sema dispatch.
+    let arch_imports: HashMap<String, &'static str> =
+        zapc_syntax::arch::collect_arch_imports(module)
+            .into_iter()
+            .map(|(name, arch)| (name, zapc_syntax::arch::arch_module_name(arch)))
+            .collect();
 
     // User `@shareable` struct names (#664, D-0113), for the `--race`
     // instrumentation predicate (#677): a mutable module global of such a type is
@@ -1426,6 +1439,7 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
         scoped_structs,
         enums,
         py,
+        arch_imports,
         tuples,
         ifaces,
         interfaces,
@@ -1783,7 +1797,7 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
                     // group metadata instead of the bare function; codegen builds
                     // the dispatcher under the public name. Other functions emit
                     // unchanged.
-                    Ok(func) => match f.decorators.iter().find(|d| d.name == "multiversion") {
+                    Ok(mut func) => match f.decorators.iter().find(|d| d.name == "multiversion") {
                         Some(d) => match expand_multiversion(func, d) {
                             Ok((clones, group)) => {
                                 out.funcs.extend(clones);
@@ -1791,7 +1805,17 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
                             }
                             Err(e) => errors.push(e),
                         },
-                        None => out.funcs.push(func),
+                        None => {
+                            // `@target_feature("feat")` (#963, epic #139, D-0200):
+                            // stamp the single feature so codegen compiles the body
+                            // with it enabled and preserves it through LTO (reusing
+                            // the `Func.target_feature` channel a `@multiversion`
+                            // clone uses). sema has rejected any unguarded call.
+                            if let Some(feat) = target_feature_of(&f.decorators) {
+                                func.target_feature = Some(feat);
+                            }
+                            out.funcs.push(func);
+                        }
                     },
                     Err(e) => errors.push(e),
                 }
@@ -2558,6 +2582,17 @@ fn mv_clone_name(public: &str, tier: &str) -> String {
     format!("{public}$mv${}", tier.replace('.', "_"))
 }
 
+/// The feature name of a `@target_feature("feat")` decorator, if present (#963,
+/// epic #139, D-0200). sema has already validated it (one string-literal feature
+/// name from the taxonomy, not `"default"`).
+fn target_feature_of(decorators: &[ast::Decorator]) -> Option<String> {
+    let d = decorators.iter().find(|d| d.name == "target_feature")?;
+    match d.args.first().map(|a| &a.value) {
+        Some(ast::Expr::Str { value, .. }) => Some(value.clone()),
+        _ => None,
+    }
+}
+
 /// Expand a `@multiversion(...)` function into its clone set (#944, epic #139).
 /// `base` is the already-lowered body under the public name; this returns one
 /// clone [`Func`] per tier (a copy tagged with its `target_feature`) plus the
@@ -3148,6 +3183,12 @@ impl DecoratorPlan {
                             // (`expand_multiversion`) clones it per CPU-feature tier
                             // and records the dispatch group. Nothing to collect in
                             // this reflection-metadata scan.
+                        } else if d.name == "target_feature" {
+                            // `@target_feature(...)` (#963, epic #139, D-0200): the
+                            // body lowers unchanged; the single feature is stamped
+                            // onto the `Func` after lowering (`target_feature_of`),
+                            // so codegen compiles it with that feature. Nothing to
+                            // collect here.
                         } else if DEFERRED_BUILTINS.contains(&d.name.as_str()) {
                             errors.push(err(format!(
                                 "built-in decorator '@{}' is not implemented yet (deferred)",
@@ -8072,6 +8113,9 @@ impl<'a> FnLower<'a> {
             } => self.lower_try(body, excepts, finally.as_ref()),
             Stmt::Spawn { call, detached, .. } => self.lower_spawn(call, *detached),
             Stmt::Scope { opts, body, .. } => self.lower_scope(opts, body),
+            // `unsafe:` (D-0200) has no runtime effect — it is a compile-time
+            // permission checked in sema; lower its body as an ordinary block.
+            Stmt::Unsafe { body, .. } => self.lower_block(body),
             Stmt::Match {
                 scrutinee, arms, ..
             } => self.lower_match(scrutinee, arms),
@@ -12121,7 +12165,17 @@ impl<'a> FnLower<'a> {
                 // (these module names are not value bindings). Not intercepted
                 // when shadowed by a local of the same name.
                 if self.lookup(tyname).is_none() {
-                    if let Some(r) = modules::lower_builtin_module_call(self, tyname, name, args)? {
+                    // Resolve an `arch.*` import alias (`x86` → `arch.x86_64`,
+                    // D-0199) to its registry name, matching the sema dispatch.
+                    let module_name = self
+                        .ctx
+                        .arch_imports
+                        .get(tyname)
+                        .copied()
+                        .unwrap_or(tyname.as_str());
+                    if let Some(r) =
+                        modules::lower_builtin_module_call(self, module_name, name, args)?
+                    {
                         return Ok(r);
                     }
                 }

@@ -262,7 +262,14 @@ import_item   ::= dotted_name [ "as" IDENT ] ;
                      `a.b` -> <src>/a/b.zap; a stdlib name is left to the
                      built-in handling (I#283/D-0081). The bound name is the
                      alias, else the path's last segment. Members are accessed
-                     qualified (`a.item`); there is no `from a import item`. *)
+                     qualified (`a.item`); there is no `from a import item`.
+                     No new syntax for the architecture-specific intrinsics
+                     modules (I#139 Tier 2, #962, D-0199): `import arch.x86_64 as
+                     x86` is an ordinary dotted stdlib import; `x86.crc32c_u64(..)`
+                     an ordinary qualified call. Such an import is a compile error
+                     (ZAP3019) when the build does not target that architecture —
+                     there is no silent fallback (D-0079) — so it is normally
+                     written inside a `when target.arch == .x86_64:` cfg arm. *)
 
 (* ---------- Types ---------- *)
 
@@ -365,6 +372,7 @@ compound_stmt ::= if_stmt
                 | try_stmt
                 | with_stmt
                 | scope_stmt
+                | unsafe_stmt        (* `unsafe:` target-feature-call gate (I#139, D-0200) *)
                 | cfg_stmt           (* `when target.*` conditional compilation (I#139) *)
                 | select_stmt ;
 
@@ -413,6 +421,17 @@ with_item     ::= expr [ "as" IDENT ] ;
 (* ---------- Structured concurrency (D-0044) ---------- *)
 
 scope_stmt    ::= "scope" [ "(" [ arg_list ] ")" ] block ;
+unsafe_stmt   ::= "unsafe" block ;
+                  (* I#139, D-0200. An ordinary block (its own lexical scope, no
+                     runtime effect) that additionally permits calling a
+                     `@target_feature` function — which is unsafe to call
+                     directly (a SIGILL risk) — typically after an
+                     `arch.cpu_has(...)` guard. It does NOT widen memory safety:
+                     the v1 `arch.*` intrinsics are memory-safe and need no
+                     `unsafe`. Hard keyword, additive/Experimental (D-0076). The
+                     user-facing `@target_feature("feat")` and `arch.cpu_has(name)`
+                     that pair with it add no new grammar — a function decorator
+                     and a qualified call respectively. *)
                   (* options are keyword args: on_error=OnError.Cancel|Wait;
                      timeout=<int-ms> — a relative deadline in a nonnegative integer
                      number of milliseconds (no unit suffix; D-0094). On expiry the

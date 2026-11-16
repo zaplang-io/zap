@@ -355,6 +355,15 @@ define_codes! {
          (`T a = ...`). Only single-name module-level declarations are admitted \
          at module scope: `const T NAME = expr` (immutable, #658) and \
          `T NAME = expr` (mutable, #662).";
+    ZAP3019 = 3019 : "architecture-specific module imported for the wrong target",
+        "An `arch.x86_64` / `arch.aarch64` intrinsics module (I#139 Tier 2, \
+         D-0199) compiles only into a build whose target is that architecture — \
+         there is no silent software fallback (D-0079 rule 0.3). Importing it on \
+         another target is a hard error. Guard the import with compile-time \
+         conditional compilation so one source carries both paths, e.g. \
+         `when target.arch == .x86_64:` / `elif target.arch == .aarch64:` / \
+         `else:`, or stay on the portable layer (`std.hash.crc32c`, the \
+         numeric-array SIMD types).";
 
     // ---- ZAP4xxx — type checking -------------------------------------------
     ZAP4001 = 4001 : "type mismatch in assignment",
@@ -783,6 +792,18 @@ define_codes! {
          one the host supports at runtime (the lower tiers / the other arch's names \
          are simply never selected). Keyword arguments, a non-string tier, an \
          unknown feature name, or a missing `\"default\"` is rejected here.";
+    ZAP5134 = 5134 : "@target_feature function called outside `unsafe`",
+        "A `@target_feature(\"feat\")` function (#963, ISA-acceleration epic #139, \
+         D-0200) is compiled with a CPU feature enabled, so calling it on a CPU \
+         that lacks the feature is an illegal-instruction trap (SIGILL) the type \
+         system cannot rule out. A direct call is therefore permitted only inside \
+         an `unsafe:` block, where you assert the feature is present — typically \
+         after an `arch.cpu_has(\"feat\")` check, e.g. `if arch.cpu_has(\"avx2\"): \
+         unsafe: y = f(x)`. For automatic, safe dispatch across CPUs, prefer a \
+         `@multiversion(...)` function instead (its clones are called only by the \
+         resolver, never unguarded). The `@target_feature` decorator itself is \
+         validated under ZAP5133's sibling rules (one positional feature name from \
+         the `cpu_features` taxonomy, not `\"default\"`).";
 
     // ---- ZAP6xxx — lowering / IR / codegen (Experimental) ------------------
     ZAP6001 = 6001 : "lowering error",

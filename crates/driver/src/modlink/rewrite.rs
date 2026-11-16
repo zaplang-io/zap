@@ -299,6 +299,7 @@ impl Rewriter<'_> {
                 }
                 self.block(body, locals, tl);
             }
+            Stmt::Unsafe { body, .. } => self.block(body, locals, tl),
             Stmt::AssignTuple { target, value, .. } => {
                 self.assign_target(target, locals);
                 self.expr(value, locals);
@@ -761,6 +762,7 @@ fn collect_stmt_bindings(st: &Stmt, s: &mut HashSet<String>) {
             }
             collect_block_bindings(body, s);
         }
+        Stmt::Unsafe { body, .. } => collect_block_bindings(body, s),
         Stmt::AssignTuple { target, value, .. } => {
             collect_bindtarget(target, s);
             collect_expr_bindings(value, s);

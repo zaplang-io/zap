@@ -291,12 +291,30 @@ fn strip_target_attrs_bitcode(path: &Path) -> Result<(), String> {
         // `_mvsimd_` is a hand-written C runtime SIMD clone (#945, e.g.
         // `zap_memchr_mvsimd_avx2`). Every other function is stripped so the
         // I#841 cross-boundary inlining holds.
+        // `$mv$` is a #944 Zap-function clone, `_mvsimd_` a hand-written C SIMD
+        // clone (#945), and `zap_arch_` an `arch.*` intrinsic shim (#962, D-0199):
+        // a `target(...)`-attributed C runtime function (e.g.
+        // `zap_arch_x86_crc32c_u8` carries `+sse4.2`). All MUST keep their
+        // `target-features`: a crc32 shim stripped to baseline cannot select its
+        // `@llvm.x86.sse42.crc32.*` intrinsic under LTO ("Cannot select") — the
+        // #845-class failure. Keeping the feature also makes it correctly an
+        // inlining barrier into a caller that lacks the feature (no SIGILL).
         let is_mv_clone = func
             .get_name()
             .to_str()
-            .map(|n| n.contains("$mv$") || n.contains("_mvsimd_"))
+            .map(|n| n.contains("$mv$") || n.contains("_mvsimd_") || n.contains("zap_arch_"))
             .unwrap_or(false);
-        if !is_mv_clone {
+        // A standalone `@target_feature` function (#963, D-0200) carries an
+        // ordinary name, so codegen marks it with the `zap-keep-target-features`
+        // sentinel; keep its `target-features` like a clone's, then drop the
+        // marker (it is internal and must not leak into the final object).
+        let is_target_feature = func
+            .get_string_attribute(AttributeLoc::Function, "zap-keep-target-features")
+            .is_some();
+        if is_target_feature {
+            func.remove_string_attribute(AttributeLoc::Function, "zap-keep-target-features");
+        }
+        if !is_mv_clone && !is_target_feature {
             for key in INLINE_BLOCKING_FN_ATTRS {
                 func.remove_string_attribute(AttributeLoc::Function, key);
             }
@@ -731,6 +749,12 @@ const CPU_FEATURES_H: &str = include_str!("zap_cpu_features.h");
 /// first multiversioned kernel: hand-written clones (scalar/SSE2/AVX2/NEON) +
 /// pointer-once-init dispatch reading `cpu_features`.
 const RUNTIME_MEMCHR_C: &str = include_str!("zapmemchr.inc.c");
+/// The `arch.x86_64` / `arch.aarch64` intrinsic shims (`crc32c_*`, `popcount_*`,
+/// `prefetch`) and the portable `hash.crc32c` wrapper (#962, epic #139, D-0199),
+/// `#include`d by `zaprt.c` after `zapcpu.inc.c`. Each arch shim carries the
+/// `target(...)` attribute its hardware instruction needs; `hash.crc32c` is a
+/// bit-identical software CRC32C (Castagnoli).
+const RUNTIME_ARCH_C: &str = include_str!("zaparch.inc.c");
 /// The SIMD sort accelerator dispatch seam (#933, epic #139, D-0195),
 /// `#include`d by `zaprt.c` after `zapcpu.inc.c`. Always compiled; its entry
 /// points fall through to the own floor unless `-DZAP_HAVE_SIMDSORT` and a
@@ -1120,6 +1144,8 @@ pub fn build_executable(
         .map_err(|e| format!("failed to write cpu-features header: {e}"))?;
     std::fs::write(build_dir.join("zapmemchr.inc.c"), RUNTIME_MEMCHR_C)
         .map_err(|e| format!("failed to write memchr runtime: {e}"))?;
+    std::fs::write(build_dir.join("zaparch.inc.c"), RUNTIME_ARCH_C)
+        .map_err(|e| format!("failed to write arch-intrinsics runtime: {e}"))?;
     std::fs::write(build_dir.join("zapcpu.inc.c"), RUNTIME_CPU_C)
         .map_err(|e| format!("failed to write cpu-features runtime: {e}"))?;
     std::fs::write(build_dir.join("zapsortaccel.inc.c"), RUNTIME_SORTACCEL_C)
@@ -3666,6 +3692,16 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     .ctx
                     .create_string_attribute("target-features", spec.llvm_features);
                 fv.add_attribute(AttributeLoc::Function, attr);
+                // Mark this function so the LTO `target-features` strip keeps it
+                // (#963, D-0200). A `@multiversion` clone is kept by its `$mv$`
+                // name, but a standalone `@target_feature` user function has an
+                // ordinary name; without this marker its features would be
+                // stripped and the function silently demoted to baseline (the
+                // #845 broken-LTO failure mode). The strip removes the marker.
+                let keep = self
+                    .ctx
+                    .create_string_attribute("zap-keep-target-features", "");
+                fv.add_attribute(AttributeLoc::Function, keep);
             }
         }
     }

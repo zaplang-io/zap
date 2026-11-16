@@ -226,6 +226,8 @@ fn build_runtime_dylib() -> Result<(PathBuf, PathBuf), String> {
         .map_err(|e| format!("failed to write cpu-features header: {e}"))?;
     std::fs::write(dir.join("zapmemchr.inc.c"), crate::RUNTIME_MEMCHR_C)
         .map_err(|e| format!("failed to write memchr runtime: {e}"))?;
+    std::fs::write(dir.join("zaparch.inc.c"), crate::RUNTIME_ARCH_C)
+        .map_err(|e| format!("failed to write arch-intrinsics runtime: {e}"))?;
     std::fs::write(dir.join("zapcpu.inc.c"), crate::RUNTIME_CPU_C)
         .map_err(|e| format!("failed to write cpu-features runtime: {e}"))?;
     // zaprt.c #includes this unconditionally; the REPL links no accelerator

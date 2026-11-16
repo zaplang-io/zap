@@ -50,6 +50,8 @@ fn main() {
         "src/zapcpu.inc.c",
         // SIMD memchr/memmem kernel (#945, epic #139): first multiversioned kernel.
         "src/zapmemchr.inc.c",
+        // arch.* intrinsic shims + hash.crc32c (#962, epic #139, D-0199).
+        "src/zaparch.inc.c",
         // SIMD sort accelerator (#933, epic #139): the dispatch seam + the two
         // per-ISA C++ kernels (their vendored headers are embedded below).
         "src/zapsortaccel.inc.c",

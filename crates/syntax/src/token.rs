@@ -168,6 +168,7 @@ pub enum Keyword {
     Select,
     Close,
     Scope,
+    Unsafe,
     // Type/decl keywords
     Struct,
     Interface,
@@ -260,6 +261,7 @@ impl Keyword {
             "select" => Select,
             "close" => Close,
             "scope" => Scope,
+            "unsafe" => Unsafe,
             "struct" => Struct,
             "interface" => Interface,
             "enum" => Enum,
@@ -341,6 +343,7 @@ impl Keyword {
             Select => "select",
             Close => "close",
             Scope => "scope",
+            Unsafe => "unsafe",
             Struct => "struct",
             Interface => "interface",
             Enum => "enum",

@@ -17,6 +17,7 @@ use zapc_syntax::ast;
 use super::{FnLower, LowerError};
 use crate::ir::*;
 
+mod arch;
 mod argparse;
 mod base64;
 mod bisect;
@@ -28,6 +29,7 @@ mod fft;
 mod fs;
 mod gc;
 mod gzip;
+mod hash;
 mod hex;
 mod http;
 mod io;
@@ -83,6 +85,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     crypto::MODULE,
     base64::MODULE,
     hex::MODULE,
+    hash::MODULE,
     math::MODULE,
     fft::MODULE,
     linalg::MODULE,
@@ -106,6 +109,11 @@ pub(super) const MODULES: &[ModuleLower] = &[
     url::MODULE,
     concurrent::MODULE,
     xml::MODULE,
+    // Architecture-specific low-level intrinsics (I#139 Tier 2, D-0199).
+    arch::MODULE_X86_64,
+    arch::MODULE_AARCH64,
+    // The portable `arch` facade: `cpu_has` (#963, D-0200).
+    arch::MODULE_FACADE,
 ];
 
 /// A module's *constant* lowering hook: lower `module.CONST` (an attribute, not

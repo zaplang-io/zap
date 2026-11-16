@@ -569,6 +569,18 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
+    /// `unsafe: ...` (I#139, D-0200) — an ordinary block (its own lexical scope,
+    /// lowered exactly like a normal block, no runtime effect) that additionally
+    /// permits the operations which are "unsafe to call directly" (a
+    /// `@target_feature` function, whose hardware precondition the compiler cannot
+    /// verify). It is purely a compile-time acknowledgement that the programmer
+    /// upholds an obligation the type system cannot (Rust's `unsafe { ... }`
+    /// model). Memory safety of the v1 arch surface does not depend on it; it
+    /// gates the SIGILL-risking target-feature calls.
+    Unsafe {
+        body: Block,
+        span: Span,
+    },
     /// `spawn call(...)` (D-0013), or `spawn detached call(...)` (D-0044).
     /// A plain `spawn` is owned by the nearest enclosing [`Stmt::Scope`] (or the
     /// program's implicit root scope); `detached` opts out of all scope

@@ -32,7 +32,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use zapc_diag::ErrorCode;
-use zapc_syntax::ast::{Expr, Import, Item, Module, Stmt};
+use zapc_syntax::ast::{CfgArch, Expr, Import, Item, Module, Stmt};
 use zapc_syntax::cfg::Target;
 use zapc_syntax::span::Span;
 
@@ -203,6 +203,39 @@ impl<'t> Loader<'t> {
         file: &str,
     ) -> Option<(PathBuf, Option<PathBuf>)> {
         let first = path.split('.').next().unwrap_or(path);
+        // (0) architecture-gated `arch.*` intrinsics module (I#139 Tier 2,
+        // D-0199): a built-in that compiles ONLY into a build whose target is
+        // that architecture — D-0079's "no silent fallback" rule. Importing it
+        // off-target is a hard error (ZAP3019). It is still a built-in (returns
+        // `None`, no file), so after the diagnostic the import links no module;
+        // the right way to carry both arches in one source is a `when target.*`
+        // cfg guard, which resolves (and removes) the dead arm before this runs.
+        if let Some(want) = zapc_syntax::arch::arch_submodule(path) {
+            if self.target.arch != Some(want) {
+                let arch_disp = |a: Option<CfgArch>| match a {
+                    Some(CfgArch::X86_64) => "x86-64",
+                    Some(CfgArch::Aarch64) => "aarch64",
+                    None => "another architecture",
+                };
+                self.diag(
+                    ErrorCode::ZAP3019,
+                    format!(
+                        "cannot `import {path}`: it compiles only when the build targets \
+                         {}, but this build targets {}. Guard it with `when target.arch == \
+                         .{}:` (there is no silent fallback).",
+                        arch_disp(Some(want)),
+                        arch_disp(self.target.arch),
+                        match want {
+                            CfgArch::X86_64 => "x86_64",
+                            CfgArch::Aarch64 => "aarch64",
+                        },
+                    ),
+                    span,
+                    file,
+                );
+            }
+            return None;
+        }
         // (1) stdlib — left to the built-in handling.
         if zapc_sema::is_builtin_module(first) {
             return None;
@@ -509,8 +542,18 @@ impl<'t> Loader<'t> {
                 // `import <name>` is also a Zap `Import::Module` and is dropped
                 // (stdlib member access resolves by the literal base name, so
                 // the import line is not load-bearing — I#70/I#121).
-                if matches!(item, Item::Import(Import::Module { .. })) {
-                    continue;
+                //
+                // EXCEPTION: an `arch.x86_64` / `arch.aarch64` intrinsics import
+                // (I#139 Tier 2, D-0199) IS load-bearing — its alias is the
+                // receiver name a call dispatches on (`x86.crc32c_u64`), with no
+                // literal module name to fall back on — so it must survive to
+                // sema and lowering, which build the alias map from it
+                // (`zapc_syntax::arch::collect_arch_imports`). Lowering skips it
+                // like any import (it emits no code).
+                if let Item::Import(Import::Module { path, .. }) = item {
+                    if zapc_syntax::arch::arch_submodule(path).is_none() {
+                        continue;
+                    }
                 }
                 let mut it = item.clone();
                 rw.item(&mut it);
@@ -676,7 +719,8 @@ fn stmt_span(st: &Stmt) -> Span {
         | Stmt::With { span, .. }
         | Stmt::Spawn { span, .. }
         | Stmt::AssignTuple { span, .. }
-        | Stmt::Scope { span, .. } => *span,
+        | Stmt::Scope { span, .. }
+        | Stmt::Unsafe { span, .. } => *span,
         Stmt::Break(s) | Stmt::Continue(s) | Stmt::Pass(s) => *s,
         Stmt::Expr(e) => expr_span(e),
         Stmt::Cfg(b) => b.span,

@@ -1357,6 +1357,7 @@ impl Walk {
                 }
                 self.block(body);
             }
+            Stmt::Unsafe { body, .. } => self.block(body),
             Stmt::LetTuple { target, value, .. } => {
                 self.bind_target(target);
                 self.expr(value);

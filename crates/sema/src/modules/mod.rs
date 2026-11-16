@@ -18,6 +18,7 @@ use zapc_syntax::span::Span;
 
 use crate::{Checker, Ty};
 
+mod arch;
 mod argparse;
 mod base64;
 mod bisect;
@@ -29,6 +30,7 @@ mod fft;
 mod fs;
 mod gc;
 mod gzip;
+mod hash;
 mod hex;
 mod http;
 mod io;
@@ -79,6 +81,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     crypto::MODULE,
     base64::MODULE,
     hex::MODULE,
+    hash::MODULE,
     math::MODULE,
     fft::MODULE,
     linalg::MODULE,
@@ -102,6 +105,13 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     url::MODULE,
     concurrent::MODULE,
     xml::MODULE,
+    // Architecture-specific low-level intrinsics (I#139 Tier 2, D-0199). Dotted
+    // registry names; dispatched via the import-alias map (see `Checker`).
+    arch::MODULE_X86_64,
+    arch::MODULE_AARCH64,
+    // The portable `arch` facade: the CPU-feature query `arch.cpu_has` (#963,
+    // D-0200). Compiles on every target (unlike the arch sub-modules).
+    arch::MODULE_FACADE,
 ];
 
 /// A built-in module's *constant* facet: the type of a `module.CONST` attribute

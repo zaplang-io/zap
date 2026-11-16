@@ -17072,6 +17072,9 @@ void zap_random_shuffle(void *l) {
  * string/bytes search paths (`zap_str_find_bytes`, forward-declared above) route
  * through. */
 #include "zapmemchr.inc.c"
+/* arch.x86_64 / arch.aarch64 intrinsic shims + hash.crc32c (I#139 Tier 2,
+ * #962, D-0199). After zapcpu.inc.c so ZapStr and the cpu header are in scope. */
+#include "zaparch.inc.c"
 
 /* SIMD sort accelerator dispatch (#933, D-0195). After zapcpu.inc.c (for
  * `zap_cpu_has`); the array sort entry points call its two functions via forward

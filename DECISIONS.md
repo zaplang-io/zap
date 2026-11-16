@@ -9834,3 +9834,143 @@ tests (`@request_source` accepted / args-rejected / wrong-target), and the
 `request_source_inject` golden (CI full-LLVM + arm64) proving `str`/`int64`
 sources, a forwarded `Query` fallback, and `Depends` composition inject and run
 end to end.
+
+## D-0199 — `arch.x86_64` / `arch.aarch64` curated intrinsics module + `hash.crc32c` (ISA-acceleration epic #139 / #962)
+**Status:** implemented
+The programmer-facing Tier-2 escape hatch of #139 (design/0032 §1–§2, ratified
+D-0079): a curated, architecture-specific module that exposes CPU intrinsics by
+their familiar C names, each lowering to the matching hardware instruction, plus
+a portable friendly wrapper. Off the default surface (an explicit `arch.*`
+import); casual code never sees it. **Experimental** (STABILITY §3.1), additive,
+post-1.0 (D-0076).
+- **Namespacing & import.** Two importable modules `arch.x86_64` / `arch.aarch64`
+  (dotted built-in names). `import arch.x86_64 as x86` then `x86.crc32c_u64(..)`;
+  the receiver alias resolves to the canonical module via an import-alias map
+  shared by sema and lowering (`zapc_syntax::arch`). An un-aliased `import
+  arch.x86_64` binds the last path segment (`x86_64`). The bare `arch` facade is
+  reserved for the portable `cpu.has` query (#963), not shipped here.
+- **No silent fallback (D-0079 rule 0.3).** `import arch.x86_64` is a hard error
+  (**ZAP3019**) off an x86-64 build and `import arch.aarch64` off aarch64, caught
+  in the driver's module linker (the only place the active `--target` arch is in
+  scope). The portable way to carry both arches in one source is a `when
+  target.arch` cfg guard (D-0079 §4, already shipped), which removes the dead
+  arm's import before it can error.
+- **v1 surface (the minimal memory-safe core, D-0079 §1).**
+  `crc32c_u8/u16/u32(crc,v)->uint32`, `crc32c_u64(crc,v)->uint64` (CRC32C
+  single-step), `popcount_u32/u64(v)->uint32`, `prefetch(buf: bytes|str[,
+  locality:int])`. All three families are **memory-safe** — none performs a
+  load/store the compiler cannot see — so none is behind an `unsafe` gate. The
+  over-reading SSE4.2 string compares that *would* need one (D-0079 §6.4,
+  Phase 4) are deferred, and Zap has no `unsafe` construct yet to gate them
+  (reported as a prerequisite, not worked around).
+- **CRC32C IS CASTAGNOLI, not ISO CRC32 (D-0079 §6.6).** `crc32c_*` and
+  `hash.crc32c` are Castagnoli (poly 0x1EDC6F41, the SSE4.2 / aarch64-CRC
+  instruction's polynomial). They are never the ISO/zlib CRC32 (0x04C11DB7) that
+  `zlib.crc32` / gzip (D-0060) use; the name is always `crc32c`, never a bare
+  `crc32`. Hardware-accelerated ISO CRC32 (PCLMULQDQ folding) stays out of scope
+  and, if ever wanted, belongs to the zlib module.
+- **Lowering.** Each intrinsic lowers to a thin `zap_arch_*` runtime shim
+  (`zaparch.inc.c`) over a `target(...)`-attributed compiler builtin, so the C
+  compiler emits the exact instruction (x86 SSE4.2 `crc32`, aarch64 CRC32C ext;
+  `POPCNT`/`CNT`; `PREFETCHh`/`PRFM`) and LTO inlines the shim into the caller —
+  the "call" disappears at -O2. The word ABI is uniform (`i64` in, natural width
+  out), so no argument width ever needs narrowing at the call site. The x86 and
+  aarch64 `crc32c_*` symbols are both declared but each arch defines only its
+  own; the other arch's symbol is never referenced (its module cannot be imported
+  off-target) and links away. A pre-SSE4.2 x86 CPU (or a non-CRC aarch64) traps
+  (SIGILL) on `crc32c_*` — the honest hardware contract.
+- **`hash.crc32c(data: bytes|str) -> uint32`** (new `hash` module) is the one v1
+  friendly wrapper (D-0079 §6.8): a portable full CRC32C checksum (reflected,
+  init 0xFFFFFFFF, final XOR 0xFFFFFFFF), implemented as a software table. A
+  software fallback is correct *here* (and only here) because the result is
+  bit-identical to folding the hardware `arch.*.crc32c_u8` intrinsic — the
+  question is "what is the checksum?", not "did I get the hardware instruction?".
+- **Tests.** Host: the `zapc_syntax::arch` alias-collection unit tests; sema arg
+  arity/type + alias-resolution tests; driver modlink off-target-import (ZAP3019,
+  both arches) and cfg-guarded on-target tests. CI (full/arm64): the
+  `arch_crc32c` / `arch_popcount_prefetch` / `hash_crc32c` goldens (a cfg-selected
+  arch, the hardware step folded == the wrapper == the canonical check value
+  0xE3069283, popcount exact, prefetch a no-fault hint), and a standalone C unit
+  test (`zaparch_test.c`) proving the hardware intrinsics against an independent
+  bitwise CRC32C ground truth, the u16/u32/u64 steps against folding u8 over LE
+  bytes, and the wrapper's bit-identity with the raw intrinsic.
+Relates to epic #139, Discussion #920, design/0032 (D-0079), D-0192
+(`cpu_features`), D-0060 (ISO CRC32, kept distinct). Pairs with #963 (the
+user-facing `@target_feature` / `cpu.has` surface). The `unsafe` construct the
+over-reading Phase-4 ops need is reported as a prerequisite.
+
+## D-0200 — user-facing `@target_feature` + `arch.cpu_has` + the `unsafe:` block (ISA-acceleration epic #139 / #963)
+**Status:** implemented
+The programmer-facing language surface on top of the already-shipped
+`@multiversion` codegen (#944, D-0193) and `cpu_features` detector (#943,
+D-0192): a power user can now write their own feature-gated function, query CPU
+features from Zap, and call a feature-gated function safely through an explicit
+`unsafe:` block. The compile-time half (`when target.*` cfg) already shipped
+(D-0079 Phase 1). **Experimental** (STABILITY §3.1), additive, post-1.0.
+- **`unsafe:` block — a new compound statement (new keyword `unsafe`).** An
+  ordinary block (its own lexical scope, lowered exactly like a normal block, no
+  runtime effect) that additionally *permits* the operations which are "unsafe to
+  call directly". It is Rust's `unsafe { … }` model: a compile-time
+  acknowledgement that the programmer upholds an obligation the type system
+  cannot verify. **It does NOT widen memory safety** — the v1 `arch.*` intrinsics
+  (D-0199) are all memory-safe and need no `unsafe`; `unsafe:` exists to gate the
+  SIGILL-risking `@target_feature` calls (and, later, the over-reading SSE4.2
+  string ops of D-0079 Phase 4). `when`-style, Python-suite grammar
+  (`unsafe:` NEWLINE INDENT … DEDENT). Hard keyword (additive per D-0076; no
+  existing source used `unsafe` as an identifier).
+- **`@target_feature("feat")` — the building block.** On a free function, it
+  compiles the body with that CPU feature enabled (reusing the `Func.target_feature`
+  channel a `@multiversion` clone uses, so the LLVM `target-features` stamp +
+  `noinline` + LTO-survival all come for free). Exactly one positional feature
+  name from the `cpu_features` taxonomy (`MULTIVERSION_TIERS`); `"default"` is a
+  @multiversion tier, not a feature, and is rejected (**ZAP5134**).
+- **Unsafe-to-call-directly rule (same as Rust).** Calling a `@target_feature`
+  function on a CPU lacking the feature is a SIGILL the type system cannot rule
+  out, so a direct call is rejected (**ZAP5134**) unless it is inside an `unsafe:`
+  block — where the programmer asserts the feature is present, typically after an
+  `arch.cpu_has(...)` guard. The permission is lexically scoped to the block (it
+  does not leak past it). For automatic *safe* dispatch across CPUs, `@multiversion`
+  remains the answer (its clones are called only by the resolver, never
+  unguarded), so a `@multiversion` function stays safe to call with no `unsafe`.
+  The `cpu.has` guard is the programmer's *soundness* obligation inside `unsafe:`;
+  the compiler does not treat the guard as lifting the `unsafe` requirement (Rust's
+  model), which keeps the rule simple and free of fragile dominator analysis.
+- **`arch.cpu_has(name: str) -> bool` — the Zap-level CPU query.** Lives in the
+  portable `arch` facade (D-0079 §2), compiles on every target, and reuses the
+  #943 detector (`zap_sys_cpu_has`, same runtime semantics as `sys.cpu_has`). The
+  curation value-add over the raw `sys.cpu_has`: a **string-literal** feature name
+  is validated against the taxonomy at compile time (a typo is a compile error,
+  not a silently-`false` query); a non-literal name is accepted and checked at
+  runtime. Enables a manual guarded dispatch (`let f = if cpu.has(...): a else: b`)
+  and is the guard before an `unsafe:` `@target_feature` call. v1 takes a string
+  (consistent with the `@multiversion`/`@target_feature` string taxonomy); the
+  `.feature` dotted-enum spelling sketched in #139 is a possible future layer.
+- **Module-linker fix (load-bearing arch imports).** The linker drops ordinary
+  stdlib `import` lines from the merged module (stdlib members resolve by the
+  literal module name), but an `arch.x86_64 as x86` import's **alias is the
+  receiver a call dispatches on**, with no literal name to fall back on — so arch
+  imports are now preserved through the merge (`zapc_syntax::arch::arch_submodule`
+  gate) and reach sema and lowering, which build the alias map from them. Without
+  this an aliased `arch.*` call failed to resolve on the real build path (it
+  worked only on the import-preserving sema test path). This also makes the
+  D-0199 goldens pass end to end.
+- **Pipeline.** Parse (new `unsafe:` statement; `@target_feature` is an existing
+  decorator shape); sema (unsafe-depth context, `@target_feature` validation +
+  the unsafe-call rule, `arch.cpu_has` name validation); lowering stamps the
+  single feature onto the `Func` and the codegen `apply_tier_features` +
+  LTO-strip exception (a `zap-keep-target-features` sentinel marks a standalone
+  `@target_feature` function so its features survive the I#841 strip, since its
+  symbol has no `$mv$` marker). Validated under -O2/LTO, not just debug (#920 §7,
+  the #845 lesson), via the `target_feature_dispatch` golden.
+- **Tests.** Host: parser (`unsafe:` → `Stmt::Unsafe`), fmt round-trip, sema
+  (`@target_feature` validation incl. reject `"default"`/unknown/arity/wrong-target;
+  the unsafe-to-call rule — rejected outside `unsafe:`, allowed inside, does not
+  leak; `arch.cpu_has` typo/type rejection; `@multiversion` regression). CI
+  (full/arm64): the `cpu_has` golden (`ZAP_CPU=generic` → deterministic `False`s)
+  and the `target_feature_dispatch` golden (a `@target_feature` kernel called in
+  an `unsafe:` block behind a `cpu.has` guard, same result as the portable path,
+  no SIGILL, under LTO).
+Relates to epic #139, Discussion #920, design/0032 (D-0079), D-0192/D-0193
+(`cpu_features` / multiversioning it builds on), D-0199 (the `arch.*` intrinsics
+it pairs with). The over-reading SSE4.2 string ops that also need `unsafe:`
+(D-0079 §6.4, Phase 4) remain deferred; `unsafe:` is now in place for them.
