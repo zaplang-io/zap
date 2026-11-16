@@ -545,3 +545,200 @@ fn math_net_positional_unchanged() {
     assert_ok(&prog("    auto p = math.pow(2.0, 10.0)\n"));
     assert_ok(&prog("    auto l = net.listen(\"0.0.0.0\", 8080)\n"));
 }
+
+// ---------------------------------------------------------------------------
+// linalg — LAPACK-backed linear algebra; NumPy names (a / b / n / x / ord).
+// The check facet only infers + arity-checks (arrays type loosely), so these
+// exercise the central binder, not linalg's own typing.
+// ---------------------------------------------------------------------------
+
+const MAT: &str = "    auto m = [[1.0, 2.0], [3.0, 4.0]]\n";
+
+#[test]
+fn linalg_keyword_and_reorder() {
+    assert_ok(&prog(&format!("{MAT}    auto r = linalg.inv(a=m)\n")));
+    assert_ok(&prog(&format!(
+        "{MAT}    auto r = linalg.solve(a=m, b=m)\n"
+    )));
+    // Reordered: solve(b=, a=) must still land a in slot 0.
+    assert_ok(&prog(&format!(
+        "{MAT}    auto r = linalg.solve(b=m, a=m)\n"
+    )));
+    assert_ok(&prog(&format!(
+        "{MAT}    auto r = linalg.matrix_power(a=m, n=2)\n"
+    )));
+}
+
+#[test]
+fn linalg_optional_ord_by_name() {
+    assert_ok(&prog(&format!("{MAT}    auto d = linalg.norm(x=m)\n")));
+    assert_ok(&prog(&format!(
+        "{MAT}    auto d = linalg.norm(x=m, ord=2)\n"
+    )));
+}
+
+#[test]
+fn linalg_unknown_keyword_rejected() {
+    assert_code(
+        &prog(&format!("{MAT}    auto r = linalg.inv(matrix=m)\n")),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn linalg_positional_unchanged() {
+    assert_ok(&prog(&format!("{MAT}    auto r = linalg.solve(m, m)\n")));
+}
+
+// ---------------------------------------------------------------------------
+// tls — client/server TLS; ctx / capath / keyfile optional trailing.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tls_keyword_and_reorder() {
+    assert_ok(&prog("    auto c = tls.connect(host=\"h\", port=443)\n"));
+    assert_ok(&prog("    auto c = tls.connect(port=443, host=\"h\")\n"));
+    assert_ok(&prog(
+        "    auto c = tls.connect(\"h\", 443)\n    auto s = tls.recv(conn=c, n=16)\n",
+    ));
+    assert_ok(&prog(
+        "    auto c = tls.connect(\"h\", 443)\n    auto k = tls.send(conn=c, data=\"x\")\n",
+    ));
+}
+
+#[test]
+fn tls_optional_trailing_by_name() {
+    assert_ok(&prog(
+        "    auto ctx = tls.SSLContext()\n    tls.load_verify_locations(ctx=ctx, cafile=\"/tmp/ca.pem\")\n",
+    ));
+    assert_ok(&prog(
+        "    auto ctx = tls.SSLContext()\n    tls.load_cert_chain(ctx=ctx, certfile=\"/tmp/c.pem\", keyfile=\"/tmp/k.pem\")\n",
+    ));
+}
+
+#[test]
+fn tls_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto c = tls.connect(host=\"h\", porta=443)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn tls_positional_unchanged() {
+    assert_ok(&prog("    auto c = tls.connect(\"h\", 443)\n"));
+}
+
+// ---------------------------------------------------------------------------
+// argparse — global singleton parser; add_option/add_int take (name, default).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn argparse_keyword_and_reorder() {
+    assert_ok(&prog(
+        "    argparse.add_option(name=\"--out\", default=\"x\")\n",
+    ));
+    assert_ok(&prog(
+        "    argparse.add_option(default=\"x\", name=\"--out\")\n",
+    ));
+    assert_ok(&prog("    argparse.add_int(name=\"--n\", default=0)\n"));
+    assert_ok(&prog("    argparse.set_description(description=\"d\")\n"));
+    assert_ok(&prog("    auto v = argparse.get(name=\"--out\")\n"));
+    assert_ok(&prog(
+        "    auto xs = [\"a\"]\n    argparse.parse(argv=xs)\n",
+    ));
+}
+
+#[test]
+fn argparse_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    argparse.add_option(flag=\"--out\", default=\"x\")\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn argparse_positional_unchanged() {
+    assert_ok(&prog("    argparse.add_option(\"--out\", \"x\")\n"));
+}
+
+// ---------------------------------------------------------------------------
+// xml — DOM parse / serialize / construct.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn xml_keyword_binding() {
+    assert_ok(&prog("    auto e = xml.parse(s=\"<a/>\")\n"));
+    assert_ok(&prog(
+        "    auto e = xml.element(name=\"a\")\n    auto out = xml.dumps(e=e)\n",
+    ));
+}
+
+#[test]
+fn xml_unknown_keyword_rejected() {
+    assert_code(&prog("    auto e = xml.parse(text=\"<a/>\")\n"), "ZAP4023");
+}
+
+#[test]
+fn xml_positional_unchanged() {
+    assert_ok(&prog("    auto e = xml.parse(\"<a/>\")\n"));
+}
+
+// ---------------------------------------------------------------------------
+// concurrent — lock-free Counter; `start` optional.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn concurrent_counter_keyword_and_default() {
+    assert_ok(&prog("    auto c = concurrent.Counter(start=5)\n"));
+    assert_ok(&prog("    auto c = concurrent.Counter()\n"));
+}
+
+#[test]
+fn concurrent_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto c = concurrent.Counter(initial=5)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn concurrent_positional_unchanged() {
+    assert_ok(&prog("    auto c = concurrent.Counter(5)\n"));
+}
+
+// ---------------------------------------------------------------------------
+// bisect — binary search over a sorted list; Python names (a / x).
+// ---------------------------------------------------------------------------
+
+const SORTED: &str = "    auto xs = [1, 2, 3, 5]\n";
+
+#[test]
+fn bisect_keyword_and_reorder() {
+    assert_ok(&prog(&format!(
+        "{SORTED}    auto i = bisect.bisect_right(a=xs, x=4)\n"
+    )));
+    assert_ok(&prog(&format!(
+        "{SORTED}    auto i = bisect.bisect_right(x=4, a=xs)\n"
+    )));
+    assert_ok(&prog(&format!(
+        "{SORTED}    bisect.insort_left(a=xs, x=4)\n"
+    )));
+}
+
+#[test]
+fn bisect_unknown_keyword_rejected() {
+    assert_code(
+        &prog(&format!(
+            "{SORTED}    auto i = bisect.bisect_right(lst=xs, x=4)\n"
+        )),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn bisect_positional_unchanged() {
+    assert_ok(&prog(&format!(
+        "{SORTED}    auto i = bisect.bisect_right(xs, 4)\n"
+    )));
+}

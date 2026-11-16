@@ -92,14 +92,39 @@ the per-method `check`/`lower` functions are not touched.
 A method with **no** registry row keeps the legacy positional-only behavior
 (names ignored).
 This is deliberate: seam calls that pass keywords today but rely on positional
-binding (`fft.irfft(r, n=4)`, `threading.Thread(target=…)`) are untouched until
-their method is given a row, so the change lands with no regressions.
-Migrated in this proposal: `zlib`/`gzip` `compress`/`decompress`,
-`zlib.crc32`/`adler32`, and all of `http` (client verbs + accessors).
-Remaining modules migrate row-by-row.
+binding are untouched until their method is given a row, so the change lands
+with no regressions.
+Migrated by the framework PR (#1008): `zlib`/`gzip` `compress`/`decompress`,
+`zlib.crc32`/`adler32`, and all of `http` (client verbs + accessors); then
+row-by-row across #1009: `datetime`, `random`, `base64`, `hex`, `hash`, `json`,
+`yaml`, `logging`, `crypto`, `os`, `fs`, `time`, `process`, `sys`, `url`, `io`,
+`signal`, `math`, `net`, and finally `linalg`, `tls`, `argparse`, `xml`,
+`concurrent`, `bisect` (NumPy / Python / `ssl` parameter names).
+
+A few modules are intentionally left positional-only rather than rowed:
+
+- **`fft` and `threading` must never be rowed under this framework.** Their
+  *lowerings* already read argument names directly (`fft` interprets `norm=` /
+  `n=` / `d=`; `threading.Thread` reads `target=` / `daemon=` and folds the rest
+  into the closure). The central reorder *strips* a keyword's name when it binds
+  it to a slot (`bound.name = None`), so handing these methods a row would make
+  their own name lookups fail — they are self-interpreting and stay on the
+  legacy path by design.
+- **`sync`, `deque`, `oset`** are low-level opaque-handle primitives whose only
+  arguments are a receiver handle plus a scalar; keyword names there would be
+  freshly invented, not Python-mappable. `deque`/`oset` are additionally in flux
+  under the `int64`-handle rework (#983). Left positional pending a maintainer
+  decision.
+- **`gc`, `runtime`, `arch`** and every `_`-prefixed internal method are not
+  user-facing surface.
+
 The end state flips the default so a method with no row **rejects** unknown
 keywords rather than ignoring them — killing the silent-accept footgun
-everywhere; that flip waits until every keyword-taking method has a row.
+everywhere. That flip waits until every keyword-taking method has a row *or* is
+explicitly ratified as positional-only (the lists above being the proposed
+end-state): the self-interpreting `fft`/`threading` and the handle primitives
+stay no-row permanently, so the flip must treat "no row" as "reject unknown
+keywords" only for methods not on that positional-only list.
 
 ## Rationale
 
@@ -142,13 +167,17 @@ behavior to break.
 - Lowering reorder verified on host via `zap ir`.
 - CI (full/arm64): the `zlib_gzip_kwargs` golden round-trips keyword, reordered,
   defaulted, and keyword-`decompress` calls byte-identically to the positional
-  form.
+  form; the `bisect_kwargs` golden proves a reordered keyword call (`x=` before
+  `a=`) mutating the slot-0 list in place matches the positional golden exactly.
 
 ## Follow-ups
 
-- Populate registry rows for the remaining seam modules (`crypto`, `random`,
-  `net`, `os`/`fs`, …), module by module with tests.
-- Flip the no-row default to reject unknown keywords once coverage is complete.
+- Registry rows are now populated for every user-facing keyword-taking seam
+  module (see "Opt-in and incremental"); the only remaining no-row methods are
+  the self-interpreting (`fft`/`threading`) and handle-primitive
+  (`sync`/`deque`/`oset`) ones held as positional-only.
+- Flip the no-row default to reject unknown keywords once the positional-only
+  list is ratified (and `deque`/`oset` settle under #983).
 - A per-parameter `required`/interior-optional model if a future method needs a
   non-trailing optional.
 - Converge with #966 (seam methods as real Zap/prelude functions).

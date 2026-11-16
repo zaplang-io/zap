@@ -248,6 +248,52 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("net", "set_read_deadline", &["conn", "ms"]),
     ("net", "close_conn", &["conn"]),
     ("net", "close_listener", &["listener"]),
+    // ---- linalg (tickets #926-#928): LAPACK-backed linear algebra (NumPy names) ----
+    ("linalg", "solve", &["a", "b"]),
+    ("linalg", "inv", &["a"]),
+    ("linalg", "det", &["a"]),
+    ("linalg", "cholesky", &["a"]),
+    ("linalg", "qr", &["a"]),
+    ("linalg", "svd", &["a"]),
+    ("linalg", "eigvals", &["a"]),
+    ("linalg", "eig", &["a"]),
+    ("linalg", "eigh", &["a"]),
+    ("linalg", "eigvalsh", &["a"]),
+    ("linalg", "lstsq", &["a", "b"]),
+    ("linalg", "pinv", &["a"]),
+    ("linalg", "matrix_power", &["a", "n"]),
+    ("linalg", "norm", &["x", "ord"]),
+    // ---- tls (tickets #147/#488/#560): client/server TLS; ctx/capath/keyfile ----
+    // optional trailing (Python `ssl` names; host/port/conn/n/data as in `net`).
+    ("tls", "connect", &["host", "port", "ctx"]),
+    ("tls", "connect_insecure", &["host", "port"]),
+    ("tls", "load_verify_locations", &["ctx", "cafile", "capath"]),
+    ("tls", "load_cert_chain", &["ctx", "certfile", "keyfile"]),
+    ("tls", "listen", &["host", "port", "cert_path", "key_path"]),
+    ("tls", "recv", &["conn", "n"]),
+    ("tls", "send", &["conn", "data"]),
+    // ---- argparse (ticket #101): global singleton parser; `default` trailing ----
+    ("argparse", "set_prog", &["prog"]),
+    ("argparse", "set_description", &["description"]),
+    ("argparse", "add_flag", &["name"]),
+    ("argparse", "add_positional", &["name"]),
+    ("argparse", "add_option", &["name", "default"]),
+    ("argparse", "add_int", &["name", "default"]),
+    ("argparse", "parse", &["argv"]),
+    ("argparse", "get", &["name"]),
+    ("argparse", "get_int", &["name"]),
+    ("argparse", "get_flag", &["name"]),
+    // ---- xml (ticket #351): DOM parse / serialize / construct ----
+    ("xml", "parse", &["s"]),
+    ("xml", "dumps", &["e"]),
+    ("xml", "element", &["name"]),
+    // ---- concurrent (ticket #184): lock-free Counter; `start` optional ----
+    ("concurrent", "Counter", &["start"]),
+    // ---- bisect (ticket #102): binary search over a sorted list (Python names) ----
+    ("bisect", "bisect_left", &["a", "x"]),
+    ("bisect", "bisect_right", &["a", "x"]),
+    ("bisect", "insort_left", &["a", "x"]),
+    ("bisect", "insort_right", &["a", "x"]),
 ];
 
 /// The declared positional parameter names of a seam method, or `None` when the
