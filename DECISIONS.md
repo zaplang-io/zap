@@ -9834,3 +9834,67 @@ tests (`@request_source` accepted / args-rejected / wrong-target), and the
 `request_source_inject` golden (CI full-LLVM + arm64) proving `str`/`int64`
 sources, a forwarded `Query` fallback, and `Depends` composition inject and run
 end to end.
+
+## D-0199 — `arch.x86_64` / `arch.aarch64` curated intrinsics module + `hash.crc32c` (ISA-acceleration epic #139 / #962)
+**Status:** implemented
+The programmer-facing Tier-2 escape hatch of #139 (design/0032 §1–§2, ratified
+D-0079): a curated, architecture-specific module that exposes CPU intrinsics by
+their familiar C names, each lowering to the matching hardware instruction, plus
+a portable friendly wrapper. Off the default surface (an explicit `arch.*`
+import); casual code never sees it. **Experimental** (STABILITY §3.1), additive,
+post-1.0 (D-0076).
+- **Namespacing & import.** Two importable modules `arch.x86_64` / `arch.aarch64`
+  (dotted built-in names). `import arch.x86_64 as x86` then `x86.crc32c_u64(..)`;
+  the receiver alias resolves to the canonical module via an import-alias map
+  shared by sema and lowering (`zapc_syntax::arch`). An un-aliased `import
+  arch.x86_64` binds the last path segment (`x86_64`). The bare `arch` facade is
+  reserved for the portable `cpu.has` query (#963), not shipped here.
+- **No silent fallback (D-0079 rule 0.3).** `import arch.x86_64` is a hard error
+  (**ZAP3019**) off an x86-64 build and `import arch.aarch64` off aarch64, caught
+  in the driver's module linker (the only place the active `--target` arch is in
+  scope). The portable way to carry both arches in one source is a `when
+  target.arch` cfg guard (D-0079 §4, already shipped), which removes the dead
+  arm's import before it can error.
+- **v1 surface (the minimal memory-safe core, D-0079 §1).**
+  `crc32c_u8/u16/u32(crc,v)->uint32`, `crc32c_u64(crc,v)->uint64` (CRC32C
+  single-step), `popcount_u32/u64(v)->uint32`, `prefetch(buf: bytes|str[,
+  locality:int])`. All three families are **memory-safe** — none performs a
+  load/store the compiler cannot see — so none is behind an `unsafe` gate. The
+  over-reading SSE4.2 string compares that *would* need one (D-0079 §6.4,
+  Phase 4) are deferred, and Zap has no `unsafe` construct yet to gate them
+  (reported as a prerequisite, not worked around).
+- **CRC32C IS CASTAGNOLI, not ISO CRC32 (D-0079 §6.6).** `crc32c_*` and
+  `hash.crc32c` are Castagnoli (poly 0x1EDC6F41, the SSE4.2 / aarch64-CRC
+  instruction's polynomial). They are never the ISO/zlib CRC32 (0x04C11DB7) that
+  `zlib.crc32` / gzip (D-0060) use; the name is always `crc32c`, never a bare
+  `crc32`. Hardware-accelerated ISO CRC32 (PCLMULQDQ folding) stays out of scope
+  and, if ever wanted, belongs to the zlib module.
+- **Lowering.** Each intrinsic lowers to a thin `zap_arch_*` runtime shim
+  (`zaparch.inc.c`) over a `target(...)`-attributed compiler builtin, so the C
+  compiler emits the exact instruction (x86 SSE4.2 `crc32`, aarch64 CRC32C ext;
+  `POPCNT`/`CNT`; `PREFETCHh`/`PRFM`) and LTO inlines the shim into the caller —
+  the "call" disappears at -O2. The word ABI is uniform (`i64` in, natural width
+  out), so no argument width ever needs narrowing at the call site. The x86 and
+  aarch64 `crc32c_*` symbols are both declared but each arch defines only its
+  own; the other arch's symbol is never referenced (its module cannot be imported
+  off-target) and links away. A pre-SSE4.2 x86 CPU (or a non-CRC aarch64) traps
+  (SIGILL) on `crc32c_*` — the honest hardware contract.
+- **`hash.crc32c(data: bytes|str) -> uint32`** (new `hash` module) is the one v1
+  friendly wrapper (D-0079 §6.8): a portable full CRC32C checksum (reflected,
+  init 0xFFFFFFFF, final XOR 0xFFFFFFFF), implemented as a software table. A
+  software fallback is correct *here* (and only here) because the result is
+  bit-identical to folding the hardware `arch.*.crc32c_u8` intrinsic — the
+  question is "what is the checksum?", not "did I get the hardware instruction?".
+- **Tests.** Host: the `zapc_syntax::arch` alias-collection unit tests; sema arg
+  arity/type + alias-resolution tests; driver modlink off-target-import (ZAP3019,
+  both arches) and cfg-guarded on-target tests. CI (full/arm64): the
+  `arch_crc32c` / `arch_popcount_prefetch` / `hash_crc32c` goldens (a cfg-selected
+  arch, the hardware step folded == the wrapper == the canonical check value
+  0xE3069283, popcount exact, prefetch a no-fault hint), and a standalone C unit
+  test (`zaparch_test.c`) proving the hardware intrinsics against an independent
+  bitwise CRC32C ground truth, the u16/u32/u64 steps against folding u8 over LE
+  bytes, and the wrapper's bit-identity with the raw intrinsic.
+Relates to epic #139, Discussion #920, design/0032 (D-0079), D-0192
+(`cpu_features`), D-0060 (ISO CRC32, kept distinct). Pairs with #963 (the
+user-facing `@target_feature` / `cpu.has` surface). The `unsafe` construct the
+over-reading Phase-4 ops need is reported as a prerequisite.

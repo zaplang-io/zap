@@ -298,6 +298,20 @@ Verifier configuration failures emit fixed DEBUG messages through `logging`;
 its default WARNING threshold suppresses them. Ordinary signature mismatches
 remain quiet.
 
+The experimental low-level-performance escape hatch (#139 Tier 2, D-0199) adds
+the architecture-specific intrinsics modules `arch.x86_64` / `arch.aarch64`:
+`import arch.x86_64 as x86` exposes `x86.crc32c_u8/u16/u32/u64(crc, v)` (hardware
+CRC32C, Castagnoli — *not* the ISO/zlib CRC32 of `zlib.crc32`), `x86.popcount_u32/u64(v)`,
+and `x86.prefetch(buf[, locality])`, each lowering to the matching CPU
+instruction. These live off the default surface and are memory-safe (no `unsafe`
+needed). Honouring the "no silent fallback" rule, `import arch.x86_64` is a
+compile error on a non-x86 build (and `arch.aarch64` off aarch64), so a portable
+program guards the import with `when target.arch == .x86_64: … elif
+target.arch == .aarch64: … else: …`. For the common case the portable wrapper
+`hash.crc32c(data)` computes the same CRC32C checksum on any target with no
+`arch.*` import. See
+[D-0199](DECISIONS.md#d-0199--archx86_64--archaarch64-curated-intrinsics-module--hashcrc32c-isa-acceleration-epic-139--962).
+
 ## License
 
 Licensed under either of

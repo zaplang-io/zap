@@ -267,6 +267,12 @@ struct StructCtx {
     /// (`import python "numpy" as np` → `np`) mapped to the CPython module name
     /// (`numpy`). A reference to one of these names lowers to a `zap_py_import`.
     py: HashMap<String, String>,
+    /// Receiver name → canonical `arch.*` module registry name (I#139 Tier 2,
+    /// D-0199), from `import arch.x86_64 [as name]` / `import arch.aarch64 [as
+    /// name]`. A call `x86.crc32c_u64(..)` lowers by resolving its receiver
+    /// (`x86`) through this map to the registry name (`arch.x86_64`), matching
+    /// the sema dispatch. Empty unless the file imports an `arch.*` module.
+    arch_imports: HashMap<String, &'static str>,
     /// Interned anonymous tuple layouts (D-0049), appended to [`Module::structs`]
     /// after lowering.
     tuples: RefCell<TupleInterner>,
@@ -1357,6 +1363,13 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
             py.insert(name, module.clone());
         }
     }
+    // Architecture-specific intrinsics imports (I#139 Tier 2, D-0199): receiver
+    // name → canonical `arch.*` registry name, mirroring the sema dispatch.
+    let arch_imports: HashMap<String, &'static str> =
+        zapc_syntax::arch::collect_arch_imports(module)
+            .into_iter()
+            .map(|(name, arch)| (name, zapc_syntax::arch::arch_module_name(arch)))
+            .collect();
 
     // User `@shareable` struct names (#664, D-0113), for the `--race`
     // instrumentation predicate (#677): a mutable module global of such a type is
@@ -1426,6 +1439,7 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
         scoped_structs,
         enums,
         py,
+        arch_imports,
         tuples,
         ifaces,
         interfaces,
@@ -12121,7 +12135,17 @@ impl<'a> FnLower<'a> {
                 // (these module names are not value bindings). Not intercepted
                 // when shadowed by a local of the same name.
                 if self.lookup(tyname).is_none() {
-                    if let Some(r) = modules::lower_builtin_module_call(self, tyname, name, args)? {
+                    // Resolve an `arch.*` import alias (`x86` → `arch.x86_64`,
+                    // D-0199) to its registry name, matching the sema dispatch.
+                    let module_name = self
+                        .ctx
+                        .arch_imports
+                        .get(tyname)
+                        .copied()
+                        .unwrap_or(tyname.as_str());
+                    if let Some(r) =
+                        modules::lower_builtin_module_call(self, module_name, name, args)?
+                    {
                         return Ok(r);
                     }
                 }

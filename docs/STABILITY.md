@@ -307,6 +307,26 @@ not supported — it may change in **any** release, including a PATCH:
   expected to graduate to Stable; the standalone `@target_feature` building block
   and its unsafe-to-call-directly rule are a later addition, Experimental until
   the #139 facility's surface is finalized.
+- **`arch.x86_64` / `arch.aarch64` intrinsics modules** (#962, epic #139,
+  D-0199) — **Experimental**. The curated Tier-2 escape hatch: `import
+  arch.x86_64 as x86` / `import arch.aarch64 as a` exposes `crc32c_u8/u16/u32`
+  (→ uint32) / `crc32c_u64` (→ uint64), `popcount_u32/u64` (→ uint32), and
+  `prefetch(buf: bytes|str[, locality])`, each lowering to the matching hardware
+  instruction. Off the default surface (an explicit `arch.*` import); all three
+  are memory-safe (no `unsafe` gate). Importing the wrong arch for the build is a
+  compile error (**ZAP3019**) — no silent fallback (D-0079) — so an `arch.*`
+  import is normally written inside a `when target.arch` cfg arm. `crc32c_*` is
+  CRC32C / Castagnoli (NOT the ISO/zlib CRC32 of `zlib.crc32`/gzip). The op set
+  is expected to grow (the over-reading SSE4.2 string compares and non-temporal
+  stores are deferred and need an `unsafe` construct); the exact lowering shim is
+  internal and not a covered surface (§1.5). A pre-SSE4.2 x86 (or non-CRC
+  aarch64) CPU traps on `crc32c_*` — the honest hardware contract.
+- **`hash.crc32c(data: bytes|str) -> uint32`** (#962, epic #139, D-0199) —
+  **Experimental**. The portable friendly CRC32C (Castagnoli) checksum wrapper
+  (iSCSI convention: reflected, init/final-XOR 0xFFFFFFFF), bit-identical to
+  folding the hardware `arch.*.crc32c_*` intrinsic. Compiles and runs on every
+  target with no `arch.*` import. `crc32c`, never a bare `crc32`; it is NOT the
+  ISO/zlib CRC32. The name is expected to graduate to Stable.
 - **Floating-point determinism policy** (`--fp=strict|default|fast` + `math.fma`,
   #946, D-0196) — **Experimental**. The `--fp` flag selects whether codegen may
   change FP rounding structure for speed: `default` contracts (`a*b+c` may fuse to

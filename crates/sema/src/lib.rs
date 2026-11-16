@@ -341,6 +341,15 @@ struct Checker {
     annotations: HashMap<String, Vec<String>>,
     /// Declared `decorator` names (behavioral, D-0036).
     user_decorators: HashSet<String>,
+    /// Receiver name → canonical `arch.*` module registry name, for the
+    /// architecture-specific intrinsics family (I#139 Tier 2, D-0199). Built
+    /// from the module's `import arch.x86_64 [as name]` / `import arch.aarch64
+    /// [as name]` statements (`zapc_syntax::arch::collect_arch_imports`). A call
+    /// `x86.crc32c_u64(..)` is dispatched by resolving its receiver (`x86`)
+    /// through this map to the registry name (`arch.x86_64`), so the intrinsics
+    /// are reachable only through an explicit `arch.*` import (off the default
+    /// surface). Empty unless the file imports an `arch.*` module.
+    arch_imports: HashMap<String, &'static str>,
     /// Functions and methods carrying `@deprecated` (I#472, D-0109), mapping the
     /// call key to the optional user message. A free function is keyed by its
     /// bare name; a method by `"Type.method"`. Each call site resolving to one of
@@ -970,6 +979,7 @@ impl Checker {
             cyclic_aliases: HashSet::new(),
             annotations: HashMap::new(),
             user_decorators: HashSet::new(),
+            arch_imports: HashMap::new(),
             deprecated: HashMap::new(),
             shareable_types: HashSet::new(),
             scoped_types: HashSet::new(),
@@ -3378,6 +3388,15 @@ impl Checker {
                 self.declare(&name, Ty::Py, *span);
             }
         }
+        // Architecture-specific intrinsics imports (I#139 Tier 2, D-0199): build
+        // the receiver-name → canonical `arch.*` registry-name map so a call
+        // `x86.crc32c_u64(..)` resolves through its `import arch.x86_64 as x86`.
+        // The off-target-import error is the driver's (it holds the target); by
+        // the time sema runs, a surviving `arch.*` import is on-target.
+        self.arch_imports = zapc_syntax::arch::collect_arch_imports(module)
+            .into_iter()
+            .map(|(name, arch)| (name, zapc_syntax::arch::arch_module_name(arch)))
+            .collect();
         // Module-level declarations (D-0112): `const T NAME = expr` (immutable,
         // #658 Phase 1) and `T NAME = expr` (mutable, #662 Phase 2). Declared up
         // front — before any function body is checked — so a reference resolves
@@ -5983,8 +6002,16 @@ impl Checker {
                 // local value, and is intercepted before the base is resolved as
                 // a value (these module names are not value bindings).
                 if self.lookup(tyname).is_none() {
+                    // Resolve an `arch.*` import alias (`x86` → `arch.x86_64`,
+                    // D-0199) to its canonical registry name; a non-arch receiver
+                    // dispatches under its own name unchanged.
+                    let module_name = self
+                        .arch_imports
+                        .get(tyname)
+                        .copied()
+                        .unwrap_or(tyname.as_str());
                     if let Some(ty) =
-                        modules::check_builtin_module_call(self, tyname, name, args, span)
+                        modules::check_builtin_module_call(self, module_name, name, args, span)
                     {
                         return ty;
                     }

@@ -532,3 +532,86 @@ fn missing_dependency_module_reports() {
         load_program_with(&p.entry("proj/main.zap"), &target(), vec![p.path("pkg")]).unwrap_err();
     assert!(err.iter().any(|d| d.code == ErrorCode::ZAP3010));
 }
+
+// --- arch.* off-target import gating (I#139 Tier 2, #962, D-0199) ----------
+
+fn target_arch(arch: CfgArch) -> Target {
+    Target::new(Some(arch), Some(zapc_syntax::ast::CfgOs::Linux))
+}
+
+#[test]
+fn arch_x86_64_import_rejected_off_target() {
+    // `import arch.x86_64` on an aarch64 build is a hard error (ZAP3019): the
+    // honest "no silent fallback" contract (D-0079 rule 0.3).
+    let p = Project::new("archx86off");
+    p.write(
+        "src/main.zap",
+        "import arch.x86_64 as x86\n\ndef main():\n    print(1)\n",
+    );
+    let err = load_program(&p.entry("src/main.zap"), &target_arch(CfgArch::Aarch64)).unwrap_err();
+    assert!(
+        err.iter().any(|d| d.code == ErrorCode::ZAP3019),
+        "expected ZAP3019 off-target arch import, got {err:?}"
+    );
+}
+
+#[test]
+fn arch_aarch64_import_rejected_off_target() {
+    let p = Project::new("archarmoff");
+    p.write(
+        "src/main.zap",
+        "import arch.aarch64 as a\n\ndef main():\n    print(1)\n",
+    );
+    let err = load_program(&p.entry("src/main.zap"), &target_arch(CfgArch::X86_64)).unwrap_err();
+    assert!(
+        err.iter().any(|d| d.code == ErrorCode::ZAP3019),
+        "expected ZAP3019 off-target arch import, got {err:?}"
+    );
+}
+
+#[test]
+fn arch_x86_64_import_ok_on_target() {
+    // On an x86-64 build the import links cleanly (it is a built-in: no file,
+    // no diagnostic). The call is left for sema/lowering to resolve.
+    let p = Project::new("archx86on");
+    p.write(
+        "src/main.zap",
+        "import arch.x86_64 as x86\n\ndef main():\n    print(1)\n",
+    );
+    let m = load_program(&p.entry("src/main.zap"), &target_arch(CfgArch::X86_64)).expect("links");
+    assert!(fn_names(&m).contains(&"main".to_string()));
+}
+
+#[test]
+fn arch_aarch64_import_ok_on_target() {
+    let p = Project::new("archarmon");
+    p.write(
+        "src/main.zap",
+        "import arch.aarch64 as a\n\ndef main():\n    print(1)\n",
+    );
+    let m = load_program(&p.entry("src/main.zap"), &target_arch(CfgArch::Aarch64)).expect("links");
+    assert!(fn_names(&m).contains(&"main".to_string()));
+}
+
+#[test]
+fn arch_import_guarded_by_cfg_compiles_on_both_targets() {
+    // The intended portable pattern: a `when target.arch` guard keeps only the
+    // matching arm, so one source carries both arch paths and the off-target
+    // `import` is removed before it can error.
+    let src = "\
+when target.arch == .x86_64:
+    import arch.x86_64 as a
+elif target.arch == .aarch64:
+    import arch.aarch64 as a
+
+def main():
+    print(1)
+";
+    let p = Project::new("archcfg");
+    p.write("src/main.zap", src);
+    for arch in [CfgArch::X86_64, CfgArch::Aarch64] {
+        let m = load_program(&p.entry("src/main.zap"), &target_arch(arch))
+            .unwrap_or_else(|e| panic!("cfg-guarded arch import should link for {arch:?}: {e:?}"));
+        assert!(fn_names(&m).contains(&"main".to_string()));
+    }
+}

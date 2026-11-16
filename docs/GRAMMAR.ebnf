@@ -262,7 +262,14 @@ import_item   ::= dotted_name [ "as" IDENT ] ;
                      `a.b` -> <src>/a/b.zap; a stdlib name is left to the
                      built-in handling (I#283/D-0081). The bound name is the
                      alias, else the path's last segment. Members are accessed
-                     qualified (`a.item`); there is no `from a import item`. *)
+                     qualified (`a.item`); there is no `from a import item`.
+                     No new syntax for the architecture-specific intrinsics
+                     modules (I#139 Tier 2, #962, D-0199): `import arch.x86_64 as
+                     x86` is an ordinary dotted stdlib import; `x86.crc32c_u64(..)`
+                     an ordinary qualified call. Such an import is a compile error
+                     (ZAP3019) when the build does not target that architecture —
+                     there is no silent fallback (D-0079) — so it is normally
+                     written inside a `when target.arch == .x86_64:` cfg arm. *)
 
 (* ---------- Types ---------- *)
 

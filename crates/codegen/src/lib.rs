@@ -731,6 +731,12 @@ const CPU_FEATURES_H: &str = include_str!("zap_cpu_features.h");
 /// first multiversioned kernel: hand-written clones (scalar/SSE2/AVX2/NEON) +
 /// pointer-once-init dispatch reading `cpu_features`.
 const RUNTIME_MEMCHR_C: &str = include_str!("zapmemchr.inc.c");
+/// The `arch.x86_64` / `arch.aarch64` intrinsic shims (`crc32c_*`, `popcount_*`,
+/// `prefetch`) and the portable `hash.crc32c` wrapper (#962, epic #139, D-0199),
+/// `#include`d by `zaprt.c` after `zapcpu.inc.c`. Each arch shim carries the
+/// `target(...)` attribute its hardware instruction needs; `hash.crc32c` is a
+/// bit-identical software CRC32C (Castagnoli).
+const RUNTIME_ARCH_C: &str = include_str!("zaparch.inc.c");
 /// The SIMD sort accelerator dispatch seam (#933, epic #139, D-0195),
 /// `#include`d by `zaprt.c` after `zapcpu.inc.c`. Always compiled; its entry
 /// points fall through to the own floor unless `-DZAP_HAVE_SIMDSORT` and a
@@ -1120,6 +1126,8 @@ pub fn build_executable(
         .map_err(|e| format!("failed to write cpu-features header: {e}"))?;
     std::fs::write(build_dir.join("zapmemchr.inc.c"), RUNTIME_MEMCHR_C)
         .map_err(|e| format!("failed to write memchr runtime: {e}"))?;
+    std::fs::write(build_dir.join("zaparch.inc.c"), RUNTIME_ARCH_C)
+        .map_err(|e| format!("failed to write arch-intrinsics runtime: {e}"))?;
     std::fs::write(build_dir.join("zapcpu.inc.c"), RUNTIME_CPU_C)
         .map_err(|e| format!("failed to write cpu-features runtime: {e}"))?;
     std::fs::write(build_dir.join("zapsortaccel.inc.c"), RUNTIME_SORTACCEL_C)

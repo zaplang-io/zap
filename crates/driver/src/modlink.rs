@@ -32,7 +32,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use zapc_diag::ErrorCode;
-use zapc_syntax::ast::{Expr, Import, Item, Module, Stmt};
+use zapc_syntax::ast::{CfgArch, Expr, Import, Item, Module, Stmt};
 use zapc_syntax::cfg::Target;
 use zapc_syntax::span::Span;
 
@@ -203,6 +203,39 @@ impl<'t> Loader<'t> {
         file: &str,
     ) -> Option<(PathBuf, Option<PathBuf>)> {
         let first = path.split('.').next().unwrap_or(path);
+        // (0) architecture-gated `arch.*` intrinsics module (I#139 Tier 2,
+        // D-0199): a built-in that compiles ONLY into a build whose target is
+        // that architecture — D-0079's "no silent fallback" rule. Importing it
+        // off-target is a hard error (ZAP3019). It is still a built-in (returns
+        // `None`, no file), so after the diagnostic the import links no module;
+        // the right way to carry both arches in one source is a `when target.*`
+        // cfg guard, which resolves (and removes) the dead arm before this runs.
+        if let Some(want) = zapc_syntax::arch::arch_submodule(path) {
+            if self.target.arch != Some(want) {
+                let arch_disp = |a: Option<CfgArch>| match a {
+                    Some(CfgArch::X86_64) => "x86-64",
+                    Some(CfgArch::Aarch64) => "aarch64",
+                    None => "another architecture",
+                };
+                self.diag(
+                    ErrorCode::ZAP3019,
+                    format!(
+                        "cannot `import {path}`: it compiles only when the build targets \
+                         {}, but this build targets {}. Guard it with `when target.arch == \
+                         .{}:` (there is no silent fallback).",
+                        arch_disp(Some(want)),
+                        arch_disp(self.target.arch),
+                        match want {
+                            CfgArch::X86_64 => "x86_64",
+                            CfgArch::Aarch64 => "aarch64",
+                        },
+                    ),
+                    span,
+                    file,
+                );
+            }
+            return None;
+        }
         // (1) stdlib — left to the built-in handling.
         if zapc_sema::is_builtin_module(first) {
             return None;

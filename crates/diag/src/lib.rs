@@ -355,6 +355,15 @@ define_codes! {
          (`T a = ...`). Only single-name module-level declarations are admitted \
          at module scope: `const T NAME = expr` (immutable, #658) and \
          `T NAME = expr` (mutable, #662).";
+    ZAP3019 = 3019 : "architecture-specific module imported for the wrong target",
+        "An `arch.x86_64` / `arch.aarch64` intrinsics module (I#139 Tier 2, \
+         D-0199) compiles only into a build whose target is that architecture — \
+         there is no silent software fallback (D-0079 rule 0.3). Importing it on \
+         another target is a hard error. Guard the import with compile-time \
+         conditional compilation so one source carries both paths, e.g. \
+         `when target.arch == .x86_64:` / `elif target.arch == .aarch64:` / \
+         `else:`, or stay on the portable layer (`std.hash.crc32c`, the \
+         numeric-array SIMD types).";
 
     // ---- ZAP4xxx — type checking -------------------------------------------
     ZAP4001 = 4001 : "type mismatch in assignment",

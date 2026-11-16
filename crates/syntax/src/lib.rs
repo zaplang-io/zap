@@ -5,6 +5,7 @@
 //! these lets the lexer, parser and type-checker be built independently
 //! (see `ROADMAP.md`). No lexing or parsing *logic* lives here yet.
 
+pub mod arch;
 pub mod ast;
 pub mod cfg;
 pub mod fstring;
