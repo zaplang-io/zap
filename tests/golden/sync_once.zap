@@ -6,15 +6,15 @@
 # always exactly 1, however the scheduler interleaves the workers — so the
 # output is deterministic. A WaitGroup joins the workers before the count is
 # read.
-def worker(bytes o, bytes d, bytes wg):
+def worker(bytes o, deque[int64] d, bytes wg):
     if sync.once_begin(o):
-        deque.append(d, 1)
+        d.append(1)
         sync.once_end(o)
     sync.done(wg)
 
 def main():
     auto o = sync.once()
-    auto d = deque.new()
+    auto d = deque[int64]()
     auto wg = sync.waitgroup()
     auto n = 8
     auto k = 0
@@ -23,4 +23,4 @@ def main():
         spawn worker(o, d, wg)
         k = k + 1
     sync.wait(wg)
-    print(deque.len(d))
+    print(len(d))

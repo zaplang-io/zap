@@ -8,18 +8,18 @@
 # deterministic while still proving the lock and the join both work (a dropped
 # lock would corrupt the deque and change the count; a broken wait would print
 # before the workers finished).
-def worker(bytes mu, bytes d, bytes wg, int64 iters):
+def worker(bytes mu, deque[int64] d, bytes wg, int64 iters):
     auto i = 0
     while i < iters:
         sync.lock(mu)
-        deque.append(d, 1)
+        d.append(1)
         sync.unlock(mu)
         i = i + 1
     sync.done(wg)
 
 def main():
     auto mu = sync.mutex()
-    auto d = deque.new()
+    auto d = deque[int64]()
     auto wg = sync.waitgroup()
     auto n = 4
     auto iters = 1000
@@ -29,4 +29,4 @@ def main():
         spawn worker(mu, d, wg, iters)
         k = k + 1
     sync.wait(wg)
-    print(deque.len(d))
+    print(len(d))

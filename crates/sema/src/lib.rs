@@ -785,7 +785,10 @@ fn is_f32_name(n: &str) -> bool {
 /// bites. `array` is deliberately absent — a dense numeric `array` carries its
 /// own dtype slots (incl. `f32`), so it is not gated here.
 fn is_f32_gap_container(n: &str) -> bool {
-    matches!(n, "list" | "heap" | "channel" | "dict" | "set")
+    matches!(
+        n,
+        "list" | "heap" | "channel" | "dict" | "set" | "deque" | "oset"
+    )
 }
 /// The honest diagnostic text for the remaining collection-element
 /// representation gaps (D-0139/#807): `f32`/`float32`, and `bigint`/`complex`.
@@ -934,8 +937,8 @@ impl Checker {
             match ty {
                 Ty::Bigint => pos != Pos::Free,
                 Ty::Complex => pos == Pos::Key,
-                Ty::List(elem) | Ty::Chan(elem) => bad(elem, Pos::Value),
-                Ty::Set(elem) | Ty::Heap(elem) => bad(elem, Pos::Key),
+                Ty::List(elem) | Ty::Chan(elem) | Ty::Deque(elem) => bad(elem, Pos::Value),
+                Ty::Set(elem) | Ty::Heap(elem) | Ty::OSet(elem) => bad(elem, Pos::Key),
                 Ty::Dict(key, value) => bad(key, Pos::Key) || bad(value, Pos::Value),
                 Ty::Tuple(elems) => {
                     let p = if pos == Pos::Free {
@@ -970,9 +973,12 @@ impl Checker {
     fn check_float_container_value(&mut self, ty: &Ty, span: Span) {
         fn unsupported(ty: &Ty) -> bool {
             match ty {
-                Ty::List(t) | Ty::Heap(t) | Ty::Chan(t) | Ty::Set(t) => {
-                    matches!(**t, Ty::Float32) || unsupported(t)
-                }
+                Ty::List(t)
+                | Ty::Heap(t)
+                | Ty::Chan(t)
+                | Ty::Set(t)
+                | Ty::Deque(t)
+                | Ty::OSet(t) => matches!(**t, Ty::Float32) || unsupported(t),
                 Ty::Dict(k, v) => {
                     matches!(**k, Ty::Float32)
                         || matches!(**v, Ty::Float32)
@@ -2673,6 +2679,20 @@ impl Checker {
                         .map(|a| self.resolve_type(a))
                         .unwrap_or(Ty::Unknown);
                     Ty::Heap(Box::new(el))
+                }
+                "deque" => {
+                    let el = args
+                        .first()
+                        .map(|a| self.resolve_type(a))
+                        .unwrap_or(Ty::Unknown);
+                    Ty::Deque(Box::new(el))
+                }
+                "oset" => {
+                    let el = args
+                        .first()
+                        .map(|a| self.resolve_type(a))
+                        .unwrap_or(Ty::Unknown);
+                    Ty::OSet(Box::new(el))
                 }
                 "channel" => {
                     let el = args
@@ -5236,6 +5256,8 @@ impl Checker {
                 }
                 match b {
                     Ty::List(t) => *t,
+                    // `deque[T]` supports `d[i]` (left-indexed), yielding `T`.
+                    Ty::Deque(t) => *t,
                     Ty::Dict(_, v) => *v,
                     Ty::Str => Ty::Char,
                     // `bytes` indexing yields the byte value as an `int64`
@@ -5677,7 +5699,9 @@ impl Checker {
     fn iterable_elem(&self, it: &Ty) -> Option<Ty> {
         match it {
             Ty::Range => Some(Ty::Int64),
-            Ty::List(t) | Ty::Set(t) | Ty::Heap(t) => Some((**t).clone()),
+            Ty::List(t) | Ty::Set(t) | Ty::Heap(t) | Ty::Deque(t) | Ty::OSet(t) => {
+                Some((**t).clone())
+            }
             // Iterating a dict yields its keys (Python semantics, ticket #299);
             // `for k, v` uses `d.items()`. Order is unspecified (hash order).
             Ty::Dict(k, _) => Some((**k).clone()),
@@ -5980,6 +6004,7 @@ impl Checker {
         match t {
             Ty::Unknown | Ty::Py => true,
             Ty::List(_) | Ty::Dict(_, _) | Ty::Set(_) | Ty::Heap(_) | Ty::Chan(_) => true,
+            Ty::Deque(_) | Ty::OSet(_) => true,
             Ty::AtomicArray(_) => true,
             _ if Self::is_optional_ty(t) => true,
             Ty::Named(n) => self.structs.get(n).is_some_and(|s| !s.is_value),
@@ -6426,6 +6451,81 @@ impl Checker {
                     }
                 }
                 return Ty::Heap(Box::new(elem));
+            }
+            // Deque construction `deque[T]()` / `deque[T](maxlen=n)` (#983). The
+            // element type `T` is the subscript; the only accepted argument is the
+            // keyword `maxlen`, an integer bound (Python `collections.deque`).
+            if matches!(base.as_ref(), Expr::Name(n, _) if n == "deque") {
+                let elem = self.chan_elem_from_expr(index);
+                for a in args {
+                    let at = self.infer(&a.value);
+                    match a.name.as_deref() {
+                        Some("maxlen") => {
+                            if !matches!(at, Ty::Int64 | Ty::UntypedInt | Ty::Unknown) {
+                                self.error(
+                                    ErrorCode::ZAP5101,
+                                    format!(
+                                        "deque[T](maxlen=...) bound must be an integer, found {}",
+                                        at.display()
+                                    ),
+                                    expr_span(&a.value),
+                                );
+                            }
+                        }
+                        Some(other) => self.error(
+                            ErrorCode::ZAP5102,
+                            format!(
+                                "deque[T](...) has no keyword argument '{other}' (only 'maxlen')"
+                            ),
+                            expr_span(&a.value),
+                        ),
+                        None => self.error(
+                            ErrorCode::ZAP5103,
+                            "deque[T](...) takes only the keyword argument 'maxlen' \
+                             (e.g. maxlen=8)"
+                                .to_string(),
+                            expr_span(&a.value),
+                        ),
+                    }
+                }
+                let ty = Ty::Deque(Box::new(elem));
+                self.check_numeric_container_value(&ty, span);
+                return ty;
+            }
+            // Ordered-set construction `oset[T]()` / `oset[T](iterable)` (#983):
+            // an insertion-ordered set, mirroring `set[T]()` but preserving first-
+            // add order on iteration. The element must be `Hashable`.
+            if matches!(base.as_ref(), Expr::Name(n, _) if n == "oset") {
+                let elem = self.chan_elem_from_expr(index);
+                // v1 supports `i64` and `str` elements; a float element (though
+                // `Hashable` under D-0139/#803) and struct elements are a
+                // documented follow-up, so reject a float element cleanly here
+                // rather than mis-tagging it as a pointer word at lowering.
+                if matches!(elem, Ty::Float64 | Ty::Float32 | Ty::UntypedFloat) {
+                    self.error(
+                        ErrorCode::ZAP4024,
+                        "oset does not support a float element yet (use int64 or str); \
+                         this is a documented follow-up"
+                            .to_string(),
+                        span,
+                    );
+                }
+                match args.len() {
+                    0 => {}
+                    1 if args[0].name.is_none() => {
+                        let at = self.infer(&args[0].value);
+                        self.iter_element(&at, expr_span(&args[0].value));
+                    }
+                    _ => self.error(
+                        ErrorCode::ZAP4025,
+                        "oset[T](...) takes at most one positional iterable argument".to_string(),
+                        span,
+                    ),
+                }
+                self.warn_struct_key(&elem, span);
+                let ty = Ty::OSet(Box::new(elem));
+                self.check_numeric_container_value(&ty, span);
+                return ty;
             }
             // Set construction `set[T]()` / `set[T](iterable)` (D17, #609). The
             // element type `T` is the subscript; with no argument it builds an
@@ -7344,6 +7444,17 @@ impl Checker {
                 let elem = (**elem).clone();
                 return self.check_atomicarray_method(name, args, &elem, *span);
             }
+            // Built-in `deque[T]` methods (#983): append/appendleft/pop/popleft/
+            // get/clear, typed precisely (pop/get yield `T`).
+            if let Ty::Deque(elem) = &bt {
+                let elem = (**elem).clone();
+                return self.check_deque_method(name, args, &elem, *span);
+            }
+            // Built-in `oset[T]` methods (#983): add/contains/get, typed precisely.
+            if let Ty::OSet(elem) = &bt {
+                let elem = (**elem).clone();
+                return self.check_oset_method(name, args, &elem, *span);
+            }
             // A method call on a user struct `recv.method(args)` is typed by the
             // method's declared return type (D-0009). The struct's method table
             // already carries the resolved signature, with `self`/`Self` bound to
@@ -7770,6 +7881,168 @@ impl Checker {
                         "AtomicArray has no method '{other}' (supported: load, store, \
                          compare_and_swap, len)"
                     ),
+                    span,
+                );
+                Ty::Unknown
+            }
+        }
+    }
+
+    /// Built-in `deque[T]` methods (#983):
+    ///   `append(x)` / `appendleft(x)`  (-> unit; x assignable to T)
+    ///   `pop()` / `popleft()`          (-> T)
+    ///   `get(i)`                       (-> T; left-indexed, like `d[i]`)
+    ///   `clear()`                      (-> unit)
+    /// Iteration (`for x in d`), `len(d)`, and `d[i]` are handled on the general
+    /// paths; `maxlen` is set at construction.
+    fn check_deque_method(&mut self, name: &str, args: &[Arg], elem: &Ty, span: Span) -> Ty {
+        let check_val = |s: &mut Self, a: &Arg| {
+            let vt = s.infer(&a.value);
+            if !assignable(&vt, elem) && !matches!(vt, Ty::Unknown) {
+                s.error(
+                    ErrorCode::ZAP4024,
+                    format!(
+                        "deque[{}] element has type {}",
+                        elem.display(),
+                        vt.display()
+                    ),
+                    expr_span(&a.value),
+                );
+            }
+        };
+        let check_index = |s: &mut Self, a: &Arg| {
+            let at = s.infer(&a.value);
+            if !at.is_int() && !matches!(at, Ty::Unknown) {
+                s.error(
+                    ErrorCode::ZAP4025,
+                    format!("deque index must be an integer, found {}", at.display()),
+                    expr_span(&a.value),
+                );
+            }
+        };
+        match name {
+            "append" | "appendleft" => {
+                if args.len() != 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!("deque.{name}(x) takes one argument, got {}", args.len()),
+                        span,
+                    );
+                } else {
+                    check_val(self, &args[0]);
+                }
+                Ty::Unit
+            }
+            "pop" | "popleft" => {
+                if !args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!("deque.{name}() takes no arguments"),
+                        span,
+                    );
+                }
+                elem.clone()
+            }
+            "get" => {
+                if args.len() != 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!("deque.get(i) takes one argument, got {}", args.len()),
+                        span,
+                    );
+                } else {
+                    check_index(self, &args[0]);
+                }
+                elem.clone()
+            }
+            "clear" => {
+                if !args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "deque.clear() takes no arguments".to_string(),
+                        span,
+                    );
+                }
+                Ty::Unit
+            }
+            other => {
+                self.error(
+                    ErrorCode::ZAP4080,
+                    format!(
+                        "deque has no method '{other}' (supported: append, appendleft, \
+                         pop, popleft, get, clear)"
+                    ),
+                    span,
+                );
+                Ty::Unknown
+            }
+        }
+    }
+
+    /// Built-in `oset[T]` methods (#983):
+    ///   `add(x)`        (-> unit; x assignable to T)
+    ///   `contains(x)`   (-> bool; `x in s` is the idiomatic form)
+    ///   `get(i)`        (-> T; element at insertion-order position i)
+    /// Iteration (`for x in s`), `len(s)`, and `x in s` are on the general paths.
+    fn check_oset_method(&mut self, name: &str, args: &[Arg], elem: &Ty, span: Span) -> Ty {
+        let check_val = |s: &mut Self, a: &Arg| {
+            let vt = s.infer(&a.value);
+            if !assignable(&vt, elem) && !matches!(vt, Ty::Unknown) {
+                s.error(
+                    ErrorCode::ZAP4024,
+                    format!("oset[{}] element has type {}", elem.display(), vt.display()),
+                    expr_span(&a.value),
+                );
+            }
+        };
+        match name {
+            "add" => {
+                if args.len() != 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!("oset.add(x) takes one argument, got {}", args.len()),
+                        span,
+                    );
+                } else {
+                    check_val(self, &args[0]);
+                }
+                Ty::Unit
+            }
+            "contains" => {
+                if args.len() != 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!("oset.contains(x) takes one argument, got {}", args.len()),
+                        span,
+                    );
+                } else {
+                    check_val(self, &args[0]);
+                }
+                Ty::Bool
+            }
+            "get" => {
+                if args.len() != 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!("oset.get(i) takes one argument, got {}", args.len()),
+                        span,
+                    );
+                } else {
+                    let at = self.infer(&args[0].value);
+                    if !at.is_int() && !matches!(at, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!("oset index must be an integer, found {}", at.display()),
+                            expr_span(&args[0].value),
+                        );
+                    }
+                }
+                elem.clone()
+            }
+            other => {
+                self.error(
+                    ErrorCode::ZAP4080,
+                    format!("oset has no method '{other}' (supported: add, contains, get)"),
                     span,
                 );
                 Ty::Unknown

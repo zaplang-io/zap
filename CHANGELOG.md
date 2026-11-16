@@ -25,6 +25,16 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`deque[T]` / `oset[T]` are real generic collection types** (#983, D-0208).
+  The `deque` (double-ended queue, optional `maxlen`) and `oset` (insertion-
+  ordered set) collections — previously `int64`-only opaque seam-module handles —
+  are re-skinned as first-class built-in generic collections alongside
+  `list`/`set`/`heap`, so `deque[str]`, an ordered set of strings, and iteration
+  (`for x in d`) now work. `deque[T]` admits any `int64`/`str`/`float64` element;
+  `oset[T]` any `Hashable` `int64`/`str`. `bisect` is generalized from
+  `list[int64]` to any `Comparable` list (`str`, `float64`, …). The old
+  `deque.*` / `oset.*` module-function API is removed (pre-1.0, no alias);
+  struct/tuple and float-`oset` elements are a documented follow-up.
 - **The `select` statement** (#1002, D-0205). CSP channel multiplexing:
   `select:` waits on several channel `case`s and proceeds with the first ready,
   choosing uniformly at random among ties; an optional `default:` makes it a

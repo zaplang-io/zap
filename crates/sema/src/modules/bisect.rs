@@ -1,26 +1,39 @@
-//! `bisect` module — sema facet (ticket #102, D-0056).
+//! `bisect` module — sema facet (ticket #102, generalized #983).
 //!
-//! Binary search and sorted insertion over an existing `list[int64]` (Python
+//! Binary search and sorted insertion over an existing sorted `list[T]` (Python
 //! `bisect`). `bisect_left`/`bisect_right` return the insertion point;
 //! `insort_left`/`insort_right` insert in place keeping the list sorted. The
-//! list argument must be a `list` whose elements compare as `int64` for v1
-//! (other element types are a documented follow-up); the value argument is an
-//! integer. The caller is responsible for the list being sorted.
+//! list argument must be a `list[T]` whose element type `T` is `Comparable`
+//! (integer, float64, str, or char — the orderable primitives the runtime
+//! compares); the value argument must be assignable to `T`. The caller is
+//! responsible for the list being sorted.
 
 use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
 
 use super::ModuleCheck;
-use crate::{expr_span, Checker, Ty};
+use crate::{assignable, expr_span, Checker, Ty};
 
 pub(super) const MODULE: ModuleCheck = ModuleCheck {
     name: "bisect",
     check,
 };
 
-/// Check the shared `(xs: list, x: int)` signature: arg0 is a `list`, arg1 an
-/// integer. Both argument expressions are inferred so they are still checked.
+/// Whether `t` is an element type `bisect` can order at runtime (the orderable
+/// primitives: any integer width, `float64`, `str`, `char`). `Unknown` is
+/// permissive so inference gaps do not cascade.
+fn is_bisect_comparable(t: &Ty) -> bool {
+    t.is_int()
+        || matches!(
+            t,
+            Ty::Float64 | Ty::UntypedFloat | Ty::Str | Ty::Char | Ty::Unknown
+        )
+}
+
+/// Check the shared `(xs: list[T], x: T)` signature: arg0 is a `list` whose
+/// element is `Comparable`, arg1 a value assignable to that element. Both
+/// argument expressions are inferred so they are still checked.
 fn check_list_and_value(checker: &mut Checker, method: &str, args: &[Arg], span: Span) {
     if args.len() != 2 {
         checker.error(
@@ -37,17 +50,41 @@ fn check_list_and_value(checker: &mut Checker, method: &str, args: &[Arg], span:
         return;
     }
     let t = checker.infer(&args[0].value);
-    if !matches!(t, Ty::List(_)) {
-        checker.error(
+    let vt = checker.infer(&args[1].value);
+    match &t {
+        Ty::List(elem) => {
+            if !is_bisect_comparable(elem) {
+                checker.error(
+                    ErrorCode::ZAP4024,
+                    format!(
+                        "bisect.{method}() needs a list of a comparable element \
+                         (integer, float64, str, or char), found list[{}]",
+                        elem.display()
+                    ),
+                    expr_span(&args[0].value),
+                );
+            } else if !assignable(&vt, elem) && !matches!(vt, Ty::Unknown) {
+                checker.error(
+                    ErrorCode::ZAP4024,
+                    format!(
+                        "bisect.{method}() value has type {} but the list holds {}",
+                        vt.display(),
+                        elem.display()
+                    ),
+                    expr_span(&args[1].value),
+                );
+            }
+        }
+        Ty::Unknown => {}
+        _ => checker.error(
             ErrorCode::ZAP4024,
             format!(
                 "bisect.{method}() expects a list argument, found {}",
                 t.display()
             ),
             expr_span(&args[0].value),
-        );
+        ),
     }
-    checker.infer(&args[1].value);
 }
 
 fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Option<Ty> {

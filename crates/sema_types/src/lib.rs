@@ -60,6 +60,13 @@ pub enum Ty {
     /// an optional `cmp=` selecting max/custom ordering. A GC-managed reference
     /// type, joining `list`/`dict`/`set`/`array`.
     Heap(Box<Ty>),
+    /// A built-in `deque[T]` double-ended queue (#983, D-0208): O(1) push/pop at
+    /// both ends with an optional bounded `maxlen`. A GC-managed reference type
+    /// like `list`; any storable element (no capability bound).
+    Deque(Box<Ty>),
+    /// A built-in `oset[T]` insertion-ordered set (#983, D-0208): membership like
+    /// `set` (element must be `Hashable`) but iteration follows first-add order.
+    OSet(Box<Ty>),
     /// A fixed-arity, heterogeneous, immutable tuple (D-0019/D-0049) carrying its
     /// element types in positional order. The empty tuple `()` is the unit value.
     Tuple(Vec<Ty>),
@@ -179,6 +186,8 @@ impl Ty {
             Ty::Dict(k, v) => format!("dict[{}, {}]", k.display(), v.display()),
             Ty::Set(t) => format!("set[{}]", t.display()),
             Ty::Heap(t) => format!("heap[{}]", t.display()),
+            Ty::Deque(t) => format!("deque[{}]", t.display()),
+            Ty::OSet(t) => format!("oset[{}]", t.display()),
             Ty::Tuple(ts) => {
                 let inner = ts
                     .iter()
@@ -249,6 +258,8 @@ pub fn assignable(from: &Ty, to: &Ty) -> bool {
         (Ty::List(a), Ty::List(b)) => assignable(a, b),
         (Ty::Set(a), Ty::Set(b)) => assignable(a, b),
         (Ty::Heap(a), Ty::Heap(b)) => assignable(a, b),
+        (Ty::Deque(a), Ty::Deque(b)) => assignable(a, b),
+        (Ty::OSet(a), Ty::OSet(b)) => assignable(a, b),
         (Ty::AtomicArray(a), Ty::AtomicArray(b)) => assignable(a, b),
         (Ty::Dict(ak, av), Ty::Dict(bk, bv)) => assignable(ak, bk) && assignable(av, bv),
         // A tuple is assignable to a tuple of the same arity when each element is
