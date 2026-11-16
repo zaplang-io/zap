@@ -3397,6 +3397,16 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_chan_send_f64", &[p.into(), f64t.into()], None);
         self.declare_rt("zap_chan_recv_f64", &[p.into()], Some(f64t.into()));
         self.declare_rt("zap_chan_close", &[p.into()], None);
+        // `select` (D-0031, #1002): variadic. Fixed: (uint64* outval, int64* outok,
+        // int64 n, int64 has_default); then n per-case triples (void* ch, int64
+        // dir, <value>) passed at each call site (fixed arity per site), so a
+        // pointer send value is a direct pointer argument and stays rooted across
+        // the park. Returns the chosen case index, or -1 for `default`.
+        {
+            let sel_ty = i.fn_type(&[p.into(), p.into(), i.into(), i.into()], true);
+            let fv = self.module.add_function("zap_select", sel_ty, None);
+            self.fns.insert("zap_select".to_string(), fv);
+        }
 
         // Precise GC (ticket #48): allocation that carries a type descriptor, a
         // safepoint poll, and the per-thread shadow-stack head. Declared on both

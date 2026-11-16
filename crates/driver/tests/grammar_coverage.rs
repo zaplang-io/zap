@@ -12,8 +12,8 @@
 //!      so "the grammar says X is legal" was never mechanically tied to "the
 //!      compiler accepts X".
 //!   2. **Parser-only.** `grammar.rs` stops at lex+parse. A construct can parse
-//!      yet be rejected by sema or fail AST→ZIR lowering (e.g. `select`), and
-//!      nothing noticed.
+//!      yet be rejected by sema or fail AST→ZIR lowering, and nothing noticed
+//!      (the `select` statement was exactly this gap until #1002).
 //!
 //! This gate closes both. For **every** nonterminal reachable from the `module`
 //! start symbol it requires exactly one of:
@@ -192,13 +192,9 @@ const fn cov(production: &'static str, status: Status, src: &'static str) -> Cov
 /// (checked by [`tracked_gaps_are_documented`]).
 #[rustfmt::skip]
 const GAP_NOTES: &[(&str, &str)] = &[
-    ("select_stmt",
-     "EBNF-ahead-of-parser: `select`/`select_case`/`select_op` (D-0031) are fully \
-      specified and reachable, but the hand-written parser has no `select` dispatch \
-      arm and no `Stmt::Select` AST node (channel send `ch <- v` / receive `<-ch` do \
-      parse). Mirrors the KNOWN_DIVERGENCES entry in crates/syntax/tests/grammar.rs."),
-    ("select_case", "see select_stmt — same unimplemented `select` statement."),
-    ("select_op",   "see select_stmt — same unimplemented `select` statement."),
+    // None. The `select` statement (D-0031) — the last tracked gap — now parses,
+    // type-checks and lowers end-to-end (#1002), so `select_stmt`/`select_case`/
+    // `select_op` moved to `Compiles` above.
 ];
 
 /// One entry per nonterminal reachable from `module`. The example is a complete,
@@ -519,7 +515,7 @@ else:
     def f():
         pass
 "#),
-    cov("select_stmt",       TrackedGap, r#"def f():
+    cov("select_stmt",       Compiles  , r#"def f():
     auto ch = channel[int64]()
     select:
         case v = <-ch:
@@ -527,7 +523,7 @@ else:
         default:
             pass
 "#),
-    cov("select_case",       TrackedGap, r#"def f():
+    cov("select_case",       Compiles  , r#"def f():
     auto ch = channel[int64]()
     select:
         case v = <-ch:
@@ -535,7 +531,7 @@ else:
         default:
             pass
 "#),
-    cov("select_op",         TrackedGap, r#"def f():
+    cov("select_op",         Compiles  , r#"def f():
     auto ch = channel[int64]()
     select:
         case v = <-ch:
