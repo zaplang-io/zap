@@ -736,6 +736,12 @@ impl Mono<'_> {
     fn apply_subst(&self, t: &Type) -> Type {
         match t {
             Type::Named { name, args, span } => {
+                // A module-qualified seam generic `concurrent.Queue[T]` is the
+                // bare prelude `Queue[T]` (I#996, D-0202): normalize the dotted
+                // head so inference (unifying a bare `Queue[T]` function return
+                // against this annotated sink) and the later generic-instance
+                // renaming both key on the bare prelude name.
+                let name = zapc_syntax::seam::seam_generic_bare_type(name).unwrap_or(name.as_str());
                 if args.is_empty() {
                     if let Some(concrete) = self.cur_subst.get(name) {
                         return concrete.clone();
@@ -748,7 +754,7 @@ impl Mono<'_> {
                     return self.apply_subst(&expanded);
                 }
                 Type::Named {
-                    name: name.clone(),
+                    name: name.to_string(),
                     args: rargs,
                     span: *span,
                 }
@@ -2729,6 +2735,15 @@ impl Mono<'_> {
         env: &mut Env,
         expected: Option<&Type>,
     ) -> Result<(Expr, CTy), LowerError> {
+        // Module-qualified construction of a seam-exposed prelude generic —
+        // `concurrent.Queue[T](...)` / `concurrent.Queue(...)` — is sugar for the
+        // bare prelude constructor `new_queue[T](...)` / `new_queue(...)` (I#996,
+        // D-0202). Desugar the callee up front so the existing bare-name generic
+        // paths below (explicit type args, or inference from `expected`) key on
+        // the constructor the monomorphizer already knows. The sema facet applies
+        // the twin rewrite on the type-check path.
+        let desugared = zapc_syntax::seam::desugar_seam_ctor_callee(callee);
+        let callee = desugared.as_ref().unwrap_or(callee);
         // Rewrite the arguments once; keep their inferred types for unification.
         let mut nargs = Vec::with_capacity(args.len());
         let mut argpairs = Vec::with_capacity(args.len());
@@ -4101,5 +4116,89 @@ mod tests {
         );
         assert_eq!(global_ty(&m, "g"), "Box$int64");
         assert!(struct_named(&m, "Box$int64").is_some());
+    }
+
+    // ---- module-qualified Queue construction (I#996, D-0202) --------------
+
+    /// Monomorphize a program that uses prelude seam types: inject the prelude
+    /// (as the lowering path does) before monomorphization, so `Queue[T]` /
+    /// `new_queue` are in scope.
+    fn mono_prelude(src: &str) -> Module {
+        let (module, perrs, lerrs) = parse_str(src);
+        assert!(perrs.is_empty(), "parse errors: {perrs:?}");
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        let module = zapc_syntax::parser::with_prelude(&module);
+        monomorphize(&module).expect("monomorphization succeeds")
+    }
+
+    #[test]
+    fn qualified_queue_explicit_desugars_to_new_queue_instance() {
+        // `concurrent.Queue[int64]()` monomorphizes to exactly the bare
+        // `new_queue[int64]()` specialization — proving the callee desugar routes
+        // through the existing bare-name machinery, which keys on `new_queue`.
+        let m = mono_prelude(
+            "import concurrent\ndef main():\n    \
+             Queue[int64] q = concurrent.Queue[int64]()\n    \
+             q.push(1)\n",
+        );
+        let names = fn_names(&m);
+        assert!(
+            names.iter().any(|n| n == "new_queue$int64"),
+            "expected a new_queue$int64 specialization, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn qualified_queue_inferred_desugars_to_new_queue_instance() {
+        // The arg-less dotted form infers T from the dotted annotation sink
+        // `concurrent.Queue[str]`, yielding the `new_queue$str` specialization.
+        let m = mono_prelude(
+            "import concurrent\ndef main():\n    \
+             concurrent.Queue[str] q = concurrent.Queue()\n    \
+             q.push(\"x\")\n",
+        );
+        let names = fn_names(&m);
+        assert!(
+            names.iter().any(|n| n == "new_queue$str"),
+            "expected a new_queue$str specialization, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn qualified_queue_distinct_element_types_monomorphize_distinctly() {
+        // Different element types produce distinct specializations, whether built
+        // via the dotted or the bare form — they must not collapse.
+        let m = mono_prelude(
+            "import concurrent\ndef main():\n    \
+             concurrent.Queue[int64] qi = concurrent.Queue[int64]()\n    \
+             concurrent.Queue[str] qs = concurrent.Queue()\n    \
+             Queue[bool] qb = new_queue[bool]()\n    \
+             qi.push(1)\n    \
+             qs.push(\"x\")\n    \
+             qb.push(True)\n",
+        );
+        let names = fn_names(&m);
+        for want in ["new_queue$int64", "new_queue$str", "new_queue$bool"] {
+            assert!(
+                names.iter().any(|n| n == want),
+                "expected a {want} specialization, got {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_new_queue_still_monomorphizes() {
+        // Back-compat: the bare form is byte-for-byte the same request the dotted
+        // form now produces.
+        let m = mono_prelude(
+            "def main():\n    \
+             Queue[int64] q = new_queue()\n    \
+             q.push(1)\n",
+        );
+        let names = fn_names(&m);
+        assert!(
+            names.iter().any(|n| n == "new_queue$int64"),
+            "expected a new_queue$int64 specialization, got {names:?}"
+        );
     }
 }

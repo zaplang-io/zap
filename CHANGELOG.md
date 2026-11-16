@@ -25,6 +25,14 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Module-qualified construction of the lock-free `Queue[T]`** (#996, D-0202).
+  The natural dotted spelling now works — `concurrent.Queue[int64] q =
+  concurrent.Queue[int64]()` (explicit T) and `concurrent.Queue[int64] q =
+  concurrent.Queue()` (T inferred from the annotation) — as pure front-end sugar
+  for the bare prelude `new_queue[T]()`, which keeps working unchanged. Distinct
+  element types still monomorphize distinctly; the monomorphizer continues to key
+  only on bare names (D-0078). No new grammar. Siblings `ConcurrentSet[K]` /
+  `ConcurrentStack[T]` are a documented follow-up pending a dotted-naming call.
 - **`@request_source` — framework-declared request-derived parameter injection**
   (#959, D-0198). Extends the reflection-driven handler adapter (D-0092): a
   top-level function marked `@request_source` is a request-derived parameter

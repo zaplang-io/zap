@@ -12,6 +12,7 @@ pub mod fstring;
 pub mod genanalysis;
 pub mod lexer;
 pub mod parser;
+pub mod seam;
 pub mod span;
 pub mod token;
 pub mod trivia;

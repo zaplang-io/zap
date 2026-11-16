@@ -9,17 +9,16 @@
 //!   `threading.Lock()` pattern: a module constructor over a compiler-known
 //!   prelude type.
 //! - the MPSC `Queue[T]` — an unbounded multi-producer / single-consumer
-//!   lock-free FIFO. Because `Queue[T]` is **generic**, it cannot ride a
-//!   module-qualified constructor (a module call carries no type argument and the
-//!   monomorphizer keys on bare names), so — like every other generic prelude
-//!   type (`Atomic[T]`, `Optional[T]`) — it is written **bare** and built with
-//!   the prelude free function `new_queue[T]()`, as either
-//!   `Queue[int64] q = new_queue()` (T inferred from the annotation) or
-//!   `Queue[str] q = new_queue[str]()` (explicit).
-//!   This keeps the whole surface within the existing grammar (no new syntax,
-//!   per D-0078) — the `concurrent.Queue[...]` dotted spelling in the design note
-//!   is illustrative; module-qualified *generic type paths* do not exist in the
-//!   grammar and adding them was explicitly out of scope.
+//!   lock-free FIFO. `Queue[T]` is **generic**; its underlying constructor is the
+//!   bare prelude free function `new_queue[T]()` (the monomorphizer keys on bare
+//!   names, D-0078), usable as `Queue[int64] q = new_queue()` (T from the
+//!   annotation) or `Queue[str] q = new_queue[str]()` (explicit). The natural
+//!   module-qualified spelling `concurrent.Queue[T]()` / `concurrent.Queue()`
+//!   also works (I#996, D-0202): it is pure front-end **sugar** that the sema +
+//!   mono facets rewrite to `new_queue` (see `zapc_syntax::seam`), so the
+//!   monomorphizer still keys only on the bare name. `Queue` therefore reaches
+//!   this check facet only as the bare prelude type; it needs no `"Queue"` arm
+//!   here (the module facet handles only the non-generic `Counter`).
 //!
 //! Reclamation leans entirely on the tracing moving Immix collector; the types
 //! are pure Zap over the `Atomic[T]` intrinsics and add **no** `zaprt.c` / `zapgc`

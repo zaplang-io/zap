@@ -281,9 +281,17 @@ import_item   ::= dotted_name [ "as" IDENT ] ;
 type          ::= named_type
                 | tuple_type
                 | func_type ;
-named_type    ::= type_name [ type_args ] ;   (* `list[int64]`, `dict[str, V]` *)
+named_type    ::= type_name [ type_args ] ;   (* `list[int64]`, `dict[str, V]`;
+                                                 a module-qualified *generic*
+                                                 seam type is also constructible
+                                                 through its module —
+                                                 `concurrent.Queue[T]()` sugar for
+                                                 `new_queue[T]()`, I#996/D-0202 *)
 type_name     ::= IDENT { "." IDENT }         (* `Point`, or module-qualified
-                                                 `mod.Type` (I#283/D-0081) *)
+                                                 `mod.Type` (I#283/D-0081); a seam
+                                                 generic head `concurrent.Queue`
+                                                 resolves to the bare prelude type
+                                                 (I#996/D-0202) *)
                 | TYPE_KEYWORD ;              (* int64, list, dict, array, ... *)
 tuple_type    ::= "(" [ type { "," type } ] ")" ;
 func_type     ::= "fn" "(" [ type { "," type } ] ")" [ "->" type ] ;
