@@ -321,17 +321,37 @@ fn str_method_limits_are_rejected() {
     // ljust() needs a width; the width must be an int.
     assert_code("def main():\n    print(\"hi\".ljust())\n", "ZAP4025");
     assert_code("def main():\n    print(\"hi\".ljust(\"x\"))\n", "ZAP4024");
-    // The deferred methods (partition/rpartition/translate/format_map/expandtabs,
-    // #971 follow-ups) are a clean ZAP4080 "str has no method", not a crash.
+    // partition/rpartition are still deferred (#1029), a clean ZAP4080 "str has
+    // no method", not a crash.
     assert_code(
         "def main():\n    print(\"a-b\".partition(\"-\"))\n",
         "ZAP4080",
     );
+    // translate / format_map / expandtabs are now implemented (#1034, D-0214);
+    // pin their argument limits rather than treating them as unknown methods.
+    // translate / format_map want a dict[str, str], not a str:
     assert_code(
         "def main():\n    print(\"a\".translate(\"x\"))\n",
-        "ZAP4080",
+        "ZAP4024",
     );
-    assert_code("def main():\n    print(\"a\".expandtabs())\n", "ZAP4080");
+    assert_code(
+        "def main():\n    print(\"{x}\".format_map(\"x\"))\n",
+        "ZAP4024",
+    );
+    // translate / format_map take exactly one argument:
+    assert_code(
+        "def main():\n    auto d = {\"a\": \"b\"}\n    print(\"a\".translate(d, d))\n",
+        "ZAP4025",
+    );
+    // expandtabs takes an optional int tabsize — at most one, int-typed:
+    assert_code(
+        "def main():\n    print(\"a\".expandtabs(1, 2))\n",
+        "ZAP4025",
+    );
+    assert_code(
+        "def main():\n    print(\"a\".expandtabs(\"x\"))\n",
+        "ZAP4024",
+    );
 }
 
 #[test]

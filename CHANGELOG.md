@@ -25,6 +25,11 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`str` gains `translate` / `format_map` / `expandtabs`** (#1034, D-0214) — the
+  remaining thin-`str` methods deferred from #971. `expandtabs([tabsize])` expands
+  tabs to the next stop; `translate(dict[str,str])` maps each character (empty
+  value deletes); `format_map(dict[str,str])` fills `{name}` fields (`{{`/`}}`
+  literal; missing field → catchable `KeyError`; `:`/`!` specs are a v1 follow-up).
 - **Line-oriented input** (#969, D-0212). A global `input([prompt]) -> str`
   builtin (writes the prompt, reads one line from stdin, strips the trailing
   newline; raises `RuntimeError` at EOF). A buffered reader for streaming:

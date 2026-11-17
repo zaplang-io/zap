@@ -19311,6 +19311,51 @@ impl<'a> FnLower<'a> {
                 });
                 Ok((d, Ty::Ptr))
             }
+            // expandtabs([tabsize]): optional int tab stop, default 8 (#1034).
+            "expandtabs" => {
+                if args.len() > 1 {
+                    return Err(err("str.expandtabs() takes 0 or 1 arguments"));
+                }
+                let tabsize = if let Some(a) = args.first() {
+                    let (v, vt) = self.expr(&a.value)?;
+                    self.coerce(v, vt, Ty::I64)
+                } else {
+                    self.iconst(Ty::I64, 8)
+                };
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_str_expandtabs".to_string(),
+                    args: vec![recv, tabsize],
+                });
+                Ok((d, Ty::Ptr))
+            }
+            // translate(table): dict[str,str] char map; never raises (#1034).
+            "translate" => {
+                if args.len() != 1 {
+                    return Err(err("str.translate() takes exactly one argument"));
+                }
+                let (table, _) = self.expr(&args[0].value)?;
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_str_translate".to_string(),
+                    args: vec![recv, table],
+                });
+                Ok((d, Ty::Ptr))
+            }
+            // format_map(mapping): dict[str,str] field fill. Raises KeyError on a
+            // missing field / ValueError on a malformed template, so it is a
+            // throwing call that `try` can catch (#1034).
+            "format_map" => {
+                if args.len() != 1 {
+                    return Err(err("str.format_map() takes exactly one argument"));
+                }
+                let (m, _) = self.expr(&args[0].value)?;
+                let d = self.new_value(Ty::Ptr);
+                self.throwing_call(Some(d), "zap_str_format_map", vec![recv, m]);
+                Ok((d, Ty::Ptr))
+            }
             "title" | "capitalize" | "casefold" | "swapcase" => {
                 if !args.is_empty() {
                     return Err(err(format!("str.{name}() takes no arguments")));
