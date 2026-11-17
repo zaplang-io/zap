@@ -10758,10 +10758,13 @@ to the handle by precedent.
 `input()`, being interactive, **raises** at EOF (Ctrl-D) like CPython — but Zap has
 no `EOFError` yet, so it raises a catchable `RuntimeError` today (see deferred).
 
-**Positional by design (no seam-kwargs rows).** Every entry is a single logical
-argument over a handle/fd/path (plus `input`'s lone optional prompt and `readn`'s
-count), so there is nothing a keyword clarifies; they stay positional ([[D-0204]]),
-matching `io.read(fd, n)`.
+**Keyword-capable (seam_sigs rows).** Each seam entry gets a `seam_sigs` row —
+`io.reader(fd=…)`, `io.readline(reader=…)`/`readall`, `io.readn(reader=…, n=…)`,
+`fs.lines(path=…)` — even the single-argument readers, so the whole `io`/`fs`
+surface is uniformly keyword-capable ([[D-0204]], [[D-0213]]): Zap's call syntax is
+Pythonic and some callers prefer named arguments. (`input` is the exception: it is
+a global builtin, not a seam function, so it has no `seam_sigs` row — like
+`print`.) The rows were added in the #969 follow-up PR after this decision merged.
 
 **Deferred (documented follow-ups).** (1) Native `for line in file` — making a
 stdlib handle participate in the iterator protocol ([[D-0048]]'s `__iter__`/
@@ -10775,3 +10778,39 @@ Relates to [[D-0056]] / #97 (the io/fs seam), [[D-0133]] (crypto streaming handl
 the opaque-handle precedent), [[D-0210]] (`str.splitlines`), [[D-0211]] (the #968
 fs gaps this builds on), [[D-0204]] (seam kwargs), epic #966, and Discussion #965
 (gap #3).
+
+## D-0213 — every seam function gets a `seam_sigs` row, including single-argument ones
+
+**Context.** [[D-0204]] made seam keyword-argument support opt-in per method (a
+registry row in `zapc_syntax::seam_sigs`), migrating modules row-by-row. That left
+the *authoring* question open: when a new seam function has only one argument, is a
+row worth adding? #969 initially skipped the rows for its single-argument readers
+(`io.readline`/`readall`, `fs.lines`) on a "nothing a keyword clarifies" rationale,
+which was inconsistent with the rest of `io`/`fs` (every existing function —
+`io.open`/`read`/`write`/even single-argument `close_fd`, `fs.read_file`,
+`os.path_isabs` — already has a row).
+
+**Decision.** **Every new seam function with at least one argument gets a
+`seam_sigs` row, single-argument functions included.** Zap's call syntax is
+Pythonic, and some developers simply prefer named arguments (`fs.read_file(path=…)`
+reads as well as the positional form); a uniformly keyword-capable stdlib is worth
+the one-line row. Only a **zero-argument** function has no row (there is nothing to
+name — e.g. `fs.mkdtemp`, `time.monotonic`). This is the going-forward authoring
+rule; it does not force an immediate back-fill of pre-D-0204 modules (that remains
+the incremental migration D-0204 describes), but no *new* single-argument seam
+function should ship without a row again.
+
+**Scope.** Authoring convention only — no code or grammar change. The binder,
+diagnostics (`ZAP4023`/`ZAP4025`), and the "a no-row method keeps legacy
+positional-only behavior" migration mechanism are all unchanged from [[D-0204]].
+Builtins (`print`, `input`, …) are **not** seam functions and remain out of
+`seam_sigs`.
+
+**Applied.** The #969 follow-up adds the missing rows (`io.reader`/`readline`/
+`readall`/`readn`, `fs.lines`) and their `seam_kwargs` tests, and corrects
+[[D-0212]]'s "positional by design" note. The `seam_sigs.rs` header documents the
+rule so future contributors see it (`AGENTS.md` is immutable, so the convention
+lives here and in that header).
+
+Relates to [[D-0204]] (the seam kwargs framework this refines) and [[D-0212]] (the
+#969 surface that prompted it).

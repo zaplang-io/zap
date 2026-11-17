@@ -842,3 +842,56 @@ fn fs_stat_keyword_and_positional() {
 fn fs_copy_positional_unchanged() {
     assert_ok(&prog("    fs.copy(\"a\", \"b\")\n"));
 }
+
+// ---------------------------------------------------------------------------
+// Line-oriented input (#969, D-0212): the buffered reader + fs.lines. `input`
+// is a global builtin (not a seam function), so it has no seam_sigs row and no
+// keyword surface — like `print`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn io_reader_keyword_and_positional() {
+    // Keyword binding for the reader verbs, plus readn keyword reordering.
+    assert_ok(&prog(
+        "    auto fd = io.open(\"/tmp/x\", \"r\")\n    \
+         auto r = io.reader(fd=fd)\n    \
+         auto l = io.readline(reader=r)\n    \
+         auto a = io.readall(reader=r)\n    \
+         auto c = io.readn(reader=r, n=8)\n",
+    ));
+    assert_ok(&prog(
+        "    auto fd = io.open(\"/tmp/x\", \"r\")\n    \
+         auto r = io.reader(fd=fd)\n    \
+         auto c = io.readn(n=8, reader=r)\n",
+    ));
+    // Positional forms unchanged.
+    assert_ok(&prog(
+        "    auto fd = io.open(\"/tmp/x\", \"r\")\n    \
+         auto r = io.reader(fd)\n    \
+         auto l = io.readline(r)\n    \
+         auto c = io.readn(r, 8)\n",
+    ));
+}
+
+#[test]
+fn io_reader_unknown_keyword_rejected() {
+    assert_code(&prog("    auto r = io.reader(descriptor=0)\n"), "ZAP4023");
+    assert_code(
+        &prog(
+            "    auto fd = io.open(\"/tmp/x\", \"r\")\n    \
+             auto r = io.reader(fd)\n    \
+             auto c = io.readn(reader=r, count=8)\n",
+        ),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn fs_lines_keyword_and_positional() {
+    assert_ok(&prog("    auto ls = fs.lines(path=\"/tmp/x\")\n"));
+    assert_ok(&prog("    auto ls = fs.lines(\"/tmp/x\")\n"));
+    assert_code(
+        &prog("    auto ls = fs.lines(file=\"/tmp/x\")\n"),
+        "ZAP4023",
+    );
+}
