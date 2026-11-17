@@ -70,6 +70,62 @@ pub(crate) static RUNTIME_FRAGMENTS: &[RuntimeFile] = &[
         text: crate::RUNTIME_SORTACCEL_C,
         in_tu: true,
     },
+    // Per-stdlib-module bodies lifted out of zaprt.c (#1023). Each is `#include`d
+    // by zaprt.c at its original position (order is semantic). Inline `include_str!`
+    // keeps "add a fragment" to two edits: a row here + the `#include` in zaprt.c.
+    RuntimeFile { path: "runtime/array.inc.c", text: include_str!("runtime/array.inc.c"), in_tu: true },
+    RuntimeFile { path: "runtime/str.inc.c", text: include_str!("runtime/str.inc.c"), in_tu: true },
+    RuntimeFile { path: "runtime/os_fs.inc.c", text: include_str!("runtime/os_fs.inc.c"), in_tu: true },
+    RuntimeFile { path: "runtime/crypto.inc.c", text: include_str!("runtime/crypto.inc.c"), in_tu: true },
+    RuntimeFile { path: "runtime/bytes.inc.c", text: include_str!("runtime/bytes.inc.c"), in_tu: true },
+    RuntimeFile {
+        path: "runtime/time_datetime.inc.c",
+        text: include_str!("runtime/time_datetime.inc.c"),
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/math_random.inc.c",
+        text: include_str!("runtime/math_random.inc.c"),
+        in_tu: true,
+    },
+    RuntimeFile { path: "runtime/json.inc.c", text: include_str!("runtime/json.inc.c"), in_tu: true },
+    RuntimeFile { path: "runtime/xml.inc.c", text: include_str!("runtime/xml.inc.c"), in_tu: true },
+    RuntimeFile { path: "runtime/url.inc.c", text: include_str!("runtime/url.inc.c"), in_tu: true },
+    RuntimeFile {
+        path: "runtime/collections.inc.c",
+        text: include_str!("runtime/collections.inc.c"),
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/logging_argparse.inc.c",
+        text: include_str!("runtime/logging_argparse.inc.c"),
+        in_tu: true,
+    },
+    RuntimeFile { path: "runtime/csv.inc.c", text: include_str!("runtime/csv.inc.c"), in_tu: true },
+    RuntimeFile { path: "runtime/yaml.inc.c", text: include_str!("runtime/yaml.inc.c"), in_tu: true },
+    RuntimeFile { path: "runtime/zlib.inc.c", text: include_str!("runtime/zlib.inc.c"), in_tu: true },
+    RuntimeFile { path: "runtime/sync.inc.c", text: include_str!("runtime/sync.inc.c"), in_tu: true },
+    RuntimeFile {
+        path: "runtime/net_http.inc.c",
+        text: include_str!("runtime/net_http.inc.c"),
+        in_tu: true,
+    },
+    RuntimeFile { path: "runtime/tls.inc.c", text: include_str!("runtime/tls.inc.c"), in_tu: true },
+    RuntimeFile {
+        path: "runtime/crypto_jose.inc.c",
+        text: include_str!("runtime/crypto_jose.inc.c"),
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/threading.inc.c",
+        text: include_str!("runtime/threading.inc.c"),
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/profile.inc.c",
+        text: include_str!("runtime/profile.inc.c"),
+        in_tu: true,
+    },
     // Separate C++ translation units (the per-ISA SIMD sort kernels): NOT
     // `#include`d into `zaprt.c`, written conditionally by their own sites, but a
     // change to one must still rebuild the runtime object, so they are hashed.
