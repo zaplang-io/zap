@@ -166,6 +166,16 @@ value struct KeyInfo:
     str curve
     bool is_private
 
+value struct UrlParts:
+    str scheme
+    bool has_authority
+    str userinfo
+    str host
+    int64 port
+    str path
+    str query
+    str fragment
+
 enum Optional[T]:
     Some(T value)
     None
@@ -1254,6 +1264,12 @@ fn references_prelude(module: &Module) -> bool {
         // injected for any program that names the method or the struct.
         "\"KeyInfo\"",
         "\"key_info\"",
+        // The `url.split` decomposition returns the `UrlParts` value struct
+        // (#970, D-0209): injected for any program that names the `url` module
+        // or the struct. Over-injection for a `url.quote`-only program is
+        // harmless — the unused struct emits no code.
+        "\"UrlParts\"",
+        "\"url\"",
         "\"JsonValue\"",
         "\"json\"",
         "\"Json\"",

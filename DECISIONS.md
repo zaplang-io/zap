@@ -10531,3 +10531,87 @@ unchanged.
 Relates to [[D-0139]] (#801/#812 capability model), [[D-0057]] (`heap[T]`, the
 template), [[D-0056]] (the original seam collections), D-0204 (seam kwargs), epic
 #967, Discussion #965, and #966 (stdlib consumers).
+
+## D-0209 — stdlib `url`: URL parse / build / query-reading / reference resolution (#970 / epic #966)
+
+**Context.** The `url` module ([[D-0056]], #335) only *percent-encoded* and built
+SigV4 query strings (`quote`/`quote_path`/`unquote`/`unquote_plus`/`encode_query`/
+`canonical_query`). It could not take a URL apart or read a query string into a
+map — a #960-class hole: a web framework (`fastzap`) cannot route on `?a=1&b=2`
+and an HTTP client cannot dissect a URL or resolve a redirect `Location`. This is
+gap #1 (top blocker) of Discussion #965, tracked under the stdlib-gaps epic #966.
+
+**Decision.** Add the decomposition half, closely mirroring Python `urllib.parse`
+(`urlsplit`/`parse_qs`/`urljoin`/`urlunsplit`) with a couple of deliberate,
+documented divergences toward Go `net/url` where that is more useful for routing.
+
+- **`UrlParts` is a prelude value struct, not flat accessors.** Following the
+  `DateTime` ([[D-0056]]) and `KeyInfo` ([[D-0126]]) precedent — the established
+  seam convention for a multi-field result is a built-in `value struct` in
+  `PRELUDE_SRC`, injected whenever the module surface is named. Fields, in order:
+
+  ```
+  value struct UrlParts:
+      str scheme          # lowercased (scheme is case-insensitive, RFC-3986 §3.1)
+      bool has_authority  # was there a "//" authority component?
+      str userinfo        # before the rightmost '@' (may hold "user:pass")
+      str host            # IPv6 stored WITHOUT brackets ("::1"), Python .hostname form
+      int64 port          # -1 when absent
+      str path
+      str query           # undecoded (the raw "a=1&b=2"); use parse_query to read it
+      str fragment
+  ```
+
+  `has_authority` is carried explicitly so `build(split(s))` round-trips an
+  *empty* authority (`file:///p` keeps its `//`, distinct from `mailto:` which has
+  none) — a distinction a bare empty `host` cannot express.
+
+- **Surface.**
+  - `url.split(s) -> UrlParts` — RFC-3986 decomposition. Lenient like `urlsplit`;
+    a present but non-numeric / out-of-range **port raises a catchable
+    `ValueError`** (Python `SplitResult.port` semantics). Because the value struct
+    is eager, the port is validated at `split` time, not lazily on field access —
+    a deliberate, documented stricter-than-Python choice that surfaces a bad URL
+    at the parse site.
+  - `url.build(parts) -> str` — the inverse (Python `urlunsplit`); round-trips a
+    normalized URL (`build(split(s)) == s`). A `host` containing `:` (an IPv6
+    literal, stored unbracketed) is re-wrapped in `[...]`. This single
+    `UrlParts`-taking form **is** the "unsplit" of the issue; a second flat
+    many-positional-argument `unsplit` is not added (the struct is the natural
+    container, and from-scratch building goes through the `UrlParts(...)` ctor).
+  - `url.parse_query(q) -> dict[str, list[str]]` — Python `parse_qs`: `%XX` and
+    `+`->space decoding, repeated keys accumulate. **Blank values are kept**
+    (`a` and `a=` both yield `a -> [""]`), matching Go `url.ParseQuery` rather than
+    Python's default `keep_blank_values=False` drop — more useful for routing and
+    form handling. A malformed `%XX` is left literal (lenient, like `unquote`);
+    empty segments (`&&`, leading/trailing `&`) are skipped; only `&` separates
+    (not `;`, matching Python ≥3.10).
+  - `url.parse_query_first(q) -> dict[str, str]` — the first value per key (a
+    scalar convenience over `parse_query`).
+  - `url.join(base, ref) -> str` — resolve a relative reference against a base per
+    RFC-3986 §5.2 (Python `urljoin`; `.`/`..` removal via §5.2.4, absolute /
+    scheme-relative / query-only / fragment-only references, excess `..` clamped
+    at root). Verified against the RFC §5.4 normal + abnormal vectors.
+  - `url.encode_query_multi(d: dict[str, list[str]]) -> str` — the repeated-key
+    query encoder (companion to `encode_query`, which is `dict[str,str]`). The
+    existing `encode_query`/`quote`/`unquote` surface is left untouched.
+
+- **Positional vs keyword (extends [[D-0204]]).** All six are rowed in
+  `seam_sigs.rs`. Only `join` materially benefits from keywords — two same-typed
+  `str` args, so `url.join(base=…, ref=…)` reads clearly and guards against an
+  accidental swap. The rest (`split`, `build`, `parse_query`,
+  `parse_query_first`, `encode_query_multi`) are single-argument and are rowed
+  only for a uniform keyword-capable surface, not because they need it.
+
+- **Runtime / GC.** All entry points are in the `url` section of `zaprt.c` (not a
+  new `.inc.c`). A single RFC parser (`zap_url_split_fields`) fills slices; the
+  eight `UrlParts` getters each copy out their field (re-parsing per field, the
+  cheap `KeyInfo` pattern). The query readers build a dict with `zap_dict_new` +
+  `zap_dict_set_str_ptr` (key/value ptr-traced); `parse_query` values are
+  ptr-traced `ZapList`s. No function polls a safepoint, so every raw slice /
+  scratch pointer is valid for the call's duration under both collectors
+  ("allocation never collects mid-call"), matching `zap_str_concat`/`zap_strbuild`.
+
+Relates to [[D-0056]] (the original `url`/`datetime` seam), [[D-0126]] (`KeyInfo`,
+the value-struct precedent), [[D-0204]] (seam kwargs), epic #966, and Discussion
+#965 (gap #1).

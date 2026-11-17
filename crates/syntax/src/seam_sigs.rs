@@ -201,6 +201,16 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("url", "unquote_plus", &["s"]),
     ("url", "encode_query", &["d"]),
     ("url", "canonical_query", &["d"]),
+    // url parse / build (#970, D-0209). `join` is the one that materially
+    // benefits from keywords — two same-typed `str` args, so `url.join(base=...,
+    // ref=...)` reads clearly and guards against an accidental swap; the rest
+    // are single-argument and rowed only for a uniform keyword-capable surface.
+    ("url", "split", &["s"]),
+    ("url", "build", &["parts"]),
+    ("url", "parse_query", &["q"]),
+    ("url", "parse_query_first", &["q"]),
+    ("url", "encode_query_multi", &["d"]),
+    ("url", "join", &["base", "ref"]),
     // ---- io (ticket #97): raw fd I/O ----
     ("io", "open", &["path", "mode"]),
     ("io", "read", &["fd", "n"]),
