@@ -1416,3 +1416,92 @@ void *zap_str_format_map(void *tmpl_, void *m_) {
     return r;
 }
 
+/* --- partition / rpartition (#1029, D-0218) --------------------------------
+ *
+ * Split on the first (partition) or last (rpartition) occurrence of a
+ * non-empty separator, returning three strings. The runtime hands back a GC
+ * `ZapStrPart` holding the three ZapStr captures (a precise object, three
+ * pointer fields, so they stay live until the lowerer reads them); the lowerer
+ * unpacks the three getters into a `(str, str, str)` tuple — the same aggregate
+ * path as `process.run`, so codegen needs no partition-specific handling.
+ * zap_obj / ZapTypeDesc / ZAP_TD_PRECISE / offsetof are core (zaprt.c), so they
+ * are visible here. */
+typedef struct {
+    ZapStr *head;
+    ZapStr *sep;
+    ZapStr *tail;
+} ZapStrPart;
+
+static const int32_t zap_off_strpart[] = {
+    (int32_t)offsetof(ZapStrPart, head),
+    (int32_t)offsetof(ZapStrPart, sep),
+    (int32_t)offsetof(ZapStrPart, tail),
+};
+static const ZapTypeDesc zap_desc_strpart = {(int64_t)sizeof(ZapStrPart),
+                                             ZAP_TD_PRECISE, 3, zap_off_strpart};
+
+/* str.partition(sep) -> (head, sep, tail): split at the FIRST occurrence of
+ * `sep`. When `sep` is absent the result is (whole, "", ""). An empty separator
+ * raises ValueError (CPython). */
+void *zap_str_partition(void *sp, void *sepp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *sep = (const ZapStr *)sepp;
+    if (sep->len == 0) {
+        const char *m = "empty separator";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
+    int64_t idx = -1;
+    for (int64_t i = 0; i + sep->len <= s->len; i++) {
+        if (memcmp(s->data + i, sep->data, (size_t)sep->len) == 0) {
+            idx = i;
+            break;
+        }
+    }
+    ZapStrPart *r = (ZapStrPart *)zap_obj(&zap_desc_strpart);
+    if (idx < 0) {
+        r->head = (ZapStr *)zap_str_new(s->data, s->len);
+        r->sep = (ZapStr *)zap_str_new("", 0);
+        r->tail = (ZapStr *)zap_str_new("", 0);
+    } else {
+        r->head = (ZapStr *)zap_str_new(s->data, idx);
+        r->sep = (ZapStr *)zap_str_new(s->data + idx, sep->len);
+        r->tail = (ZapStr *)zap_str_new(s->data + idx + sep->len, s->len - idx - sep->len);
+    }
+    return r;
+}
+
+/* str.rpartition(sep) -> (head, sep, tail): split at the LAST occurrence of
+ * `sep`. When `sep` is absent the result is ("", "", whole). An empty separator
+ * raises ValueError (CPython). */
+void *zap_str_rpartition(void *sp, void *sepp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *sep = (const ZapStr *)sepp;
+    if (sep->len == 0) {
+        const char *m = "empty separator";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
+    int64_t idx = zap_str_rfind(sp, sepp); /* last occurrence, or -1 */
+    ZapStrPart *r = (ZapStrPart *)zap_obj(&zap_desc_strpart);
+    if (idx < 0) {
+        r->head = (ZapStr *)zap_str_new("", 0);
+        r->sep = (ZapStr *)zap_str_new("", 0);
+        r->tail = (ZapStr *)zap_str_new(s->data, s->len);
+    } else {
+        r->head = (ZapStr *)zap_str_new(s->data, idx);
+        r->sep = (ZapStr *)zap_str_new(s->data + idx, sep->len);
+        r->tail = (ZapStr *)zap_str_new(s->data + idx + sep->len, s->len - idx - sep->len);
+    }
+    return r;
+}
+
+/* Field getters the lowerer unpacks into the (str, str, str) tuple. */
+void *zap_str_part_head(void *r) {
+    return ((ZapStrPart *)r)->head;
+}
+void *zap_str_part_sep(void *r) {
+    return ((ZapStrPart *)r)->sep;
+}
+void *zap_str_part_tail(void *r) {
+    return ((ZapStrPart *)r)->tail;
+}
+

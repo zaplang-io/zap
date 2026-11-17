@@ -25,6 +25,12 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`str` gains `partition` / `rpartition`** (#1029, D-0218) — the last thin-`str`
+  deferral. Each splits on the first / last occurrence of the separator into a
+  `(head, sep, tail)` tuple (absent separator: `(whole, "", "")` for `partition`,
+  `("", "", whole)` for `rpartition`; an empty separator raises `ValueError`).
+  The first `str` method to return a tuple — it reuses the existing D-0049 tuple
+  path (as `process.run` does), so no new mechanism was needed.
 - **`sys` standard streams as objects** (#1035, D-0217). `sys.stdin()` is a
   buffered reader over fd 0 (read with `io.readline`/`readall`/`readn`);
   `sys.stdout()` / `sys.stderr()` are writer handles over fds 1/2; `sys.write(

@@ -321,11 +321,16 @@ fn str_method_limits_are_rejected() {
     // ljust() needs a width; the width must be an int.
     assert_code("def main():\n    print(\"hi\".ljust())\n", "ZAP4025");
     assert_code("def main():\n    print(\"hi\".ljust(\"x\"))\n", "ZAP4024");
-    // partition/rpartition are still deferred (#1029), a clean ZAP4080 "str has
-    // no method", not a crash.
+    // partition / rpartition are now implemented (#1029, D-0218) — they return a
+    // (str, str, str) tuple. Pin their argument limits: exactly one str separator
+    // (wrong arity -> ZAP4025, a non-str separator -> ZAP4024).
     assert_code(
-        "def main():\n    print(\"a-b\".partition(\"-\"))\n",
-        "ZAP4080",
+        "def main():\n    auto t = \"a-b\".partition(\"-\", \"x\")\n",
+        "ZAP4025",
+    );
+    assert_code(
+        "def main():\n    auto t = \"a-b\".rpartition(5)\n",
+        "ZAP4024",
     );
     // translate / format_map / expandtabs are now implemented (#1034, D-0214);
     // pin their argument limits rather than treating them as unknown methods.
