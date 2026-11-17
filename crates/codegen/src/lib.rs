@@ -2319,6 +2319,68 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             self.declare_rt("zap_str_split", &[p.into(), p.into()], Some(p.into()));
             self.declare_rt("zap_str_join", &[p.into(), p.into()], Some(p.into()));
             self.declare_rt("zap_str_encode", &[p.into()], Some(p.into()));
+            // Thin str method set (#971, D-0210). Split family: an `int64`
+            // maxsplit trails each split variant (-1 = unlimited).
+            self.declare_rt("zap_str_split_ws", &[p.into(), i.into()], Some(p.into()));
+            self.declare_rt(
+                "zap_str_split_sep",
+                &[p.into(), p.into(), i.into()],
+                Some(p.into()),
+            );
+            self.declare_rt("zap_str_rsplit_ws", &[p.into(), i.into()], Some(p.into()));
+            self.declare_rt(
+                "zap_str_rsplit_sep",
+                &[p.into(), p.into(), i.into()],
+                Some(p.into()),
+            );
+            self.declare_rt("zap_str_splitlines", &[p.into()], Some(p.into()));
+            self.declare_rt("zap_str_count", &[p.into(), p.into()], Some(i.into()));
+            self.declare_rt("zap_str_rfind", &[p.into(), p.into()], Some(i.into()));
+            self.declare_rt("zap_str_rindex", &[p.into(), p.into()], Some(i.into()));
+            self.declare_rt(
+                "zap_str_removeprefix",
+                &[p.into(), p.into()],
+                Some(p.into()),
+            );
+            self.declare_rt(
+                "zap_str_removesuffix",
+                &[p.into(), p.into()],
+                Some(p.into()),
+            );
+            self.declare_rt(
+                "zap_str_strip_chars",
+                &[p.into(), p.into(), i.into()],
+                Some(p.into()),
+            );
+            // Pad family: (str, width:int64, fill:str) -> str; zfill drops fill.
+            self.declare_rt(
+                "zap_str_ljust",
+                &[p.into(), i.into(), p.into()],
+                Some(p.into()),
+            );
+            self.declare_rt(
+                "zap_str_rjust",
+                &[p.into(), i.into(), p.into()],
+                Some(p.into()),
+            );
+            self.declare_rt(
+                "zap_str_center",
+                &[p.into(), i.into(), p.into()],
+                Some(p.into()),
+            );
+            self.declare_rt("zap_str_zfill", &[p.into(), i.into()], Some(p.into()));
+            // Case family: str -> str.
+            self.declare_rt("zap_str_title", &[p.into()], Some(p.into()));
+            self.declare_rt("zap_str_capitalize", &[p.into()], Some(p.into()));
+            self.declare_rt("zap_str_casefold", &[p.into()], Some(p.into()));
+            self.declare_rt("zap_str_swapcase", &[p.into()], Some(p.into()));
+            // is* predicates: str -> int64 (0/1).
+            self.declare_rt("zap_str_isdigit", &[p.into()], Some(i.into()));
+            self.declare_rt("zap_str_isalpha", &[p.into()], Some(i.into()));
+            self.declare_rt("zap_str_isalnum", &[p.into()], Some(i.into()));
+            self.declare_rt("zap_str_isspace", &[p.into()], Some(i.into()));
+            self.declare_rt("zap_str_islower", &[p.into()], Some(i.into()));
+            self.declare_rt("zap_str_isupper", &[p.into()], Some(i.into()));
             let f = self.ctx.f64_type();
             // Strict float parse for `float(s)` (#282/#285), the f64 analog of
             // `zap_str_parse_int`; faults on a malformed string.

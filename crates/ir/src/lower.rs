@@ -19084,8 +19084,8 @@ impl<'a> FnLower<'a> {
                 Ok((d, Ty::Ptr))
             }
             "strip" | "lstrip" | "rstrip" => {
-                if !args.is_empty() {
-                    return Err(err(format!("str.{name}() takes no arguments")));
+                if args.len() > 1 {
+                    return Err(err(format!("str.{name}() takes 0 or 1 arguments")));
                 }
                 let mode = match name {
                     "strip" => 0,
@@ -19094,11 +19094,21 @@ impl<'a> FnLower<'a> {
                 };
                 let m = self.iconst(Ty::I64, mode);
                 let d = self.new_value(Ty::Ptr);
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: "zap_str_strip".to_string(),
-                    args: vec![recv, m],
-                });
+                if let Some(a) = args.first() {
+                    // strip(chars): trim any byte in the explicit set (#971).
+                    let (cs, _) = self.expr(&a.value)?;
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_str_strip_chars".to_string(),
+                        args: vec![recv, cs, m],
+                    });
+                } else {
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_str_strip".to_string(),
+                        args: vec![recv, m],
+                    });
+                }
                 Ok((d, Ty::Ptr))
             }
             "startswith" | "endswith" | "contains" => {
@@ -19153,15 +19163,177 @@ impl<'a> FnLower<'a> {
                 });
                 Ok((d, Ty::Ptr))
             }
-            "split" => {
-                let a = one_str(self)?;
+            "split" | "rsplit" => {
+                // 0 args: whitespace split. 1 arg: explicit separator. 2 args:
+                // separator + int maxsplit (#971). maxsplit defaults to -1.
+                if args.len() > 2 {
+                    return Err(err(format!("str.{name}() takes 0, 1, or 2 arguments")));
+                }
+                let d = self.new_value(Ty::List(Elem::Ptr));
+                let maxsplit = if let Some(a) = args.get(1) {
+                    let (v, vt) = self.expr(&a.value)?;
+                    self.coerce(v, vt, Ty::I64)
+                } else {
+                    self.iconst(Ty::I64, -1)
+                };
+                if let Some(a) = args.first() {
+                    let (sep, _) = self.expr(&a.value)?;
+                    let func = if name == "split" {
+                        "zap_str_split_sep"
+                    } else {
+                        "zap_str_rsplit_sep"
+                    };
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: func.to_string(),
+                        args: vec![recv, sep, maxsplit],
+                    });
+                } else {
+                    let func = if name == "split" {
+                        "zap_str_split_ws"
+                    } else {
+                        "zap_str_rsplit_ws"
+                    };
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: func.to_string(),
+                        args: vec![recv, maxsplit],
+                    });
+                }
+                Ok((d, Ty::List(Elem::Ptr)))
+            }
+            "splitlines" => {
+                if !args.is_empty() {
+                    return Err(err("str.splitlines() takes no arguments"));
+                }
                 let d = self.new_value(Ty::List(Elem::Ptr));
                 self.emit(Inst::Call {
                     dest: Some(d),
-                    func: "zap_str_split".to_string(),
-                    args: vec![recv, a],
+                    func: "zap_str_splitlines".to_string(),
+                    args: vec![recv],
                 });
                 Ok((d, Ty::List(Elem::Ptr)))
+            }
+            "count" | "rfind" | "rindex" => {
+                let a = one_str(self)?;
+                let func = match name {
+                    "count" => "zap_str_count",
+                    "rfind" => "zap_str_rfind",
+                    _ => "zap_str_rindex",
+                };
+                let d = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: func.to_string(),
+                    args: vec![recv, a],
+                });
+                Ok((d, Ty::I64))
+            }
+            "removeprefix" | "removesuffix" => {
+                let a = one_str(self)?;
+                let func = if name == "removeprefix" {
+                    "zap_str_removeprefix"
+                } else {
+                    "zap_str_removesuffix"
+                };
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: func.to_string(),
+                    args: vec![recv, a],
+                });
+                Ok((d, Ty::Ptr))
+            }
+            "ljust" | "rjust" | "center" => {
+                // width (int) + optional fill (str); default fill is a space.
+                if args.is_empty() || args.len() > 2 {
+                    return Err(err(format!("str.{name}() takes 1 or 2 arguments")));
+                }
+                let (wv, wt) = self.expr(&args[0].value)?;
+                let width = self.coerce(wv, wt, Ty::I64);
+                let fill = if let Some(a) = args.get(1) {
+                    let (v, _) = self.expr(&a.value)?;
+                    v
+                } else {
+                    let e = self.new_value(Ty::Ptr);
+                    self.emit(Inst::StrConst {
+                        dest: e,
+                        bytes: b" ".to_vec(),
+                    });
+                    e
+                };
+                let func = match name {
+                    "ljust" => "zap_str_ljust",
+                    "rjust" => "zap_str_rjust",
+                    _ => "zap_str_center",
+                };
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: func.to_string(),
+                    args: vec![recv, width, fill],
+                });
+                Ok((d, Ty::Ptr))
+            }
+            "zfill" => {
+                if args.len() != 1 {
+                    return Err(err("str.zfill() takes exactly one argument"));
+                }
+                let (wv, wt) = self.expr(&args[0].value)?;
+                let width = self.coerce(wv, wt, Ty::I64);
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_str_zfill".to_string(),
+                    args: vec![recv, width],
+                });
+                Ok((d, Ty::Ptr))
+            }
+            "title" | "capitalize" | "casefold" | "swapcase" => {
+                if !args.is_empty() {
+                    return Err(err(format!("str.{name}() takes no arguments")));
+                }
+                let func = match name {
+                    "title" => "zap_str_title",
+                    "capitalize" => "zap_str_capitalize",
+                    "casefold" => "zap_str_casefold",
+                    _ => "zap_str_swapcase",
+                };
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: func.to_string(),
+                    args: vec![recv],
+                });
+                Ok((d, Ty::Ptr))
+            }
+            "isdigit" | "isalpha" | "isalnum" | "isspace" | "islower" | "isupper" => {
+                if !args.is_empty() {
+                    return Err(err(format!("str.{name}() takes no arguments")));
+                }
+                let func = match name {
+                    "isdigit" => "zap_str_isdigit",
+                    "isalpha" => "zap_str_isalpha",
+                    "isalnum" => "zap_str_isalnum",
+                    "isspace" => "zap_str_isspace",
+                    "islower" => "zap_str_islower",
+                    _ => "zap_str_isupper",
+                };
+                let raw = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(raw),
+                    func: func.to_string(),
+                    args: vec![recv],
+                });
+                let zero = self.iconst(Ty::I64, 0);
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred: CmpPred::Ne,
+                    lhs: raw,
+                    rhs: zero,
+                });
+                Ok((d, Ty::I1))
             }
             "join" => {
                 // `sep.join(parts)`: the receiver is the separator; the single

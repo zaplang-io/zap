@@ -8799,6 +8799,494 @@ void *zap_str_encode(void *sp) {
     return out;
 }
 
+/* ===========================================================================
+ * stdlib: thin `str` method set (ticket #971, D-0210)
+ * ---------------------------------------------------------------------------
+ * The Python-faithful string toolkit that was missing: whitespace / maxsplit
+ * split, rsplit, splitlines; count / rfind / rindex; removeprefix / removesuffix
+ * and char-set strip; the ljust / rjust / center / zfill pad family; the
+ * title / capitalize / casefold / swapcase case family; and the is* predicates.
+ * All operate over raw UTF-8 bytes (a `str`'s bytes ARE its UTF-8), so ASCII
+ * classification is byte-local and multibyte codepoints pass through untouched;
+ * offsets returned (`rfind`/`rindex`) and counts are BYTE offsets/counts (as
+ * `find`/`index` already are), which coincide with codepoints on ASCII input.
+ * Padding widths count CODEPOINTS (`zap_str_len_cp`), Python-style. None of these
+ * poll a safepoint, so every raw slice stays valid for the call ("allocation
+ * never collects mid-call"). `maxsplit < 0` means unlimited.
+ * =========================================================================== */
+
+/* split() with no separator: split on runs of ASCII whitespace, ignoring
+ * leading/trailing whitespace (Python `str.split()` / Go `strings.Fields`). With
+ * `maxsplit >= 0`, after that many splits the remainder (from its first
+ * non-whitespace byte to the end, verbatim) is the final field. An all-whitespace
+ * or empty string yields an empty list. */
+void *zap_str_split_ws(void *sp, int64_t maxsplit) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const char *d = s->data;
+    int64_t n = s->len;
+    void *out = zap_list_new();
+    int64_t i = 0, splits = 0;
+    while (i < n) {
+        while (i < n && zap_is_ascii_ws((unsigned char)d[i])) {
+            i++;
+        }
+        if (i >= n) {
+            break;
+        }
+        if (maxsplit >= 0 && splits == maxsplit) {
+            /* remainder is one field, verbatim (keeps interior/trailing ws). */
+            zap_list_push_ptr(out, zap_str_new(d + i, n - i));
+            break;
+        }
+        int64_t start = i;
+        while (i < n && !zap_is_ascii_ws((unsigned char)d[i])) {
+            i++;
+        }
+        zap_list_push_ptr(out, zap_str_new(d + start, i - start));
+        splits++;
+    }
+    return out;
+}
+
+/* split(sep[, maxsplit]): split on the explicit (non-empty) separator. An empty
+ * separator returns the whole string as the single element (unchanged from the
+ * historical `zap_str_split`, which never raised). `maxsplit >= 0` caps the
+ * number of splits; the tail keeps the rest verbatim. */
+void *zap_str_split_sep(void *sp, void *sepp, int64_t maxsplit) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *sep = (const ZapStr *)sepp;
+    const char *d = s->data;
+    int64_t n = s->len, m = sep->len;
+    void *out = zap_list_new();
+    if (m == 0) {
+        zap_list_push_ptr(out, zap_str_new(d, n));
+        return out;
+    }
+    int64_t start = 0, i = 0, splits = 0;
+    while (i + m <= n) {
+        if (maxsplit >= 0 && splits == maxsplit) {
+            break;
+        }
+        if (memcmp(d + i, sep->data, (size_t)m) == 0) {
+            zap_list_push_ptr(out, zap_str_new(d + start, i - start));
+            i += m;
+            start = i;
+            splits++;
+        } else {
+            i++;
+        }
+    }
+    zap_list_push_ptr(out, zap_str_new(d + start, n - start));
+    return out;
+}
+
+/* rsplit() with no separator: whitespace split from the right. Only `maxsplit`
+ * matters for the result vs `split_ws` (the head keeps the rest verbatim); with
+ * no limit the result equals `split_ws`. */
+void *zap_str_rsplit_ws(void *sp, int64_t maxsplit) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const char *d = s->data;
+    int64_t n = s->len;
+    if (maxsplit < 0) {
+        return zap_str_split_ws(sp, -1);
+    }
+    /* collect fields from the right into a temp list, then reverse. */
+    void *rev = zap_list_new();
+    int64_t i = n, splits = 0;
+    while (i > 0) {
+        while (i > 0 && zap_is_ascii_ws((unsigned char)d[i - 1])) {
+            i--;
+        }
+        if (i <= 0) {
+            break;
+        }
+        if (splits == maxsplit) {
+            zap_list_push_ptr(rev, zap_str_new(d, i));
+            i = 0;
+            break;
+        }
+        int64_t end = i;
+        while (i > 0 && !zap_is_ascii_ws((unsigned char)d[i - 1])) {
+            i--;
+        }
+        zap_list_push_ptr(rev, zap_str_new(d + i, end - i));
+        splits++;
+    }
+    int64_t k = zap_list_len(rev);
+    void *out = zap_list_new();
+    for (int64_t j = k - 1; j >= 0; j--) {
+        zap_list_push_ptr(out, zap_list_get_ptr(rev, j));
+    }
+    return out;
+}
+
+/* rsplit(sep[, maxsplit]): split on an explicit separator from the right. */
+void *zap_str_rsplit_sep(void *sp, void *sepp, int64_t maxsplit) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *sep = (const ZapStr *)sepp;
+    const char *d = s->data;
+    int64_t n = s->len, m = sep->len;
+    if (m == 0 || maxsplit < 0) {
+        return zap_str_split_sep(sp, sepp, maxsplit);
+    }
+    void *rev = zap_list_new();
+    int64_t end = n, i = n - m, splits = 0;
+    while (i >= 0) {
+        if (splits == maxsplit) {
+            break;
+        }
+        if (memcmp(d + i, sep->data, (size_t)m) == 0) {
+            zap_list_push_ptr(rev, zap_str_new(d + i + m, end - (i + m)));
+            end = i;
+            i -= m;
+            splits++;
+        } else {
+            i--;
+        }
+    }
+    zap_list_push_ptr(rev, zap_str_new(d, end));
+    int64_t k = zap_list_len(rev);
+    void *out = zap_list_new();
+    for (int64_t j = k - 1; j >= 0; j--) {
+        zap_list_push_ptr(out, zap_list_get_ptr(rev, j));
+    }
+    return out;
+}
+
+/* splitlines(): split on ASCII line boundaries (\n, \r, \r\n), dropping the
+ * terminators (keepends=False). A trailing newline does NOT produce a final
+ * empty field (Python). */
+void *zap_str_splitlines(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const char *d = s->data;
+    int64_t n = s->len;
+    void *out = zap_list_new();
+    int64_t start = 0, i = 0;
+    while (i < n) {
+        unsigned char c = (unsigned char)d[i];
+        if (c == '\n' || c == '\r') {
+            zap_list_push_ptr(out, zap_str_new(d + start, i - start));
+            if (c == '\r' && i + 1 < n && d[i + 1] == '\n') {
+                i += 2;
+            } else {
+                i++;
+            }
+            start = i;
+        } else {
+            i++;
+        }
+    }
+    if (start < n) {
+        zap_list_push_ptr(out, zap_str_new(d + start, n - start));
+    }
+    return out;
+}
+
+/* count(sub): non-overlapping occurrences (byte scan). An empty `sub` returns
+ * byte-length + 1 (Python's count-of-empty, byte-based here). */
+int64_t zap_str_count(void *sp, void *subp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *sub = (const ZapStr *)subp;
+    int64_t n = s->len, m = sub->len;
+    if (m == 0) {
+        return n + 1;
+    }
+    int64_t c = 0, i = 0;
+    while (i + m <= n) {
+        if (memcmp(s->data + i, sub->data, (size_t)m) == 0) {
+            c++;
+            i += m;
+        } else {
+            i++;
+        }
+    }
+    return c;
+}
+
+/* rfind(sub): last byte offset of `sub`, or -1. An empty `sub` returns the
+ * byte length (Python). */
+int64_t zap_str_rfind(void *sp, void *subp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *sub = (const ZapStr *)subp;
+    int64_t n = s->len, m = sub->len;
+    if (m == 0) {
+        return n;
+    }
+    for (int64_t i = n - m; i >= 0; i--) {
+        if (memcmp(s->data + i, sub->data, (size_t)m) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* rindex(sub): like rfind, but faults when absent (Python's ValueError), the
+ * same abort contract as `zap_str_index_of`. */
+int64_t zap_str_rindex(void *sp, void *subp) {
+    int64_t r = zap_str_rfind(sp, subp);
+    if (r < 0) {
+        fprintf(stderr, "zap: substring not found\n");
+        abort();
+    }
+    return r;
+}
+
+/* removeprefix(p): drop a leading `p` if present (else unchanged). */
+void *zap_str_removeprefix(void *sp, void *pp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *p = (const ZapStr *)pp;
+    if (p->len > 0 && p->len <= s->len && memcmp(s->data, p->data, (size_t)p->len) == 0) {
+        return zap_str_new(s->data + p->len, s->len - p->len);
+    }
+    return zap_str_new(s->data, s->len);
+}
+
+/* removesuffix(x): drop a trailing `x` if present (else unchanged). */
+void *zap_str_removesuffix(void *sp, void *xp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *x = (const ZapStr *)xp;
+    if (x->len > 0 && x->len <= s->len &&
+        memcmp(s->data + (s->len - x->len), x->data, (size_t)x->len) == 0) {
+        return zap_str_new(s->data, s->len - x->len);
+    }
+    return zap_str_new(s->data, s->len);
+}
+
+/* strip(chars, mode): mode 0 both / 1 left / 2 right. Trim any byte that appears
+ * in the `chars` set (Python `strip(chars)`). An empty set trims nothing. */
+void *zap_str_strip_chars(void *sp, void *charsp, int64_t mode) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *cs = (const ZapStr *)charsp;
+    int64_t a = 0, b = s->len;
+    uint8_t set[256] = {0};
+    for (int64_t i = 0; i < cs->len; i++) {
+        set[(unsigned char)cs->data[i]] = 1;
+    }
+    if (mode != 2) {
+        while (a < b && set[(unsigned char)s->data[a]]) {
+            a++;
+        }
+    }
+    if (mode != 1) {
+        while (b > a && set[(unsigned char)s->data[b - 1]]) {
+            b--;
+        }
+    }
+    return zap_str_new(s->data + a, b - a);
+}
+
+/* Pad `s` to `width` CODEPOINTS using the first byte of `fill` (ASCII; space
+ * when `fill` is empty). `side`: 0 left-justify (pad right), 1 right-justify
+ * (pad left), 2 center. If `s` is already wide enough it is returned unchanged. */
+static void *zap_str_pad(void *sp, int64_t width, void *fillp, int side) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *fill = (const ZapStr *)fillp;
+    char fc = (fill && fill->len > 0) ? fill->data[0] : ' ';
+    int64_t cur = zap_str_len_cp(sp);
+    if (width <= cur) {
+        return zap_str_new(s->data, s->len);
+    }
+    int64_t pad = width - cur;
+    int64_t left = 0, right = 0;
+    if (side == 0) {
+        right = pad;
+    } else if (side == 1) {
+        left = pad;
+    } else {
+        left = pad / 2;
+        right = pad - left;
+    }
+    int64_t total = s->len + left + right;
+    char *buf = (char *)zap_buf((size_t)(total > 0 ? total : 1));
+    int64_t w = 0;
+    for (int64_t i = 0; i < left; i++) {
+        buf[w++] = fc;
+    }
+    memcpy(buf + w, s->data, (size_t)s->len);
+    w += s->len;
+    for (int64_t i = 0; i < right; i++) {
+        buf[w++] = fc;
+    }
+    return zap_str_adopt(buf, total);
+}
+
+void *zap_str_ljust(void *sp, int64_t width, void *fillp) {
+    return zap_str_pad(sp, width, fillp, 0);
+}
+void *zap_str_rjust(void *sp, int64_t width, void *fillp) {
+    return zap_str_pad(sp, width, fillp, 1);
+}
+void *zap_str_center(void *sp, int64_t width, void *fillp) {
+    return zap_str_pad(sp, width, fillp, 2);
+}
+
+/* zfill(width): right-justify with '0', but keep a leading sign ('+'/'-') at the
+ * front (Python). Codepoint width. */
+void *zap_str_zfill(void *sp, int64_t width) {
+    const ZapStr *s = (const ZapStr *)sp;
+    int64_t cur = zap_str_len_cp(sp);
+    if (width <= cur) {
+        return zap_str_new(s->data, s->len);
+    }
+    int64_t pad = width - cur;
+    int64_t total = s->len + pad;
+    char *buf = (char *)zap_buf((size_t)(total > 0 ? total : 1));
+    int64_t w = 0, src = 0;
+    if (s->len > 0 && (s->data[0] == '+' || s->data[0] == '-')) {
+        buf[w++] = s->data[0];
+        src = 1;
+    }
+    for (int64_t i = 0; i < pad; i++) {
+        buf[w++] = '0';
+    }
+    memcpy(buf + w, s->data + src, (size_t)(s->len - src));
+    w += s->len - src;
+    return zap_str_adopt(buf, total);
+}
+
+/* title(): ASCII titlecase — the first letter of each run of letters uppercased,
+ * the rest lowercased; non-letters are word boundaries. */
+void *zap_str_title(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    char *buf = (char *)zap_buf((size_t)(s->len > 0 ? s->len : 1));
+    int in_word = 0;
+    for (int64_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        int is_alpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        if (is_alpha) {
+            if (!in_word) {
+                buf[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : (char)c;
+            } else {
+                buf[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c;
+            }
+            in_word = 1;
+        } else {
+            buf[i] = (char)c;
+            in_word = 0;
+        }
+    }
+    return zap_str_adopt(buf, s->len);
+}
+
+/* capitalize(): first char uppercased, the rest lowercased (ASCII). */
+void *zap_str_capitalize(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    char *buf = (char *)zap_buf((size_t)(s->len > 0 ? s->len : 1));
+    for (int64_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        if (i == 0) {
+            buf[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : (char)c;
+        } else {
+            buf[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c;
+        }
+    }
+    return zap_str_adopt(buf, s->len);
+}
+
+/* casefold(): ASCII case-folding == lowercase (full Unicode folding is a
+ * documented follow-up). */
+void *zap_str_casefold(void *sp) { return zap_str_lower(sp); }
+
+/* swapcase(): invert the case of each ASCII letter. */
+void *zap_str_swapcase(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    char *buf = (char *)zap_buf((size_t)(s->len > 0 ? s->len : 1));
+    for (int64_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        if (c >= 'a' && c <= 'z') {
+            buf[i] = (char)(c - 32);
+        } else if (c >= 'A' && c <= 'Z') {
+            buf[i] = (char)(c + 32);
+        } else {
+            buf[i] = (char)c;
+        }
+    }
+    return zap_str_adopt(buf, s->len);
+}
+
+/* The is* predicates (ASCII). Each is False for the empty string (Python). */
+int64_t zap_str_isdigit(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    if (s->len == 0) {
+        return 0;
+    }
+    for (int64_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        if (c < '0' || c > '9') {
+            return 0;
+        }
+    }
+    return 1;
+}
+int64_t zap_str_isalpha(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    if (s->len == 0) {
+        return 0;
+    }
+    for (int64_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) {
+            return 0;
+        }
+    }
+    return 1;
+}
+int64_t zap_str_isalnum(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    if (s->len == 0) {
+        return 0;
+    }
+    for (int64_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) {
+            return 0;
+        }
+    }
+    return 1;
+}
+int64_t zap_str_isspace(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    if (s->len == 0) {
+        return 0;
+    }
+    for (int64_t i = 0; i < s->len; i++) {
+        if (!zap_is_ascii_ws((unsigned char)s->data[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+/* islower(): at least one cased letter, and no uppercase letter (Python). */
+int64_t zap_str_islower(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    int cased = 0;
+    for (int64_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        if (c >= 'A' && c <= 'Z') {
+            return 0;
+        }
+        if (c >= 'a' && c <= 'z') {
+            cased = 1;
+        }
+    }
+    return cased ? 1 : 0;
+}
+/* isupper(): at least one cased letter, and no lowercase letter (Python). */
+int64_t zap_str_isupper(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    int cased = 0;
+    for (int64_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        if (c >= 'a' && c <= 'z') {
+            return 0;
+        }
+        if (c >= 'A' && c <= 'Z') {
+            cased = 1;
+        }
+    }
+    return cased ? 1 : 0;
+}
+
 typedef struct {
     ZapStr *type_name;
     ZapStr *deco_name;
