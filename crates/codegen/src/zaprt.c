@@ -15821,7 +15821,14 @@ void zap_fs_makedirs(void *path_) {
  * A plain file is unlinked. */
 static void zap_fs_rmtree_cstr(const char *path) {
     struct stat st;
+    /* lstat (don't follow a symlink to a dir — unlink it) on POSIX; the MSVC CRT
+     * has no lstat, so Windows uses stat (symlink-dir edge case is a follow-up,
+     * like `fs.stat`'s is_symlink). */
+#if defined(ZAP_PLATFORM_WINDOWS)
+    if (stat(path, &st) != 0) {
+#else
     if (lstat(path, &st) != 0) {
+#endif
         zap_sys_fail("fs.rmtree", strerror(errno));
     }
     if (!S_ISDIR(st.st_mode)) {
