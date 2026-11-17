@@ -23423,6 +23423,7 @@ fn exception_type_id_name(name: &str) -> Option<i64> {
         "ScopeTimeout" => 14,
         "TimeoutError" => 15,
         "AssertionError" => 16,
+        "EOFError" => 17,
         _ => return None,
     })
 }
