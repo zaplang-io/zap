@@ -10705,13 +10705,13 @@ rather than `\` on Windows. Path helpers are lexical where Python's are
 (`normpath`/`relpath` do not touch the filesystem; `abspath` joins against the
 cwd but normalizes lexically); `realpath` is the one that resolves symlinks.
 
-**Deferred (documented follow-ups — the issue's own slicing).** Traversal
-(`fs.walk` / `fs.scandir`, which need the iterator protocol over a native tree
-walk — a design question flagged in the #965 L-cluster) and matching
-(`fs.glob` / `fs.fnmatch`) form the natural next slice; `fs.copytree` (recursive
-dir copy) pairs with them; and `os.path_split` / `os.path_splitext` want the
-tuple-return design still pending (same as [[D-0210]]'s `partition`). None has a
-worse workaround than what ships here.
+**Deferred (documented follow-ups — the issue's own slicing).** Matching
+(`fs.glob` / `fs.fnmatch`) shipped in [[D-0216]] (#1033), and `os.path_split` /
+`os.path_splitext` in [[D-0219]] (#1030) — the "tuple-return design" they waited
+on turned out to already exist (the D-0049 interner, as [[D-0218]] confirmed).
+Still open: traversal (`fs.walk` / `fs.scandir`, #1032), which needs the iterator
+protocol over a native tree walk (a design question flagged in the #965
+L-cluster), and `fs.copytree` (recursive dir copy), which pairs with it.
 
 Relates to [[D-0056]] / #97 (the original os/fs seam), [[D-0126]] (`KeyInfo`, the
 value-struct precedent), [[D-0204]] (seam kwargs), epic #966, and Discussion #965
@@ -11011,3 +11011,37 @@ Relates to [[D-0210]] (the thin-str set this completes), [[D-0049]] (the tuple
 interner it reuses), [[D-0056]] / #97 (`process.run`, the tuple-return precedent),
 epic #966, and Discussion #965 (gap #2). Clears the way for #1030
 (`os.path_split` / `path_splitext`), which reuses the same tuple path.
+
+## D-0219 — stdlib os.path: tuple-returning decomposition — path_split / path_splitext (#1030 / epic #966)
+
+**Context.** [[D-0211]] deferred `os.path_split` / `os.path_splitext` on the
+"tuple-return design", which [[D-0218]] then showed already exists (the D-0049
+interner, proven by `process.run` and `str.partition`). This ships them, gap #4's
+last decomposition piece under epic #966.
+
+**Decision.** Both CPython `os.path`-faithful, returning a `(str, str)` tuple:
+- `os.path_split(p) -> (head, tail)` — split at the last `/`. `posixpath.split`:
+  `"/a/b/c" -> ("/a/b", "c")`, `"/a/b/" -> ("/a/b", "")`, `"c" -> ("", "c")`,
+  `"/" -> ("/", "")`. The head's trailing separators are stripped unless the head
+  is all separators.
+- `os.path_splitext(p) -> (root, ext)` — split at the last `.` of the final
+  component, with the leading-dot rule: `"/a/b.txt" -> ("/a/b", ".txt")`,
+  `"/a/.bashrc" -> ("/a/.bashrc", "")`, `"a.b.c" -> ("a.b", ".c")`.
+
+**Not `basename`/`dirname`.** `path_split` is deliberately **not**
+`(path_dirname, path_basename)`: those existing helpers use POSIX-command
+semantics (`basename("a/") -> "a"`, `dirname("c") -> "."`), whereas
+`posixpath.split` wants `("a", "")` and `("", "c")`. So `path_split` is its own
+exact-`split` implementation (two getters — head/tail — that the lowerer
+assembles into the tuple via the D-0049 path, like `process.run`); `splitext` is
+a matching pair of root/ext getters. Neither raises.
+
+**Tests.** Golden `path_split` (trailing slash, no separator, root `/`, the
+leading-dot and multi-dot `splitext` cases) — pure lexical, no filesystem, so
+deterministic; sema shape + arity tests; seam-kwargs binding
+(`os.path_split(path=…)`).
+
+Relates to [[D-0211]] (the fs/os gaps this completes), [[D-0218]] / [[D-0049]]
+(the tuple path it reuses), [[D-0213]] (seam rows), epic #966, and Discussion
+#965 (gap #4). Only traversal (`fs.walk`/`scandir`/`copytree`, #1032) and the
+iterator protocol (#1031) remain of the stdlib-gap follow-ups.

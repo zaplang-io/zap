@@ -178,6 +178,9 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("os", "path_exists", &["path"]),
     ("os", "path_basename", &["path"]),
     ("os", "path_dirname", &["path"]),
+    // Tuple-returning decomposition (#1030, D-0219).
+    ("os", "path_split", &["path"]),
+    ("os", "path_splitext", &["path"]),
     // filesystem gaps (#968, D-0211); environ/sep take no args, so no row.
     ("os", "path_isabs", &["path"]),
     ("os", "path_expanduser", &["path"]),

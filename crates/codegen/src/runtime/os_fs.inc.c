@@ -268,6 +268,90 @@ void *zap_os_path_dirname(void *path_) {
     return zap_str_new(p->data, i);
 }
 
+/* --- path split / splitext (#1030, D-0219) ---------------------------------
+ *
+ * CPython `os.path.split` / `os.path.splitext`, returned as a `(str, str)`
+ * tuple built by the lowerer from these getters. These deliberately differ from
+ * `path_basename`/`path_dirname` above (POSIX-command semantics): `split`
+ * strips trailing separators from the head only when the head is not all
+ * separators, keeps the tail empty for a trailing-slash path, and gives an empty
+ * head (not ".") when there is no separator — the exact `posixpath.split`
+ * contract. */
+
+/* os.path_split head: everything up to and excluding the last '/', with trailing
+ * separators stripped unless the head is all separators (posixpath.split[0]). */
+void *zap_os_path_split_head(void *path_) {
+    const ZapStr *p = (const ZapStr *)path_;
+    int64_t i = p->len;
+    while (i > 0 && p->data[i - 1] != '/') {
+        i--; /* i = index just past the last '/', or 0 when there is none */
+    }
+    int64_t hlen = i;
+    int all_slash = 1;
+    for (int64_t k = 0; k < hlen; k++) {
+        if (p->data[k] != '/') {
+            all_slash = 0;
+            break;
+        }
+    }
+    if (hlen > 0 && !all_slash) {
+        while (hlen > 0 && p->data[hlen - 1] == '/') {
+            hlen--;
+        }
+    }
+    return zap_str_new(p->data, hlen);
+}
+
+/* os.path_split tail: the final component (posixpath.split[1]); "" for a
+ * trailing-slash path, the whole string when there is no '/'. */
+void *zap_os_path_split_tail(void *path_) {
+    const ZapStr *p = (const ZapStr *)path_;
+    int64_t i = p->len;
+    while (i > 0 && p->data[i - 1] != '/') {
+        i--;
+    }
+    return zap_str_new(p->data + i, p->len - i);
+}
+
+/* Byte offset of the extension-splitting '.' (posixpath.splitext), or -1 when
+ * there is no extension: the last '.' that comes after the last '/' and is not
+ * part of a run of leading dots in the final component. */
+static int64_t zap_os_splitext_dot(const ZapStr *p) {
+    int64_t sep = -1, dot = -1;
+    for (int64_t i = 0; i < p->len; i++) {
+        if (p->data[i] == '/') {
+            sep = i;
+        } else if (p->data[i] == '.') {
+            dot = i;
+        }
+    }
+    if (dot > sep) {
+        int64_t fi = sep + 1;
+        while (fi < dot) {
+            if (p->data[fi] != '.') {
+                return dot;
+            }
+            fi++;
+        }
+    }
+    return -1;
+}
+
+/* os.path_splitext root: the path without its extension (posixpath.splitext[0]). */
+void *zap_os_path_splitext_root(void *path_) {
+    const ZapStr *p = (const ZapStr *)path_;
+    int64_t d = zap_os_splitext_dot(p);
+    return d < 0 ? zap_str_new(p->data, p->len) : zap_str_new(p->data, d);
+}
+
+/* os.path_splitext ext: the extension incl. the leading '.', or "" when none
+ * (posixpath.splitext[1]). */
+void *zap_os_path_splitext_ext(void *path_) {
+    const ZapStr *p = (const ZapStr *)path_;
+    int64_t d = zap_os_splitext_dot(p);
+    return d < 0 ? zap_str_new("", 0) : zap_str_new(p->data + d, p->len - d);
+}
+
 /* --- sys -------------------------------------------------------------------- */
 
 #if defined(__APPLE__)

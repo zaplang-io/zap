@@ -833,6 +833,20 @@ fn os_path_relpath_keyword() {
 }
 
 #[test]
+fn os_path_split_splitext_keyword_and_positional() {
+    // Tuple-returning decomposition (#1030, D-0219).
+    assert_ok(&prog("    auto h, t = os.path_split(path=\"/a/b.txt\")\n"));
+    assert_ok(&prog("    auto h, t = os.path_split(\"/a/b.txt\")\n"));
+    assert_ok(&prog(
+        "    auto r, e = os.path_splitext(path=\"/a/b.txt\")\n",
+    ));
+    assert_code(
+        &prog("    auto h, t = os.path_split(p=\"/a\")\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
 fn fs_stat_keyword_and_positional() {
     assert_ok(&prog("    auto s = fs.stat(path=\"/tmp\")\n"));
     assert_ok(&prog("    auto s = fs.stat(\"/tmp\")\n"));

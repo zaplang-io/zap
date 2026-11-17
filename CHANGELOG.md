@@ -25,6 +25,10 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`os.path` gains tuple-returning decomposition — `path_split` / `path_splitext`**
+  (#1030, D-0219). `path_split(p)` → `(head, tail)` and `path_splitext(p)` →
+  `(root, ext)`, CPython `os.path` semantics (not the POSIX-command
+  `basename`/`dirname` behavior). Reuses the existing D-0049 tuple path.
 - **`str` gains `partition` / `rpartition`** (#1029, D-0218) — the last thin-`str`
   deferral. Each splits on the first / last occurrence of the separator into a
   `(head, sep, tail)` tuple (absent separator: `(whole, "", "")` for `partition`,

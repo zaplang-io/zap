@@ -9,6 +9,44 @@ use crate::lower::{FnLower, LowerError};
 
 pub(super) const MODULE: ModuleLower = ModuleLower { name: "os", lower };
 
+/// Build a `(str, str)` tuple from two path getters over `path` (#1030, D-0219)
+/// — the `process.run` aggregate path (intern + StructNew + FieldSet), so
+/// codegen needs no path-specific handling. Neither getter raises.
+fn build_path_pair(lowerer: &mut FnLower, path: Value, first: &str, second: &str) -> (Value, Ty) {
+    let a = lowerer.new_value(Ty::Ptr);
+    lowerer.emit(Inst::Call {
+        dest: Some(a),
+        func: first.to_string(),
+        args: vec![path],
+    });
+    let b = lowerer.new_value(Ty::Ptr);
+    lowerer.emit(Inst::Call {
+        dest: Some(b),
+        func: second.to_string(),
+        args: vec![path],
+    });
+    let sid = lowerer
+        .ctx
+        .tuples
+        .borrow_mut()
+        .intern(vec![Ty::Ptr, Ty::Ptr]);
+    let dest = lowerer.new_value(Ty::Struct(sid));
+    lowerer.emit(Inst::StructNew { dest, sid });
+    lowerer.emit(Inst::FieldSet {
+        base: dest,
+        sid,
+        idx: 0,
+        val: a,
+    });
+    lowerer.emit(Inst::FieldSet {
+        base: dest,
+        sid,
+        idx: 1,
+        val: b,
+    });
+    (dest, Ty::Struct(sid))
+}
+
 fn lower(
     lowerer: &mut FnLower,
     method: &str,
@@ -46,6 +84,19 @@ fn lower(
         "path_abspath" => call_ret(lowerer, "zap_os_path_abspath", a, Ty::Ptr, true),
         "path_realpath" => call_ret(lowerer, "zap_os_path_realpath", a, Ty::Ptr, true),
         "path_relpath" => call_ret(lowerer, "zap_os_path_relpath", a, Ty::Ptr, true),
+        // Tuple-returning decomposition (#1030, D-0219).
+        "path_split" => build_path_pair(
+            lowerer,
+            a[0],
+            "zap_os_path_split_head",
+            "zap_os_path_split_tail",
+        ),
+        "path_splitext" => build_path_pair(
+            lowerer,
+            a[0],
+            "zap_os_path_splitext_root",
+            "zap_os_path_splitext_ext",
+        ),
         _ => return Ok(None),
     }))
 }
