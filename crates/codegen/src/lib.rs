@@ -7634,12 +7634,19 @@ mod tests {
         // On-disk fragment files, as manifest-style relative paths ("runtime/..").
         let mut on_disk: BTreeSet<String> = BTreeSet::new();
         fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut BTreeSet<String>) {
-            for e in std::fs::read_dir(dir).expect("read_dir src/runtime").flatten() {
+            for e in std::fs::read_dir(dir)
+                .expect("read_dir src/runtime")
+                .flatten()
+            {
                 let p = e.path();
                 if p.is_dir() {
                     walk(&p, root, out);
                 } else {
-                    let rel = p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+                    let rel = p
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
                     out.insert(format!("runtime/{rel}"));
                 }
             }
@@ -7672,7 +7679,11 @@ mod tests {
         // (2) every `.inc.c` row is #included by zaprt.c; (3) every runtime/ include
         // in zaprt.c is a manifest row. Non-empty texts throughout.
         for f in runtime_manifest::RUNTIME_FRAGMENTS {
-            assert!(!f.text.is_empty(), "runtime fragment {} is embedded empty", f.path);
+            assert!(
+                !f.text.is_empty(),
+                "runtime fragment {} is embedded empty",
+                f.path
+            );
             if f.path.ends_with(".inc.c") {
                 let needle = format!("#include \"{}\"", f.path);
                 assert!(

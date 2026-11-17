@@ -47,11 +47,31 @@ pub(crate) struct RuntimeFile {
 /// `in_tu` rows here is irrelevant (files are written independently); the semantic
 /// `#include` order lives in `zaprt.c`.
 pub(crate) static RUNTIME_FRAGMENTS: &[RuntimeFile] = &[
-    RuntimeFile { path: "zaprt.c", text: crate::RUNTIME_C, in_tu: true },
-    RuntimeFile { path: "runtime/gc.inc.c", text: crate::RUNTIME_GC_C, in_tu: true },
-    RuntimeFile { path: "runtime/race.inc.c", text: crate::RUNTIME_RACE_C, in_tu: true },
-    RuntimeFile { path: "runtime/accel/blas.inc.c", text: crate::RUNTIME_BLAS_C, in_tu: true },
-    RuntimeFile { path: "runtime/accel/random.inc.c", text: crate::RUNTIME_RANDOM_C, in_tu: true },
+    RuntimeFile {
+        path: "zaprt.c",
+        text: crate::RUNTIME_C,
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/gc.inc.c",
+        text: crate::RUNTIME_GC_C,
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/race.inc.c",
+        text: crate::RUNTIME_RACE_C,
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/accel/blas.inc.c",
+        text: crate::RUNTIME_BLAS_C,
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/accel/random.inc.c",
+        text: crate::RUNTIME_RANDOM_C,
+        in_tu: true,
+    },
     RuntimeFile {
         path: "runtime/accel/ziggurat_constants.h",
         text: crate::ZIGGURAT_H,
@@ -62,9 +82,21 @@ pub(crate) static RUNTIME_FRAGMENTS: &[RuntimeFile] = &[
         text: crate::CPU_FEATURES_H,
         in_tu: true,
     },
-    RuntimeFile { path: "runtime/accel/cpu.inc.c", text: crate::RUNTIME_CPU_C, in_tu: true },
-    RuntimeFile { path: "runtime/accel/memchr.inc.c", text: crate::RUNTIME_MEMCHR_C, in_tu: true },
-    RuntimeFile { path: "runtime/accel/arch.inc.c", text: crate::RUNTIME_ARCH_C, in_tu: true },
+    RuntimeFile {
+        path: "runtime/accel/cpu.inc.c",
+        text: crate::RUNTIME_CPU_C,
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/accel/memchr.inc.c",
+        text: crate::RUNTIME_MEMCHR_C,
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/accel/arch.inc.c",
+        text: crate::RUNTIME_ARCH_C,
+        in_tu: true,
+    },
     RuntimeFile {
         path: "runtime/accel/sortaccel.inc.c",
         text: crate::RUNTIME_SORTACCEL_C,
@@ -73,11 +105,31 @@ pub(crate) static RUNTIME_FRAGMENTS: &[RuntimeFile] = &[
     // Per-stdlib-module bodies lifted out of zaprt.c (#1023). Each is `#include`d
     // by zaprt.c at its original position (order is semantic). Inline `include_str!`
     // keeps "add a fragment" to two edits: a row here + the `#include` in zaprt.c.
-    RuntimeFile { path: "runtime/array.inc.c", text: include_str!("runtime/array.inc.c"), in_tu: true },
-    RuntimeFile { path: "runtime/str.inc.c", text: include_str!("runtime/str.inc.c"), in_tu: true },
-    RuntimeFile { path: "runtime/os_fs.inc.c", text: include_str!("runtime/os_fs.inc.c"), in_tu: true },
-    RuntimeFile { path: "runtime/crypto.inc.c", text: include_str!("runtime/crypto.inc.c"), in_tu: true },
-    RuntimeFile { path: "runtime/bytes.inc.c", text: include_str!("runtime/bytes.inc.c"), in_tu: true },
+    RuntimeFile {
+        path: "runtime/array.inc.c",
+        text: include_str!("runtime/array.inc.c"),
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/str.inc.c",
+        text: include_str!("runtime/str.inc.c"),
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/os_fs.inc.c",
+        text: include_str!("runtime/os_fs.inc.c"),
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/crypto.inc.c",
+        text: include_str!("runtime/crypto.inc.c"),
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/bytes.inc.c",
+        text: include_str!("runtime/bytes.inc.c"),
+        in_tu: true,
+    },
     RuntimeFile {
         path: "runtime/time_datetime.inc.c",
         text: include_str!("runtime/time_datetime.inc.c"),
@@ -88,9 +140,21 @@ pub(crate) static RUNTIME_FRAGMENTS: &[RuntimeFile] = &[
         text: include_str!("runtime/math_random.inc.c"),
         in_tu: true,
     },
-    RuntimeFile { path: "runtime/json.inc.c", text: include_str!("runtime/json.inc.c"), in_tu: true },
-    RuntimeFile { path: "runtime/xml.inc.c", text: include_str!("runtime/xml.inc.c"), in_tu: true },
-    RuntimeFile { path: "runtime/url.inc.c", text: include_str!("runtime/url.inc.c"), in_tu: true },
+    RuntimeFile {
+        path: "runtime/json.inc.c",
+        text: include_str!("runtime/json.inc.c"),
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/xml.inc.c",
+        text: include_str!("runtime/xml.inc.c"),
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/url.inc.c",
+        text: include_str!("runtime/url.inc.c"),
+        in_tu: true,
+    },
     RuntimeFile {
         path: "runtime/collections.inc.c",
         text: include_str!("runtime/collections.inc.c"),
@@ -101,16 +165,36 @@ pub(crate) static RUNTIME_FRAGMENTS: &[RuntimeFile] = &[
         text: include_str!("runtime/logging_argparse.inc.c"),
         in_tu: true,
     },
-    RuntimeFile { path: "runtime/csv.inc.c", text: include_str!("runtime/csv.inc.c"), in_tu: true },
-    RuntimeFile { path: "runtime/yaml.inc.c", text: include_str!("runtime/yaml.inc.c"), in_tu: true },
-    RuntimeFile { path: "runtime/zlib.inc.c", text: include_str!("runtime/zlib.inc.c"), in_tu: true },
-    RuntimeFile { path: "runtime/sync.inc.c", text: include_str!("runtime/sync.inc.c"), in_tu: true },
+    RuntimeFile {
+        path: "runtime/csv.inc.c",
+        text: include_str!("runtime/csv.inc.c"),
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/yaml.inc.c",
+        text: include_str!("runtime/yaml.inc.c"),
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/zlib.inc.c",
+        text: include_str!("runtime/zlib.inc.c"),
+        in_tu: true,
+    },
+    RuntimeFile {
+        path: "runtime/sync.inc.c",
+        text: include_str!("runtime/sync.inc.c"),
+        in_tu: true,
+    },
     RuntimeFile {
         path: "runtime/net_http.inc.c",
         text: include_str!("runtime/net_http.inc.c"),
         in_tu: true,
     },
-    RuntimeFile { path: "runtime/tls.inc.c", text: include_str!("runtime/tls.inc.c"), in_tu: true },
+    RuntimeFile {
+        path: "runtime/tls.inc.c",
+        text: include_str!("runtime/tls.inc.c"),
+        in_tu: true,
+    },
     RuntimeFile {
         path: "runtime/crypto_jose.inc.c",
         text: include_str!("runtime/crypto_jose.inc.c"),
@@ -129,8 +213,16 @@ pub(crate) static RUNTIME_FRAGMENTS: &[RuntimeFile] = &[
     // Separate C++ translation units (the per-ISA SIMD sort kernels): NOT
     // `#include`d into `zaprt.c`, written conditionally by their own sites, but a
     // change to one must still rebuild the runtime object, so they are hashed.
-    RuntimeFile { path: "zapxsort.cpp", text: crate::RUNTIME_XSORT_CPP, in_tu: false },
-    RuntimeFile { path: "zaphwysort.cpp", text: crate::RUNTIME_HWYSORT_CPP, in_tu: false },
+    RuntimeFile {
+        path: "zapxsort.cpp",
+        text: crate::RUNTIME_XSORT_CPP,
+        in_tu: false,
+    },
+    RuntimeFile {
+        path: "zaphwysort.cpp",
+        text: crate::RUNTIME_HWYSORT_CPP,
+        in_tu: false,
+    },
 ];
 
 /// Hash every runtime file's text into the runtime cache key. Replaces the two
