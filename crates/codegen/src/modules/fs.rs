@@ -41,4 +41,7 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_fs_append", &[p.into(), p.into()], None);
     // Line-oriented input (#969, D-0212): whole-file read split into lines.
     cg.declare_rt("zap_fs_lines", &[p.into()], Some(p.into()));
+    // Path matching (#1033, D-0216): fnmatch -> int64 bool; glob -> list[str].
+    cg.declare_rt("zap_fs_fnmatch", &[p.into(), p.into()], Some(i.into()));
+    cg.declare_rt("zap_fs_glob", &[p.into(), p.into()], Some(p.into()));
 }

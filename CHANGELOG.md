@@ -25,6 +25,12 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`fs` gains path matching — `fs.glob` / `fs.fnmatch`** (#1033, D-0216).
+  `fs.fnmatch(name, pattern)` is a whole-string shell-glob match (`*`/`?`/`[seq]`/
+  `[!seq]`); `fs.glob(root, pattern)` returns the paths under `root` matching a
+  `/`-split glob, relative to `root` and sorted, with `**` crossing directory
+  levels (self-contained recursive walk; skips dotfiles and symlinked dirs like
+  CPython).
 - **`EOFError` builtin exception** (#1036, D-0215). A direct subclass of
   `Exception` (CPython placement). `input()` now raises `EOFError` at end-of-input
   instead of the stopgap `RuntimeError`, so `except EOFError` (and `except

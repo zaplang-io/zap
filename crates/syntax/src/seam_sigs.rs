@@ -207,6 +207,9 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("fs", "append", &["path", "data"]),
     // Line-oriented input (#969, D-0212): whole-file read split into lines.
     ("fs", "lines", &["path"]),
+    // Path matching (#1033, D-0216).
+    ("fs", "fnmatch", &["name", "pattern"]),
+    ("fs", "glob", &["root", "pattern"]),
     // ---- time (ticket #99): sleeps + Duration constructors/accessors ----
     // (monotonic/monotonic_ns/time/time_ns take no args, so no row.)
     ("time", "sleep", &["seconds"]),

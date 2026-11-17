@@ -1522,3 +1522,255 @@ void *zap_fs_lines(void *path_) {
     return zap_str_splitlines(content);
 }
 
+/* --- path matching: fnmatch / glob (#1033, D-0216) ------------------------- */
+
+/* Shell-glob matcher over two byte strings. `*` matches any run (including '/',
+ * which is why `glob` applies it per path segment), `?` any single byte,
+ * `[seq]` / `[!seq]` a byte class with `a-z` ranges. Recursive with `*`
+ * backtracking; patterns are short, so the O(n*m) worst case is fine. */
+static int zap_fnmatch_core(const char *s, int64_t ns, const char *p, int64_t np) {
+    if (np == 0) {
+        return ns == 0;
+    }
+    if (p[0] == '*') {
+        int64_t k = 0;
+        while (k < np && p[k] == '*') {
+            k++; /* collapse consecutive stars */
+        }
+        if (k == np) {
+            return 1; /* trailing star(s) match the rest */
+        }
+        for (int64_t i = 0; i <= ns; i++) {
+            if (zap_fnmatch_core(s + i, ns - i, p + k, np - k)) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (ns == 0) {
+        return 0;
+    }
+    if (p[0] == '?') {
+        return zap_fnmatch_core(s + 1, ns - 1, p + 1, np - 1);
+    }
+    if (p[0] == '[') {
+        int64_t j = 1;
+        int neg = 0;
+        if (j < np && (p[j] == '!' || p[j] == '^')) {
+            neg = 1;
+            j++;
+        }
+        int matched = 0;
+        int64_t first = j;
+        while (j < np && (p[j] != ']' || j == first)) {
+            if (j + 2 < np && p[j + 1] == '-' && p[j + 2] != ']') {
+                unsigned char c = (unsigned char)s[0];
+                if (c >= (unsigned char)p[j] && c <= (unsigned char)p[j + 2]) {
+                    matched = 1;
+                }
+                j += 3;
+            } else {
+                if (s[0] == p[j]) {
+                    matched = 1;
+                }
+                j++;
+            }
+        }
+        if (j >= np) {
+            /* no closing ']': treat '[' as a literal */
+            return s[0] == '[' ? zap_fnmatch_core(s + 1, ns - 1, p + 1, np - 1) : 0;
+        }
+        if (matched != neg) {
+            return zap_fnmatch_core(s + 1, ns - 1, p + j + 1, np - (j + 1));
+        }
+        return 0;
+    }
+    return s[0] == p[0] ? zap_fnmatch_core(s + 1, ns - 1, p + 1, np - 1) : 0;
+}
+
+/* fs.fnmatch(name, pattern) -> bool: whole-string shell-glob match. */
+int64_t zap_fs_fnmatch(void *name_, void *pat_) {
+    const ZapStr *n = (const ZapStr *)name_;
+    const ZapStr *p = (const ZapStr *)pat_;
+    return zap_fnmatch_core(n->data, n->len, p->data, p->len) ? 1 : 0;
+}
+
+/* Growable array of NUL-terminated result paths (relative to the glob root). */
+typedef struct {
+    char **items;
+    size_t len, cap;
+} zap_glob_acc;
+
+static char *zap_glob_dup(const char *s, size_t n) {
+    char *out = (char *)malloc(n + 1);
+    if (!out) {
+        const char *m = "out of memory";
+        zap_panic_typed(ZAP_EXC_RUNTIME_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
+    if (n > 0) {
+        memcpy(out, s, n);
+    }
+    out[n] = '\0';
+    return out;
+}
+
+static void zap_glob_push(zap_glob_acc *a, const char *s) {
+    if (a->len == a->cap) {
+        a->cap = a->cap ? a->cap * 2 : 16;
+        a->items = (char **)realloc(a->items, a->cap * sizeof(char *));
+        if (!a->items) {
+            const char *m = "out of memory";
+            zap_panic_typed(ZAP_EXC_RUNTIME_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+        }
+    }
+    a->items[a->len++] = zap_glob_dup(s, strlen(s));
+}
+
+/* Join `a`/`b` with a '/', or just `b` when `a` is empty. Caller frees. */
+static char *zap_glob_join(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    if (la == 0) {
+        return zap_glob_dup(b, lb);
+    }
+    char *out = zap_glob_dup(a, la + 1 + lb);
+    out[la] = '/';
+    memcpy(out + la + 1, b, lb);
+    out[la + 1 + lb] = '\0';
+    return out;
+}
+
+static int zap_glob_is_dir(const char *p) {
+    struct stat st;
+    return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+/* True if `p` is a symlink. `**` does not descend through symlinks (matching
+ * CPython's `glob`), which also makes a symlink cycle safe. */
+static int zap_glob_is_symlink(const char *p) {
+#if defined(ZAP_PLATFORM_WINDOWS)
+    (void)p;
+    return 0; /* MSVC CRT has no lstat; Windows symlinks are rare here */
+#else
+    struct stat st;
+    return lstat(p, &st) == 0 && S_ISLNK(st.st_mode);
+#endif
+}
+
+/* Match `segs[i..]` against the tree rooted at `dir`; `prefix` is the matched
+ * path so far relative to the glob root. `**` matches zero or more directory
+ * levels. A leading-dot entry is skipped unless its segment also starts with
+ * '.', matching CPython's `glob` dotfile rule. */
+static void zap_glob_rec(const char *dir, const char *prefix, char **segs, int nseg,
+                         int i, zap_glob_acc *acc) {
+    if (i == nseg) {
+        if (prefix[0] != '\0') {
+            zap_glob_push(acc, prefix);
+        }
+        return;
+    }
+    const char *seg = segs[i];
+    int is_dstar = strcmp(seg, "**") == 0;
+    int last = i == nseg - 1;
+    if (is_dstar) {
+        /* zero directories: advance past `**` in the same directory */
+        zap_glob_rec(dir, prefix, segs, nseg, i + 1, acc);
+        /* one or more: descend into each subdirectory, keeping `**` */
+        DIR *d = opendir(dir);
+        if (!d) {
+            return;
+        }
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+                continue;
+            }
+            if (e->d_name[0] == '.') {
+                continue; /* `**` never descends into dotted directories */
+            }
+            char *full = zap_glob_join(dir, e->d_name);
+            if (zap_glob_is_dir(full) && !zap_glob_is_symlink(full)) {
+                char *np = zap_glob_join(prefix, e->d_name);
+                zap_glob_rec(full, np, segs, nseg, i, acc);
+                free(np);
+            }
+            free(full);
+        }
+        closedir(d);
+        return;
+    }
+    DIR *d = opendir(dir);
+    if (!d) {
+        return; /* unreadable / missing directory: no matches, not an error */
+    }
+    int seg_dot = seg[0] == '.';
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+            continue;
+        }
+        if (e->d_name[0] == '.' && !seg_dot) {
+            continue; /* dotfile rule */
+        }
+        if (zap_fnmatch_core(e->d_name, (int64_t)strlen(e->d_name), seg,
+                             (int64_t)strlen(seg))) {
+            char *np = zap_glob_join(prefix, e->d_name);
+            if (last) {
+                zap_glob_push(acc, np);
+            } else {
+                char *full = zap_glob_join(dir, e->d_name);
+                if (zap_glob_is_dir(full)) {
+                    zap_glob_rec(full, np, segs, nseg, i + 1, acc);
+                }
+                free(full);
+            }
+            free(np);
+        }
+    }
+    closedir(d);
+}
+
+static int zap_glob_cmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* fs.glob(root, pattern) -> list[str]: paths under `root` matching the '/'-split
+ * glob `pattern`, returned RELATIVE to `root` and sorted. `*`/`?`/`[seq]` match
+ * within a path segment; `**` matches across directory levels. Dotfiles are
+ * skipped unless the segment starts with '.' (CPython `glob` semantics). */
+void *zap_fs_glob(void *root_, void *pat_) {
+    char *root = zap_sys_cstr((ZapStr *)root_);
+    const ZapStr *pat = (const ZapStr *)pat_;
+    /* Split the pattern into non-empty '/'-separated segments. */
+    char *pbuf = zap_glob_dup(pat->data, pat->len);
+    char **segs = (char **)malloc((pat->len + 1) * sizeof(char *) + sizeof(char *));
+    if (!segs) {
+        const char *m = "out of memory";
+        zap_panic_typed(ZAP_EXC_RUNTIME_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
+    int nseg = 0;
+    char *cur = pbuf;
+    for (int64_t k = 0; k <= pat->len; k++) {
+        if (pbuf[k] == '/' || pbuf[k] == '\0') {
+            pbuf[k] = '\0';
+            if (*cur != '\0') {
+                segs[nseg++] = cur;
+            }
+            cur = pbuf + k + 1;
+        }
+    }
+    zap_glob_acc acc = {NULL, 0, 0};
+    zap_glob_rec(root, "", segs, nseg, 0, &acc);
+    if (acc.len > 1) {
+        qsort(acc.items, acc.len, sizeof(char *), zap_glob_cmp);
+    }
+    void *out = zap_list_new();
+    for (size_t j = 0; j < acc.len; j++) {
+        zap_list_push_ptr(out, zap_str_new(acc.items[j], (int64_t)strlen(acc.items[j])));
+        free(acc.items[j]);
+    }
+    free(acc.items);
+    free(segs);
+    free(pbuf);
+    return out;
+}
+
