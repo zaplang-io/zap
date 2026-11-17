@@ -1,3 +1,9 @@
+/* zap runtime fragment: bytes.inc.c -- one translation unit: #include'd by zaprt.c at a
+ * fixed position (order is semantic). NOT a standalone TU; it relies on declarations
+ * made earlier in zaprt.c (and may leave a preprocessor #if open for a later
+ * fragment). Registered in crates/codegen/src/runtime_manifest.rs; see
+ * crates/codegen/FOLDER_ARCHITECTURE.md for the add-a-fragment checklist.
+ */
 /* ===========================================================================
  * bytes + base64 + hex (ticket #337). `bytes` reuses the ZapStr length-prefixed
  * byte buffer; these entry points give it byte-wise indexing/slicing/decoding,

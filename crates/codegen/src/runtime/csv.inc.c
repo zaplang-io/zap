@@ -1,3 +1,9 @@
+/* zap runtime fragment: csv.inc.c -- one translation unit: #include'd by zaprt.c at a
+ * fixed position (order is semantic). NOT a standalone TU; it relies on declarations
+ * made earlier in zaprt.c (and may leave a preprocessor #if open for a later
+ * fragment). Registered in crates/codegen/src/runtime_manifest.rs; see
+ * crates/codegen/FOLDER_ARCHITECTURE.md for the add-a-fragment checklist.
+ */
 /* ===========================================================================
  * csv — RFC 4180-ish field helpers for the @derive(Csv) record codec
  * (ticket #132, D-0059 §4b). A @derive(Csv) struct maps to one CSV record

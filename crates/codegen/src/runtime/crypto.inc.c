@@ -1,3 +1,9 @@
+/* zap runtime fragment: crypto.inc.c -- one translation unit: #include'd by zaprt.c at a
+ * fixed position (order is semantic). NOT a standalone TU; it relies on declarations
+ * made earlier in zaprt.c (and may leave a preprocessor #if open for a later
+ * fragment). Registered in crates/codegen/src/runtime_manifest.rs; see
+ * crates/codegen/FOLDER_ARCHITECTURE.md for the add-a-fragment checklist.
+ */
 /* ===========================================================================
  * crypto module (ticket #105, D-0056): hashing, HMAC, secure random / secrets.
  * TLS is deferred (late-v1). Self-contained reference implementations of the

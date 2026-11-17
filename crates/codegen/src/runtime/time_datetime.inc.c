@@ -1,3 +1,9 @@
+/* zap runtime fragment: time_datetime.inc.c -- one translation unit: #include'd by zaprt.c at a
+ * fixed position (order is semantic). NOT a standalone TU; it relies on declarations
+ * made earlier in zaprt.c (and may leave a preprocessor #if open for a later
+ * fragment). Registered in crates/codegen/src/runtime_manifest.rs; see
+ * crates/codegen/FOLDER_ARCHITECTURE.md for the add-a-fragment checklist.
+ */
 /* ===========================================================================
  * time & datetime (ticket #99, D-0056). Clocks, sleep, duration-unit helpers,
  * and civil-time conversion. Durations are plain int64 nanoseconds (Go

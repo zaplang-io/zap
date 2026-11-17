@@ -1,3 +1,9 @@
+/* zap runtime fragment: net_http.inc.c -- one translation unit: #include'd by zaprt.c at a
+ * fixed position (order is semantic). NOT a standalone TU; it relies on declarations
+ * made earlier in zaprt.c (and may leave a preprocessor #if open for a later
+ * fragment). Registered in crates/codegen/src/runtime_manifest.rs; see
+ * crates/codegen/FOLDER_ARCHITECTURE.md for the add-a-fragment checklist.
+ */
 /* ===========================================================================
  * net / http (ticket #104, D-0056). Plaintext TCP sockets + HTTP/1.1 client and
  * server, built on the netpoller (#80) and the M:N scheduler (#47): every

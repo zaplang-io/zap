@@ -1,3 +1,9 @@
+/* zap runtime fragment: gc.inc.c -- one translation unit: #include'd by zaprt.c at a
+ * fixed position (order is semantic). NOT a standalone TU; it relies on declarations
+ * made earlier in zaprt.c (and may leave a preprocessor #if open for a later
+ * fragment). Registered in crates/codegen/src/runtime_manifest.rs; see
+ * crates/codegen/FOLDER_ARCHITECTURE.md for the add-a-fragment checklist.
+ */
 /* =============================================================================
  * Precise, Immix-style garbage collector (ticket #48, D-0009,
  * design/0008-precise-gc.md).
