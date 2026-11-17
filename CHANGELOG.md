@@ -25,6 +25,10 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`list` gains mutation methods — `extend` / `insert` / `remove` / `count` /
+  `clear`** (#977, D-0220), joining `append`/`sort`. `insert(i, x)` saturates the
+  index; `remove(x)`/`count(x)` compare by value (`==` semantics: numeric, `str`
+  by contents, struct `__eq__`); `remove` of an absent value raises `ValueError`.
 - **`os.path` gains tuple-returning decomposition — `path_split` / `path_splitext`**
   (#1030, D-0219). `path_split(p)` → `(head, tail)` and `path_splitext(p)` →
   `(root, ext)`, CPython `os.path` semantics (not the POSIX-command

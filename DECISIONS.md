@@ -11045,3 +11045,36 @@ Relates to [[D-0211]] (the fs/os gaps this completes), [[D-0218]] / [[D-0049]]
 (the tuple path it reuses), [[D-0213]] (seam rows), epic #966, and Discussion
 #965 (gap #4). Only traversal (`fs.walk`/`scandir`/`copytree`, #1032) and the
 iterator protocol (#1031) remain of the stdlib-gap follow-ups.
+
+## D-0220 — stdlib list: mutation methods — extend / insert / remove / count / clear (#977 / epic #966)
+
+**Context.** `list[T]` had only `append` and `sort`; the common in-place
+mutations were missing (#965 L-cluster, under epic #966).
+
+**Decision.** Add them, CPython-faithful and element-kind-generic:
+- `xs.extend(other)` — append every element of another `list[T]`.
+- `xs.insert(i, x)` — shift-insert `x` before index `i`, which saturates to
+  `[0, len]` (a negative index counts from the end); never raises.
+- `xs.remove(x)` — delete the first element equal to `x`; raise `ValueError`
+  when none matches.
+- `xs.count(x) -> int64` — the number of elements equal to `x`.
+- `xs.clear()` — drop every element in place.
+
+**By-value equality (remove / count).** Both scan the list comparing each
+element to `x` through the same `==` path the `in` operator uses (#399) — numeric
+joins, `str`/`bytes` by contents, a struct's `__eq__` — so they are
+element-kind-generic with **no per-kind runtime**: the scan is lowered in-IR (the
+`in` loop template). `insert`/`extend` reuse the typed `zap_list_insert_*` /
+`zap_list_push_*` word paths (i64/ptr/f64); `clear` zeroes the freed slots so the
+precise collector does not pin removed referents.
+
+**Sema.** A `Ty::List` dispatch types these precisely (`count -> int64`, the rest
+unit); `append`/`sort` and any other name keep the existing loose method fallback
+the lowerer validates (D-0009), so no existing list-method behavior changes.
+
+**Tests.** Golden `list_mutation` (all five over an `int` and a `str` list, so
+the by-contents equality path is covered, plus the catchable `ValueError`); sema
+shape + arity / element-type tests.
+
+Relates to [[D-0049]] (the list value model), #399 (the `in` equality the scans
+reuse), epic #966, and Discussion #965.

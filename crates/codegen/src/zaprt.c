@@ -1867,6 +1867,55 @@ void zap_list_del_at(void *lp, int64_t i) {
     l->data[l->len] = 0; /* don't pin the removed referent for the collector */
 }
 
+/* Insert a word at index `i`, shifting the tail right (#977). `i` is clamped to
+ * `[0, len]` — a negative index counts from the end, and both ends saturate —
+ * so `insert` never raises (CPython `list.insert`). The typed wrappers below
+ * mirror `zap_list_push_*`. */
+static void zap_list_insert_word(ZapList *l, int64_t i, int64_t word) {
+    if (i < 0) {
+        i += l->len;
+        if (i < 0) {
+            i = 0;
+        }
+    }
+    if (i > l->len) {
+        i = l->len;
+    }
+    if (l->len == l->cap) {
+        zap_list_grow(l);
+    }
+    for (int64_t j = l->len; j > i; j--) {
+        l->data[j] = l->data[j - 1];
+    }
+    l->data[i] = word;
+    l->len++;
+}
+void zap_list_insert_i64(void *lp, int64_t i, int64_t v) {
+    zap_list_insert_word((ZapList *)lp, i, v);
+}
+void zap_list_insert_ptr(void *lp, int64_t i, void *v) {
+    ((ZapList *)lp)->elem_ptr = 1; /* precise GC: elements are pointers (#48) */
+    zap_list_insert_word((ZapList *)lp, i, (int64_t)(intptr_t)v);
+}
+void zap_list_insert_f64(void *lp, int64_t i, double v) {
+    union {
+        int64_t i;
+        double d;
+    } u;
+    u.d = v;
+    zap_list_insert_word((ZapList *)lp, i, u.i);
+}
+
+/* Remove every element (#977, CPython `list.clear`); the freed slots are zeroed
+ * so the precise collector does not pin removed referents. */
+void zap_list_clear(void *lp) {
+    ZapList *l = (ZapList *)lp;
+    for (int64_t j = 0; j < l->len; j++) {
+        l->data[j] = 0;
+    }
+    l->len = 0;
+}
+
 /* Shallow copy: a fresh list with the same element words (shared referents) and
  * the same `elem_ptr` kind, so the precise collector traces the copy correctly.
  * Used by `sorted()` (ticket #336) to leave its input untouched. */

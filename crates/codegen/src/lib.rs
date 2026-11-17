@@ -2536,6 +2536,16 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // list element removal `del xs[i]` (#595): normalize + bounds-check the
         // index (same `IndexError` as a read) and shift the tail down one slot.
         self.declare_rt("zap_list_del_at", &[p.into(), i.into()], None);
+        // list mutation methods (#977, D-0220): insert shifts a word in at an
+        // index (typed like push_*); clear drops every element.
+        self.declare_rt("zap_list_insert_i64", &[p.into(), i.into(), i.into()], None);
+        self.declare_rt("zap_list_insert_ptr", &[p.into(), i.into(), p.into()], None);
+        self.declare_rt(
+            "zap_list_insert_f64",
+            &[p.into(), i.into(), f64t.into()],
+            None,
+        );
+        self.declare_rt("zap_list_clear", &[p.into()], None);
         // dict
         self.declare_rt("zap_dict_new", &[], Some(p.into()));
         self.declare_rt("zap_dict_len", &[p.into()], Some(i.into()));
