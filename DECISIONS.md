@@ -10934,3 +10934,45 @@ shape + arity tests; seam-kwargs binding tests.
 
 Relates to [[D-0211]] (the fs gaps this extends), [[D-0213]] (seam rows), epic
 #966, and Discussion #965 (gap #4). `fs.walk`/`scandir`/`copytree` stays #1032.
+
+## D-0217 — stdlib sys: standard streams as objects — stdin / stdout / stderr (#1035 / epic #966)
+
+**Context.** The standard streams were reachable only as raw fds
+(`sys.stdin_fd`/`stdout_fd`/`stderr_fd` → 0/1/2, used with `io.*(fd, …)`). A
+program could not pass "the output" around as a value or wrap stdin in the #969
+buffered reader ergonomically. The #965 nice-to-have, deferred from [[D-0212]].
+
+**Decision.** Add stream-object accessors on `sys`:
+- `sys.stdin() -> reader` — a buffered reader over fd 0 (the #969 `io.reader`
+  handle); read it with `io.readline`/`readall`/`readn` (and, once the iterator
+  protocol covers stdlib handles, `for line in sys.stdin()`).
+- `sys.stdout() -> writer`, `sys.stderr() -> writer` — opaque writer handles over
+  fds 1 / 2.
+- `sys.write(stream, data) -> int64` — write `data` to a writer, returning the
+  bytes written (raises on an I/O error, via the existing `zap_io_write`).
+
+The raw `sys.std*_fd()` accessors stay unchanged for code that wants the bare fd.
+
+**Design notes.**
+- The write verb lives on `sys` (`sys.write`), not `io`, to avoid colliding with
+  the existing `io.write(fd, data)`; reading reuses the `io` reader verbs on the
+  `sys.stdin()` handle. Both handle kinds are opaque `bytes` values (the #969 /
+  crypto-handle pattern): the reader wraps the #969 reader state, the writer
+  wraps just the fd (pointer-free, GC-traced).
+- **Fresh per call, bind once.** Each accessor returns a new handle — no cached C
+  static, which under the precise collector would be an unrooted GC pointer. Bind
+  the result once (`auto out = sys.stdout()`) rather than re-fetching in a loop; a
+  second `sys.stdin()` reader starts with an empty buffer and would not see bytes
+  the first already read ahead.
+- Positional, with a `seam_sigs` row for `sys.write(stream=…, data=…)`
+  ([[D-0213]]); the zero-argument accessors take no row.
+
+**Tests.** Golden `sys_streams` (writes to `sys.stdout()` via `sys.write`, pure
+fd-1 output); driver `zap_cli` tests for `sys.stdin()` line reading over piped
+stdin and `sys.stderr()` routing to fd 2; sema shape + arity and seam-kwargs
+binding tests.
+
+Relates to [[D-0212]] (the #969 reader this reuses), [[D-0056]] / #97 (the io
+seam + the `std*_fd` accessors), [[D-0213]] (seam rows), epic #966, and
+Discussion #965. Native `for line in sys.stdin()` awaits the iterator-protocol
+work (#1031).

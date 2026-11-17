@@ -1774,3 +1774,36 @@ void *zap_fs_glob(void *root_, void *pat_) {
     return out;
 }
 
+/* --- sys standard streams (#1035, D-0217) ---------------------------------
+ *
+ * Stream objects over the standard fds, so a program can pass "the input" or
+ * "the output" around as a value instead of a bare fd. `stdin()` reuses the
+ * #969 buffered reader over fd 0; `stdout()`/`stderr()` return an opaque writer
+ * (a `bytes` handle whose buffer is just the pointer-free fd). Fresh per call —
+ * bind the result once (`auto out = sys.stdout()`) rather than re-fetching it in
+ * a loop (a fresh `stdin()` reader starts with an empty buffer). */
+
+/* Opaque writer handle: a bytes value whose buffer is the int64 fd. */
+static void *zap_sys_writer_new(int64_t fd) {
+    ZapStr *h = zap_str_alloc((int64_t)sizeof(int64_t));
+    *(int64_t *)(void *)h->data = fd;
+    return h;
+}
+
+void *zap_sys_stdin(void) {
+    return zap_io_reader_new(0);
+}
+void *zap_sys_stdout(void) {
+    return zap_sys_writer_new(1);
+}
+void *zap_sys_stderr(void) {
+    return zap_sys_writer_new(2);
+}
+
+/* sys.write(stream, data) -> int64: write `data` to a writer stream, returning
+ * the number of bytes written. Raises on an I/O error (via zap_io_write). */
+int64_t zap_sys_write(void *w_, void *data_) {
+    int64_t fd = *(int64_t *)(void *)((ZapStr *)w_)->data;
+    return zap_io_write(fd, data_);
+}
+

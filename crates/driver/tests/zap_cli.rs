@@ -879,3 +879,49 @@ fn input_eof_is_catchable() {
     assert!(ok, "stderr:\n{stderr}");
     assert_eq!(stdout.trim_end(), "eof-caught");
 }
+
+// --- sys standard streams: sys.stdin() reader + sys.stderr() (#1035, D-0217) -
+//
+// stdin reading needs a piped child stdin; stderr needs a separate capture —
+// neither is available to the golden harness, so these drive the real binary.
+
+/// `sys.stdin()` is a buffered reader over fd 0: `io.readline` consumes it line
+/// by line, exactly like a reader from `io.reader`.
+#[cfg(feature = "codegen")]
+#[test]
+fn sys_stdin_reads_lines() {
+    let dir = scratch("sys_stdin");
+    let prog = dir.join("p.zap");
+    std::fs::write(
+        &prog,
+        "import sys\nimport io\ndef main():\n    \
+         auto r = sys.stdin()\n    \
+         auto a = io.readline(r)\n    \
+         auto b = io.readline(r)\n    \
+         print(\"[\" + a.removesuffix(\"\\n\") + \"][\" + b.removesuffix(\"\\n\") + \"]\")\n",
+    )
+    .unwrap();
+    let (ok, stdout, stderr) = run_with_stdin(&prog, b"foo\nbar\n");
+    assert!(ok, "stderr:\n{stderr}");
+    assert_eq!(stdout.trim_end(), "[foo][bar]");
+}
+
+/// `sys.stdout()` / `sys.stderr()` are writer streams over fds 1 / 2:
+/// `sys.write` routes to the right descriptor.
+#[cfg(feature = "codegen")]
+#[test]
+fn sys_stdout_stderr_route_to_their_fds() {
+    let dir = scratch("sys_streams");
+    let prog = dir.join("p.zap");
+    std::fs::write(
+        &prog,
+        "import sys\ndef main():\n    \
+         sys.write(sys.stdout(), \"to-out\\n\")\n    \
+         sys.write(sys.stderr(), \"to-err\\n\")\n",
+    )
+    .unwrap();
+    let (ok, stdout, stderr) = run_with_stdin(&prog, b"");
+    assert!(ok, "stderr:\n{stderr}");
+    assert_eq!(stdout, "to-out\n");
+    assert!(stderr.contains("to-err"), "stderr:\n{stderr}");
+}

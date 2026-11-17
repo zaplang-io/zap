@@ -19,4 +19,10 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_sys_cpu_has", &[p.into()], Some(i.into()));
     cg.declare_rt("zap_sys_cpu_source", &[], Some(p.into()));
     cg.declare_rt("zap_sys_cpu_sve_vl", &[], Some(i.into()));
+    // Standard streams as objects (#1035, D-0217): stdin/stdout/stderr return an
+    // opaque handle (ptr); write(stream, data) -> int64 bytes written.
+    cg.declare_rt("zap_sys_stdin", &[], Some(p.into()));
+    cg.declare_rt("zap_sys_stdout", &[], Some(p.into()));
+    cg.declare_rt("zap_sys_stderr", &[], Some(p.into()));
+    cg.declare_rt("zap_sys_write", &[p.into(), p.into()], Some(i.into()));
 }

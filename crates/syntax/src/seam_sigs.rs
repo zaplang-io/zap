@@ -227,6 +227,8 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     // cpu_source/cpu_sve_vl take no args, so no row) ----
     ("sys", "exit", &["code"]),
     ("sys", "cpu_has", &["name"]),
+    // Standard-stream write (#1035, D-0217); stdin/stdout/stderr take no args.
+    ("sys", "write", &["stream", "data"]),
     // ---- url (ticket #335): percent-encoding + query builders ----
     ("url", "quote", &["s"]),
     ("url", "quote_path", &["s"]),

@@ -897,6 +897,24 @@ fn fs_lines_keyword_and_positional() {
 }
 
 #[test]
+fn sys_write_keyword_and_positional() {
+    // Standard-stream write (#1035, D-0217). stdin/stdout/stderr take no args.
+    assert_ok(&prog(
+        "    auto out = sys.stdout()\n    auto n = sys.write(stream=out, data=\"hi\")\n",
+    ));
+    assert_ok(&prog(
+        "    auto out = sys.stdout()\n    auto n = sys.write(data=\"hi\", stream=out)\n",
+    ));
+    assert_ok(&prog(
+        "    auto out = sys.stdout()\n    auto n = sys.write(out, \"hi\")\n",
+    ));
+    assert_code(
+        &prog("    auto out = sys.stdout()\n    auto n = sys.write(stream=out, payload=\"hi\")\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
 fn fs_glob_fnmatch_keyword_and_positional() {
     // Path matching (#1033, D-0216): keyword binding, reordering, positional.
     assert_ok(&prog(
