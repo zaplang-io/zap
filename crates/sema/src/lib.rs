@@ -7696,15 +7696,25 @@ impl Checker {
 
     fn check_str_method(&mut self, name: &str, args: &[Arg], span: Span) -> Ty {
         // Methods taking no arguments → `str`.
-        let no_arg_str = matches!(name, "upper" | "lower" | "strip" | "lstrip" | "rstrip");
+        let no_arg_str = matches!(
+            name,
+            "upper" | "lower" | "title" | "capitalize" | "casefold" | "swapcase"
+        );
+        // Zero-argument `is*` predicates → `bool` (#971).
+        let no_arg_bool = matches!(
+            name,
+            "isdigit" | "isalpha" | "isalnum" | "isspace" | "islower" | "isupper"
+        );
         // Methods taking a single `str` argument, with their result type.
         let one_str_arg: Option<Ty> = match name {
             "startswith" | "endswith" | "contains" => Some(Ty::Bool),
-            "find" | "index" => Some(Ty::Int64),
-            "split" => Some(Ty::List(Box::new(Ty::Str))),
+            // find/index/rfind/rindex return a byte offset; count a tally (#971).
+            "find" | "index" | "rfind" | "rindex" | "count" => Some(Ty::Int64),
+            // prefix/suffix trimming (#971).
+            "removeprefix" | "removesuffix" => Some(Ty::Str),
             _ => None,
         };
-        if no_arg_str {
+        if no_arg_str || no_arg_bool {
             if !args.is_empty() {
                 self.error(
                     ErrorCode::ZAP4025,
@@ -7715,7 +7725,7 @@ impl Checker {
                     self.infer(&a.value);
                 }
             }
-            return Ty::Str;
+            return if no_arg_bool { Ty::Bool } else { Ty::Str };
         }
         if let Some(ret) = one_str_arg {
             self.check_str_args(name, args, 1, span);
@@ -7724,6 +7734,135 @@ impl Checker {
         match name {
             "replace" => {
                 self.check_str_args(name, args, 2, span);
+                Ty::Str
+            }
+            // strip / lstrip / rstrip: whitespace (no arg) OR an explicit char
+            // set (one str arg) (#971).
+            "strip" | "lstrip" | "rstrip" => {
+                if args.len() > 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!("str.{name}() takes 0 or 1 arguments"),
+                        span,
+                    );
+                }
+                for a in args {
+                    let at = self.infer(&a.value);
+                    if !assignable(&at, &Ty::Str) && !matches!(at, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "str.{name}() expects a str argument, found {}",
+                                at.display()
+                            ),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+                Ty::Str
+            }
+            // split / rsplit: whitespace (no arg), an explicit separator (one
+            // str), or separator + an int `maxsplit` (two args) (#971).
+            "split" | "rsplit" => {
+                if args.len() > 2 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!("str.{name}() takes 0, 1, or 2 arguments"),
+                        span,
+                    );
+                }
+                if let Some(a) = args.first() {
+                    let at = self.infer(&a.value);
+                    if !assignable(&at, &Ty::Str) && !matches!(at, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "str.{name}() separator must be a str, found {}",
+                                at.display()
+                            ),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+                if let Some(a) = args.get(1) {
+                    let at = self.infer(&a.value);
+                    if !at.is_int() && !matches!(at, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "str.{name}() maxsplit must be an int, found {}",
+                                at.display()
+                            ),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+                Ty::List(Box::new(Ty::Str))
+            }
+            // splitlines(): no arg (#971).
+            "splitlines" => {
+                if !args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "str.splitlines() takes no arguments".to_string(),
+                        span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                }
+                Ty::List(Box::new(Ty::Str))
+            }
+            // ljust / rjust / center: an int width, plus an optional str fill (#971).
+            "ljust" | "rjust" | "center" => {
+                if args.is_empty() || args.len() > 2 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!("str.{name}() takes 1 or 2 arguments (width[, fill])"),
+                        span,
+                    );
+                }
+                if let Some(a) = args.first() {
+                    let at = self.infer(&a.value);
+                    if !at.is_int() && !matches!(at, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!("str.{name}() width must be an int, found {}", at.display()),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+                if let Some(a) = args.get(1) {
+                    let at = self.infer(&a.value);
+                    if !assignable(&at, &Ty::Str) && !matches!(at, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!("str.{name}() fill must be a str, found {}", at.display()),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+                Ty::Str
+            }
+            // zfill(width): a single int (#971).
+            "zfill" => {
+                if args.len() != 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "str.zfill() takes exactly one argument".to_string(),
+                        span,
+                    );
+                }
+                if let Some(a) = args.first() {
+                    let at = self.infer(&a.value);
+                    if !at.is_int() && !matches!(at, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!("str.zfill() width must be an int, found {}", at.display()),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
                 Ty::Str
             }
             "join" => {

@@ -10615,3 +10615,57 @@ documented divergences toward Go `net/url` where that is more useful for routing
 Relates to [[D-0056]] (the original `url`/`datetime` seam), [[D-0126]] (`KeyInfo`,
 the value-struct precedent), [[D-0204]] (seam kwargs), epic #966, and Discussion
 #965 (gap #1).
+
+## D-0210 — stdlib `str`: the thin string-method set (#971 / epic #966)
+
+**Context.** The built-in `str` method surface ([[D-0056]]-era, #284) was thin —
+`upper`/`lower`/`strip`/`split`/`join`/`find`/`index`/`replace`/`startswith`/
+`endswith`/`contains`/`encode` plus f-strings, slicing, `ord`, `len`. Text munging
+is in nearly every program (log parsing, CLI formatting, tokenizing), so each
+missing method was constant friction. Gap #2 (pervasive) of Discussion #965,
+under the stdlib-gaps epic #966.
+
+**Decision.** Add the Python-faithful (`str`) / Go-faithful (`strings`) methods
+below. All operate over raw UTF-8 bytes, so ASCII classification is byte-local
+and multibyte codepoints pass through untouched; returned offsets/counts are
+BYTE offsets/counts (as `find`/`index` already are, coinciding with codepoints on
+ASCII), while padding widths count CODEPOINTS (Python-style).
+
+- **Split family.** `split()` with no argument splits on runs of ASCII
+  whitespace, ignoring leading/trailing whitespace (Python `str.split()` / Go
+  `strings.Fields`); `split(sep)` keeps the existing explicit-separator behavior;
+  `split(sep, maxsplit)` caps the number of splits. `rsplit(...)` is the
+  right-to-left twin. `splitlines()` splits on `\n` / `\r` / `\r\n` line
+  boundaries, dropping the terminators (a trailing newline yields no final empty
+  field). These stay **positional** (built-in methods, not the seam-kwargs path).
+- **Search.** `count(sub)` (non-overlapping byte scan; empty `sub` → byte-length
+  + 1), `rfind(sub)` (last byte offset or -1), `rindex(sub)` (like `rfind` but
+  faults when absent, the same abort contract as `index`).
+- **Trim.** `removeprefix(p)` / `removesuffix(s)` (Go `TrimPrefix`/`TrimSuffix`);
+  `strip`/`lstrip`/`rstrip` gain an **optional char-set argument** (trim any byte
+  in the set) while the no-argument whitespace form is unchanged.
+- **Pad / justify.** `ljust(w[, fill])` / `rjust(w[, fill])` / `center(w[, fill])`
+  (fill defaults to a space; ASCII fill byte), and `zfill(w)` (left-pad with
+  `'0'`, keeping a leading `'+'`/`'-'` sign at the front). A string already at or
+  beyond the width is returned unchanged.
+- **Case.** `title()` (ASCII titlecase; non-letters are word boundaries),
+  `capitalize()`, `casefold()` (ASCII case-fold == lowercase in v1; full Unicode
+  folding is a follow-up), `swapcase()`.
+- **Predicates → `bool`.** `isdigit()` / `isalpha()` / `isalnum()` / `isspace()`
+  / `islower()` / `isupper()` (ASCII; each is `False` for the empty string, and
+  `islower`/`isupper` require at least one cased letter, Python semantics).
+
+**Deferred (documented follow-ups, with real design questions or lower value).**
+`partition(sep)` / `rpartition(sep)` (a `(str, str, str)` tuple return);
+`translate(table)` (needs a mapping representation); `format_map(dict)` (named
+`format` fields from a dict); `expandtabs([n])`. None has a worse workaround than
+the shipped set, and each wants its own design pass.
+
+**Why byte-based offsets / ASCII classification.** It matches the existing
+`find`/`index`/`strip` and the `str`-is-UTF-8-bytes model ([[D-0025]]); a full
+Unicode case/space database and codepoint-indexed search are a separate,
+cross-cutting effort (the same `ASCII-only case folding in v1` caveat STABILITY
+already records for `upper`/`lower`).
+
+Relates to [[D-0056]] / #284 (the original `str` surface), [[D-0025]] (str is
+UTF-8 bytes), epic #966, and Discussion #965 (gap #2).

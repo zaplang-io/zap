@@ -25,6 +25,16 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`str` gains the thin method set** (#971, D-0210). Pervasive text-munging
+  methods, Python/Go-faithful: `split()` with no argument (whitespace) and a
+  `maxsplit` limit, `rsplit`, `splitlines`; `count`, `rfind`/`rindex`;
+  `removeprefix`/`removesuffix`; `strip`/`lstrip`/`rstrip` with an optional
+  char-set argument; the `ljust`/`rjust`/`center`/`zfill` pad family;
+  `title`/`capitalize`/`casefold`/`swapcase`; and the `isdigit`/`isalpha`/
+  `isalnum`/`isspace`/`islower`/`isupper` predicates. ASCII classification over
+  the UTF-8 bytes; offsets/counts are byte-based (as `find`/`index` already are),
+  padding widths count codepoints. `partition`/`rpartition`, `translate`,
+  `format_map` and `expandtabs` are documented follow-ups.
 - **`url` gains URL parse / build / query-reading / reference resolution**
   (#970, D-0209). The `url` module could only percent-encode; it can now take a
   URL apart and put one back together, closely mirroring Python `urllib.parse`:
