@@ -18660,8 +18660,244 @@ impl<'a> FnLower<'a> {
                 });
                 Ok((self.iconst(Ty::I32, 0), Ty::I32))
             }
+            // clear(): drop every element in place (#977).
+            "clear" => {
+                if !args.is_empty() {
+                    return Err(err("clear() takes no arguments"));
+                }
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_list_clear".to_string(),
+                    args: vec![recv],
+                });
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
+            // extend(other): append every element of another list[elem] (#977).
+            "extend" => {
+                if args.len() != 1 {
+                    return Err(err("extend() takes exactly one argument"));
+                }
+                let (other, _) = self.expr(&args[0].value)?;
+                let push = format!("zap_list_push_{}", elem.val_suffix());
+                self.iterate_list(other, elem, move |s, v, _vt| {
+                    s.emit(Inst::Call {
+                        dest: None,
+                        func: push.clone(),
+                        args: vec![recv, v],
+                    });
+                    Ok(())
+                })?;
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
+            // insert(index, value): shift-insert at a (saturating) index (#977).
+            "insert" => {
+                if args.len() != 2 {
+                    return Err(err("insert() takes exactly two arguments (index, value)"));
+                }
+                let (iv, it) = self.expr(&args[0].value)?;
+                let idx = self.coerce(iv, it, Ty::I64);
+                let (v, vt) = self.expr_collection_context(&args[1].value, self.elem_ty(elem))?;
+                let v = self.coerce(v, vt, elem.ty());
+                let v = self.box_elem_for_store(v, elem.ty());
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_list_insert_{}", elem.val_suffix()),
+                    args: vec![recv, idx, v],
+                });
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
+            // count(x) -> int64: number of equal elements. A linear scan whose
+            // per-element equality routes through `binop(Eq, ..)`, so it matches
+            // `==`/`in` semantics (numeric joins, str by contents, struct __eq__),
+            // the `in` template (#399, #977).
+            "count" => {
+                if args.len() != 1 {
+                    return Err(err("count() takes exactly one argument"));
+                }
+                let (x, xt) = self.expr(&args[0].value)?;
+                let cnt = self.alloca(Ty::I64);
+                let zero = self.iconst(Ty::I64, 0);
+                self.store(cnt, zero);
+                let idx = self.alloca(Ty::I64);
+                self.store(idx, zero);
+                let cond_bb = self.new_block();
+                let body_bb = self.new_block();
+                let incr_bb = self.new_block();
+                let end_bb = self.new_block();
+                self.set_term(Term::Br(cond_bb));
+                self.position(cond_bb);
+                let cur = self.load(idx, Ty::I64);
+                let len = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(len),
+                    func: "zap_list_len".to_string(),
+                    args: vec![recv],
+                });
+                let c = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: c,
+                    pred: CmpPred::Lt,
+                    lhs: cur,
+                    rhs: len,
+                });
+                self.set_term(Term::BrIf {
+                    cond: c,
+                    then_bb: body_bb,
+                    else_bb: end_bb,
+                });
+                self.position(body_bb);
+                let i = self.load(idx, Ty::I64);
+                let e = self.new_value(elem.ty());
+                self.emit(Inst::Call {
+                    dest: Some(e),
+                    func: format!("zap_list_get_{}", elem.val_suffix()),
+                    args: vec![recv, i],
+                });
+                let (eq, _) = self.binop(AstBin::Eq, e, elem.ty(), x, xt)?;
+                let bump_bb = self.new_block();
+                self.set_term(Term::BrIf {
+                    cond: eq,
+                    then_bb: bump_bb,
+                    else_bb: incr_bb,
+                });
+                self.position(bump_bb);
+                let cv = self.load(cnt, Ty::I64);
+                let one = self.iconst(Ty::I64, 1);
+                let cv1 = self.new_value(Ty::I64);
+                self.emit(Inst::Bin {
+                    dest: cv1,
+                    op: BinOp::Add,
+                    lhs: cv,
+                    rhs: one,
+                });
+                self.store(cnt, cv1);
+                self.set_term(Term::Br(incr_bb));
+                self.position(incr_bb);
+                let cur2 = self.load(idx, Ty::I64);
+                let one2 = self.iconst(Ty::I64, 1);
+                let next = self.new_value(Ty::I64);
+                self.emit(Inst::Bin {
+                    dest: next,
+                    op: BinOp::Add,
+                    lhs: cur2,
+                    rhs: one2,
+                });
+                self.store(idx, next);
+                self.set_term(Term::Br(cond_bb));
+                self.position(end_bb);
+                let total = self.load(cnt, Ty::I64);
+                Ok((total, Ty::I64))
+            }
+            // remove(x): delete the first element equal to `x`; raise ValueError
+            // when none matches (CPython). Same scan as `count`, breaking on the
+            // first hit (#977).
+            "remove" => {
+                if args.len() != 1 {
+                    return Err(err("remove() takes exactly one argument"));
+                }
+                let (x, xt) = self.expr(&args[0].value)?;
+                let found = self.alloca(Ty::I1);
+                let ff = self.new_value(Ty::I1);
+                self.emit(Inst::BConst {
+                    dest: ff,
+                    val: false,
+                });
+                self.store(found, ff);
+                let idx = self.alloca(Ty::I64);
+                let zero = self.iconst(Ty::I64, 0);
+                self.store(idx, zero);
+                let cond_bb = self.new_block();
+                let body_bb = self.new_block();
+                let incr_bb = self.new_block();
+                let end_bb = self.new_block();
+                self.set_term(Term::Br(cond_bb));
+                self.position(cond_bb);
+                let cur = self.load(idx, Ty::I64);
+                let len = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(len),
+                    func: "zap_list_len".to_string(),
+                    args: vec![recv],
+                });
+                let c = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: c,
+                    pred: CmpPred::Lt,
+                    lhs: cur,
+                    rhs: len,
+                });
+                self.set_term(Term::BrIf {
+                    cond: c,
+                    then_bb: body_bb,
+                    else_bb: end_bb,
+                });
+                self.position(body_bb);
+                let i = self.load(idx, Ty::I64);
+                let e = self.new_value(elem.ty());
+                self.emit(Inst::Call {
+                    dest: Some(e),
+                    func: format!("zap_list_get_{}", elem.val_suffix()),
+                    args: vec![recv, i],
+                });
+                let (eq, _) = self.binop(AstBin::Eq, e, elem.ty(), x, xt)?;
+                let del_bb = self.new_block();
+                self.set_term(Term::BrIf {
+                    cond: eq,
+                    then_bb: del_bb,
+                    else_bb: incr_bb,
+                });
+                self.position(del_bb);
+                let i2 = self.load(idx, Ty::I64);
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_list_del_at".to_string(),
+                    args: vec![recv, i2],
+                });
+                let tt = self.new_value(Ty::I1);
+                self.emit(Inst::BConst {
+                    dest: tt,
+                    val: true,
+                });
+                self.store(found, tt);
+                self.set_term(Term::Br(end_bb));
+                self.position(incr_bb);
+                let cur2 = self.load(idx, Ty::I64);
+                let one = self.iconst(Ty::I64, 1);
+                let next = self.new_value(Ty::I64);
+                self.emit(Inst::Bin {
+                    dest: next,
+                    op: BinOp::Add,
+                    lhs: cur2,
+                    rhs: one,
+                });
+                self.store(idx, next);
+                self.set_term(Term::Br(cond_bb));
+                self.position(end_bb);
+                let fv = self.load(found, Ty::I1);
+                let raise_bb = self.new_block();
+                let done_bb = self.new_block();
+                self.set_term(Term::BrIf {
+                    cond: fv,
+                    then_bb: done_bb,
+                    else_bb: raise_bb,
+                });
+                self.position(raise_bb);
+                let m = self.new_value(Ty::Ptr);
+                self.emit(Inst::StrConst {
+                    dest: m,
+                    bytes: b"list.remove(x): x not in list".to_vec(),
+                });
+                let value_error = self.iconst(Ty::I64, 3); // ZAP_EXC_VALUE_ERROR
+                self.throwing_call(None, "zap_panic_typed", vec![value_error, m]);
+                if !self.terminated() {
+                    self.set_term(Term::Unreachable);
+                }
+                self.position(done_bb);
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
             other => Err(err(format!(
-                "list has no method '{other}' (supported: append, sort)"
+                "list has no method '{other}' (supported: append, sort, extend, \
+                 insert, remove, count, clear)"
             ))),
         }
     }

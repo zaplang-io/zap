@@ -7481,6 +7481,16 @@ impl Checker {
                 let elem = (**elem).clone();
                 return self.check_oset_method(name, args, &elem, *span);
             }
+            // Built-in `list[T]` mutation methods (#977): extend/insert/remove/
+            // count/clear, typed precisely (count -> int64). `append`/`sort` and
+            // any other name fall through to the loose Unknown path the lowerer
+            // validates (D-0009), unchanged.
+            if let Ty::List(elem) = &bt {
+                let elem = (**elem).clone();
+                if let Some(ret) = self.check_list_method(name, args, &elem, *span) {
+                    return ret;
+                }
+            }
             // A method call on a user struct `recv.method(args)` is typed by the
             // method's declared return type (D-0009). The struct's method table
             // already carries the resolved signature, with `self`/`Self` bound to
@@ -8204,6 +8214,123 @@ impl Checker {
                 Ty::Unknown
             }
         }
+    }
+
+    /// Built-in `list[T]` mutation methods (#977, D-0220): `extend(other)`,
+    /// `insert(i, x)`, `remove(x)`, `count(x) -> int64`, `clear()`. Returns the
+    /// result type, or `None` for `append`/`sort`/any other name (left to the
+    /// loose method fallback the lowerer validates). `remove`/`count` compare by
+    /// value (`==` semantics); `count` is the only one that yields a value.
+    fn check_list_method(&mut self, name: &str, args: &[Arg], elem: &Ty, span: Span) -> Option<Ty> {
+        let check_val = |s: &mut Self, a: &Arg| {
+            let vt = s.infer(&a.value);
+            if !assignable(&vt, elem) && !matches!(vt, Ty::Unknown) {
+                s.error(
+                    ErrorCode::ZAP4024,
+                    format!("list[{}] element has type {}", elem.display(), vt.display()),
+                    expr_span(&a.value),
+                );
+            }
+        };
+        Some(match name {
+            "extend" => {
+                if args.len() != 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!("list.extend(other) takes one argument, got {}", args.len()),
+                        span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                } else {
+                    let at = self.infer(&args[0].value);
+                    let want = Ty::List(Box::new(elem.clone()));
+                    if !assignable(&at, &want) && !matches!(at, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "list.extend() expects a list[{}], found {}",
+                                elem.display(),
+                                at.display()
+                            ),
+                            expr_span(&args[0].value),
+                        );
+                    }
+                }
+                Ty::Unit
+            }
+            "insert" => {
+                if args.len() != 2 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!(
+                            "list.insert(index, value) takes two arguments, got {}",
+                            args.len()
+                        ),
+                        span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                } else {
+                    let it = self.infer(&args[0].value);
+                    if !it.is_int() && !matches!(it, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!("list.insert() index must be an int, found {}", it.display()),
+                            expr_span(&args[0].value),
+                        );
+                    }
+                    check_val(self, &args[1]);
+                }
+                Ty::Unit
+            }
+            "remove" => {
+                if args.len() != 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!("list.remove(x) takes one argument, got {}", args.len()),
+                        span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                } else {
+                    check_val(self, &args[0]);
+                }
+                Ty::Unit
+            }
+            "count" => {
+                if args.len() != 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!("list.count(x) takes one argument, got {}", args.len()),
+                        span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                } else {
+                    check_val(self, &args[0]);
+                }
+                Ty::Int64
+            }
+            "clear" => {
+                if !args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "list.clear() takes no arguments".to_string(),
+                        span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                }
+                Ty::Unit
+            }
+            _ => return None,
+        })
     }
 
     /// Built-in `oset[T]` methods (#983):
@@ -10147,6 +10274,53 @@ def main():
             assert!(
                 e.iter().any(|x| x.code == ErrorCode::ZAP4025),
                 "`{bad}` should be ZAP4025, got {e:?}"
+            );
+        }
+    }
+
+    // ---- list: mutation methods (#977, D-0220) ----------------------------
+
+    #[test]
+    fn list_mutation_methods_type_check() {
+        ok(r#"def main():
+    list[int64] xs = [1, 2, 3]
+    xs.extend([4, 5])
+    xs.insert(0, 9)
+    xs.remove(9)
+    int64 n = xs.count(2)
+    xs.clear()
+    print(str(n))
+"#);
+        // count yields int64 (usable in arithmetic).
+        ok("def main():\n    list[int64] xs = [1]\n    auto n = xs.count(1) + 1\n    print(str(n))\n");
+        // Arity + element-type errors.
+        let bad = [
+            (
+                "def main():\n    list[int64] xs = [1]\n    xs.insert(0)\n",
+                "ZAP4025",
+            ),
+            (
+                "def main():\n    list[int64] xs = [1]\n    xs.clear(1)\n",
+                "ZAP4025",
+            ),
+            (
+                "def main():\n    list[int64] xs = [1]\n    xs.remove(\"a\")\n",
+                "ZAP4024",
+            ),
+            (
+                "def main():\n    list[int64] xs = [1]\n    xs.count(\"a\")\n",
+                "ZAP4024",
+            ),
+            (
+                "def main():\n    list[int64] xs = [1]\n    xs.insert(\"a\", 1)\n",
+                "ZAP4024",
+            ),
+        ];
+        for (src, code) in bad {
+            let e = errors(src);
+            assert!(
+                e.iter().any(|x| x.code.to_string() == code),
+                "`{src}` should be {code}, got {e:?}"
             );
         }
     }
