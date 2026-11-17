@@ -25,7 +25,7 @@ use zapc_syntax::ast;
 use super::support::{call_bool, lower_args};
 use super::ModuleLower;
 use crate::ir::*;
-use crate::lower::{err, FnLower, LowerError};
+use crate::lower::{elem_kind, err, FnLower, LowerError};
 
 pub(super) const MODULE: ModuleLower = ModuleLower { name: "url", lower };
 
@@ -197,13 +197,30 @@ fn lower(
     Ok(Some(match method {
         "split" => lower_split(lowerer, &args[0])?,
         "build" => lower_build(lowerer, &args[0])?,
+        "parse_query" => {
+            // `dict[str, list[str]]`: the value is a NESTED collection, so its
+            // element must be `Elem::Nested(list[str])`, NOT a bare `Elem::Ptr` —
+            // otherwise read-back (`q[k][i]`) collapses the inner `list[str]` to a
+            // pointer and dispatches as a string op, yielding empty values (the
+            // exact #625 nested-collection failure). The `str` key stays
+            // `Elem::Ptr`. An `auto`-bound result keys off this IR type, so it
+            // must carry the real nesting.
+            let a = lower_args(lowerer, args)?;
+            let val = elem_kind(Ty::List(Elem::Ptr), &lowerer.ctx.nested)?;
+            plain_call(lowerer, "zap_url_parse_query", a, Ty::Dict(Elem::Ptr, val))
+        }
+        "parse_query_first" => {
+            // `dict[str, str]`: both key and value are plain `str` reference words.
+            let a = lower_args(lowerer, args)?;
+            plain_call(
+                lowerer,
+                "zap_url_parse_query_first",
+                a,
+                Ty::Dict(Elem::Ptr, Elem::Ptr),
+            )
+        }
         _ => {
             let a = lower_args(lowerer, args)?;
-            // Key and value words are both references: a `str` key and a `str`
-            // (parse_query_first) or `list[str]` (parse_query) value. The sema
-            // type carries the precise value element; the IR dict only needs the
-            // reference-word kind (`Elem::Ptr`) so `auto`-bound results index.
-            let dict_ty = || Ty::Dict(Elem::Ptr, Elem::Ptr);
             match method {
                 "quote" => plain_call(lowerer, "zap_url_quote", a, Ty::Ptr),
                 "quote_path" => plain_call(lowerer, "zap_url_quote_path", a, Ty::Ptr),
@@ -213,10 +230,6 @@ fn lower(
                 "canonical_query" => plain_call(lowerer, "zap_url_canonical_query", a, Ty::Ptr),
                 "encode_query_multi" => {
                     plain_call(lowerer, "zap_url_encode_query_multi", a, Ty::Ptr)
-                }
-                "parse_query" => plain_call(lowerer, "zap_url_parse_query", a, dict_ty()),
-                "parse_query_first" => {
-                    plain_call(lowerer, "zap_url_parse_query_first", a, dict_ty())
                 }
                 "join" => plain_call(lowerer, "zap_url_join", a, Ty::Ptr),
                 _ => return Ok(None),
