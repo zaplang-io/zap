@@ -7624,6 +7624,7 @@ mod tests {
     ///   3. every `#include "runtime/…"` in `zaprt.c` has a manifest row (compiled
     ///      but never written beside `zaprt.c` → a compile failure only where `cc`
     ///      actually runs).
+    ///
     /// Also checks every manifest text is non-empty.
     #[test]
     fn runtime_manifest_matches_disk_and_includes() {
