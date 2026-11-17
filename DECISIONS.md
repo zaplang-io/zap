@@ -10814,3 +10814,45 @@ lives here and in that header).
 
 Relates to [[D-0204]] (the seam kwargs framework this refines) and [[D-0212]] (the
 #969 surface that prompted it).
+
+## D-0214 — stdlib str: the remaining thin methods — translate / format_map / expandtabs (#1034 / epic #966)
+
+**Context.** [[D-0210]] shipped the thin `str` method set but deferred
+`translate`, `format_map`, and `expandtabs` as independent follow-ups. This
+closes the tail of gap #2 (Discussion #965), under epic #966.
+
+**Decision.** Add the three, Python-faithful and ASCII / byte-offset like the
+rest of the set:
+- `expandtabs([tabsize = 8]) -> str` — expand each `\t` to the next tab stop
+  (column rounded up to a multiple of `tabsize`); `\n`/`\r` reset the column; a
+  `tabsize` of 0 drops tabs. CPython `str.expandtabs`.
+- `translate(table: dict[str, str]) -> str` — map each character (as a 1-char
+  key) through `table`: an absent key keeps the character, a present key
+  substitutes its value, and an empty value deletes the character. CPython
+  `str.translate`.
+- `format_map(mapping: dict[str, str]) -> str` — fill each `{name}` field from
+  `mapping`; `{{`/`}}` are literal braces. CPython `str.format_map`.
+
+**Deliberate divergences / v1 limits.**
+- `translate` takes a **dict of 1-character string keys**, not CPython's
+  ordinal-keyed table, so no `str.maketrans` step exists — a `dict[str, str]` is
+  the natural Zap spelling and the thin-set's other methods are already
+  character/byte oriented.
+- `format_map` supports plain `{name}` substitution only; a conversion or
+  format-spec (`!`/`:`) raises `ValueError`, left as a documented follow-up (it
+  shares the field grammar with `format`/f-strings, #285). A missing field
+  raises a catchable `KeyError` carrying the field name; a stray `}` or an
+  unterminated `{` raises `ValueError` — matching CPython's error shape.
+
+**Positional.** All three are `str` **methods**, not seam module functions, so
+they sit outside the `seam_sigs` registry ([[D-0204]], [[D-0213]]) and take their
+arguments positionally like the rest of the `str` surface.
+
+**Tests.** Golden `str_translate` (tab expansion; translate replace / delete /
+no-match; format_map substitution, literal braces, and the catchable KeyError /
+ValueError); `error_codes::str_method_limits_are_rejected` pins the argument
+limits (a non-dict argument → ZAP4024, wrong arity → ZAP4025); sema shape tests.
+
+Relates to [[D-0210]] (the thin-str set this completes), epic #966, and
+Discussion #965 (gap #2). `partition`/`rpartition` remain deferred to #1029 —
+they need the seam tuple-return mechanism, which these three do not.

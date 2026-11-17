@@ -7911,6 +7911,65 @@ impl Checker {
                 }
                 Ty::Str
             }
+            // expandtabs([tabsize]): expand tabs to spaces; optional int tab
+            // stop, default 8 (#1034, D-0214).
+            "expandtabs" => {
+                if args.len() > 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "str.expandtabs() takes 0 or 1 arguments (tabsize)".to_string(),
+                        span,
+                    );
+                }
+                if let Some(a) = args.first() {
+                    let at = self.infer(&a.value);
+                    if !at.is_int() && !matches!(at, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "str.expandtabs() tabsize must be an int, found {}",
+                                at.display()
+                            ),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+                Ty::Str
+            }
+            // translate(table) / format_map(mapping): a single dict[str, str]
+            // argument (#1034, D-0214). translate maps each character (as a
+            // 1-char key) to a replacement; format_map fills `{name}` fields.
+            "translate" | "format_map" => {
+                if args.len() != 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!("str.{name}() takes exactly one argument"),
+                        span,
+                    );
+                }
+                if let Some(a) = args.first() {
+                    let at = self.infer(&a.value);
+                    let ok = match &at {
+                        Ty::Unknown => true,
+                        Ty::Dict(k, v) => {
+                            (assignable(k, &Ty::Str) || matches!(**k, Ty::Unknown))
+                                && (assignable(v, &Ty::Str) || matches!(**v, Ty::Unknown))
+                        }
+                        _ => false,
+                    };
+                    if !ok {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "str.{name}() expects a dict[str, str], found {}",
+                                at.display()
+                            ),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+                Ty::Str
+            }
             "encode" => {
                 if !args.is_empty() {
                     self.error(
@@ -10023,6 +10082,49 @@ def main():
             let e = errors(&src);
             assert!(!e.is_empty(), "expected an arity error for `{bad}`");
         }
+    }
+
+    // ---- str: translate / format_map / expandtabs (#1034, D-0214) ---------
+
+    #[test]
+    fn str_translate_format_map_expandtabs_type_check() {
+        ok(r#"def main():
+    auto t = {"a": "A", "b": ""}
+    str x = "abc".translate(t)
+    str y = "{k}".format_map({"k": "v"})
+    str z = "a\tb".expandtabs()
+    str w = "a\tb".expandtabs(4)
+    print(x + y + z + w)
+"#);
+    }
+
+    #[test]
+    fn str_translate_format_map_expandtabs_reject_bad_args() {
+        // translate / format_map want a dict[str, str], not a str (ZAP4024).
+        for bad in ["\"a\".translate(\"x\")", "\"{k}\".format_map(\"x\")"] {
+            let e = errors(&format!("def main():\n    auto z = {bad}\n"));
+            assert!(
+                e.iter().any(|x| x.code == ErrorCode::ZAP4024),
+                "`{bad}` should be ZAP4024, got {e:?}"
+            );
+        }
+        // Arity: translate/format_map take exactly one; expandtabs at most one.
+        for bad in [
+            "auto d = {\"a\": \"b\"}\n    auto z = \"a\".translate(d, d)",
+            "auto z = \"a\".expandtabs(1, 2)",
+        ] {
+            let e = errors(&format!("def main():\n    {bad}\n"));
+            assert!(
+                e.iter().any(|x| x.code == ErrorCode::ZAP4025),
+                "`{bad}` should be ZAP4025, got {e:?}"
+            );
+        }
+        // expandtabs tabsize must be an int (ZAP4024).
+        let e = errors("def main():\n    auto z = \"a\".expandtabs(\"x\")\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4024),
+            "expandtabs(str) should be ZAP4024, got {e:?}"
+        );
     }
 
     // ---- transparent type aliases (#606, D-0105) --------------------------

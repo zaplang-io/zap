@@ -1253,3 +1253,165 @@ void *zap_py_str(void *obj_) {
 }
 #endif /* ZAP_HAVE_CPYTHON */
 
+/* --- translate / format_map / expandtabs (#1034, D-0214) -------------------
+ *
+ * The remaining thin-`str` methods. ASCII / byte-offset, like the #971 set.
+ * `translate`/`format_map` take a `dict[str, str]` (str-keyed dict helpers live
+ * in zaprt.c, included before this fragment). Output is grown with a small
+ * realloc buffer then copied into a fresh ZapStr. NOTE: `zap_sys_fail` is not
+ * visible here (it is defined in os_fs.inc.c, included later), so error exits
+ * use `zap_panic_typed` with the shared ZAP_EXC_* codes. */
+
+/* Grow `buf` so it holds at least `need` bytes; returns the (possibly moved)
+ * buffer. Aborts to a catchable RuntimeError on allocation failure. */
+static char *zap_strbuf_ensure(char *buf, size_t need, size_t *cap) {
+    if (need > *cap) {
+        while (need > *cap) {
+            *cap = *cap ? *cap * 2 : 16;
+        }
+        buf = (char *)realloc(buf, *cap);
+        if (!buf) {
+            const char *m = "out of memory";
+            zap_panic_typed(ZAP_EXC_RUNTIME_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+        }
+    }
+    return buf;
+}
+
+/* str.expandtabs([tabsize]) -> str: expand each '\t' to the next tab stop
+ * (column rounded up to a multiple of tabsize). '\n'/'\r' reset the column;
+ * tabsize 0 drops tabs. CPython `str.expandtabs`. */
+void *zap_str_expandtabs(void *sp, int64_t tabsize) {
+    const ZapStr *s = (const ZapStr *)sp;
+    if (tabsize < 0) {
+        tabsize = 0;
+    }
+    size_t cap = 0, len = 0;
+    char *buf = NULL;
+    int64_t col = 0;
+    for (int64_t i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        if (c == '\t') {
+            int64_t n = tabsize > 0 ? tabsize - (col % tabsize) : 0;
+            buf = zap_strbuf_ensure(buf, len + (size_t)n, &cap);
+            for (int64_t k = 0; k < n; k++) {
+                buf[len++] = ' ';
+            }
+            col += n;
+        } else if (c == '\n' || c == '\r') {
+            buf = zap_strbuf_ensure(buf, len + 1, &cap);
+            buf[len++] = c;
+            col = 0;
+        } else {
+            buf = zap_strbuf_ensure(buf, len + 1, &cap);
+            buf[len++] = c;
+            col++;
+        }
+    }
+    void *r = zap_str_new(buf ? buf : "", (int64_t)len);
+    free(buf);
+    return r;
+}
+
+/* str.translate(table) -> str: map each character (as a 1-char key) through
+ * `table` (dict[str, str]); an absent key keeps the character, a present key
+ * substitutes its value, and an empty value deletes the character. CPython
+ * `str.translate` (Zap uses 1-char string keys rather than ordinal keys, so no
+ * `maketrans` step is needed). */
+void *zap_str_translate(void *sp, void *table_) {
+    const ZapStr *s = (const ZapStr *)sp;
+    size_t cap = 0, len = 0;
+    char *buf = NULL;
+    for (int64_t i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        void *key = zap_str_new(&c, 1);
+        if (zap_dict_contains_str(table_, key)) {
+            const ZapStr *rep = (const ZapStr *)zap_dict_get_str_ptr(table_, key);
+            if (rep && rep->len > 0) {
+                buf = zap_strbuf_ensure(buf, len + (size_t)rep->len, &cap);
+                memcpy(buf + len, rep->data, (size_t)rep->len);
+                len += (size_t)rep->len;
+            }
+            /* empty replacement => delete the character */
+        } else {
+            buf = zap_strbuf_ensure(buf, len + 1, &cap);
+            buf[len++] = c;
+        }
+    }
+    void *r = zap_str_new(buf ? buf : "", (int64_t)len);
+    free(buf);
+    return r;
+}
+
+/* str.format_map(mapping) -> str: substitute each `{name}` field with
+ * mapping[name] (dict[str, str]); `{{`/`}}` are literal braces. A missing field
+ * raises KeyError (carrying the field name); a stray `}`, an unterminated `{`,
+ * or a conversion / format-spec (`!`/`:`) raises ValueError. CPython
+ * `str.format_map`; the `:spec`/`!conv` mini-language is a documented v1 gap. */
+void *zap_str_format_map(void *tmpl_, void *m_) {
+    const ZapStr *t = (const ZapStr *)tmpl_;
+    size_t cap = 0, len = 0;
+    char *buf = NULL;
+    int64_t i = 0;
+    while (i < t->len) {
+        char c = t->data[i];
+        if (c == '{') {
+            if (i + 1 < t->len && t->data[i + 1] == '{') {
+                buf = zap_strbuf_ensure(buf, len + 1, &cap);
+                buf[len++] = '{';
+                i += 2;
+                continue;
+            }
+            int64_t j = i + 1;
+            while (j < t->len && t->data[j] != '}') {
+                if (t->data[j] == '{') {
+                    free(buf);
+                    const char *m = "unexpected '{' in field name";
+                    zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+                }
+                if (t->data[j] == ':' || t->data[j] == '!') {
+                    free(buf);
+                    const char *m =
+                        "str.format_map(): format specs and conversions are unsupported in v1";
+                    zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+                }
+                j++;
+            }
+            if (j >= t->len) {
+                free(buf);
+                const char *m = "expected '}' before end of string";
+                zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+            }
+            void *key = zap_str_new(t->data + i + 1, j - (i + 1));
+            if (!zap_dict_contains_str(m_, key)) {
+                free(buf);
+                zap_panic_typed(ZAP_EXC_KEY_ERROR, key); /* message = the field name */
+            }
+            const ZapStr *rep = (const ZapStr *)zap_dict_get_str_ptr(m_, key);
+            if (rep && rep->len > 0) {
+                buf = zap_strbuf_ensure(buf, len + (size_t)rep->len, &cap);
+                memcpy(buf + len, rep->data, (size_t)rep->len);
+                len += (size_t)rep->len;
+            }
+            i = j + 1;
+        } else if (c == '}') {
+            if (i + 1 < t->len && t->data[i + 1] == '}') {
+                buf = zap_strbuf_ensure(buf, len + 1, &cap);
+                buf[len++] = '}';
+                i += 2;
+                continue;
+            }
+            free(buf);
+            const char *m = "single '}' encountered in format string";
+            zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+        } else {
+            buf = zap_strbuf_ensure(buf, len + 1, &cap);
+            buf[len++] = c;
+            i++;
+        }
+    }
+    void *r = zap_str_new(buf ? buf : "", (int64_t)len);
+    free(buf);
+    return r;
+}
+

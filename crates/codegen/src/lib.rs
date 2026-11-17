@@ -2349,6 +2349,11 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             self.declare_rt("zap_str_isspace", &[p.into()], Some(i.into()));
             self.declare_rt("zap_str_islower", &[p.into()], Some(i.into()));
             self.declare_rt("zap_str_isupper", &[p.into()], Some(i.into()));
+            // translate / format_map / expandtabs (#1034, D-0214). translate and
+            // format_map take a dict[str,str] (a pointer); expandtabs an int.
+            self.declare_rt("zap_str_expandtabs", &[p.into(), i.into()], Some(p.into()));
+            self.declare_rt("zap_str_translate", &[p.into(), p.into()], Some(p.into()));
+            self.declare_rt("zap_str_format_map", &[p.into(), p.into()], Some(p.into()));
             let f = self.ctx.f64_type();
             // Strict float parse for `float(s)` (#282/#285), the f64 analog of
             // `zap_str_parse_int`; faults on a malformed string.
