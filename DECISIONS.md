@@ -10669,3 +10669,51 @@ already records for `upper`/`lower`).
 
 Relates to [[D-0056]] / #284 (the original `str` surface), [[D-0025]] (str is
 UTF-8 bytes), epic #966, and Discussion #965 (gap #2).
+
+## D-0211 — stdlib os/fs: filesystem gaps (stat, mutation, binary I/O, path helpers, environ) (#968 / epic #966)
+
+**Context.** `os`/`fs` covered only the basics (env get/set, cwd, single-level
+mkdir/remove, whole-file str read/write, type/size queries, `path_join`/
+`basename`/`dirname`). Build tools, installers and file-processing scripts hit
+the gaps immediately and had to shell out via `process.run("mv"/"find"/…)` or
+could not proceed. Gap #4 of Discussion #965, under the stdlib-gaps epic #966.
+
+**Decision.** Add the table-stakes filesystem surface, Python (`os`/`os.path`/
+`shutil`) / Go (`os`/`path/filepath`) faithful, as flat seam functions (no
+`pathlib` object — out of scope, matching the current seam).
+
+- **Metadata.** `fs.stat(path) -> Stat` — the new prelude `value struct Stat`
+  (`size`, `mtime`, `ctime`, `mode`, `is_dir`, `is_file`, `is_symlink`), built the
+  `KeyInfo`/`UrlParts` way (a getter per field; `size` is the throwing gate, so a
+  bad path raises a catchable error eagerly). `fs.mtime(path) -> int64`. `stat`
+  follows symlinks (Python `os.stat`); `is_symlink` is an `lstat` test.
+- **Mutation.** `fs.rename(src,dst)`, `fs.move(src,dst)` (rename, with an
+  EXDEV copy+unlink fallback for a regular file), `fs.copy(src,dst)` (file
+  contents), `fs.makedirs(path)` (recursive, existing dir OK), `fs.rmtree(path)`
+  (recursive remove).
+- **Binary I/O.** `fs.read_bytes(path) -> bytes`, `fs.write_bytes(path, data)`,
+  `fs.append(path, data)` (create-or-append).
+- **Environment.** `os.environ() -> dict[str,str]` (enumerate all).
+- **Path helpers.** `os.path_abspath`, `os.path_realpath` (libc `realpath`),
+  `os.path_relpath(path, start)`, `os.path_normpath` (lexical `.`/`..`/`//`
+  collapse), `os.path_isabs`, `os.path_expanduser` (leading `~` -> `$HOME`),
+  `os.sep()` (always `/`, Zap's one portable separator, accepted by every Windows
+  API — consistent with `path_join`).
+
+**Separator / case policy.** `/` is Zap's single portable separator on every
+platform (the existing `path_join` convention); `os.sep()` returns it everywhere
+rather than `\` on Windows. Path helpers are lexical where Python's are
+(`normpath`/`relpath` do not touch the filesystem; `abspath` joins against the
+cwd but normalizes lexically); `realpath` is the one that resolves symlinks.
+
+**Deferred (documented follow-ups — the issue's own slicing).** Traversal
+(`fs.walk` / `fs.scandir`, which need the iterator protocol over a native tree
+walk — a design question flagged in the #965 L-cluster) and matching
+(`fs.glob` / `fs.fnmatch`) form the natural next slice; `fs.copytree` (recursive
+dir copy) pairs with them; and `os.path_split` / `os.path_splitext` want the
+tuple-return design still pending (same as [[D-0210]]'s `partition`). None has a
+worse workaround than what ships here.
+
+Relates to [[D-0056]] / #97 (the original os/fs seam), [[D-0126]] (`KeyInfo`, the
+value-struct precedent), [[D-0204]] (seam kwargs), epic #966, and Discussion #965
+(gap #4).

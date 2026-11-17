@@ -53,6 +53,27 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "os", method, args, 1, span);
             Ty::Str
         }
+        // Filesystem gaps (#968, D-0211).
+        "environ" => {
+            expect_argc(checker, "os", method, args, 0, span);
+            Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Str))
+        }
+        "sep" => {
+            expect_argc(checker, "os", method, args, 0, span);
+            Ty::Str
+        }
+        "path_isabs" => {
+            expect_argc(checker, "os", method, args, 1, span);
+            Ty::Bool
+        }
+        "path_expanduser" | "path_normpath" | "path_abspath" | "path_realpath" => {
+            expect_argc(checker, "os", method, args, 1, span);
+            Ty::Str
+        }
+        "path_relpath" => {
+            expect_argc(checker, "os", method, args, 2, span);
+            Ty::Str
+        }
         _ => return None,
     })
 }

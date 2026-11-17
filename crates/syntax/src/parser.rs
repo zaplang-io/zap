@@ -176,6 +176,15 @@ value struct UrlParts:
     str query
     str fragment
 
+value struct Stat:
+    int64 size
+    int64 mtime
+    int64 ctime
+    int64 mode
+    bool is_dir
+    bool is_file
+    bool is_symlink
+
 enum Optional[T]:
     Some(T value)
     None
@@ -1270,6 +1279,11 @@ fn references_prelude(module: &Module) -> bool {
         // harmless — the unused struct emits no code.
         "\"UrlParts\"",
         "\"url\"",
+        // The `fs.stat` metadata value struct (#968, D-0211): injected for any
+        // program that names the `fs` module or the struct. Over-injection for an
+        // `fs.read_file`-only program is harmless (the unused struct emits no code).
+        "\"Stat\"",
+        "\"fs\"",
         "\"JsonValue\"",
         "\"json\"",
         "\"Json\"",

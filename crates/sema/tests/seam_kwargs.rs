@@ -806,3 +806,39 @@ fn url_parse_query_unknown_keyword_rejected() {
         "ZAP4023",
     );
 }
+
+// ---------------------------------------------------------------------------
+// os/fs filesystem gaps (#968, D-0211): the new multi-arg methods take keywords.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fs_rename_keyword_and_reorder() {
+    assert_ok(&prog("    fs.rename(src=\"a\", dst=\"b\")\n"));
+    assert_ok(&prog("    fs.rename(dst=\"b\", src=\"a\")\n"));
+}
+
+#[test]
+fn fs_rename_unknown_keyword_rejected() {
+    assert_code(&prog("    fs.rename(src=\"a\", to=\"b\")\n"), "ZAP4023");
+}
+
+#[test]
+fn os_path_relpath_keyword() {
+    assert_ok(&prog(
+        "    auto r = os.path_relpath(path=\"/a/b\", start=\"/a\")\n",
+    ));
+    assert_ok(&prog(
+        "    auto r = os.path_relpath(start=\"/a\", path=\"/a/b\")\n",
+    ));
+}
+
+#[test]
+fn fs_stat_keyword_and_positional() {
+    assert_ok(&prog("    auto s = fs.stat(path=\"/tmp\")\n"));
+    assert_ok(&prog("    auto s = fs.stat(\"/tmp\")\n"));
+}
+
+#[test]
+fn fs_copy_positional_unchanged() {
+    assert_ok(&prog("    fs.copy(\"a\", \"b\")\n"));
+}

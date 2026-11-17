@@ -25,6 +25,16 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`os`/`fs` gain the filesystem gaps** (#968, D-0211). Metadata: `fs.stat`
+  (the new prelude `Stat` value struct — size/mtime/ctime/mode/is_dir/is_file/
+  is_symlink) and `fs.mtime`. Mutation: `fs.rename`, `fs.move` (with a
+  cross-device copy+unlink fallback), `fs.copy`, `fs.makedirs` (recursive),
+  `fs.rmtree` (recursive). Binary I/O: `fs.read_bytes`/`write_bytes`/`append`.
+  Environment: `os.environ()` enumerates all variables. Path helpers:
+  `os.path_abspath`/`realpath`/`relpath`/`normpath`/`isabs`/`expanduser` and
+  `os.sep()`. Traversal (`walk`/`scandir`), matching (`glob`/`fnmatch`),
+  `copytree`, and the tuple-returning `path_split`/`path_splitext` are documented
+  follow-ups.
 - **`str` gains the thin method set** (#971, D-0210). Pervasive text-munging
   methods, Python/Go-faithful: `split()` with no argument (whitespace) and a
   `maxsplit` limit, `rsplit`, `splitlines`; `count`, `rfind`/`rindex`;

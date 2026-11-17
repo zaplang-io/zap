@@ -26,4 +26,13 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_os_path_exists", &[p.into()], Some(i.into()));
     cg.declare_rt("zap_os_path_basename", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_os_path_dirname", &[p.into()], Some(p.into()));
+    // Filesystem gaps (#968, D-0211): environment enumeration + the path helpers.
+    cg.declare_rt("zap_os_environ", &[], Some(p.into()));
+    cg.declare_rt("zap_os_sep", &[], Some(p.into()));
+    cg.declare_rt("zap_os_path_isabs", &[p.into()], Some(i.into()));
+    cg.declare_rt("zap_os_path_expanduser", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_os_path_normpath", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_os_path_abspath", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_os_path_realpath", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_os_path_relpath", &[p.into(), p.into()], Some(p.into()));
 }
