@@ -646,8 +646,16 @@ the matching **optional trailing `dict[str, str]` of response headers** (#279);
 the server request handle additionally gained **`http.req_headers(req) ->
 list[(str, str)]`** (#960, D-0197), enumerating the raw received header block as
 ordered `(name, value)` pairs (duplicates preserved) alongside the unchanged
-case-insensitive by-name `http.req_header`. Because `http` is **Experimental**,
-all of these are additive surface changes requiring no stability promise.
+case-insensitive by-name `http.req_header`. The client verbs now **follow 3xx
+redirects by default** (#987, D-0222): up to a fixed hop cap, resolving each
+`Location` against the current URL (RFC-3986, as `url.join`), with the
+browser/`requests` method rules (303 → GET; 301/302 downgrade only POST → GET;
+307/308 preserve method and body) and a catchable `ValueError` when the cap is
+exceeded; two additive accessors, **`http.final_url(resp) -> str`** and
+**`http.redirects(resp) -> list[str]`** (the targets followed, in order), expose
+the outcome. A configurable cap / opt-out is a deferred follow-up. Because `http`
+is **Experimental**, all of these are additive surface changes requiring no
+stability promise.
 
 **CLI (`SPEC.md` §17, `crates/driver/src/cli.rs`).**
 

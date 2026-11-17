@@ -39,6 +39,9 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_http_status", &[p.into()], Some(i.into()));
     cg.declare_rt("zap_http_body", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_http_header", &[p.into(), p.into()], Some(p.into()));
+    // redirect-following result accessors (#987)
+    cg.declare_rt("zap_http_final_url", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_http_redirects", &[p.into()], Some(p.into()));
     cg.declare_rt(
         "zap_http_url",
         &[p.into(), i.into(), p.into()],

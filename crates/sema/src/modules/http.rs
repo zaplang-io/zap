@@ -3,7 +3,12 @@
 //! HTTP/1.1 over the `net` TCP sockets: a plaintext client (`get`/`post`/
 //! `request`, each also taking an optional trailing `dict[str,str]` of request
 //! headers — #280 — and returning an opaque response handle with
-//! `status`/`body`/`header` accessors) and the server-side helpers (`read_request` parses a request off a
+//! `status`/`body`/`header` accessors). The client follows 3xx redirects by
+//! default (#987, D-0222): up to a fixed hop cap, resolving each `Location`
+//! against the current URL (RFC-3986, as `url.join`), with the browser/`requests`
+//! method rules (303 → GET; 301/302 downgrade only POST → GET; 307/308 preserve);
+//! `final_url` and `redirects` expose the outcome. The server-side helpers
+//! (`read_request` parses a request off a
 //! connection into an opaque request handle with `method`/`path`/`req_version`/
 //! `req_header`/`req_headers`/`req_body` accessors; `respond` writes a response). Response/request handles
 //! are opaque GC objects typed as `bytes` (the `crypto`/`sync` pattern). `https`
@@ -77,6 +82,19 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "header" => {
             expect_argc(checker, "http", method, args, 2, span);
             Ty::Str
+        }
+        // http.final_url(resp) -> str. The URL the returned response came from
+        // after redirect following: the last URL dialed, or the original request
+        // URL when nothing was followed (#987).
+        "final_url" => {
+            expect_argc(checker, "http", method, args, 1, span);
+            Ty::Str
+        }
+        // http.redirects(resp) -> list[str]. The redirect targets followed, in
+        // order; the empty list when none were (#987).
+        "redirects" => {
+            expect_argc(checker, "http", method, args, 1, span);
+            Ty::List(Box::new(Ty::Str))
         }
         // http.url(host, port, path) -> "http://host:port/path". A convenience
         // for dialing an ephemeral server whose port is only known at runtime,

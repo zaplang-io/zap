@@ -25,6 +25,14 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`http` client follows redirects** (#987, D-0222). `get`/`post`/`request` now
+  follow 3xx responses by default — up to a fixed hop cap, resolving each
+  `Location` against the current URL (RFC-3986, as `url.join`), with the
+  browser/`requests` method rules (303 → GET; 301/302 downgrade only POST → GET;
+  307/308 preserve method and body); exceeding the cap raises `ValueError`. Two
+  new accessors expose the outcome: `http.final_url(resp)` (the URL the final
+  response came from) and `http.redirects(resp)` (`list[str]` of targets
+  followed, in order). A configurable cap / opt-out is a deferred follow-up.
 - **`datetime` gains date arithmetic, comparisons, and field helpers** (#974,
   D-0221). `datetime.add(dt, seconds)` / `datetime.diff(a, b)` (seconds),
   `datetime.before`/`after`/`equal`, and `datetime.weekday` (Mon=0) /

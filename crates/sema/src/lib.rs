@@ -10318,6 +10318,37 @@ def main():
         );
     }
 
+    // ---- http: redirect-following result accessors (#987, D-0222) ----------
+
+    #[test]
+    fn http_redirect_accessors_type_check() {
+        // final_url -> str, redirects -> list[str]; the explicit bindings pin the
+        // return types (a wrong type would fail to assign).
+        ok(r#"def main():
+    auto r = http.get("http://x")
+    str u = http.final_url(r)
+    list[str] cs = http.redirects(r)
+    for c in cs:
+        print(c)
+    print(u)
+"#);
+        // Each accessor takes exactly one argument.
+        let e = errors(
+            "def main():\n    auto r = http.get(\"http://x\")\n    auto u = http.final_url(r, r)\n",
+        );
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4025),
+            "final_url/2 should be ZAP4025, got {e:?}"
+        );
+        let e = errors(
+            "def main():\n    auto r = http.get(\"http://x\")\n    auto c = http.redirects()\n",
+        );
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4025),
+            "redirects/0 should be ZAP4025, got {e:?}"
+        );
+    }
+
     // ---- list: mutation methods (#977, D-0220) ----------------------------
 
     #[test]

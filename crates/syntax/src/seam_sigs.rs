@@ -68,6 +68,10 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("http", "status", &["resp"]),
     ("http", "body", &["resp"]),
     ("http", "header", &["resp", "name"]),
+    // redirect-following result accessors (#987). Single-argument, rowed for a
+    // uniform keyword-capable surface (D-0213).
+    ("http", "final_url", &["resp"]),
+    ("http", "redirects", &["resp"]),
     ("http", "url", &["host", "port", "path"]),
     ("http", "read_request", &["conn"]),
     ("http", "method", &["req"]),
