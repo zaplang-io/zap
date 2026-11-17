@@ -10155,6 +10155,33 @@ def main():
         }
     }
 
+    // ---- sys standard streams (#1035, D-0217) -----------------------------
+
+    #[test]
+    fn sys_streams_type_check_and_arity() {
+        ok(r#"def main():
+    auto r = sys.stdin()
+    str line = io.readline(r)
+    auto out = sys.stdout()
+    int64 n = sys.write(out, "hi\n")
+    int64 m = sys.write(sys.stderr(), line)
+    print(str(n + m))
+"#);
+        // stdin/stdout/stderr take no arguments; write takes exactly two.
+        for bad in [
+            "sys.stdin(0)",
+            "sys.stdout(1)",
+            "sys.write(sys.stdout())",
+            "sys.write(sys.stdout(), \"a\", \"b\")",
+        ] {
+            let e = errors(&format!("def main():\n    auto z = {bad}\n"));
+            assert!(
+                e.iter().any(|x| x.code == ErrorCode::ZAP4025),
+                "`{bad}` should be ZAP4025, got {e:?}"
+            );
+        }
+    }
+
     // ---- transparent type aliases (#606, D-0105) --------------------------
 
     #[test]

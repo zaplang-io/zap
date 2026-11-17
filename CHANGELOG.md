@@ -25,6 +25,12 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`sys` standard streams as objects** (#1035, D-0217). `sys.stdin()` is a
+  buffered reader over fd 0 (read with `io.readline`/`readall`/`readn`);
+  `sys.stdout()` / `sys.stderr()` are writer handles over fds 1/2; `sys.write(
+  stream, data)` writes and returns the byte count. Lets a program pass "the
+  input"/"the output" around as a value instead of a raw fd (the `sys.std*_fd()`
+  accessors stay).
 - **`fs` gains path matching — `fs.glob` / `fs.fnmatch`** (#1033, D-0216).
   `fs.fnmatch(name, pattern)` is a whole-string shell-glob match (`*`/`?`/`[seq]`/
   `[!seq]`); `fs.glob(root, pattern)` returns the paths under `root` matching a

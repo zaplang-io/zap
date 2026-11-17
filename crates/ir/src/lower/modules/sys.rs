@@ -34,6 +34,13 @@ fn lower(
         "cpu_has" => call_bool(lowerer, "zap_sys_cpu_has", a),
         "cpu_source" => call_ret(lowerer, "zap_sys_cpu_source", a, Ty::Ptr, false),
         "cpu_sve_vl" => call_ret(lowerer, "zap_sys_cpu_sve_vl", a, Ty::I64, false),
+        // Standard streams as objects (#1035, D-0217). stdin -> reader handle,
+        // stdout/stderr -> writer handle; write -> bytes written (throwing: the
+        // backing zap_io_write raises on an I/O error).
+        "stdin" => call_ret(lowerer, "zap_sys_stdin", a, Ty::Ptr, false),
+        "stdout" => call_ret(lowerer, "zap_sys_stdout", a, Ty::Ptr, false),
+        "stderr" => call_ret(lowerer, "zap_sys_stderr", a, Ty::Ptr, false),
+        "write" => call_ret(lowerer, "zap_sys_write", a, Ty::I64, true),
         _ => return Ok(None),
     }))
 }
