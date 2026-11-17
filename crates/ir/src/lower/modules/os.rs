@@ -30,6 +30,22 @@ fn lower(
         "path_exists" => call_bool(lowerer, "zap_os_path_exists", a),
         "path_basename" => call_ret(lowerer, "zap_os_path_basename", a, Ty::Ptr, false),
         "path_dirname" => call_ret(lowerer, "zap_os_path_dirname", a, Ty::Ptr, false),
+        // Filesystem gaps (#968, D-0211). environ() builds a dict[str,str]
+        // (key + value are plain str reference words -> Elem::Ptr).
+        "environ" => call_ret(
+            lowerer,
+            "zap_os_environ",
+            a,
+            Ty::Dict(Elem::Ptr, Elem::Ptr),
+            false,
+        ),
+        "sep" => call_ret(lowerer, "zap_os_sep", a, Ty::Ptr, false),
+        "path_isabs" => call_bool(lowerer, "zap_os_path_isabs", a),
+        "path_expanduser" => call_ret(lowerer, "zap_os_path_expanduser", a, Ty::Ptr, false),
+        "path_normpath" => call_ret(lowerer, "zap_os_path_normpath", a, Ty::Ptr, false),
+        "path_abspath" => call_ret(lowerer, "zap_os_path_abspath", a, Ty::Ptr, true),
+        "path_realpath" => call_ret(lowerer, "zap_os_path_realpath", a, Ty::Ptr, true),
+        "path_relpath" => call_ret(lowerer, "zap_os_path_relpath", a, Ty::Ptr, true),
         _ => return Ok(None),
     }))
 }

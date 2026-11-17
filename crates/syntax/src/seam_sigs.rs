@@ -168,6 +168,13 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("os", "path_exists", &["path"]),
     ("os", "path_basename", &["path"]),
     ("os", "path_dirname", &["path"]),
+    // filesystem gaps (#968, D-0211); environ/sep take no args, so no row.
+    ("os", "path_isabs", &["path"]),
+    ("os", "path_expanduser", &["path"]),
+    ("os", "path_normpath", &["path"]),
+    ("os", "path_abspath", &["path"]),
+    ("os", "path_realpath", &["path"]),
+    ("os", "path_relpath", &["path", "start"]),
     // ---- fs (ticket #97): file read/write + stat ----
     // (mkdtemp takes no args, so no row.)
     ("fs", "read_file", &["path"]),
@@ -177,6 +184,17 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("fs", "is_file", &["path"]),
     ("fs", "size", &["path"]),
     ("fs", "listdir", &["path"]),
+    // filesystem gaps (#968, D-0211).
+    ("fs", "stat", &["path"]),
+    ("fs", "mtime", &["path"]),
+    ("fs", "rename", &["src", "dst"]),
+    ("fs", "move", &["src", "dst"]),
+    ("fs", "copy", &["src", "dst"]),
+    ("fs", "makedirs", &["path"]),
+    ("fs", "rmtree", &["path"]),
+    ("fs", "read_bytes", &["path"]),
+    ("fs", "write_bytes", &["path", "data"]),
+    ("fs", "append", &["path", "data"]),
     // ---- time (ticket #99): sleeps + Duration constructors/accessors ----
     // (monotonic/monotonic_ns/time/time_ns take no args, so no row.)
     ("time", "sleep", &["seconds"]),

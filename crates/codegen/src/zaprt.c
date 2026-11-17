@@ -15638,6 +15638,489 @@ void *zap_fs_mkdtemp(void) {
     return zap_str_new(tmpl, (int64_t)strlen(tmpl));
 }
 
+/* ===========================================================================
+ * stdlib: os/fs filesystem gaps (ticket #968, D-0211)
+ * ---------------------------------------------------------------------------
+ * Metadata (the prelude `Stat` value struct + `mtime`), mutation (rename/move/
+ * makedirs/copy/rmtree and binary read/write/append), environment enumeration,
+ * and the path helpers (abspath/realpath/relpath/normpath/isabs/expanduser/sep).
+ * Traversal (`walk`/`scandir`), matching (`glob`/`fnmatch`), `copytree`, and the
+ * tuple-returning `path_split`/`path_splitext` are documented follow-ups. All
+ * `cstr`/`sys_fail` conventions and the `/`-separator policy match the existing
+ * os/fs surface (#97).
+ * =========================================================================== */
+
+/* fs.stat getters (#968): each runs stat()/lstat() and returns one field, the
+ * `KeyInfo` pattern — re-stat per field is a cheap syscall and keeps the struct
+ * build uniform. Every getter raises (catchable) if the path cannot be stat'd,
+ * so an eager `fs.stat` surfaces ENOENT at the call. `is_symlink` uses lstat
+ * (the others follow symlinks, like Python `os.stat`). */
+static void zap_fs_do_stat(void *path_, struct stat *st, const char *op) {
+    if (stat(zap_sys_cstr((ZapStr *)path_), st) != 0) {
+        zap_sys_fail(op, strerror(errno));
+    }
+}
+int64_t zap_fs_stat_size(void *path_) {
+    struct stat st;
+    zap_fs_do_stat(path_, &st, "fs.stat");
+    return (int64_t)st.st_size;
+}
+int64_t zap_fs_stat_mtime(void *path_) {
+    struct stat st;
+    zap_fs_do_stat(path_, &st, "fs.stat");
+    return (int64_t)st.st_mtime;
+}
+int64_t zap_fs_stat_ctime(void *path_) {
+    struct stat st;
+    zap_fs_do_stat(path_, &st, "fs.stat");
+    return (int64_t)st.st_ctime;
+}
+int64_t zap_fs_stat_mode(void *path_) {
+    struct stat st;
+    zap_fs_do_stat(path_, &st, "fs.stat");
+    return (int64_t)st.st_mode;
+}
+int64_t zap_fs_stat_is_dir(void *path_) {
+    struct stat st;
+    zap_fs_do_stat(path_, &st, "fs.stat");
+    return S_ISDIR(st.st_mode) ? 1 : 0;
+}
+int64_t zap_fs_stat_is_file(void *path_) {
+    struct stat st;
+    zap_fs_do_stat(path_, &st, "fs.stat");
+    return S_ISREG(st.st_mode) ? 1 : 0;
+}
+int64_t zap_fs_stat_is_symlink(void *path_) {
+#if defined(ZAP_PLATFORM_WINDOWS)
+    /* no lstat on the MSVC CRT; a symlink test is a follow-up — report false. */
+    (void)path_;
+    return 0;
+#else
+    struct stat st;
+    if (lstat(zap_sys_cstr((ZapStr *)path_), &st) != 0) {
+        zap_sys_fail("fs.stat", strerror(errno));
+    }
+    return S_ISLNK(st.st_mode) ? 1 : 0;
+#endif
+}
+
+/* fs.mtime(path) -> int64 (seconds since the epoch). */
+int64_t zap_fs_mtime(void *path_) { return zap_fs_stat_mtime(path_); }
+
+/* fs.rename(src, dst): atomic within a filesystem (POSIX rename). */
+void zap_fs_rename(void *src_, void *dst_) {
+    char *src = zap_sys_cstr((ZapStr *)src_);
+    char *dst = zap_sys_cstr((ZapStr *)dst_);
+    if (rename(src, dst) != 0) {
+        zap_sys_fail("fs.rename", strerror(errno));
+    }
+}
+
+/* Copy a regular file `src` -> `dst` (create/truncate, 0644). Shared by
+ * `fs.copy` and `fs.move`'s cross-device fallback. Returns 0 on success, or sets
+ * errno and returns -1. */
+static int zap_fs_copy_file(const char *src, const char *dst) {
+    int in = open(src, O_RDONLY | ZAP_O_BINARY);
+    if (in < 0) {
+        return -1;
+    }
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC | ZAP_O_BINARY, 0644);
+    if (out < 0) {
+        int e = errno;
+        close(in);
+        errno = e;
+        return -1;
+    }
+    char buf[65536];
+    ssize_t r;
+    int rc = 0;
+    while ((r = read(in, buf, sizeof buf)) > 0) {
+        ssize_t w = 0;
+        while (w < r) {
+            ssize_t k = write(out, buf + w, (size_t)(r - w));
+            if (k < 0) {
+                rc = -1;
+                break;
+            }
+            w += k;
+        }
+        if (rc != 0) {
+            break;
+        }
+    }
+    if (r < 0) {
+        rc = -1;
+    }
+    int e = errno;
+    close(in);
+    close(out);
+    errno = e;
+    return rc;
+}
+
+/* fs.copy(src, dst): copy a regular file's contents. */
+void zap_fs_copy(void *src_, void *dst_) {
+    char *src = zap_sys_cstr((ZapStr *)src_);
+    char *dst = zap_sys_cstr((ZapStr *)dst_);
+    if (zap_fs_copy_file(src, dst) != 0) {
+        zap_sys_fail("fs.copy", strerror(errno));
+    }
+}
+
+/* fs.move(src, dst): rename, falling back to copy+unlink across filesystems
+ * (EXDEV) for a regular file (Python `shutil.move`, file case). */
+void zap_fs_move(void *src_, void *dst_) {
+    char *src = zap_sys_cstr((ZapStr *)src_);
+    char *dst = zap_sys_cstr((ZapStr *)dst_);
+    if (rename(src, dst) == 0) {
+        return;
+    }
+#if !defined(ZAP_PLATFORM_WINDOWS)
+    if (errno == EXDEV) {
+        if (zap_fs_copy_file(src, dst) == 0 && unlink(src) == 0) {
+            return;
+        }
+    }
+#endif
+    zap_sys_fail("fs.move", strerror(errno));
+}
+
+/* fs.makedirs(path): create `path` and every missing parent (Python
+ * `os.makedirs`, Go `MkdirAll`). An already-existing directory is not an error;
+ * an existing non-directory component is. */
+void zap_fs_makedirs(void *path_) {
+    const ZapStr *p = (const ZapStr *)path_;
+    int64_t n = p->len;
+    if (n == 0) {
+        zap_sys_fail("fs.makedirs", "empty path");
+    }
+    char *buf = (char *)zap_buf(n + 1);
+    memcpy(buf, p->data, (size_t)n);
+    buf[n] = '\0';
+    /* create each prefix ending at a '/', then the whole path. */
+    for (int64_t i = 1; i <= n; i++) {
+        if (i == n || buf[i] == '/') {
+            char saved = buf[i];
+            buf[i] = '\0';
+            if (buf[0] != '\0' && !(i == 1 && buf[0] == '/')) {
+#if defined(ZAP_PLATFORM_WINDOWS)
+                int rc = _mkdir(buf);
+#else
+                int rc = mkdir(buf, 0777);
+#endif
+                if (rc != 0 && errno != EEXIST) {
+                    zap_sys_fail("fs.makedirs", strerror(errno));
+                }
+            }
+            buf[i] = saved;
+        }
+    }
+}
+
+/* fs.rmtree(path): recursively remove a directory tree (Python `shutil.rmtree`).
+ * A plain file is unlinked. */
+static void zap_fs_rmtree_cstr(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        zap_sys_fail("fs.rmtree", strerror(errno));
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        if (unlink(path) != 0) {
+            zap_sys_fail("fs.rmtree", strerror(errno));
+        }
+        return;
+    }
+    DIR *d = opendir(path);
+    if (d == NULL) {
+        zap_sys_fail("fs.rmtree", strerror(errno));
+    }
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+            continue;
+        }
+        size_t need = strlen(path) + 1 + strlen(e->d_name) + 1;
+        char *child = (char *)malloc(need);
+        if (child == NULL) {
+            closedir(d);
+            zap_sys_fail("fs.rmtree", "out of memory");
+        }
+        snprintf(child, need, "%s/%s", path, e->d_name);
+        zap_fs_rmtree_cstr(child);
+        free(child);
+    }
+    closedir(d);
+    if (rmdir(path) != 0) {
+        zap_sys_fail("fs.rmtree", strerror(errno));
+    }
+}
+void zap_fs_rmtree(void *path_) {
+    zap_fs_rmtree_cstr(zap_sys_cstr((ZapStr *)path_));
+}
+
+/* fs.read_bytes(path) -> bytes: the whole file as raw bytes (physically a
+ * `ZapStr` buffer, typed `bytes` by the lowerer). */
+void *zap_fs_read_bytes(void *path_) {
+    int fd = open(zap_sys_cstr((ZapStr *)path_), O_RDONLY | ZAP_O_BINARY);
+    if (fd < 0) {
+        zap_sys_fail("fs.read_bytes", strerror(errno));
+    }
+    void *s = zap_read_all_fd(fd);
+    close(fd);
+    return s;
+}
+
+/* fs.write_bytes(path, data): create/truncate and write all of `data` (bytes). */
+void zap_fs_write_bytes(void *path_, void *data_) {
+    int fd = open(zap_sys_cstr((ZapStr *)path_), O_WRONLY | O_CREAT | O_TRUNC | ZAP_O_BINARY,
+                  0644);
+    if (fd < 0) {
+        zap_sys_fail("fs.write_bytes", strerror(errno));
+    }
+    (void)zap_io_write((int64_t)fd, data_);
+    close(fd);
+}
+
+/* fs.append(path, data): create if absent, append `data` at the end. */
+void zap_fs_append(void *path_, void *data_) {
+    int fd = open(zap_sys_cstr((ZapStr *)path_), O_WRONLY | O_CREAT | O_APPEND | ZAP_O_BINARY,
+                  0644);
+    if (fd < 0) {
+        zap_sys_fail("fs.append", strerror(errno));
+    }
+    (void)zap_io_write((int64_t)fd, data_);
+    close(fd);
+}
+
+/* os.environ() -> dict[str, str]: every environment variable, split on the
+ * first '='. */
+void *zap_os_environ(void) {
+    void *d = zap_dict_new();
+    if (environ == NULL) {
+        return d;
+    }
+    for (char **ep = environ; *ep != NULL; ep++) {
+        const char *entry = *ep;
+        const char *eq = strchr(entry, '=');
+        if (eq == NULL) {
+            continue;
+        }
+        void *k = zap_str_new(entry, (int64_t)(eq - entry));
+        void *v = zap_str_new(eq + 1, (int64_t)strlen(eq + 1));
+        zap_dict_set_str_ptr(d, k, v);
+    }
+    return d;
+}
+
+/* os.sep() -> str: Zap's one portable, Python-readable separator ('/'), on every
+ * platform (every Windows API accepts it). */
+void *zap_os_sep(void) { return zap_str_new("/", 1); }
+
+/* os.path_isabs(path) -> bool. */
+int64_t zap_os_path_isabs(void *path_) {
+    return zap_path_is_abs((const ZapStr *)path_) ? 1 : 0;
+}
+
+/* os.path_expanduser(path): a leading "~" (alone or before a '/') expands to
+ * $HOME; "~user" and a HOME-less environment are left unchanged. */
+void *zap_os_path_expanduser(void *path_) {
+    const ZapStr *p = (const ZapStr *)path_;
+    if (p->len == 0 || p->data[0] != '~') {
+        return zap_str_new(p->data, p->len);
+    }
+    if (p->len > 1 && p->data[1] != '/') {
+        return zap_str_new(p->data, p->len); /* "~user" — unsupported, verbatim */
+    }
+    const char *home = getenv("HOME");
+    if (home == NULL) {
+        return zap_str_new(p->data, p->len);
+    }
+    int64_t hlen = (int64_t)strlen(home);
+    int64_t rest = p->len - 1; /* everything after '~' (includes the '/') */
+    int64_t total = hlen + rest;
+    char *buf = (char *)zap_buf(total > 0 ? total : 1);
+    memcpy(buf, home, (size_t)hlen);
+    if (rest > 0) {
+        memcpy(buf + hlen, p->data + 1, (size_t)rest);
+    }
+    return zap_str_adopt(buf, total);
+}
+
+/* Normalize a path in place over `in`/`n` into `out` (collapse '.', resolve
+ * '..' lexically, squeeze '//'), returning the output length. Leading '/' is
+ * preserved; an empty non-absolute result becomes ".". Pure lexical (Python
+ * `os.path.normpath`); it does NOT touch the filesystem. */
+static int64_t zap_path_norm_bytes(const char *in, int64_t n, char *out) {
+    int abs = (n > 0 && in[0] == '/');
+    /* component offsets into `out`, tracked as a stack over the output buffer. */
+    int64_t o = 0;
+    if (abs) {
+        out[o++] = '/';
+    }
+    int64_t seg_count = 0;
+    int64_t i = 0;
+    while (i < n) {
+        while (i < n && in[i] == '/') {
+            i++;
+        }
+        int64_t s = i;
+        while (i < n && in[i] != '/') {
+            i++;
+        }
+        int64_t len = i - s;
+        if (len == 0) {
+            continue;
+        }
+        if (len == 1 && in[s] == '.') {
+            continue;
+        }
+        if (len == 2 && in[s] == '.' && in[s + 1] == '.') {
+            /* pop one segment unless at root / a leading ".." run on a relative
+             * path (which must be preserved). */
+            if (seg_count > 0) {
+                /* `o` points just past the last output segment's content (we
+                 * only ever write a separator BEFORE content). Find that
+                 * segment's start `j`, and if it is not itself a preserved
+                 * "..", pop it AND the separator that preceded it. */
+                int64_t j = o;
+                while (j > (abs ? 1 : 0) && out[j - 1] != '/') {
+                    j--;
+                }
+                int is_dotdot = (o - j == 2 && out[j] == '.' && out[j + 1] == '.');
+                if (!is_dotdot) {
+                    o = j;
+                    if (o > (abs ? 1 : 0) && out[o - 1] == '/') {
+                        o--; /* drop the separator before the popped segment */
+                    }
+                    seg_count--;
+                    continue;
+                }
+            }
+            if (abs) {
+                continue; /* ".." at root is a no-op */
+            }
+            /* relative: keep the ".." */
+        }
+        if (o > (abs ? 1 : 0)) {
+            out[o++] = '/';
+        }
+        memcpy(out + o, in + s, (size_t)len);
+        o += len;
+        seg_count++;
+    }
+    if (o == 0) {
+        out[o++] = '.';
+    }
+    return o;
+}
+
+/* os.path_normpath(path). */
+void *zap_os_path_normpath(void *path_) {
+    const ZapStr *p = (const ZapStr *)path_;
+    char *out = (char *)zap_buf(p->len + 2);
+    int64_t len = zap_path_norm_bytes(p->data, p->len, out);
+    return zap_str_adopt(out, len);
+}
+
+/* os.path_abspath(path): normalize against the current directory when relative
+ * (Python `os.path.abspath`). */
+void *zap_os_path_abspath(void *path_) {
+    const ZapStr *p = (const ZapStr *)path_;
+    if (zap_path_is_abs(p)) {
+        return zap_os_path_normpath(path_);
+    }
+    char cwd[4096];
+    if (getcwd(cwd, sizeof cwd) == NULL) {
+        zap_sys_fail("os.path_abspath", strerror(errno));
+    }
+    int64_t clen = (int64_t)strlen(cwd);
+    int64_t joined = clen + 1 + p->len;
+    char *buf = (char *)zap_buf(joined > 0 ? joined : 1);
+    memcpy(buf, cwd, (size_t)clen);
+    buf[clen] = '/';
+    memcpy(buf + clen + 1, p->data, (size_t)p->len);
+    char *out = (char *)zap_buf(joined + 2);
+    int64_t len = zap_path_norm_bytes(buf, joined, out);
+    return zap_str_adopt(out, len);
+}
+
+/* os.path_realpath(path): canonical absolute path with symlinks resolved
+ * (libc realpath). Raises if the path cannot be resolved. */
+void *zap_os_path_realpath(void *path_) {
+#if defined(ZAP_PLATFORM_WINDOWS)
+    char buf[4096];
+    if (_fullpath(buf, zap_sys_cstr((ZapStr *)path_), sizeof buf) == NULL) {
+        zap_sys_fail("os.path_realpath", "cannot resolve path");
+    }
+    return zap_str_new(buf, (int64_t)strlen(buf));
+#else
+    char buf[4096];
+    if (realpath(zap_sys_cstr((ZapStr *)path_), buf) == NULL) {
+        zap_sys_fail("os.path_realpath", strerror(errno));
+    }
+    return zap_str_new(buf, (int64_t)strlen(buf));
+#endif
+}
+
+/* os.path_relpath(path, start): the relative path from `start` to `path`
+ * (Python `os.path.relpath`), computed lexically on the normalized absolute
+ * forms. Returns "." when they are equal. */
+void *zap_os_path_relpath(void *path_, void *start_) {
+    void *pa = zap_os_path_abspath(path_);
+    void *sa = zap_os_path_abspath(start_);
+    const ZapStr *P = (const ZapStr *)pa;
+    const ZapStr *S = (const ZapStr *)sa;
+    /* find the common directory prefix at a '/' boundary. */
+    int64_t common = 0, i = 0;
+    int64_t m = P->len < S->len ? P->len : S->len;
+    int64_t last_sep = 0;
+    while (i < m && P->data[i] == S->data[i]) {
+        if (P->data[i] == '/') {
+            last_sep = i;
+        }
+        i++;
+    }
+    if (i == P->len && i == S->len) {
+        return zap_str_new(".", 1); /* identical */
+    }
+    /* a full-component match where one ends exactly at the other's '/'. */
+    if ((i == P->len && S->data[i] == '/') || (i == S->len && P->data[i] == '/')) {
+        last_sep = i;
+    }
+    common = last_sep;
+    /* count the components remaining in `start` after the common prefix -> "..". */
+    int64_t ups = 0;
+    for (int64_t k = common; k < S->len; k++) {
+        if (S->data[k] == '/' && k + 1 < S->len) {
+            ups++;
+        }
+    }
+    /* tail of `path` after the common prefix (skip a leading '/'). */
+    int64_t tstart = common;
+    while (tstart < P->len && P->data[tstart] == '/') {
+        tstart++;
+    }
+    int64_t tlen = P->len - tstart;
+    int64_t cap = ups * 3 + (tlen > 0 ? tlen : 1) + 2;
+    char *buf = (char *)zap_buf(cap);
+    int64_t o = 0;
+    for (int64_t u = 0; u < ups; u++) {
+        buf[o++] = '.';
+        buf[o++] = '.';
+        if (u + 1 < ups || tlen > 0) {
+            buf[o++] = '/';
+        }
+    }
+    if (tlen > 0) {
+        memcpy(buf + o, P->data + tstart, (size_t)tlen);
+        o += tlen;
+    }
+    if (o == 0) {
+        buf[o++] = '.';
+    }
+    return zap_str_adopt(buf, o);
+}
+
 /* --- process: subprocess spawn + capture ------------------------------------ */
 
 /* The result of process.run: exit code + captured stdout/stderr. A precise GC
