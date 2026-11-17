@@ -18,7 +18,9 @@ fn lower(
     // `LineReader` so `for line in io.lines(r)` iterates (#1031, D-0223). Its
     // argument is the handle itself; lower it and wrap — no flat runtime call.
     if method == "lines" {
-        let arg = args.first().ok_or_else(|| err("io.lines expects 1 argument"))?;
+        let arg = args
+            .first()
+            .ok_or_else(|| err("io.lines expects 1 argument"))?;
         let (h, _) = lowerer.expr(&arg.value)?;
         return Ok(Some(line_reader_wrap(lowerer, h)?));
     }
