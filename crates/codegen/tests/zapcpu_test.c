@@ -10,7 +10,7 @@
  * is printed). */
 
 #define ZAP_CPU_TEST 1
-#include "../src/zapcpu.inc.c"
+#include "../src/runtime/accel/cpu.inc.c"
 
 #include <stdio.h>
 

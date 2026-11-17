@@ -25,7 +25,7 @@ typedef struct {
     char data[];
 } ZapStr;
 
-#include "../src/zaparch.inc.c"
+#include "../src/runtime/accel/arch.inc.c"
 
 static int zt_fail = 0;
 #define CHECK(cond, msg)                                                                           \
