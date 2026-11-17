@@ -86,6 +86,32 @@ fn read_components(lowerer: &mut FnLower, args: &[ast::Arg]) -> Result<Vec<Value
     Ok(comps)
 }
 
+/// Read the six `DateTime` fields of a single argument (#974).
+fn components_of(lowerer: &mut FnLower, arg: &ast::Arg) -> Result<Vec<Value>, LowerError> {
+    let sid = datetime_sid(lowerer)?;
+    let (base, _) = lowerer.expr(&arg.value)?;
+    let mut comps = Vec::with_capacity(6);
+    for idx in 0..6 {
+        comps.push(lowerer.field_get(base, sid, idx, Ty::I64));
+    }
+    Ok(comps)
+}
+
+/// A `DateTime` argument's UTC Unix timestamp (`zap_datetime_to_unix` over its
+/// six fields). The shared basis for arithmetic and comparisons (#974, D-0221):
+/// `DateTime` is naive and whole-second, so these operate in the UTC-timestamp
+/// domain, which round-trips exactly through `to_unix`/the field getters.
+fn to_unix_of(lowerer: &mut FnLower, arg: &ast::Arg) -> Result<Value, LowerError> {
+    let comps = components_of(lowerer, arg)?;
+    let d = lowerer.new_value(Ty::I64);
+    lowerer.emit(Inst::Call {
+        dest: Some(d),
+        func: "zap_datetime_to_unix".to_string(),
+        args: comps,
+    });
+    Ok(d)
+}
+
 /// Lower a `(DateTime, fmt)` custom-format call: read the six fields of the
 /// first argument, lower the format string, and hand both to the runtime
 /// `zap_datetime_strftime` (#286). The result is a fresh `str` (`Ty::Ptr`).
@@ -175,6 +201,83 @@ fn lower(
             (d, Ty::Ptr)
         }
         "strftime" => strftime(lowerer, args)?,
+        // Date arithmetic + comparisons + field helpers (#974, D-0221). All
+        // over the UTC-timestamp domain (DateTime is naive, whole-second).
+        "add" => {
+            let ts = to_unix_of(lowerer, &args[0])?;
+            let (sv, st) = lowerer.expr(&args[1].value)?;
+            let sec = lowerer.coerce(sv, st, Ty::I64);
+            let ts2 = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Bin {
+                dest: ts2,
+                op: BinOp::Add,
+                lhs: ts,
+                rhs: sec,
+            });
+            build_datetime(lowerer, ts2, 0)?
+        }
+        "diff" => {
+            let a = to_unix_of(lowerer, &args[0])?;
+            let b = to_unix_of(lowerer, &args[1])?;
+            let d = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Bin {
+                dest: d,
+                op: BinOp::Sub,
+                lhs: a,
+                rhs: b,
+            });
+            (d, Ty::I64)
+        }
+        "before" | "after" | "equal" => {
+            let a = to_unix_of(lowerer, &args[0])?;
+            let b = to_unix_of(lowerer, &args[1])?;
+            let pred = match method {
+                "before" => CmpPred::Lt,
+                "after" => CmpPred::Gt,
+                _ => CmpPred::Eq,
+            };
+            let d = lowerer.new_value(Ty::I1);
+            lowerer.emit(Inst::ICmp {
+                dest: d,
+                pred,
+                lhs: a,
+                rhs: b,
+            });
+            (d, Ty::I1)
+        }
+        "weekday" | "day_of_year" => {
+            let comps = components_of(lowerer, &args[0])?;
+            let func = if method == "weekday" {
+                "zap_datetime_weekday"
+            } else {
+                "zap_datetime_day_of_year"
+            };
+            let d = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(d),
+                func: func.to_string(),
+                args: comps,
+            });
+            (d, Ty::I64)
+        }
+        "isoweekday" => {
+            let comps = components_of(lowerer, &args[0])?;
+            let w = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(w),
+                func: "zap_datetime_weekday".to_string(),
+                args: comps,
+            });
+            let one = lowerer.iconst(Ty::I64, 1);
+            let d = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Bin {
+                dest: d,
+                op: BinOp::Add,
+                lhs: w,
+                rhs: one,
+            });
+            (d, Ty::I64)
+        }
         _ => return Ok(None),
     };
     Ok(Some(r))

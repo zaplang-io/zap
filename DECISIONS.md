@@ -11078,3 +11078,45 @@ shape + arity / element-type tests.
 
 Relates to [[D-0049]] (the list value model), #399 (the `in` equality the scans
 reuse), epic #966, and Discussion #965.
+
+## D-0221 — stdlib datetime: date arithmetic, comparisons, weekday (#974 slice 1 / epic #966)
+
+**Context.** `datetime` had timestamp↔civil conversion + format/parse (UTC +
+host-local) but no arithmetic, comparisons, or field helpers (#965 gap #7). This
+is the issue's own first slice — "date arithmetic + comparisons + `weekday` are
+the cheap, high-value first slice"; the timezone database is the heavy,
+correctness-critical piece, deferred to its own design-decision slice.
+
+**Decision.** Add, over the existing naive whole-second `DateTime`:
+- `datetime.add(dt, seconds) -> DateTime` — shift by a signed second count.
+- `datetime.diff(a, b) -> int64` — `a - b` in seconds.
+- `datetime.before(a, b)` / `after` / `equal` `-> bool`.
+- `datetime.weekday(dt) -> int64` (Monday=0 … Sunday=6, Python),
+  `datetime.isoweekday(dt) -> int64` (Monday=1 … Sunday=7),
+  `datetime.day_of_year(dt) -> int64` (1..=366).
+
+**UTC-timestamp domain.** `DateTime` is naive (no zone) and whole-second, so
+arithmetic and comparisons go through the existing `zap_datetime_to_unix`
+(`timegm`, UTC) and back — leap-year/overflow correct, and `add`/`diff`
+round-trip exactly through the field getters. `weekday`/`day_of_year` recompose
+the instant in UTC (`timegm`+`gmtime_r`, the same path `strftime`'s `%A`/`%j`
+uses), so there is no hand-rolled civil calendar. `add`/`diff`/comparisons are
+pure lowering over `to_unix`; only `weekday`/`day_of_year` add a runtime entry
+point.
+
+**Duration = int64 seconds.** Per the issue, rather than introduce a `timedelta`
+type the duration is a plain `int64` second count (matching `DateTime`'s
+resolution; `time`'s ns durations are a separate unit). A richer `timedelta` is
+a possible future refinement.
+
+**Deferred (their own follow-ups).** The **timezone database** (named zones /
+`zoneinfo` / `astimezone` / fixed offsets — *bundle IANA tzdata vs rely on host*,
+a design-decision) and offset-aware `isoformat`/RFC-3339; plus `replace(...)` and
+separate `date`/`time` types.
+
+**Tests.** Golden `datetime_arith` (fixed UTC timestamps → deterministic: format,
+weekday/isoweekday/day_of_year incl. a 2020 leap day = 366, add-a-day, diff,
+before/after/equal); sema shape + arity/type tests; seam-kwargs binding.
+
+Relates to [[D-0056]] / #99 (the datetime seam), #338 (strftime/strptime),
+[[D-0213]] (seam rows), epic #966, and Discussion #965 (gap #7).

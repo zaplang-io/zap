@@ -929,6 +929,24 @@ fn sys_write_keyword_and_positional() {
 }
 
 #[test]
+fn datetime_arith_keyword_and_positional() {
+    // Arithmetic / comparison / field helpers (#974, D-0221).
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    auto b = datetime.add(dt=t, seconds=1)\n",
+    ));
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    auto d = datetime.diff(a=t, b=t)\n",
+    ));
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    auto w = datetime.weekday(dt=t)\n",
+    ));
+    assert_code(
+        &prog("    auto t = datetime.from_timestamp(0)\n    auto b = datetime.add(dt=t, secs=1)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
 fn fs_glob_fnmatch_keyword_and_positional() {
     // Path matching (#1033, D-0216): keyword binding, reordering, positional.
     assert_ok(&prog(

@@ -139,6 +139,35 @@ int64_t zap_datetime_to_unix(int64_t y, int64_t mo, int64_t d, int64_t h,
     return (int64_t)timegm(&tm);
 }
 
+/* Day-of-week for a civil date (#974, D-0221): Python's `weekday()`, Monday=0 …
+ * Sunday=6. The date is recomposed in UTC (`timegm` then `gmtime_r`, the same
+ * path `strftime` uses for `%A`/`%j`); C's `tm_wday` is Sunday=0, shifted to
+ * Monday=0. Only y/mo/d matter, but all six components are taken so the lowerer
+ * can reuse its `DateTime` field read. */
+int64_t zap_datetime_weekday(int64_t y, int64_t mo, int64_t d, int64_t h,
+                             int64_t mi, int64_t s) {
+    (void)h;
+    (void)mi;
+    (void)s;
+    time_t ts = (time_t)zap_datetime_to_unix(y, mo, d, 0, 0, 0);
+    struct tm tm;
+    gmtime_r(&ts, &tm);
+    return (int64_t)((tm.tm_wday + 6) % 7);
+}
+
+/* Day of the year for a civil date (#974, D-0221): 1..=366 (Python
+ * `timetuple().tm_yday` / `%j`), leap years handled by the libc civil math. */
+int64_t zap_datetime_day_of_year(int64_t y, int64_t mo, int64_t d, int64_t h,
+                                 int64_t mi, int64_t s) {
+    (void)h;
+    (void)mi;
+    (void)s;
+    time_t ts = (time_t)zap_datetime_to_unix(y, mo, d, 0, 0, 0);
+    struct tm tm;
+    gmtime_r(&ts, &tm);
+    return (int64_t)(tm.tm_yday + 1);
+}
+
 /* Civil components -> ISO-8601 "YYYY-MM-DDTHH:MM:SS" (returns a fresh ZapStr*). */
 void *zap_datetime_format_iso(int64_t y, int64_t mo, int64_t d, int64_t h,
                               int64_t mi, int64_t s) {

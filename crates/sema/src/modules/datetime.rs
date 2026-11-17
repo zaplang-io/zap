@@ -188,6 +188,83 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             check_strptime(checker, args, span);
             Some(Ty::Named(DATETIME.to_string()))
         }
+        // Date arithmetic + comparisons + field helpers (#974, D-0221).
+        // add(dt, seconds) -> DateTime (naive, whole-second, UTC-timestamp math).
+        "add" => {
+            if args.len() != 2 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!("datetime.add() takes 2 arguments, found {}", args.len()),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                let dt = checker.infer(&args[0].value);
+                if !is_datetime(&dt) && !matches!(dt, Ty::Unknown) {
+                    checker.error(
+                        ErrorCode::ZAP4024,
+                        format!("datetime.add() expects a DateTime, found {}", dt.display()),
+                        expr_span(&args[0].value),
+                    );
+                }
+                let sec = checker.infer(&args[1].value);
+                if !sec.is_int() && !matches!(sec, Ty::Unknown) {
+                    checker.error(
+                        ErrorCode::ZAP4024,
+                        format!(
+                            "datetime.add() seconds must be an int, found {}",
+                            sec.display()
+                        ),
+                        expr_span(&args[1].value),
+                    );
+                }
+            }
+            Some(Ty::Named(DATETIME.to_string()))
+        }
+        // (DateTime, DateTime): diff -> int64 seconds (a - b); the comparisons
+        // -> bool.
+        "diff" | "before" | "after" | "equal" => {
+            if args.len() != 2 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "datetime.{method}() takes 2 arguments, found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                for a in args {
+                    let t = checker.infer(&a.value);
+                    if !is_datetime(&t) && !matches!(t, Ty::Unknown) {
+                        checker.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "datetime.{method}() expects a DateTime, found {}",
+                                t.display()
+                            ),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+            }
+            Some(if method == "diff" {
+                Ty::Int64
+            } else {
+                Ty::Bool
+            })
+        }
+        // (DateTime) -> int64 field helpers: weekday (Mon=0), isoweekday (Mon=1),
+        // day_of_year (1..=366).
+        "weekday" | "isoweekday" | "day_of_year" => {
+            expect1(checker, method, args, span, "a DateTime", is_datetime);
+            Some(Ty::Int64)
+        }
         _ => None,
     }
 }
