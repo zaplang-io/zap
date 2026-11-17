@@ -25,6 +25,15 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Line-oriented input** (#969, D-0212). A global `input([prompt]) -> str`
+  builtin (writes the prompt, reads one line from stdin, strips the trailing
+  newline; raises `RuntimeError` at EOF). A buffered reader for streaming:
+  `io.reader(fd)` returns an opaque handle (the crypto streaming-hash pattern),
+  with `io.readline` (keeps the `\n`, `""` at EOF), `io.readall`, and
+  `io.readn(reader, n)` — a read-ahead `while line != "":` loop consumes input
+  bigger than memory. `fs.lines(path) -> list[str]` is the whole-file
+  convenience. Native `for line in file`, `sys.stdin`/`stdout`/`stderr` stream
+  objects, and a real `EOFError` builtin are documented follow-ups.
 - **`os`/`fs` gain the filesystem gaps** (#968, D-0211). Metadata: `fs.stat`
   (the new prelude `Stat` value struct — size/mtime/ctime/mode/is_dir/is_file/
   is_symlink) and `fs.mtime`. Mutation: `fs.rename`, `fs.move` (with a

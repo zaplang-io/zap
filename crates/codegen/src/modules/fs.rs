@@ -39,4 +39,6 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_fs_read_bytes", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_fs_write_bytes", &[p.into(), p.into()], None);
     cg.declare_rt("zap_fs_append", &[p.into(), p.into()], None);
+    // Line-oriented input (#969, D-0212): whole-file read split into lines.
+    cg.declare_rt("zap_fs_lines", &[p.into()], Some(p.into()));
 }

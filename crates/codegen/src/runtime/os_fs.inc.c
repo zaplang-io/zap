@@ -1285,3 +1285,240 @@ int64_t zap_process_result_code(void *r) { return ((ZapProc *)r)->code; }
 void *zap_process_result_stdout(void *r) { return ((ZapProc *)r)->out; }
 void *zap_process_result_stderr(void *r) { return ((ZapProc *)r)->err; }
 
+/* --- Line-oriented input (#969, D-0212) ------------------------------------
+ *
+ * `input([prompt])` plus a buffered reader over an fd. The reader is an opaque
+ * handle built with the crypto-streaming pattern (`zap_crypto_new`): the handle
+ * is a `bytes` value (ZapStr) whose buffer is a POINTER-FREE `zap_io_reader`
+ * struct, so the precise/moving collector traces and frees it with no special
+ * finalizer. Line/chunk accumulators use plain `malloc`/`realloc` and are copied
+ * into a fresh ZapStr before return, so no raw pointer is held across an
+ * allocation that the GC could observe. */
+
+/* input([prompt]) -> str: write the optional prompt to stdout (no trailing
+ * newline), then read one line from stdin (fd 0). The returned string excludes
+ * the trailing '\n' and a preceding '\r' (CRLF). At end-of-input with no bytes
+ * read it raises RuntimeError (Zap has no EOFError yet — tracked as a follow-up;
+ * CPython raises EOFError here). Reads a byte at a time so it never consumes past
+ * the newline, which keeps the fd positioned for a following reader. */
+void *zap_input(void *prompt_) {
+    if (prompt_) {
+        ZapStr *p = (ZapStr *)prompt_;
+        size_t off = 0;
+        while (off < (size_t)p->len) {
+            ssize_t w = write(1, p->data + off, (size_t)p->len - off);
+            if (w < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                zap_sys_fail("input", strerror(errno));
+            }
+            off += (size_t)w;
+        }
+    }
+    size_t cap = 128, len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) {
+        zap_sys_fail("input", "out of memory");
+    }
+    int saw_any = 0;
+    for (;;) {
+        char c;
+        ssize_t got;
+        do {
+            got = read(0, &c, 1);
+        } while (got < 0 && errno == EINTR);
+        if (got < 0) {
+            free(buf);
+            zap_sys_fail("input", strerror(errno));
+        }
+        if (got == 0) {
+            break; /* EOF */
+        }
+        saw_any = 1;
+        if (c == '\n') {
+            break;
+        }
+        if (len + 1 > cap) {
+            cap *= 2;
+            char *nb = (char *)realloc(buf, cap);
+            if (!nb) {
+                free(buf);
+                zap_sys_fail("input", "out of memory");
+            }
+            buf = nb;
+        }
+        buf[len++] = c;
+    }
+    if (!saw_any) {
+        free(buf);
+        const char *msg = "EOF when reading a line";
+        zap_panic_typed(ZAP_EXC_RUNTIME_ERROR,
+                        zap_str_new(msg, (int64_t)strlen(msg)));
+        return NULL; /* unreachable */
+    }
+    if (len > 0 && buf[len - 1] == '\r') {
+        len--; /* strip a CRLF carriage return */
+    }
+    void *s = zap_str_new(buf, (int64_t)len);
+    free(buf);
+    return s;
+}
+
+/* Buffered reader over an fd. All fields are pointer-free, so the handle's
+ * ZapStr buffer is traced safely by the precise collector. */
+#define ZAP_IO_RBUF 8192
+typedef struct {
+    int64_t fd;
+    int32_t fill; /* bytes currently valid in buf */
+    int32_t pos;  /* index of next unread byte in buf */
+    int32_t eof;  /* 1 once read() has reported end-of-input */
+    int32_t _pad;
+    char buf[ZAP_IO_RBUF];
+} zap_io_reader;
+
+/* io.reader(fd) -> handle: wrap an open fd in an 8 KiB-buffered reader. */
+void *zap_io_reader_new(int64_t fd) {
+    ZapStr *h = zap_str_alloc((int64_t)sizeof(zap_io_reader));
+    zap_io_reader *r = (zap_io_reader *)(void *)h->data;
+    r->fd = fd;
+    r->fill = 0;
+    r->pos = 0;
+    r->eof = 0;
+    r->_pad = 0;
+    return h;
+}
+
+/* Ensure buffered bytes are available; returns the count unread in buf (0 at
+ * EOF). Never allocates, so the caller's `r` pointer stays valid across it. */
+static int32_t zap_io_reader_fill(zap_io_reader *r) {
+    if (r->pos < r->fill) {
+        return r->fill - r->pos;
+    }
+    if (r->eof) {
+        return 0;
+    }
+    ssize_t got;
+    do {
+        got = read((int)r->fd, r->buf, ZAP_IO_RBUF);
+    } while (got < 0 && errno == EINTR);
+    if (got < 0) {
+        zap_sys_fail("io.reader", strerror(errno));
+    }
+    r->pos = 0;
+    r->fill = (int32_t)got;
+    if (got == 0) {
+        r->eof = 1;
+        return 0;
+    }
+    return r->fill;
+}
+
+/* io.readline(reader) -> str: the next line INCLUDING its trailing '\n'; "" at
+ * EOF. Keeping the newline lets a `while line != ""` loop distinguish a blank
+ * line from end-of-input. */
+void *zap_io_readline(void *h_) {
+    zap_io_reader *r = (zap_io_reader *)(void *)((ZapStr *)h_)->data;
+    size_t cap = 128, len = 0;
+    char *out = (char *)malloc(cap);
+    if (!out) {
+        zap_sys_fail("io.readline", "out of memory");
+    }
+    for (;;) {
+        if (zap_io_reader_fill(r) == 0) {
+            break; /* EOF */
+        }
+        char *start = r->buf + r->pos;
+        int32_t avail = r->fill - r->pos;
+        char *nl = (char *)memchr(start, '\n', (size_t)avail);
+        int32_t take = nl ? (int32_t)(nl - start) + 1 : avail;
+        if (len + (size_t)take > cap) {
+            while (len + (size_t)take > cap) {
+                cap *= 2;
+            }
+            char *nb = (char *)realloc(out, cap);
+            if (!nb) {
+                free(out);
+                zap_sys_fail("io.readline", "out of memory");
+            }
+            out = nb;
+        }
+        memcpy(out + len, start, (size_t)take);
+        len += (size_t)take;
+        r->pos += take;
+        if (nl) {
+            break; /* found the line terminator */
+        }
+    }
+    void *s = zap_str_new(out, (int64_t)len);
+    free(out);
+    return s;
+}
+
+/* io.readall(reader) -> str: the remainder of the stream as one string. */
+void *zap_io_readall(void *h_) {
+    zap_io_reader *r = (zap_io_reader *)(void *)((ZapStr *)h_)->data;
+    size_t cap = ZAP_IO_RBUF, len = 0;
+    char *out = (char *)malloc(cap);
+    if (!out) {
+        zap_sys_fail("io.readall", "out of memory");
+    }
+    for (;;) {
+        if (zap_io_reader_fill(r) == 0) {
+            break; /* EOF */
+        }
+        int32_t avail = r->fill - r->pos;
+        if (len + (size_t)avail > cap) {
+            while (len + (size_t)avail > cap) {
+                cap *= 2;
+            }
+            char *nb = (char *)realloc(out, cap);
+            if (!nb) {
+                free(out);
+                zap_sys_fail("io.readall", "out of memory");
+            }
+            out = nb;
+        }
+        memcpy(out + len, r->buf + r->pos, (size_t)avail);
+        len += (size_t)avail;
+        r->pos = r->fill;
+    }
+    void *s = zap_str_new(out, (int64_t)len);
+    free(out);
+    return s;
+}
+
+/* io.readn(reader, n) -> str: up to `n` bytes (fewer at EOF, "" once drained). */
+void *zap_io_readn(void *h_, int64_t n) {
+    if (n <= 0) {
+        return zap_str_new("", 0);
+    }
+    zap_io_reader *r = (zap_io_reader *)(void *)((ZapStr *)h_)->data;
+    char *out = (char *)malloc((size_t)n);
+    if (!out) {
+        zap_sys_fail("io.readn", "out of memory");
+    }
+    size_t len = 0;
+    while (len < (size_t)n) {
+        if (zap_io_reader_fill(r) == 0) {
+            break; /* EOF */
+        }
+        size_t avail = (size_t)(r->fill - r->pos);
+        size_t take = avail < (size_t)n - len ? avail : (size_t)n - len;
+        memcpy(out + len, r->buf + r->pos, take);
+        len += take;
+        r->pos += (int32_t)take;
+    }
+    void *s = zap_str_new(out, (int64_t)len);
+    free(out);
+    return s;
+}
+
+/* fs.lines(path) -> list[str]: read the whole file and split into lines with the
+ * terminators stripped (`str.splitlines` semantics). A convenience for files
+ * that fit in memory; stream larger inputs with io.reader + io.readline. */
+void *zap_fs_lines(void *path_) {
+    void *content = zap_fs_read_file(path_); /* raises on a bad path */
+    return zap_str_splitlines(content);
+}
+

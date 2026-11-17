@@ -797,3 +797,85 @@ fn publish_to_https_index_is_gated() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// --- line-oriented input: the `input([prompt])` builtin (#969, D-0212) -------
+//
+// input() reads one line from stdin, so it needs a piped child stdin that the
+// golden/conformance harnesses do not provide. These drive the real binary.
+
+/// Run `zap run <prog>` feeding `stdin_bytes`, returning (status-ok, stdout).
+#[cfg(feature = "codegen")]
+fn run_with_stdin(prog: &std::path::Path, stdin_bytes: &[u8]) -> (bool, String, String) {
+    let mut child = zap()
+        .arg("run")
+        .arg(prog)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin_bytes).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// The prompt is written to stdout (no trailing newline), then one line is read;
+/// the returned string excludes the trailing newline. A second `input()` with no
+/// prompt reads the next line. CRLF is also trimmed.
+#[cfg(feature = "codegen")]
+#[test]
+fn input_reads_lines_from_stdin_with_a_prompt() {
+    let dir = scratch("input_prompt");
+    let prog = dir.join("p.zap");
+    std::fs::write(
+        &prog,
+        "def main():\n    \
+         auto name = input(\"Name: \")\n    \
+         auto rest = input()\n    \
+         print(\"hi \" + name)\n    \
+         print(\"len=\" + str(len(rest)))\n",
+    )
+    .unwrap();
+    // Second line arrives as CRLF to prove the '\r' is stripped (len 3, "bar").
+    let (ok, stdout, stderr) = run_with_stdin(&prog, b"Alice\nbar\r\n");
+    assert!(ok, "stderr:\n{stderr}");
+    assert_eq!(stdout, "Name: hi Alice\nlen=3\n");
+}
+
+/// At end-of-input with no bytes read, `input()` raises (RuntimeError today —
+/// Zap has no EOFError yet). Uncaught, it aborts with a non-zero status and names
+/// the condition.
+#[cfg(feature = "codegen")]
+#[test]
+fn input_at_eof_raises() {
+    let dir = scratch("input_eof");
+    let prog = dir.join("p.zap");
+    std::fs::write(&prog, "def main():\n    print(input())\n").unwrap();
+    let (ok, _stdout, stderr) = run_with_stdin(&prog, b"");
+    assert!(!ok, "expected a non-zero exit at EOF");
+    assert!(stderr.contains("EOF"), "stderr:\n{stderr}");
+}
+
+/// The EOF error is a catchable RuntimeError, so a program can recover from it.
+#[cfg(feature = "codegen")]
+#[test]
+fn input_eof_is_catchable() {
+    let dir = scratch("input_eof_catch");
+    let prog = dir.join("p.zap");
+    std::fs::write(
+        &prog,
+        "def main():\n    \
+         try:\n        \
+         print(input())\n    \
+         except RuntimeError:\n        \
+         print(\"eof-caught\")\n",
+    )
+    .unwrap();
+    let (ok, stdout, stderr) = run_with_stdin(&prog, b"");
+    assert!(ok, "stderr:\n{stderr}");
+    assert_eq!(stdout.trim_end(), "eof-caught");
+}

@@ -12574,6 +12574,28 @@ impl<'a> FnLower<'a> {
                 self.emit(Inst::Print { args: vals });
                 return Ok((self.iconst(Ty::I32, 0), Ty::I32));
             }
+            if fname == "input" {
+                // input([prompt]) -> str (#969, D-0212). Write the optional
+                // prompt to stdout, then read one line from stdin. With no
+                // prompt, pass an empty string constant — the runtime writes
+                // nothing for a zero-length prompt. The call can raise
+                // (RuntimeError at EOF), so it is a throwing call that `try` can
+                // catch.
+                let prompt = if let Some(a) = args.first() {
+                    let (v, _) = self.expr(&a.value)?;
+                    v
+                } else {
+                    let e = self.new_value(Ty::Ptr);
+                    self.emit(Inst::StrConst {
+                        dest: e,
+                        bytes: Vec::new(),
+                    });
+                    e
+                };
+                let dest = self.new_value(Ty::Ptr);
+                self.throwing_call(Some(dest), "zap_input", vec![prompt]);
+                return Ok((dest, Ty::Ptr));
+            }
             // REPL session-binding slot access (I#159, design/0025-repl.md). The
             // driver synthesizes these calls to persist `let` values across
             // entries: a load reads a slot (integer bindings via `_i64`, GC
