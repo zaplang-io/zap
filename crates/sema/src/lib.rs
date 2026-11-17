@@ -10278,6 +10278,46 @@ def main():
         }
     }
 
+    // ---- datetime: arithmetic / comparisons / field helpers (#974, D-0221) ----
+
+    #[test]
+    fn datetime_arith_methods_type_check() {
+        ok(r#"def main():
+    auto a = datetime.from_timestamp(0)
+    auto b = datetime.add(a, 86400)
+    int64 d = datetime.diff(b, a)
+    bool lt = datetime.before(a, b)
+    bool eq = datetime.equal(a, a)
+    int64 w = datetime.weekday(a)
+    int64 iw = datetime.isoweekday(a)
+    int64 doy = datetime.day_of_year(a)
+    print(str(d + w + iw + doy))
+    if lt and eq:
+        print("ok")
+"#);
+        // add: (DateTime, int) — arity -> ZAP4025, non-int seconds -> ZAP4024.
+        let e = errors(
+            "def main():\n    auto a = datetime.from_timestamp(0)\n    auto x = datetime.add(a)\n",
+        );
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4025),
+            "add/1 should be ZAP4025, got {e:?}"
+        );
+        let e = errors(
+            "def main():\n    auto a = datetime.from_timestamp(0)\n    auto x = datetime.add(a, \"x\")\n",
+        );
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4024),
+            "add(dt, str) should be ZAP4024, got {e:?}"
+        );
+        // weekday wants a DateTime, not an int.
+        let e = errors("def main():\n    auto x = datetime.weekday(5)\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4024),
+            "weekday(int) should be ZAP4024, got {e:?}"
+        );
+    }
+
     // ---- list: mutation methods (#977, D-0220) ----------------------------
 
     #[test]

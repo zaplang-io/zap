@@ -32,6 +32,9 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     // (year, month, day, hour, minute, second) -> unix seconds
     let six = [i.into(), i.into(), i.into(), i.into(), i.into(), i.into()];
     cg.declare_rt("zap_datetime_to_unix", &six, Some(i.into()));
+    // Field helpers (#974, D-0221): (y,mo,d,h,mi,s) -> int64 weekday / day-of-year.
+    cg.declare_rt("zap_datetime_weekday", &six, Some(i.into()));
+    cg.declare_rt("zap_datetime_day_of_year", &six, Some(i.into()));
     cg.declare_rt("zap_datetime_format_iso", &six, Some(p.into()));
     // (year, month, day, hour, minute, second, fmt: ZapStr*) -> ZapStr* (#286)
     let six_and_fmt = [

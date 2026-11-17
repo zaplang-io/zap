@@ -87,6 +87,15 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("datetime", "strftime", &["dt", "fmt"]),
     ("datetime", "parse", &["s"]),
     ("datetime", "strptime", &["s", "fmt"]),
+    // Arithmetic / comparisons / field helpers (#974, D-0221).
+    ("datetime", "add", &["dt", "seconds"]),
+    ("datetime", "diff", &["a", "b"]),
+    ("datetime", "before", &["a", "b"]),
+    ("datetime", "after", &["a", "b"]),
+    ("datetime", "equal", &["a", "b"]),
+    ("datetime", "weekday", &["dt"]),
+    ("datetime", "isoweekday", &["dt"]),
+    ("datetime", "day_of_year", &["dt"]),
     // ---- random (ticket #98): only the non-numpy-overloaded verbs ----
     // `random`/`uniform`/`choice`/`shuffle` are overloaded with the NumPy
     // `Generator` surface (a distinct second signature keyed on an arg-0

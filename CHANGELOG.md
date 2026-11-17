@@ -25,6 +25,11 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`datetime` gains date arithmetic, comparisons, and field helpers** (#974,
+  D-0221). `datetime.add(dt, seconds)` / `datetime.diff(a, b)` (seconds),
+  `datetime.before`/`after`/`equal`, and `datetime.weekday` (Mon=0) /
+  `isoweekday` (Mon=1) / `day_of_year` (1..366). Naive UTC-second math over the
+  existing `DateTime`; the timezone database is a separate follow-up.
 - **`list` gains mutation methods — `extend` / `insert` / `remove` / `count` /
   `clear`** (#977, D-0220), joining `append`/`sort`. `insert(i, x)` saturates the
   index; `remove(x)`/`count(x)` compare by value (`==` semantics: numeric, `str`
