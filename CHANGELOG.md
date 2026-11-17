@@ -25,6 +25,14 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Native `for line in file`** (#1031, D-0223). A buffered reader now
+  participates in the D-0048 iterator protocol through the prelude `LineReader`:
+  `for line in fs.open_reader(path):` and `for line in io.lines(reader):` stream
+  a file a line at a time (each line keeps its trailing newline; a blank line is
+  preserved, only true EOF ends the loop). `LineReader` is a thin wrapper over
+  the existing `io.reader` handle — the raw `io.reader`/`io.readline` surface is
+  unchanged — so it reuses the same iteration machinery as user iterables, with
+  no core type-system change.
 - **`http` client follows redirects** (#987, D-0222). `get`/`post`/`request` now
   follow 3xx responses by default — up to a fixed hop cap, resolving each
   `Location` against the current URL (RFC-3986, as `url.join`), with the

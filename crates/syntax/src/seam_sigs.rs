@@ -223,6 +223,7 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("fs", "append", &["path", "data"]),
     // Line-oriented input (#969, D-0212): whole-file read split into lines.
     ("fs", "lines", &["path"]),
+    ("fs", "open_reader", &["path"]),
     // Path matching (#1033, D-0216).
     ("fs", "fnmatch", &["name", "pattern"]),
     ("fs", "glob", &["root", "pattern"]),
@@ -276,6 +277,7 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("io", "readline", &["reader"]),
     ("io", "readall", &["reader"]),
     ("io", "readn", &["reader", "n"]),
+    ("io", "lines", &["reader"]),
     // ---- signal (ticket #77): subscribe to a Signal ----
     ("signal", "notify", &["sig"]),
     // ---- math (ticket #98): scalar transcendentals + 2/3-arg forms ----

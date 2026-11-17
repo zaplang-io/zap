@@ -929,6 +929,39 @@ fn fs_lines_keyword_and_positional() {
     );
 }
 
+// The `for line in file` iterator wrappers (#1031, D-0223).
+#[test]
+fn io_lines_and_fs_open_reader_keyword_and_positional() {
+    assert_ok(&prog(
+        "    auto fd = io.open(\"/tmp/x\", \"r\")\n    \
+         auto r = io.reader(fd)\n    \
+         auto it = io.lines(reader=r)\n",
+    ));
+    assert_ok(&prog(
+        "    auto fd = io.open(\"/tmp/x\", \"r\")\n    \
+         auto r = io.reader(fd)\n    \
+         auto it = io.lines(r)\n",
+    ));
+    assert_ok(&prog("    auto it = fs.open_reader(path=\"/tmp/x\")\n"));
+    assert_ok(&prog("    auto it = fs.open_reader(\"/tmp/x\")\n"));
+}
+
+#[test]
+fn io_lines_and_fs_open_reader_unknown_keyword_rejected() {
+    assert_code(
+        &prog(
+            "    auto fd = io.open(\"/tmp/x\", \"r\")\n    \
+             auto r = io.reader(fd)\n    \
+             auto it = io.lines(stream=r)\n",
+        ),
+        "ZAP4023",
+    );
+    assert_code(
+        &prog("    auto it = fs.open_reader(file=\"/tmp/x\")\n"),
+        "ZAP4023",
+    );
+}
+
 #[test]
 fn sys_write_keyword_and_positional() {
     // Standard-stream write (#1035, D-0217). stdin/stdout/stderr take no args.

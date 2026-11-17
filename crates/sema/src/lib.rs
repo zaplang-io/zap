@@ -10349,6 +10349,35 @@ def main():
         );
     }
 
+    // ---- io/fs: `for line in file` via the prelude LineReader (#1031, D-0223) --
+
+    #[test]
+    fn line_reader_is_iterable_yielding_str() {
+        // io.lines(reader) and fs.open_reader(path) are iterable; the element is a
+        // `str` (pinned by the explicit typed binding inside the loop).
+        ok(r#"def main():
+    auto r = io.reader(io.open("x", "r"))
+    for line in io.lines(r):
+        str s = line
+        print(s)
+"#);
+        ok(r#"def main():
+    for line in fs.open_reader("x"):
+        print(line.removesuffix("\n"))
+"#);
+        // Arity: each wrapper takes exactly one argument.
+        let e = errors("def main():\n    auto x = fs.open_reader()\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4025),
+            "fs.open_reader/0 should be ZAP4025, got {e:?}"
+        );
+        let e = errors("def main():\n    auto r = io.reader(0)\n    auto x = io.lines(r, r)\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4025),
+            "io.lines/2 should be ZAP4025, got {e:?}"
+        );
+    }
+
     // ---- list: mutation methods (#977, D-0220) ----------------------------
 
     #[test]
