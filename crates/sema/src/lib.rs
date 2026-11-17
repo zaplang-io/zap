@@ -10132,6 +10132,25 @@ def main():
         );
     }
 
+    // ---- os.path: path_split / path_splitext (#1030, D-0219) --------------
+
+    #[test]
+    fn os_path_split_splitext_return_a_str_pair() {
+        ok(r#"def main():
+    auto h, t = os.path_split("/a/b.txt")
+    auto r, e = os.path_splitext("/a/b.txt")
+    print(h + t + r + e)
+"#);
+        // Each takes exactly one argument.
+        for bad in ["os.path_split()", "os.path_splitext(\"a\", \"b\")"] {
+            let e = errors(&format!("def main():\n    auto z = {bad}\n"));
+            assert!(
+                e.iter().any(|x| x.code == ErrorCode::ZAP4025),
+                "`{bad}` should be ZAP4025, got {e:?}"
+            );
+        }
+    }
+
     // ---- str: partition / rpartition (#1029, D-0218) ----------------------
 
     #[test]

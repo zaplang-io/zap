@@ -53,6 +53,12 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "os", method, args, 1, span);
             Ty::Str
         }
+        // Tuple-returning path decomposition (#1030, D-0219), CPython os.path.
+        // path_split -> (head, tail); path_splitext -> (root, ext).
+        "path_split" | "path_splitext" => {
+            expect_argc(checker, "os", method, args, 1, span);
+            Ty::Tuple(vec![Ty::Str, Ty::Str])
+        }
         // Filesystem gaps (#968, D-0211).
         "environ" => {
             expect_argc(checker, "os", method, args, 0, span);

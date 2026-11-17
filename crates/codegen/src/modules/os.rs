@@ -26,6 +26,12 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_os_path_exists", &[p.into()], Some(i.into()));
     cg.declare_rt("zap_os_path_basename", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_os_path_dirname", &[p.into()], Some(p.into()));
+    // Tuple-returning path decomposition (#1030, D-0219): each half is a getter
+    // the lowerer assembles into a (str, str) tuple.
+    cg.declare_rt("zap_os_path_split_head", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_os_path_split_tail", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_os_path_splitext_root", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_os_path_splitext_ext", &[p.into()], Some(p.into()));
     // Filesystem gaps (#968, D-0211): environment enumeration + the path helpers.
     cg.declare_rt("zap_os_environ", &[], Some(p.into()));
     cg.declare_rt("zap_os_sep", &[], Some(p.into()));
