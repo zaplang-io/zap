@@ -212,3 +212,4 @@ int64_t zap_zlib_adler32(void *data) {
     return 0;
 }
 #endif /* ZAP_NO_ZLIB */
+

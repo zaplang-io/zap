@@ -665,3 +665,4 @@ void zap_argparse_reset(void) {
 void *zap_json_bool_str(int64_t b) {
     return b ? zap_str_new("true", 4) : zap_str_new("false", 5);
 }
+

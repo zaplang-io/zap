@@ -296,3 +296,4 @@ void *zap_hex_decode(void *sp) {
     }
     return zap_str_adopt(out, m);
 }
+

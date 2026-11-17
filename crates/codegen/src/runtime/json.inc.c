@@ -570,3 +570,4 @@ void *zap_json_join(void *lp) {
     }
     return zap_str_new(out, o);
 }
+

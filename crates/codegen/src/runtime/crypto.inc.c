@@ -1016,3 +1016,4 @@ int64_t zap_crypto_list_index(void *l) {
     /* list->len > 0, so randbelow never raises here; it only draws the index. */
     return zap_crypto_randbelow(list->len);
 }
+

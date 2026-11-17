@@ -35,17 +35,3 @@
  * absent, because such a program never calls them (the self-contained
  * SHA/MD5/HMAC/CSPRNG `zap_crypto_*` live above this region and stay compiled).
  * See `program_backend_use` in crates/codegen/src/lib.rs. */
-#if !defined(ZAP_NO_OPENSSL)
-#include <openssl/bn.h>
-#include <openssl/crypto.h> /* CRYPTO_memcmp: constant-time compare (#729)     */
-#include <openssl/ec.h>
-#include <openssl/ecdsa.h>
-#include <openssl/err.h>
-#include <openssl/evp.h>
-#include <openssl/kdf.h> /* PBKDF2 / HKDF key derivation (#762, #763)           */
-#include <openssl/obj_mac.h>
-#include <openssl/objects.h>
-#include <openssl/pem.h>
-#include <openssl/rsa.h>
-#include <openssl/ssl.h>
-#include <openssl/x509v3.h>

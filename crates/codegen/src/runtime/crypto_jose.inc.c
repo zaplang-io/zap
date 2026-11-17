@@ -1,3 +1,18 @@
+#if !defined(ZAP_NO_OPENSSL)
+#include <openssl/bn.h>
+#include <openssl/crypto.h> /* CRYPTO_memcmp: constant-time compare (#729)     */
+#include <openssl/ec.h>
+#include <openssl/ecdsa.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/kdf.h> /* PBKDF2 / HKDF key derivation (#762, #763)           */
+#include <openssl/obj_mac.h>
+#include <openssl/objects.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+
 /* ==========================================================================
  * crypto: constant-time byte comparison (ticket #729, D-0131)
  * --------------------------------------------------------------------------
@@ -3733,3 +3748,4 @@ void zap_http_respond_h(void *c_, int64_t status, void *body_, void *headers_) {
     zap_http_respond_do(c_, status, body_, headers_);
 }
 #endif /* !ZAP_NO_OPENSSL — end TLS transport + http client/server (#853) */
+

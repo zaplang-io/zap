@@ -1278,3 +1278,4 @@ void *zap_process_run(void *argv_list) {
 int64_t zap_process_result_code(void *r) { return ((ZapProc *)r)->code; }
 void *zap_process_result_stdout(void *r) { return ((ZapProc *)r)->out; }
 void *zap_process_result_stderr(void *r) { return ((ZapProc *)r)->err; }
+

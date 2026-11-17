@@ -422,3 +422,4 @@ void *zap_xml_esc_attr(void *sp) {
     out[o++] = '"';
     return zap_str_new(out, o);
 }
+
