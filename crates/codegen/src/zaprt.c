@@ -18884,26 +18884,26 @@ static void zap_url_split_fields(const void *sp, ZapUrlFields *f) {
             int64_t after = (close < b) ? close + 1 : b;
             if (after < b && p[after] == ':') {
                 /* port text after "]:" */
-                f->port_valid = 0; /* recomputed below */
                 int64_t ps = after + 1, pe = b;
-                int64_t val = 0, digits = 0, ok = 1;
+                int64_t val = 0, ok = 1;
                 for (int64_t i = ps; i < pe; i++) {
                     if (p[i] < '0' || p[i] > '9') {
                         ok = 0;
                         break;
                     }
                     val = val * 10 + (p[i] - '0');
-                    digits++;
                     if (val > 65535) {
                         ok = 0;
                         break;
                     }
                 }
-                if (digits == 0) {
-                    /* "]:" with no digits — treat as no port (lenient). */
+                if (ps == pe) {
+                    /* "]:" with no port text — lenient: no port. */
                     f->port = -1;
                     f->port_valid = 1;
                 } else {
+                    /* a non-empty but non-numeric / out-of-range port is invalid
+                     * (raises in the getter). */
                     f->port_valid = ok;
                     f->port = ok ? val : -1;
                 }
@@ -18924,23 +18924,25 @@ static void zap_url_split_fields(const void *sp, ZapUrlFields *f) {
                 f->host = p + host_start;
                 f->host_len = colon - host_start;
                 int64_t ps = colon + 1, pe = b;
-                int64_t val = 0, digits = 0, ok = 1;
+                int64_t val = 0, ok = 1;
                 for (int64_t i = ps; i < pe; i++) {
                     if (p[i] < '0' || p[i] > '9') {
                         ok = 0;
                         break;
                     }
                     val = val * 10 + (p[i] - '0');
-                    digits++;
                     if (val > 65535) {
                         ok = 0;
                         break;
                     }
                 }
-                if (digits == 0) {
+                if (ps == pe) {
+                    /* "host:" with no port text — lenient: no port. */
                     f->port = -1;
                     f->port_valid = 1;
                 } else {
+                    /* a non-empty but non-numeric / out-of-range port is invalid
+                     * (raises in the getter). */
                     f->port_valid = ok;
                     f->port = ok ? val : -1;
                 }
