@@ -19266,6 +19266,47 @@ impl<'a> FnLower<'a> {
                 });
                 Ok((d, Ty::Ptr))
             }
+            // partition / rpartition (#1029, D-0218): split on the first / last
+            // occurrence of the separator into a (head, sep, tail) tuple. The
+            // runtime returns a GC result object (throwing — an empty separator
+            // raises ValueError); three getters feed an interned (str, str, str)
+            // tuple, the same aggregate path as `process.run`.
+            "partition" | "rpartition" => {
+                let sep = one_str(self)?;
+                let func = if name == "partition" {
+                    "zap_str_partition"
+                } else {
+                    "zap_str_rpartition"
+                };
+                let h = self.new_value(Ty::Ptr);
+                self.throwing_call(Some(h), func, vec![recv, sep]);
+                let mut fields = Vec::with_capacity(3);
+                for getter in ["zap_str_part_head", "zap_str_part_sep", "zap_str_part_tail"] {
+                    let v = self.new_value(Ty::Ptr);
+                    self.emit(Inst::Call {
+                        dest: Some(v),
+                        func: getter.to_string(),
+                        args: vec![h],
+                    });
+                    fields.push(v);
+                }
+                let sid = self
+                    .ctx
+                    .tuples
+                    .borrow_mut()
+                    .intern(vec![Ty::Ptr, Ty::Ptr, Ty::Ptr]);
+                let dest = self.new_value(Ty::Struct(sid));
+                self.emit(Inst::StructNew { dest, sid });
+                for (idx, val) in fields.into_iter().enumerate() {
+                    self.emit(Inst::FieldSet {
+                        base: dest,
+                        sid,
+                        idx: idx as u32,
+                        val,
+                    });
+                }
+                Ok((dest, Ty::Struct(sid)))
+            }
             "ljust" | "rjust" | "center" => {
                 // width (int) + optional fill (str); default fill is a space.
                 if args.is_empty() || args.len() > 2 {

@@ -2354,6 +2354,13 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             self.declare_rt("zap_str_expandtabs", &[p.into(), i.into()], Some(p.into()));
             self.declare_rt("zap_str_translate", &[p.into(), p.into()], Some(p.into()));
             self.declare_rt("zap_str_format_map", &[p.into(), p.into()], Some(p.into()));
+            // partition / rpartition (#1029, D-0218): a result object (ptr) that
+            // three getters unpack into a (str, str, str) tuple.
+            self.declare_rt("zap_str_partition", &[p.into(), p.into()], Some(p.into()));
+            self.declare_rt("zap_str_rpartition", &[p.into(), p.into()], Some(p.into()));
+            self.declare_rt("zap_str_part_head", &[p.into()], Some(p.into()));
+            self.declare_rt("zap_str_part_sep", &[p.into()], Some(p.into()));
+            self.declare_rt("zap_str_part_tail", &[p.into()], Some(p.into()));
             let f = self.ctx.f64_type();
             // Strict float parse for `float(s)` (#282/#285), the f64 analog of
             // `zap_str_parse_int`; faults on a malformed string.

@@ -7738,6 +7738,9 @@ impl Checker {
             "find" | "index" | "rfind" | "rindex" | "count" => Some(Ty::Int64),
             // prefix/suffix trimming (#971).
             "removeprefix" | "removesuffix" => Some(Ty::Str),
+            // partition/rpartition split on the first/last separator into a
+            // (head, sep, tail) triple (#1029, D-0218).
+            "partition" | "rpartition" => Some(Ty::Tuple(vec![Ty::Str, Ty::Str, Ty::Str])),
             _ => None,
         };
         if no_arg_str || no_arg_bool {
@@ -10126,6 +10129,29 @@ def main():
         assert!(
             e.iter().any(|x| x.code == ErrorCode::ZAP4024),
             "expandtabs(str) should be ZAP4024, got {e:?}"
+        );
+    }
+
+    // ---- str: partition / rpartition (#1029, D-0218) ----------------------
+
+    #[test]
+    fn str_partition_returns_a_str_triple() {
+        // Destructuring a method-call tuple return; each element is a str.
+        ok(r#"def main():
+    auto h, s, t = "a=b=c".partition("=")
+    auto h2, s2, t2 = "a=b=c".rpartition("=")
+    print(h + s + t + h2 + s2 + t2)
+"#);
+        // Exactly one str separator: wrong arity -> ZAP4025, non-str -> ZAP4024.
+        let e = errors("def main():\n    auto t = \"a\".partition()\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4025),
+            "partition/0 should be ZAP4025, got {e:?}"
+        );
+        let e = errors("def main():\n    auto t = \"a\".rpartition(5)\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4024),
+            "rpartition(int) should be ZAP4024, got {e:?}"
         );
     }
 

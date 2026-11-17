@@ -10655,11 +10655,10 @@ ASCII), while padding widths count CODEPOINTS (Python-style).
   / `islower()` / `isupper()` (ASCII; each is `False` for the empty string, and
   `islower`/`isupper` require at least one cased letter, Python semantics).
 
-**Deferred (documented follow-ups, with real design questions or lower value).**
-`partition(sep)` / `rpartition(sep)` (a `(str, str, str)` tuple return);
-`translate(table)` (needs a mapping representation); `format_map(dict)` (named
-`format` fields from a dict); `expandtabs([n])`. None has a worse workaround than
-the shipped set, and each wants its own design pass.
+**Deferred (documented follow-ups) — all now shipped.** `translate(table)` /
+`format_map(dict)` / `expandtabs([n])` landed in [[D-0214]] (#1034), and
+`partition(sep)` / `rpartition(sep)` (the `(str, str, str)` tuple return) in
+[[D-0218]] (#1029).
 
 **Why byte-based offsets / ASCII classification.** It matches the existing
 `find`/`index`/`strip` and the `str`-is-UTF-8-bytes model ([[D-0025]]); a full
@@ -10976,3 +10975,39 @@ Relates to [[D-0212]] (the #969 reader this reuses), [[D-0056]] / #97 (the io
 seam + the `std*_fd` accessors), [[D-0213]] (seam rows), epic #966, and
 Discussion #965. Native `for line in sys.stdin()` awaits the iterator-protocol
 work (#1031).
+
+## D-0218 — stdlib str: partition / rpartition — the first tuple-returning str method (#1029 / epic #966)
+
+**Context.** [[D-0210]] deferred `str.partition` / `rpartition` because a
+hand-written `str`-method lowering had never returned a **tuple** before, and it
+was unclear whether a str method could produce one cleanly. Last of the thin-str
+deferrals; gap #2 under epic #966.
+
+**Decision.** Add both, CPython-faithful and ASCII / byte-offset:
+- `str.partition(sep) -> (str, str, str)` — split at the **first** occurrence of
+  `sep` into `(head, sep, tail)`. When `sep` is absent: `(whole, "", "")`.
+- `str.rpartition(sep) -> (str, str, str)` — split at the **last** occurrence.
+  When `sep` is absent: `("", "", whole)` (CPython's asymmetry).
+- An **empty separator** raises a catchable `ValueError` (CPython).
+
+**The tuple return — no new mechanism needed.** The D-0049 anonymous-tuple
+interner already lets a hand-written lowering build a tuple exactly as a tuple
+literal does, and `process.run` (which returns `(int64, str, str)`) already
+proves the module-function path. `partition` is simply the first *`str` method*
+to use it: the runtime hands back a GC result object (`ZapStrPart`, three pointer
+fields, precise-traced — the `ZapProc` pattern); `lower_str_method` reads its
+three getters into an interned `(str, str, str)` tuple via `StructNew` +
+`FieldSet`. So the "seam tuple-return enabler" that #1029/#1030 were waiting on
+turned out to already exist — this PR just confirms it works from a str method,
+and #1030 (`os.path_split`/`splitext`) can reuse the same path.
+
+**Tests.** Golden `str_partition` (present / absent separator for both; the
+asymmetric absent cases; destructuring `auto h, s, t = …`; the catchable
+`ValueError`); `error_codes::str_method_limits_are_rejected` now pins the
+argument limits (one str separator — arity → ZAP4025, non-str → ZAP4024) instead
+of ZAP4080; a sema test of the destructured str-triple return.
+
+Relates to [[D-0210]] (the thin-str set this completes), [[D-0049]] (the tuple
+interner it reuses), [[D-0056]] / #97 (`process.run`, the tuple-return precedent),
+epic #966, and Discussion #965 (gap #2). Clears the way for #1030
+(`os.path_split` / `path_splitext`), which reuses the same tuple path.
