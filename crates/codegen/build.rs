@@ -25,13 +25,14 @@
 use std::path::Path;
 
 fn main() {
-    // Every file `src/lib.rs` pulls in with `include_str!` / `include_bytes!`.
-    // Keep this list in sync with those macros.
+    // Master runtime TU + the standalone-object translation units (NOT the
+    // `runtime/` fragments — those are globbed below). `src/lib.rs` pulls each in
+    // with `include_str!` / `include_bytes!`; keep this list in sync with those
+    // macros. The per-module/per-accel fragments live under `src/runtime/` and are
+    // listed in `src/runtime_manifest.rs`; the glob below covers the whole subtree
+    // so adding a fragment needs no edit here.
     const EMBEDDED_RUNTIME_FILES: &[&str] = &[
         "src/zaprt.c",
-        "src/zapgc.inc.c",
-        "src/zaprace.inc.c",
-        "src/zapblas.inc.c",
         "src/zap_ctx_win_x64.c",
         "src/zap_win_a3.c",
         "src/zap_np_iocp.c",
@@ -40,27 +41,23 @@ fn main() {
         // it includes, both embedded and written out at compile time.
         "src/zapfft.cpp",
         "../../third_party/pocketfft/pocketfft_hdronly.h",
-        // random Generator (#930/#931): the bit-exact PCG64 surface and the
-        // vendored NumPy ziggurat tables it includes.
-        "src/zaprandom.inc.c",
-        "src/ziggurat_constants.h",
-        // cpu_features detector (#943, epic #139): the shared bit-taxonomy header
-        // and the detection module that includes it.
-        "src/zap_cpu_features.h",
-        "src/zapcpu.inc.c",
-        // SIMD memchr/memmem kernel (#945, epic #139): first multiversioned kernel.
-        "src/zapmemchr.inc.c",
-        // arch.* intrinsic shims + hash.crc32c (#962, epic #139, D-0199).
-        "src/zaparch.inc.c",
-        // SIMD sort accelerator (#933, epic #139): the dispatch seam + the two
-        // per-ISA C++ kernels (their vendored headers are embedded below).
-        "src/zapsortaccel.inc.c",
+        // SIMD sort accelerator (#933, epic #139): the two per-ISA C++ kernels
+        // (their vendored headers are embedded below; the dispatch seam is a
+        // `runtime/` fragment covered by the glob).
         "src/zapxsort.cpp",
         "src/zaphwysort.cpp",
     ];
     for f in EMBEDDED_RUNTIME_FILES {
         println!("cargo:rerun-if-changed={f}");
     }
+
+    // Every runtime C fragment + header under `src/runtime/` (the per-module and
+    // per-accel bodies that `zaprt.c` `#include`s). A fragment-only edit must
+    // rebuild this crate so the embedded runtime never goes stale (#678); globbing
+    // the subtree means a NEW fragment is tracked automatically, with no third
+    // list to keep in sync beyond `runtime_manifest.rs`.
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    rerun_for_runtime_fragments(&Path::new(&manifest_dir).join("src/runtime"));
 
     // Embed every vendored SIMD-sort header (+ Highway's one needed `abort.cc`)
     // into the compiler, keyed by its path relative to `third_party/`.
@@ -116,5 +113,23 @@ fn collect(dir: &Path, third_party: &Path, out: &mut Vec<(String, String)>) {
             .replace('\\', "/");
         let abs = p.to_string_lossy().to_string();
         out.push((rel, abs));
+    }
+}
+
+/// Emit `cargo:rerun-if-changed` for every file under `dir` (the `src/runtime/`
+/// fragment subtree), recursively. Rust's `include_str!` dependency tracking is
+/// not reliably honoured across a CI `target/` cache restore, so a fragment-only
+/// edit must be declared here or the rebuilt compiler can keep a stale runtime.
+fn rerun_for_runtime_fragments(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            rerun_for_runtime_fragments(&p);
+        } else {
+            println!("cargo:rerun-if-changed={}", p.to_string_lossy());
+        }
     }
 }

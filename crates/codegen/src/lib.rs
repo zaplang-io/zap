@@ -44,6 +44,7 @@ use zapc_syntax::ast::Module as AstModule;
 /// Consumed by the function-multiversioning cloner/resolvers (#944).
 pub mod cpu_features;
 mod modules;
+mod runtime_manifest;
 
 /// The REPL JIT engine (I#159): executes typed Zap incrementally in one
 /// long-lived process via an in-process MCJIT, reusing this crate's ZIR->LLVM
@@ -378,15 +379,7 @@ fn lto_runtime_bitcode(
 
     // Cache key: everything that determines the runtime bitcode.
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    RUNTIME_C.hash(&mut h);
-    RUNTIME_GC_C.hash(&mut h);
-    RUNTIME_RACE_C.hash(&mut h);
-    RUNTIME_BLAS_C.hash(&mut h);
-    RUNTIME_RANDOM_C.hash(&mut h);
-    ZIGGURAT_H.hash(&mut h);
-    RUNTIME_SORTACCEL_C.hash(&mut h);
-    RUNTIME_XSORT_CPP.hash(&mut h);
-    RUNTIME_HWYSORT_CPP.hash(&mut h);
+    runtime_manifest::hash_runtime_fragments(&mut h);
     cc.hash(&mut h);
     triple.hash(&mut h);
     immix.hash(&mut h);
@@ -552,15 +545,7 @@ fn native_runtime_object(
 
     // Cache key: everything that determines the runtime object.
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    RUNTIME_C.hash(&mut h);
-    RUNTIME_GC_C.hash(&mut h);
-    RUNTIME_RACE_C.hash(&mut h);
-    RUNTIME_BLAS_C.hash(&mut h);
-    RUNTIME_RANDOM_C.hash(&mut h);
-    ZIGGURAT_H.hash(&mut h);
-    RUNTIME_SORTACCEL_C.hash(&mut h);
-    RUNTIME_XSORT_CPP.hash(&mut h);
-    RUNTIME_HWYSORT_CPP.hash(&mut h);
+    runtime_manifest::hash_runtime_fragments(&mut h);
     cc.hash(&mut h);
     triple.hash(&mut h);
     opt_flag.hash(&mut h);
@@ -713,27 +698,27 @@ pub(crate) fn build_llvm_module<'ctx>(
 const RUNTIME_C: &str = include_str!("zaprt.c");
 /// The precise Immix collector, `#include`d by `zaprt.c` under `ZAP_GC_IMMIX`
 /// (ticket #48). Written next to the runtime so the relative include resolves.
-const RUNTIME_GC_C: &str = include_str!("zapgc.inc.c");
+const RUNTIME_GC_C: &str = include_str!("runtime/gc.inc.c");
 /// The runtime data-race detector hooks (`--race`, #677, epic #665, D-0114),
 /// `#include`d unconditionally by `zaprt.c`. Written next to the runtime so the
 /// relative include resolves. Slice 2 (#678) replaces the slice-1 no-op stubs
 /// with the happens-before / vector-clock engine. A `build.rs` declares this and
 /// the other embedded runtime files as `rerun-if-changed` inputs so a runtime
 /// edit always rebuilds this crate (CI's cache otherwise kept a stale runtime).
-const RUNTIME_RACE_C: &str = include_str!("zaprace.inc.c");
+const RUNTIME_RACE_C: &str = include_str!("runtime/race.inc.c");
 /// The numeric acceleration seam (#912, D-0179), `#include`d unconditionally by
 /// `zaprt.c`. Written next to the runtime so the relative include resolves. Its
 /// tier/thread knobs are always compiled; the provider thread-pool call is gated
 /// behind `ZAP_HAVE_BLAS`, which codegen defines only for a program that links a
 /// BLAS provider (see `blas_build_flags`).
-const RUNTIME_BLAS_C: &str = include_str!("zapblas.inc.c");
+const RUNTIME_BLAS_C: &str = include_str!("runtime/accel/blas.inc.c");
 /// The NumPy-compatible bit-exact PCG64 `Generator` surface (#930/#931, D-0189),
 /// `#include`d unconditionally by `zaprt.c`. Written next to the runtime so the
 /// relative include resolves, along with the vendored NumPy ziggurat tables it
 /// `#include`s (`ziggurat_constants.h`). Pointer-free, no provider — always
 /// compiled into the runtime like the rest of `random`.
-const RUNTIME_RANDOM_C: &str = include_str!("zaprandom.inc.c");
-const ZIGGURAT_H: &str = include_str!("ziggurat_constants.h");
+const RUNTIME_RANDOM_C: &str = include_str!("runtime/accel/random.inc.c");
+const ZIGGURAT_H: &str = include_str!("runtime/accel/ziggurat_constants.h");
 /// The `cpu_features` runtime detector (#943, ISA-acceleration epic #139,
 /// D-0192) and the shared feature-bit taxonomy header it `#include`s. Both are
 /// `#include`d unconditionally by `zaprt.c` and written next to it so the
@@ -741,25 +726,25 @@ const ZIGGURAT_H: &str = include_str!("ziggurat_constants.h");
 /// in an ifunc resolver before libc init, #944) and process-lifetime-constant;
 /// the header is the single source of truth for the feature indices, mirrored in
 /// Rust by `crate::cpu_features` and locked by its agreement test.
-const RUNTIME_CPU_C: &str = include_str!("zapcpu.inc.c");
-const CPU_FEATURES_H: &str = include_str!("zap_cpu_features.h");
+const RUNTIME_CPU_C: &str = include_str!("runtime/accel/cpu.inc.c");
+const CPU_FEATURES_H: &str = include_str!("runtime/accel/zap_cpu_features.h");
 /// The SIMD byte/substring search kernel (#945, ISA-acceleration epic #139,
 /// D-0194), `#include`d by `zaprt.c` after `zapcpu.inc.c` (it dispatches on the
 /// detector). Written next to the runtime so the relative include resolves. The
 /// first multiversioned kernel: hand-written clones (scalar/SSE2/AVX2/NEON) +
 /// pointer-once-init dispatch reading `cpu_features`.
-const RUNTIME_MEMCHR_C: &str = include_str!("zapmemchr.inc.c");
+const RUNTIME_MEMCHR_C: &str = include_str!("runtime/accel/memchr.inc.c");
 /// The `arch.x86_64` / `arch.aarch64` intrinsic shims (`crc32c_*`, `popcount_*`,
 /// `prefetch`) and the portable `hash.crc32c` wrapper (#962, epic #139, D-0199),
 /// `#include`d by `zaprt.c` after `zapcpu.inc.c`. Each arch shim carries the
 /// `target(...)` attribute its hardware instruction needs; `hash.crc32c` is a
 /// bit-identical software CRC32C (Castagnoli).
-const RUNTIME_ARCH_C: &str = include_str!("zaparch.inc.c");
+const RUNTIME_ARCH_C: &str = include_str!("runtime/accel/arch.inc.c");
 /// The SIMD sort accelerator dispatch seam (#933, epic #139, D-0195),
 /// `#include`d by `zaprt.c` after `zapcpu.inc.c`. Always compiled; its entry
 /// points fall through to the own floor unless `-DZAP_HAVE_SIMDSORT` and a
 /// per-ISA kernel object are linked (BackendUse::simdsort).
-const RUNTIME_SORTACCEL_C: &str = include_str!("zapsortaccel.inc.c");
+const RUNTIME_SORTACCEL_C: &str = include_str!("runtime/accel/sortaccel.inc.c");
 /// The per-ISA SIMD sort kernels (standalone C++ objects, like `zapfft.cpp`):
 /// x86 via vendored Intel x86-simd-sort, aarch64 via vendored Google Highway
 /// vqsort. Compiled + linked only for a program that sorts (BackendUse::simdsort)
@@ -1129,27 +1114,10 @@ pub fn build_executable(
     let build_dir = std::env::temp_dir().join(format!("zap-build-{}", std::process::id()));
     std::fs::create_dir_all(&build_dir).map_err(|e| format!("failed to create build dir: {e}"))?;
     let rt_path = build_dir.join("zaprt.c");
-    std::fs::write(&rt_path, RUNTIME_C).map_err(|e| format!("failed to write runtime: {e}"))?;
-    std::fs::write(build_dir.join("zapgc.inc.c"), RUNTIME_GC_C)
-        .map_err(|e| format!("failed to write gc runtime: {e}"))?;
-    std::fs::write(build_dir.join("zaprace.inc.c"), RUNTIME_RACE_C)
-        .map_err(|e| format!("failed to write race runtime: {e}"))?;
-    std::fs::write(build_dir.join("zapblas.inc.c"), RUNTIME_BLAS_C)
-        .map_err(|e| format!("failed to write accel seam runtime: {e}"))?;
-    std::fs::write(build_dir.join("zaprandom.inc.c"), RUNTIME_RANDOM_C)
-        .map_err(|e| format!("failed to write random runtime: {e}"))?;
-    std::fs::write(build_dir.join("ziggurat_constants.h"), ZIGGURAT_H)
-        .map_err(|e| format!("failed to write ziggurat constants: {e}"))?;
-    std::fs::write(build_dir.join("zap_cpu_features.h"), CPU_FEATURES_H)
-        .map_err(|e| format!("failed to write cpu-features header: {e}"))?;
-    std::fs::write(build_dir.join("zapmemchr.inc.c"), RUNTIME_MEMCHR_C)
-        .map_err(|e| format!("failed to write memchr runtime: {e}"))?;
-    std::fs::write(build_dir.join("zaparch.inc.c"), RUNTIME_ARCH_C)
-        .map_err(|e| format!("failed to write arch-intrinsics runtime: {e}"))?;
-    std::fs::write(build_dir.join("zapcpu.inc.c"), RUNTIME_CPU_C)
-        .map_err(|e| format!("failed to write cpu-features runtime: {e}"))?;
-    std::fs::write(build_dir.join("zapsortaccel.inc.c"), RUNTIME_SORTACCEL_C)
-        .map_err(|e| format!("failed to write sort-accel runtime: {e}"))?;
+    // Write `zaprt.c` and every in-TU fragment (incl. the `runtime/` subtree) in
+    // one shot from the manifest, so this site cannot drift from the REPL/JIT one.
+    runtime_manifest::write_tu_fragments(&build_dir)
+        .map_err(|e| format!("failed to write runtime: {e}"))?;
 
     // Target-aware link step (ticket #199, platform epic #158 / Area A5). Today
     // codegen emits for the host triple only, so "Windows target" means "running
@@ -7644,6 +7612,89 @@ mod tests {
     use super::*;
     use zapc_ir::lower_module;
     use zapc_syntax::parser::parse_str;
+
+    /// Drift guard for the runtime-fragment manifest (host-only, no LLVM). Asserts
+    /// three ways that the on-disk `src/runtime/` tree, `RUNTIME_FRAGMENTS`, and the
+    /// `#include`s in `zaprt.c` all agree, so a fragment can never half-land and
+    /// fail only in full/arm64 CI or `zap test --doc`:
+    ///   1. every file under `src/runtime/` has a manifest row (added a file,
+    ///      forgot the manifest → embed/write/hash would silently skip it);
+    ///   2. every `.inc.c` manifest row is `#include`d by `zaprt.c` (embedded but
+    ///      never compiled into the TU);
+    ///   3. every `#include "runtime/…"` in `zaprt.c` has a manifest row (compiled
+    ///      but never written beside `zaprt.c` → a compile failure only where `cc`
+    ///      actually runs).
+    /// Also checks every manifest text is non-empty.
+    #[test]
+    fn runtime_manifest_matches_disk_and_includes() {
+        use std::collections::BTreeSet;
+
+        let src_runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime");
+
+        // On-disk fragment files, as manifest-style relative paths ("runtime/..").
+        let mut on_disk: BTreeSet<String> = BTreeSet::new();
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut BTreeSet<String>) {
+            for e in std::fs::read_dir(dir).expect("read_dir src/runtime").flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, root, out);
+                } else {
+                    let rel = p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+                    out.insert(format!("runtime/{rel}"));
+                }
+            }
+        }
+        walk(&src_runtime, &src_runtime, &mut on_disk);
+
+        let manifest_paths: BTreeSet<String> = runtime_manifest::RUNTIME_FRAGMENTS
+            .iter()
+            .map(|f| f.path.to_string())
+            .collect();
+
+        // (1) disk ⊆ manifest.
+        for f in &on_disk {
+            assert!(
+                manifest_paths.contains(f),
+                "src/{f} exists on disk but is missing from RUNTIME_FRAGMENTS \
+                 (add a row in runtime_manifest.rs + its include_str! const in lib.rs)"
+            );
+        }
+        // Manifest `runtime/` rows ⊆ disk (catches a typo'd path or a deleted file).
+        for p in &manifest_paths {
+            if let Some(rel) = p.strip_prefix("runtime/") {
+                assert!(
+                    src_runtime.join(rel).is_file(),
+                    "RUNTIME_FRAGMENTS lists runtime/{rel} but no such file exists on disk"
+                );
+            }
+        }
+
+        // (2) every `.inc.c` row is #included by zaprt.c; (3) every runtime/ include
+        // in zaprt.c is a manifest row. Non-empty texts throughout.
+        for f in runtime_manifest::RUNTIME_FRAGMENTS {
+            assert!(!f.text.is_empty(), "runtime fragment {} is embedded empty", f.path);
+            if f.path.ends_with(".inc.c") {
+                let needle = format!("#include \"{}\"", f.path);
+                assert!(
+                    RUNTIME_C.contains(&needle),
+                    "fragment {} is in the manifest but zaprt.c never `{needle}`s it",
+                    f.path
+                );
+            }
+        }
+        for line in RUNTIME_C.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("#include \"runtime/") {
+                if let Some(path) = rest.strip_suffix('"') {
+                    let full = format!("runtime/{path}");
+                    assert!(
+                        manifest_paths.contains(&full),
+                        "zaprt.c `#include`s {full} but it has no RUNTIME_FRAGMENTS row"
+                    );
+                }
+            }
+        }
+    }
 
     /// The default (non-LTO) runtime compile is `-O2` on EVERY target (the
     /// aarch64 gate from #868 is gone now that I#869 is fixed in the runtime);

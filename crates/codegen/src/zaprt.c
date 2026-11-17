@@ -18328,21 +18328,21 @@ __attribute__((constructor)) static void zap_gc_register_statics(void) {
 
 /* The precise Immix collector implementation. Included last so it sees every
  * runtime type and the scheduler globals above. */
-#include "zapgc.inc.c"
+#include "runtime/gc.inc.c"
 #endif
 
 /* Runtime data-race detector hooks (`--race`, #677, epic #665, D-0114). Slice 1
  * no-op stubs, compiled unconditionally for both collectors (the detector is
  * collector-independent). Only a `--race` build calls them; the symbols must
  * link in that case. See zaprace.inc.c. */
-#include "zaprace.inc.c"
+#include "runtime/race.inc.c"
 
 /* Numeric acceleration seam (#912, D-0179): the tier/thread knobs + capability
  * probe the array dispatcher (#904) consults. Included after `zap_maxprocs` /
  * `zap_setenv_compat` so it reads them directly. The provider thread-pool call
  * is gated behind ZAP_HAVE_BLAS, which the codegen defines only for a program
  * that links a provider. */
-#include "zapblas.inc.c"
+#include "runtime/accel/blas.inc.c"
 
 /* ===========================================================================
  * stdlib: math + random (ticket #98, D-0056)
@@ -18529,31 +18529,31 @@ void zap_random_shuffle(void *l) {
 /* NumPy-compatible bit-exact PCG64 `Generator` surface (#930/#931, D-0189).
  * Included here, after the ZapArray helpers (array construction/access) and the
  * xoshiro block (`zap_os_entropy_u64`), so both are in scope. */
-#include "zaprandom.inc.c"
+#include "runtime/accel/random.inc.c"
 
 /* CPU-feature detection (#943, ISA-acceleration epic #139, D-0192). The shared
  * bit-taxonomy header + the malloc-free, compute-once detector every future
  * multiversioning resolver (#944) and arch intrinsic reads. Included here, after
  * the string helpers (`zap_str_new` / `zap_sys_cstr`) its `sys.cpu_*` wrappers
  * build on are in scope. */
-#include "zapcpu.inc.c"
+#include "runtime/accel/cpu.inc.c"
 
 /* SIMD byte/substring search (#945, ISA-acceleration epic #139, D-0194): the
  * first multiversioned kernel. Included after `zapcpu.inc.c` so its resolver
  * sees `zap_cpu_has`. Defines `zap_memchr_off` / `zap_memmem_off`, which the
  * string/bytes search paths (`zap_str_find_bytes`, forward-declared above) route
  * through. */
-#include "zapmemchr.inc.c"
+#include "runtime/accel/memchr.inc.c"
 /* arch.x86_64 / arch.aarch64 intrinsic shims + hash.crc32c (I#139 Tier 2,
  * #962, D-0199). After zapcpu.inc.c so ZapStr and the cpu header are in scope. */
-#include "zaparch.inc.c"
+#include "runtime/accel/arch.inc.c"
 
 /* SIMD sort accelerator dispatch (#933, D-0195). After zapcpu.inc.c (for
  * `zap_cpu_has`); the array sort entry points call its two functions via forward
  * declarations. The per-ISA kernels (zapxsort.cpp / zaphwysort.cpp) are linked
  * and ZAP_HAVE_SIMDSORT defined only for a program that reaches the sort path on
  * a supported arch; otherwise this seam returns 0 and the own floor runs. */
-#include "zapsortaccel.inc.c"
+#include "runtime/accel/sortaccel.inc.c"
 
 /* ===========================================================================
  * json — JSON tokenizer cursor (ticket #100 / #131, D-0059)

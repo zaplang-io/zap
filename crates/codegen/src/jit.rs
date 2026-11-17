@@ -210,30 +210,12 @@ fn build_runtime_dylib() -> Result<(PathBuf, PathBuf), String> {
 
     let dir = std::env::temp_dir().join(format!("zap-repl-rt-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create runtime dir: {e}"))?;
-    std::fs::write(dir.join("zaprt.c"), crate::RUNTIME_C)
+    // Write `zaprt.c` and every in-TU fragment (incl. the `runtime/` subtree) from
+    // the shared manifest, identical to the object-link path in `lib.rs`. The REPL
+    // links no accelerator object (no `-DZAP_HAVE_SIMDSORT`), so the sort-accel seam
+    // falls through to the own floor.
+    crate::runtime_manifest::write_tu_fragments(&dir)
         .map_err(|e| format!("failed to write runtime: {e}"))?;
-    std::fs::write(dir.join("zapgc.inc.c"), crate::RUNTIME_GC_C)
-        .map_err(|e| format!("failed to write gc runtime: {e}"))?;
-    std::fs::write(dir.join("zaprace.inc.c"), crate::RUNTIME_RACE_C)
-        .map_err(|e| format!("failed to write race runtime: {e}"))?;
-    std::fs::write(dir.join("zapblas.inc.c"), crate::RUNTIME_BLAS_C)
-        .map_err(|e| format!("failed to write accel seam runtime: {e}"))?;
-    std::fs::write(dir.join("zaprandom.inc.c"), crate::RUNTIME_RANDOM_C)
-        .map_err(|e| format!("failed to write random runtime: {e}"))?;
-    std::fs::write(dir.join("ziggurat_constants.h"), crate::ZIGGURAT_H)
-        .map_err(|e| format!("failed to write ziggurat constants: {e}"))?;
-    std::fs::write(dir.join("zap_cpu_features.h"), crate::CPU_FEATURES_H)
-        .map_err(|e| format!("failed to write cpu-features header: {e}"))?;
-    std::fs::write(dir.join("zapmemchr.inc.c"), crate::RUNTIME_MEMCHR_C)
-        .map_err(|e| format!("failed to write memchr runtime: {e}"))?;
-    std::fs::write(dir.join("zaparch.inc.c"), crate::RUNTIME_ARCH_C)
-        .map_err(|e| format!("failed to write arch-intrinsics runtime: {e}"))?;
-    std::fs::write(dir.join("zapcpu.inc.c"), crate::RUNTIME_CPU_C)
-        .map_err(|e| format!("failed to write cpu-features runtime: {e}"))?;
-    // zaprt.c #includes this unconditionally; the REPL links no accelerator
-    // object (no -DZAP_HAVE_SIMDSORT), so its seam falls through to the own floor.
-    std::fs::write(dir.join("zapsortaccel.inc.c"), crate::RUNTIME_SORTACCEL_C)
-        .map_err(|e| format!("failed to write sort-accel runtime: {e}"))?;
 
     let is_macos = triple.as_str().to_string_lossy().contains("darwin");
     let lib = dir.join(if is_macos {
