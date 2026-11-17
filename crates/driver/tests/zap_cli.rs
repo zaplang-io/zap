@@ -846,9 +846,9 @@ fn input_reads_lines_from_stdin_with_a_prompt() {
     assert_eq!(stdout, "Name: hi Alice\nlen=3\n");
 }
 
-/// At end-of-input with no bytes read, `input()` raises (RuntimeError today —
-/// Zap has no EOFError yet). Uncaught, it aborts with a non-zero status and names
-/// the condition.
+/// At end-of-input with no bytes read, `input()` raises `EOFError` (#1036,
+/// D-0215), matching CPython. Uncaught, it aborts with a non-zero status and
+/// names the condition in the message.
 #[cfg(feature = "codegen")]
 #[test]
 fn input_at_eof_raises() {
@@ -860,7 +860,7 @@ fn input_at_eof_raises() {
     assert!(stderr.contains("EOF"), "stderr:\n{stderr}");
 }
 
-/// The EOF error is a catchable RuntimeError, so a program can recover from it.
+/// The EOF error is a catchable `EOFError`, so a program can recover from it.
 #[cfg(feature = "codegen")]
 #[test]
 fn input_eof_is_catchable() {
@@ -871,7 +871,7 @@ fn input_eof_is_catchable() {
         "def main():\n    \
          try:\n        \
          print(input())\n    \
-         except RuntimeError:\n        \
+         except EOFError:\n        \
          print(\"eof-caught\")\n",
     )
     .unwrap();

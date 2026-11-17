@@ -1298,8 +1298,8 @@ void *zap_process_result_stderr(void *r) { return ((ZapProc *)r)->err; }
 /* input([prompt]) -> str: write the optional prompt to stdout (no trailing
  * newline), then read one line from stdin (fd 0). The returned string excludes
  * the trailing '\n' and a preceding '\r' (CRLF). At end-of-input with no bytes
- * read it raises RuntimeError (Zap has no EOFError yet — tracked as a follow-up;
- * CPython raises EOFError here). Reads a byte at a time so it never consumes past
+ * read it raises EOFError (#1036, D-0215), matching CPython's `input()`. Reads a
+ * byte at a time so it never consumes past
  * the newline, which keeps the fd positioned for a following reader. */
 void *zap_input(void *prompt_) {
     if (prompt_) {
@@ -1353,7 +1353,7 @@ void *zap_input(void *prompt_) {
     if (!saw_any) {
         free(buf);
         const char *msg = "EOF when reading a line";
-        zap_panic_typed(ZAP_EXC_RUNTIME_ERROR,
+        zap_panic_typed(ZAP_EXC_EOF_ERROR,
                         zap_str_new(msg, (int64_t)strlen(msg)));
         return NULL; /* unreachable */
     }

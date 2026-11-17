@@ -1013,6 +1013,7 @@ static int64_t zap_py_exception_type_id(const char *name) {
     if (strcmp(name, "ScopeTimeout") == 0) return ZAP_EXC_SCOPE_TIMEOUT;
     if (strcmp(name, "TimeoutError") == 0) return ZAP_EXC_TIMEOUT_ERROR;
     if (strcmp(name, "AssertionError") == 0) return ZAP_EXC_ASSERTION_ERROR;
+    if (strcmp(name, "EOFError") == 0) return ZAP_EXC_EOF_ERROR;
     if (strcmp(name, "BaseException") == 0) return ZAP_EXC_BASE;
     return ZAP_EXC_EXCEPTION;
 }

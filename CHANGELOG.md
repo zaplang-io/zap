@@ -25,6 +25,10 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`EOFError` builtin exception** (#1036, D-0215). A direct subclass of
+  `Exception` (CPython placement). `input()` now raises `EOFError` at end-of-input
+  instead of the stopgap `RuntimeError`, so `except EOFError` (and `except
+  Exception`) cleanly handles Ctrl-D / closed stdin.
 - **`str` gains `translate` / `format_map` / `expandtabs`** (#1034, D-0214) — the
   remaining thin-`str` methods deferred from #971. `expandtabs([tabsize])` expands
   tabs to the next stop; `translate(dict[str,str])` maps each character (empty

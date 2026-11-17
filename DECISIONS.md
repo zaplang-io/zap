@@ -10755,8 +10755,9 @@ to the handle by precedent.
 
 **EOF semantics.** `io.readline`/`readall`/`readn` signal end-of-input by returning
 `""` / a short read (never raising), which is what the streaming loop wants.
-`input()`, being interactive, **raises** at EOF (Ctrl-D) like CPython — but Zap has
-no `EOFError` yet, so it raises a catchable `RuntimeError` today (see deferred).
+`input()`, being interactive, **raises** at EOF (Ctrl-D) like CPython. It raised a
+catchable `RuntimeError` in the first cut (Zap had no `EOFError`); it now raises
+`EOFError`, added in [[D-0215]].
 
 **Keyword-capable (seam_sigs rows).** Each seam entry gets a `seam_sigs` row —
 `io.reader(fd=…)`, `io.readline(reader=…)`/`readall`, `io.readn(reader=…, n=…)`,
@@ -10770,9 +10771,10 @@ a global builtin, not a seam function, so it has no `seam_sigs` row — like
 stdlib handle participate in the iterator protocol ([[D-0048]]'s `__iter__`/
 `__next__`) is a deeper integration than this slice; the read-ahead `readline`
 loop covers the need meanwhile. (2) `sys.stdin`/`stdout`/`stderr` as stream
-objects (the #965 nice-to-have). (3) A real `EOFError` builtin exception, after
-which `input()` switches to it from `RuntimeError`. Each is filed as its own issue;
-none has a worse workaround than what ships here.
+objects (the #965 nice-to-have). (3) ~~A real `EOFError` builtin exception, after
+which `input()` switches to it from `RuntimeError`.~~ **Done** — [[D-0215]] / #1036.
+Each remaining item is filed as its own issue; none has a worse workaround than
+what ships here.
 
 Relates to [[D-0056]] / #97 (the io/fs seam), [[D-0133]] (crypto streaming handle,
 the opaque-handle precedent), [[D-0210]] (`str.splitlines`), [[D-0211]] (the #968
@@ -10856,3 +10858,40 @@ limits (a non-dict argument → ZAP4024, wrong arity → ZAP4025); sema shape te
 Relates to [[D-0210]] (the thin-str set this completes), epic #966, and
 Discussion #965 (gap #2). `partition`/`rpartition` remain deferred to #1029 —
 they need the seam tuple-return mechanism, which these three do not.
+
+## D-0215 — `EOFError` builtin exception; `input()` raises it at EOF (#1036 / epic #966)
+
+**Context.** [[D-0212]] shipped `input()`, which raises at end-of-input like
+CPython, but Zap had no `EOFError`, so the first cut raised a catchable
+`RuntimeError` as a stopgap — a visible divergence (CPython's `input()` raises
+`EOFError` on Ctrl-D, a subclass of `Exception`, distinct from `RuntimeError`).
+Deferred item (3) of [[D-0212]].
+
+**Decision.** Add `EOFError` to the built-in exception hierarchy as a direct
+subclass of `Exception` (CPython's placement: `EOFError < Exception`), assign it
+the next stable runtime id `ZAP_EXC_EOF_ERROR = 17`, and switch `input()`'s EOF
+raise to it. `except EOFError` and `except Exception` now catch end-of-input; an
+unrelated `except ValueError` does not. The message is unchanged ("EOF when
+reading a line").
+
+**Wiring (the full set for a new builtin exception).** The id must agree across
+every site that enumerates the hierarchy, or `except` matching silently drifts:
+- `zaprt.c`: the `ZAP_EXC_*` enum value, and a `zap_exception_parent` case mapping
+  it to `ZAP_EXC_EXCEPTION` (the `zap_exception_is_a` walker climbs that chain).
+- `zapc_sema`: the `BUILTINS` list and the built-in-exception classifier, so
+  `raise EOFError(...)` / `except EOFError` resolve.
+- `zapc_ir`: `exception_type_id_name` maps the name to id 17 for codegen.
+- `runtime/str.inc.c`: the CPython-interop `zap_py_exception_type_id` map (so a
+  Python `EOFError` crossing the FFI boundary keeps its identity).
+- `runtime/os_fs.inc.c`: `zap_input`'s raise site.
+
+There is no type-id→name table to update: an uncaught exception prints only its
+message ("Uncaught exception: …"), never a type name.
+
+**Tests.** Golden `eoferror` (`raise EOFError` caught by name, by `except
+Exception`, and NOT by `except ValueError`); the #969 `zap_cli` `input()` EOF
+tests now assert a catchable `EOFError`; the full sema suite still passes with
+`EOFError` in the builtin set.
+
+Relates to [[D-0212]] (the `input()` surface that needed it), [[D-0048]] /
+I#471 (the exception hierarchy + runtime ids), epic #966, and Discussion #965.
