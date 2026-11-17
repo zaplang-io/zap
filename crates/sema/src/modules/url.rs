@@ -24,6 +24,29 @@
 //!   CanonicalQueryString: every key/value `quote`-encoded, pairs sorted by
 //!   encoded key then encoded value, joined with `&`.
 //!
+//! The parse/build half (#970, D-0209) takes a URL apart and reassembles it:
+//!
+//! - `url.split(s) -> UrlParts` — RFC-3986 decomposition into the prelude value
+//!   struct `UrlParts` (`scheme`, `has_authority`, `userinfo`, `host`, `port`,
+//!   `path`, `query`, `fragment`). Lenient like Python `urlsplit`; a present but
+//!   non-numeric / out-of-range `port` raises a catchable `ValueError`. The
+//!   IPv6 `host` is stored WITHOUT its brackets (Python `.hostname` form), and
+//!   `port` is `-1` when absent.
+//! - `url.build(parts: UrlParts) -> str` — the inverse of `split` (Python
+//!   `urlunsplit`); round-trips a normalized URL (`build(split(s)) == s`). A
+//!   host containing `:` (an IPv6 literal) is re-wrapped in `[...]`.
+//! - `url.parse_query(q: str) -> dict[str, list[str]]` — read `k=v&k=v` into a
+//!   multimap (Python `parse_qs`), honoring `%XX`, `+`->space and repeated keys;
+//!   a blank value / a key with no `=` is kept with an empty value (Go
+//!   `url.ParseQuery` form). A malformed `%XX` is left literal (like `unquote`).
+//! - `url.parse_query_first(q: str) -> dict[str, str]` — the first value per key
+//!   (a scalar convenience over `parse_query`).
+//! - `url.join(base: str, ref: str) -> str` — resolve a relative reference
+//!   against a base per RFC-3986 §5 (Python `urljoin`; `.`/`..` removal,
+//!   absolute / scheme-relative / query-only / fragment-only references).
+//! - `url.encode_query_multi(d: dict[str, list[str]]) -> str` — the repeated-key
+//!   query encoder (companion to `encode_query`, which is `dict[str,str]`).
+//!
 //! `import url` is accepted but not required.
 
 use zapc_diag::ErrorCode;
@@ -54,24 +77,32 @@ fn expect_str(checker: &mut Checker, method: &str, args: &[Arg], span: Span) {
     }
 }
 
-/// Require exactly one `dict[str,str]` argument (the query map).
-fn expect_str_dict(checker: &mut Checker, method: &str, args: &[Arg], span: Span) {
+/// Require exactly one argument assignable to `want` (a query map), with a
+/// human-readable `desc` for the diagnostic.
+fn expect_dict(
+    checker: &mut Checker,
+    method: &str,
+    args: &[Arg],
+    span: Span,
+    want: Ty,
+    desc: &str,
+) {
     expect_argc(checker, "url", method, args, 1, span);
     if let Some(arg) = args.first() {
         let t = checker.infer(&arg.value);
-        let want = Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Str));
         if !assignable(&t, &want) {
             checker.error(
                 ErrorCode::ZAP4024,
-                format!(
-                    "url.{method}() expects a dict[str, str] argument, found {}",
-                    t.display()
-                ),
+                format!("url.{method}() expects {desc}, found {}", t.display()),
                 expr_span(&arg.value),
             );
         }
     }
 }
+
+/// The prelude value-struct name `url.split` returns / `url.build` consumes.
+/// Kept in step with `zapc_syntax::parser::PRELUDE_SRC`.
+const URL_PARTS: &str = "UrlParts";
 
 fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Option<Ty> {
     Some(match method {
@@ -82,7 +113,76 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         }
         // Query builders over a dict[str,str].
         "encode_query" | "canonical_query" => {
-            expect_str_dict(checker, method, args, span);
+            expect_dict(
+                checker,
+                method,
+                args,
+                span,
+                Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Str)),
+                "a dict[str, str] argument",
+            );
+            Ty::Str
+        }
+        // Repeated-key query encoder over a dict[str, list[str]] (#970).
+        "encode_query_multi" => {
+            expect_dict(
+                checker,
+                method,
+                args,
+                span,
+                Ty::Dict(Box::new(Ty::Str), Box::new(Ty::List(Box::new(Ty::Str)))),
+                "a dict[str, list[str]] argument",
+            );
+            Ty::Str
+        }
+        // Decompose a URL into the prelude `UrlParts` value struct (#970).
+        "split" => {
+            expect_str(checker, method, args, span);
+            Ty::Named(URL_PARTS.to_string())
+        }
+        // Reassemble a URL from a `UrlParts` value struct (#970).
+        "build" => {
+            expect_argc(checker, "url", method, args, 1, span);
+            if let Some(arg) = args.first() {
+                let t = checker.infer(&arg.value);
+                if !assignable(&t, &Ty::Named(URL_PARTS.to_string())) && !matches!(t, Ty::Unknown) {
+                    checker.error(
+                        ErrorCode::ZAP4024,
+                        format!(
+                            "url.{method}() expects a UrlParts argument, found {}",
+                            t.display()
+                        ),
+                        expr_span(&arg.value),
+                    );
+                }
+            }
+            Ty::Str
+        }
+        // Query-string readers (#970): str -> dict.
+        "parse_query" => {
+            expect_str(checker, method, args, span);
+            Ty::Dict(Box::new(Ty::Str), Box::new(Ty::List(Box::new(Ty::Str))))
+        }
+        "parse_query_first" => {
+            expect_str(checker, method, args, span);
+            Ty::Dict(Box::new(Ty::Str), Box::new(Ty::Str))
+        }
+        // RFC-3986 reference resolution (#970): (base, ref) -> str.
+        "join" => {
+            expect_argc(checker, "url", method, args, 2, span);
+            for arg in args {
+                let t = checker.infer(&arg.value);
+                if !assignable(&t, &Ty::Str) && !assignable(&t, &Ty::Bytes) {
+                    checker.error(
+                        ErrorCode::ZAP4024,
+                        format!(
+                            "url.{method}() expects str arguments, found {}",
+                            t.display()
+                        ),
+                        expr_span(&arg.value),
+                    );
+                }
+            }
             Ty::Str
         }
         _ => return None,

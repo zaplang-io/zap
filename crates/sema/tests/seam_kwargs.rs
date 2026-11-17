@@ -742,3 +742,67 @@ fn bisect_positional_unchanged() {
         "{SORTED}    auto i = bisect.bisect_right(xs, 4)\n"
     )));
 }
+
+// ---------------------------------------------------------------------------
+// url parse / build (#970, D-0209). `join` is the two-argument method that most
+// benefits from keywords (`base` / `ref`); the rest are single-argument and
+// rowed for a uniform keyword-capable surface.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn url_join_keyword_and_reorder() {
+    assert_ok(&prog(
+        "    auto u = url.join(base=\"http://a/b/c\", ref=\"../g\")\n",
+    ));
+    // Reordered by name — the two same-typed str args are the reason to allow
+    // keywords here (guards against an accidental base/ref swap).
+    assert_ok(&prog(
+        "    auto u = url.join(ref=\"../g\", base=\"http://a/b/c\")\n",
+    ));
+}
+
+#[test]
+fn url_join_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto u = url.join(base=\"http://a/b/c\", url=\"../g\")\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn url_join_positional_unchanged() {
+    assert_ok(&prog("    auto u = url.join(\"http://a/b/c\", \"../g\")\n"));
+}
+
+#[test]
+fn url_split_keyword() {
+    assert_ok(&prog("    auto p = url.split(s=\"http://h/path\")\n"));
+}
+
+#[test]
+fn url_build_keyword() {
+    assert_ok(&prog(
+        "    auto p = url.split(\"http://h/path\")\n    auto s = url.build(parts=p)\n",
+    ));
+}
+
+#[test]
+fn url_parse_query_keyword() {
+    assert_ok(&prog("    auto q = url.parse_query(q=\"a=1&b=2\")\n"));
+    assert_ok(&prog("    auto q = url.parse_query_first(q=\"a=1&b=2\")\n"));
+}
+
+#[test]
+fn url_encode_query_multi_keyword() {
+    assert_ok(&prog(
+        "    auto d = {\"a\": [\"1\", \"2\"]}\n    auto s = url.encode_query_multi(d=d)\n",
+    ));
+}
+
+#[test]
+fn url_parse_query_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto q = url.parse_query(query=\"a=1\")\n"),
+        "ZAP4023",
+    );
+}

@@ -25,6 +25,20 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`url` gains URL parse / build / query-reading / reference resolution**
+  (#970, D-0209). The `url` module could only percent-encode; it can now take a
+  URL apart and put one back together, closely mirroring Python `urllib.parse`:
+  `url.split(s)` returns the prelude `UrlParts` value struct
+  (`scheme`/`has_authority`/`userinfo`/`host`/`port`/`path`/`query`/`fragment`;
+  IPv6 hosts, empty/scheme-relative authorities, `port` `-1` when absent, a bad
+  port raises `ValueError`), `url.build(parts)` is its inverse (round-trips a
+  normalized URL), `url.parse_query(q)` reads `k=v&k=v` into a
+  `dict[str, list[str]]` (`%XX`/`+` decoding, repeated + blank keys, Go-style
+  blank-value-keeping) with a scalar `url.parse_query_first(q)`,
+  `url.join(base, ref)` resolves a relative reference per RFC-3986 §5, and
+  `url.encode_query_multi` is the repeated-key query encoder. This unblocks
+  `fastzap` query routing and HTTP-client redirect resolution. The existing
+  `quote`/`unquote`/`encode_query`/`canonical_query` surface is unchanged.
 - **`deque[T]` / `oset[T]` are real generic collection types** (#983, D-0208).
   The `deque` (double-ended queue, optional `maxlen`) and `oset` (insertion-
   ordered set) collections — previously `int64`-only opaque seam-module handles —
