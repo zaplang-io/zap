@@ -291,29 +291,47 @@ fn call_argument_matrix_is_rejected() {
 
 #[test]
 fn str_method_limits_are_rejected() {
-    // The str method surface is deliberately a strict subset of CPython's
-    // (#284, #374 walled garden). These cases pin the limitations as intent:
-    // a program that relies on an unsupported form fails at compile time with a
-    // stable code, rather than silently mis-behaving.
+    // The str method surface is a subset of CPython's (#284 / #971, #374 walled
+    // garden). The thin method set (#971, D-0210) LIFTED the former limits —
+    // whitespace/`maxsplit` split, char-set `strip`, `count`/`rfind`/`title`/…
+    // are now valid (covered at runtime by `tests/golden/string_methods_ext`).
+    // These cases pin what is STILL unsupported, so a program relying on an
+    // unsupported form fails at compile time with a stable code.
     //
-    // strip()/lstrip()/rstrip() take NO chars argument.
-    assert_code("def main():\n    print(\"xxhi\".strip(\"x\"))\n", "ZAP4025");
-    // split() takes exactly one separator — no maxsplit, no no-arg whitespace
-    // split.
-    assert_code(
-        "def main():\n    auto p = \"a b c\".split(\" \", 1)\n",
-        "ZAP4025",
-    );
-    assert_code("def main():\n    auto p = \"a b\".split()\n", "ZAP4025");
-    // replace() takes exactly (old, new) — no count.
+    // replace() takes exactly (old, new) — no `count` argument yet.
     assert_code(
         "def main():\n    print(\"aaa\".replace(\"a\", \"b\", 1))\n",
         "ZAP4025",
     );
-    // Absent methods are a clean ZAP4080 "str has no method", not a crash.
-    assert_code("def main():\n    print(\"aaa\".count(\"a\"))\n", "ZAP4080");
-    assert_code("def main():\n    print(\"ab cd\".title())\n", "ZAP4080");
-    assert_code("def main():\n    print(\"abc\".rfind(\"b\"))\n", "ZAP4080");
+    // strip()/lstrip()/rstrip() take at most one (chars) argument.
+    assert_code(
+        "def main():\n    print(\"xxhi\".strip(\"x\", \"y\"))\n",
+        "ZAP4025",
+    );
+    // split()/rsplit() take at most (sep, maxsplit).
+    assert_code(
+        "def main():\n    auto p = \"a b c\".split(\" \", 1, 2)\n",
+        "ZAP4025",
+    );
+    // maxsplit must be an int, not a str.
+    assert_code(
+        "def main():\n    auto p = \"a b\".split(\" \", \"x\")\n",
+        "ZAP4024",
+    );
+    // ljust() needs a width; the width must be an int.
+    assert_code("def main():\n    print(\"hi\".ljust())\n", "ZAP4025");
+    assert_code("def main():\n    print(\"hi\".ljust(\"x\"))\n", "ZAP4024");
+    // The deferred methods (partition/rpartition/translate/format_map/expandtabs,
+    // #971 follow-ups) are a clean ZAP4080 "str has no method", not a crash.
+    assert_code(
+        "def main():\n    print(\"a-b\".partition(\"-\"))\n",
+        "ZAP4080",
+    );
+    assert_code(
+        "def main():\n    print(\"a\".translate(\"x\"))\n",
+        "ZAP4080",
+    );
+    assert_code("def main():\n    print(\"a\".expandtabs())\n", "ZAP4080");
 }
 
 #[test]
