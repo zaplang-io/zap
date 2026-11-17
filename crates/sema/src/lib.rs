@@ -10129,6 +10129,32 @@ def main():
         );
     }
 
+    // ---- fs: glob / fnmatch (#1033, D-0216) -------------------------------
+
+    #[test]
+    fn fs_glob_fnmatch_type_check_and_arity() {
+        ok(r#"def main():
+    bool hit = fs.fnmatch("a.txt", "*.txt")
+    auto ps = fs.glob("/tmp", "**/*.zap")
+    str first = ps[0]
+    print(first)
+    if hit:
+        print(len(ps))
+"#);
+        // Both take exactly two arguments (ZAP4025 otherwise).
+        for bad in [
+            "fs.fnmatch(\"a\")",
+            "fs.fnmatch(\"a\", \"b\", \"c\")",
+            "fs.glob(\"/tmp\")",
+        ] {
+            let e = errors(&format!("def main():\n    auto z = {bad}\n"));
+            assert!(
+                e.iter().any(|x| x.code == ErrorCode::ZAP4025),
+                "`{bad}` should be ZAP4025, got {e:?}"
+            );
+        }
+    }
+
     // ---- transparent type aliases (#606, D-0105) --------------------------
 
     #[test]

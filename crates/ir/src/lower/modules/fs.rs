@@ -111,6 +111,10 @@ fn lower(
         "append" => call_void(lowerer, "zap_fs_append", a, true),
         // Line-oriented input (#969, D-0212): whole-file read split into lines.
         "lines" => call_ret(lowerer, "zap_fs_lines", a, Ty::List(Elem::Ptr), true),
+        // Path matching (#1033, D-0216). Neither raises: a bad pattern or an
+        // unreadable directory simply yields no match.
+        "fnmatch" => call_bool(lowerer, "zap_fs_fnmatch", a),
+        "glob" => call_ret(lowerer, "zap_fs_glob", a, Ty::List(Elem::Ptr), false),
         _ => return Ok(None),
     }))
 }

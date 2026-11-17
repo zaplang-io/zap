@@ -10895,3 +10895,42 @@ tests now assert a catchable `EOFError`; the full sema suite still passes with
 
 Relates to [[D-0212]] (the `input()` surface that needed it), [[D-0048]] /
 I#471 (the exception hierarchy + runtime ids), epic #966, and Discussion #965.
+
+## D-0216 — stdlib fs: path matching — fnmatch / glob (#1033 / epic #966)
+
+**Context.** [[D-0211]] deferred directory traversal and pattern matching. This
+adds the matching half, gap #4's follow-up under epic #966. (Traversal
+`fs.walk`/`scandir` stays #1032.)
+
+**Decision.**
+- `fs.fnmatch(name: str, pattern: str) -> bool` — whole-string shell-glob match:
+  `*` (any run), `?` (any one byte), `[seq]` / `[!seq]` byte classes with `a-z`
+  ranges. CPython `fnmatch.fnmatch` (ASCII / byte, case-sensitive).
+- `fs.glob(root: str, pattern: str) -> list[str]` — paths under `root` matching
+  the `/`-split glob `pattern`, returned **relative to `root`** and **sorted**.
+  `*`/`?`/`[seq]` match within a path segment; `**` matches across directory
+  levels. Dotfiles are skipped unless the segment itself starts with `.`
+  (CPython `glob` rule).
+
+**Design notes / v1 limits.**
+- glob returns root-relative paths (not root-joined), so results are
+  deterministic and composable; join with `os.path_join(root, p)` for a full
+  path. Sorting makes the order stable across platforms (readdir order is
+  unspecified).
+- glob is a **self-contained** recursive runtime walk (opendir/readdir + stat),
+  so it does **not** depend on the iterator-protocol traversal of #1032 — the two
+  are independent. `**` does not descend through symlinked directories (matching
+  CPython), which also makes a symlink cycle safe.
+- A **trailing** `**` matches directories (by accumulated prefix), not files; the
+  recursive idiom is `**/<pat>` (e.g. `**/*.zap`), whose trailing segment matches
+  files at any depth. Neither entry raises: a bad pattern or an unreadable
+  directory yields no match / `false`.
+- Both are seam functions, so they carry `seam_sigs` rows ([[D-0213]]):
+  `fs.fnmatch(name=…, pattern=…)`, `fs.glob(root=…, pattern=…)`.
+
+**Tests.** Golden `glob_fnmatch` (fnmatch `*`/`?`/`[seq]`/`[!seq]`; single-level,
+recursive `**`, and segment globs; the no-match case) over a mkdtemp tree; sema
+shape + arity tests; seam-kwargs binding tests.
+
+Relates to [[D-0211]] (the fs gaps this extends), [[D-0213]] (seam rows), epic
+#966, and Discussion #965 (gap #4). `fs.walk`/`scandir`/`copytree` stays #1032.

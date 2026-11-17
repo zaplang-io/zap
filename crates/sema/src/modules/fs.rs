@@ -37,6 +37,17 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "fs", method, args, 1, span);
             Ty::List(Box::new(Ty::Str))
         }
+        // Path matching (#1033, D-0216).
+        // fs.fnmatch(name, pattern) -> bool: shell-glob string match.
+        "fnmatch" => {
+            expect_argc(checker, "fs", method, args, 2, span);
+            Ty::Bool
+        }
+        // fs.glob(root, pattern) -> list[str]: matching paths relative to root.
+        "glob" => {
+            expect_argc(checker, "fs", method, args, 2, span);
+            Ty::List(Box::new(Ty::Str))
+        }
         "mkdtemp" => {
             expect_argc(checker, "fs", method, args, 0, span);
             Ty::Str

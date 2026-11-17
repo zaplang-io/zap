@@ -895,3 +895,23 @@ fn fs_lines_keyword_and_positional() {
         "ZAP4023",
     );
 }
+
+#[test]
+fn fs_glob_fnmatch_keyword_and_positional() {
+    // Path matching (#1033, D-0216): keyword binding, reordering, positional.
+    assert_ok(&prog(
+        "    auto hit = fs.fnmatch(name=\"a.txt\", pattern=\"*.txt\")\n",
+    ));
+    assert_ok(&prog(
+        "    auto hit = fs.fnmatch(pattern=\"*.txt\", name=\"a.txt\")\n",
+    ));
+    assert_ok(&prog("    auto hit = fs.fnmatch(\"a.txt\", \"*.txt\")\n"));
+    assert_ok(&prog(
+        "    auto ps = fs.glob(root=\"/tmp\", pattern=\"**/*.zap\")\n",
+    ));
+    assert_ok(&prog("    auto ps = fs.glob(\"/tmp\", \"*.zap\")\n"));
+    assert_code(
+        &prog("    auto hit = fs.fnmatch(name=\"a\", glob=\"*\")\n"),
+        "ZAP4023",
+    );
+}
