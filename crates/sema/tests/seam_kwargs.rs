@@ -203,6 +203,25 @@ fn http_positional_calls_unchanged() {
     assert_ok(&prog("    auto r = http.post(\"http://x\", \"n=zap\")\n"));
 }
 
+// redirect-following result accessors (#987): single-arg, keyword-capable.
+#[test]
+fn http_redirect_accessors_keyword_and_positional() {
+    assert_ok(&prog(
+        "    auto r = http.get(\"http://x\")\n    auto u = http.final_url(resp=r)\n    auto c = http.redirects(resp=r)\n",
+    ));
+    assert_ok(&prog(
+        "    auto r = http.get(\"http://x\")\n    auto u = http.final_url(r)\n    auto c = http.redirects(r)\n",
+    ));
+}
+
+#[test]
+fn http_redirect_accessor_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto r = http.get(\"http://x\")\n    auto u = http.final_url(response=r)\n"),
+        "ZAP4023",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // datetime — timestamp conversions + format/parse (#99/#338).
 // ---------------------------------------------------------------------------

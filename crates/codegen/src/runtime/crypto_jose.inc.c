@@ -2908,13 +2908,22 @@ typedef struct {
     int64_t status;
     const ZapStr *headers; /* raw header block */
     const ZapStr *body;
+    const ZapStr *final_url; /* URL the final response came from (#987); after any
+                              * redirects this is the last URL dialed, else the
+                              * original request URL. */
+    void *chain;             /* list[str] of redirect targets followed in order
+                              * (#987); the empty list when nothing was followed.
+                              * A ZapList; typed void* so the GC desc tracks the
+                              * slot as a plain pointer. */
 } ZapHttpResp;
 
 static const int32_t zap_off_httpresp[] = {
     (int32_t)offsetof(ZapHttpResp, headers),
     (int32_t)offsetof(ZapHttpResp, body),
+    (int32_t)offsetof(ZapHttpResp, final_url),
+    (int32_t)offsetof(ZapHttpResp, chain),
 };
-static const ZapTypeDesc zap_desc_httpresp = {(int64_t)sizeof(ZapHttpResp), ZAP_TD_PRECISE, 2,
+static const ZapTypeDesc zap_desc_httpresp = {(int64_t)sizeof(ZapHttpResp), ZAP_TD_PRECISE, 4,
                                               zap_off_httpresp};
 
 /* ---- HTTP request handle (server) ----------------------------------------- */
@@ -3128,34 +3137,32 @@ static int zap_http_hdr_managed(const ZapStr *name) {
            zap_http_name_eq(name, "Connection");
 }
 
-/* HTTP/1.1 client core (ticket #104; request headers #280). `headers_` is an
- * optional `dict[str,str]` (NULL for the no-header forms): each live entry is
- * emitted as a `Name: Value` header line, except the transport-managed ones
- * (zap_http_hdr_managed). A caller-supplied Content-Type suppresses the default
- * text/plain. Keys and values are copied into the malloc request buffer before
- * any send, so the GC dict is only touched while it is still rooted by the
- * caller's frame. */
-void *zap_http_do(void *method_, void *url_, void *body_, void *headers_) {
-    const ZapStr *method = (const ZapStr *)method_;
-    const ZapStr *url = (const ZapStr *)url_;
-    const ZapStr *body = (const ZapStr *)body_;
-    const ZapDict *hdrs = (const ZapDict *)headers_;
-
-    char *u = zap_net_dupz(url);
+/* HTTP/1.1 client core (ticket #104; request headers #280). One request/response
+ * round-trip: `zap_http_do` (below) layers redirect-following over this. `url_cstr`
+ * is a NUL-terminated absolute URL owned by the caller (never freed here).
+ * `headers_` is an optional `dict[str,str]` (NULL for the no-header forms): each
+ * live entry is emitted as a `Name: Value` header line, except the
+ * transport-managed ones (zap_http_hdr_managed). A caller-supplied Content-Type
+ * suppresses the default text/plain, unless `suppress_ctype` is set — the
+ * redirect path sets it when a method-downgrading redirect has dropped the body,
+ * so a stale Content-Type is not carried onto the follow-up GET. Keys and values
+ * are copied into the malloc request buffer before any send, so the GC dict is
+ * only touched while it is still rooted by the caller's frame. */
+static void *zap_http_do_once(const ZapStr *method, const char *url_cstr,
+                              const ZapStr *body, const ZapDict *hdrs,
+                              int suppress_ctype) {
     char *mz = zap_net_dupz(method);
-    if (!u || !mz) {
-        free(u);
-        free(mz);
+    if (!mz) {
         zap_net_panic("http: out of memory");
         return NULL;
     }
     int is_tls = 0;
-    const char *rest = u;
-    if (strncmp(u, "https://", 8) == 0) {
+    const char *rest = url_cstr;
+    if (strncmp(url_cstr, "https://", 8) == 0) {
         is_tls = 1;
-        rest = u + 8;
-    } else if (strncmp(u, "http://", 7) == 0) {
-        rest = u + 7;
+        rest = url_cstr + 8;
+    } else if (strncmp(url_cstr, "http://", 7) == 0) {
+        rest = url_cstr + 7;
     }
     /* host[:port][/path] */
     size_t hostend = 0;
@@ -3164,7 +3171,6 @@ void *zap_http_do(void *method_, void *url_, void *body_, void *headers_) {
     }
     char *host = (char *)malloc(hostend + 1);
     if (!host) {
-        free(u);
         free(mz);
         zap_net_panic("http: out of memory");
         return NULL;
@@ -3235,7 +3241,6 @@ void *zap_http_do(void *method_, void *url_, void *body_, void *headers_) {
     size_t reqcap = strlen(mz) + strlen(path) + hostend + blen + hdrbytes + 256;
     char *req = (char *)malloc(reqcap);
     if (!req) {
-        free(u);
         free(mz);
         zap_httpconn_close(&hc);
         zap_net_panic("http: out of memory");
@@ -3262,6 +3267,11 @@ void *zap_http_do(void *method_, void *url_, void *body_, void *headers_) {
             if (zap_http_hdr_managed(name)) {
                 continue;
             }
+            if (suppress_ctype && zap_http_name_eq(name, "Content-Type")) {
+                /* a redirect downgraded the method and dropped the body — don't
+                 * carry the original Content-Type onto the bodyless follow-up. */
+                continue;
+            }
             size_t nl = (size_t)(name->len < 0 ? 0 : name->len);
             size_t vl = (size_t)(val->len < 0 ? 0 : val->len);
             hdr += snprintf(req + hdr, reqcap - (size_t)hdr, "%.*s: %.*s\r\n", (int)nl,
@@ -3273,7 +3283,6 @@ void *zap_http_do(void *method_, void *url_, void *body_, void *headers_) {
         memcpy(req + hdr, body->data, blen);
         hdr += (int)blen;
     }
-    free(u);
     free(mz);
 
     int sent = zap_httpconn_send_all(&hc, req, (size_t)hdr);
@@ -3328,8 +3337,210 @@ void *zap_http_do(void *method_, void *url_, void *body_, void *headers_) {
     resp->status = (int64_t)status;
     resp->headers = (const ZapStr *)headers;
     resp->body = (const ZapStr *)bodyobj;
+    resp->final_url = NULL; /* filled by the zap_http_do redirect wrapper */
+    resp->chain = NULL;
     return resp;
 }
+
+/* ---- redirect following (#987, D-0222) ------------------------------------ *
+ * `zap_http_do` wraps the single-shot core in a redirect loop: it follows 3xx
+ * responses that carry a `Location`, resolving each (possibly relative) target
+ * against the current URL with `zap_url_join` (the same RFC-3986 resolution as
+ * `url.join`), up to ZAP_HTTP_MAX_REDIRECTS hops. Method/body across a hop follow
+ * the browser/`requests` rules: 303 -> GET (body dropped); 301/302 downgrade only
+ * a POST to GET (body dropped), other methods preserved; 307/308 preserve method
+ * and body. The chain of resolved targets and the final URL are recorded on the
+ * response (`http.redirects` / `http.final_url`).
+ *
+ * GC: every URL followed is accumulated in malloc'd C strings, never a GC object
+ * held across a network park — the GC `chain` list and `final_url` are built only
+ * at the very end, after the last response, where no further park occurs. */
+#define ZAP_HTTP_MAX_REDIRECTS 10
+
+/* malloc NUL-terminated copy of a C string (chain bookkeeping); NULL on OOM. */
+static char *zap_http_cstr_dup(const char *s) {
+    size_t n = strlen(s);
+    char *o = (char *)malloc(n + 1);
+    if (o) {
+        memcpy(o, s, n + 1);
+    }
+    return o;
+}
+
+/* Full case-insensitive compare of a NUL-terminated method against a literal. */
+static int zap_http_method_is(const char *m, const char *lit) {
+    size_t i = 0;
+    for (;;) {
+        char a = m[i];
+        char b = lit[i];
+        if (a >= 'A' && a <= 'Z') {
+            a = (char)(a - 'A' + 'a');
+        }
+        if (b >= 'A' && b <= 'Z') {
+            b = (char)(b - 'A' + 'a');
+        }
+        if (a != b) {
+            return 0;
+        }
+        if (!a) {
+            return 1;
+        }
+        i++;
+    }
+}
+
+/* Is `status` a redirect this client follows? */
+static int zap_http_is_redirect(long status) {
+    return status == 301 || status == 302 || status == 303 || status == 307 ||
+           status == 308;
+}
+
+/* malloc'd NUL-terminated copy of response header `name`, or NULL when absent or
+ * empty. The transient GC string from zap_http_header_value is copied out before
+ * any park, so nothing GC is carried into the next request. */
+static char *zap_http_resp_header_cstr(ZapHttpResp *resp, const char *name) {
+    const ZapStr *s = (const ZapStr *)zap_http_header_value(
+        resp->headers->data, (size_t)resp->headers->len, name);
+    if (!s || s->len <= 0) {
+        return NULL;
+    }
+    char *out = (char *)malloc((size_t)s->len + 1);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, s->data, (size_t)s->len);
+    out[s->len] = '\0';
+    return out;
+}
+
+/* HTTP/1.1 client with redirect following. See the block comment above. */
+void *zap_http_do(void *method_, void *url_, void *body_, void *headers_) {
+    const ZapStr *body = (const ZapStr *)body_;
+    const ZapDict *hdrs = (const ZapDict *)headers_;
+
+    char *cur = zap_net_dupz((const ZapStr *)url_);   /* current absolute URL */
+    char *curm = zap_net_dupz((const ZapStr *)method_); /* current method */
+    if (!cur || !curm) {
+        free(cur);
+        free(curm);
+        zap_net_panic("http: out of memory");
+        return NULL;
+    }
+
+    char **chain = NULL; /* resolved redirect targets, in order */
+    size_t nchain = 0;
+    int drop_body = 0;     /* this hop sends an empty body */
+    int suppress_ctype = 0; /* and no caller Content-Type */
+    ZAP_STACK_STR(empty, "", 0);
+    ZapHttpResp *resp = NULL;
+
+    for (int hop = 0;; hop++) {
+        /* Method as a one-shot GC string; the body is either the caller's
+         * original (still rooted by its frame) or the stack empty. Both are
+         * consumed into the malloc request buffer before do_once's first park. */
+        ZapStr *mZ = (ZapStr *)zap_str_new(curm, (int64_t)strlen(curm));
+        const ZapStr *bodyArg = drop_body ? (const ZapStr *)empty : body;
+        resp = (ZapHttpResp *)zap_http_do_once(mZ, cur, bodyArg, hdrs, suppress_ctype);
+        long st = resp->status; /* captured before any later allocation */
+
+        if (!zap_http_is_redirect(st)) {
+            break; /* terminal response */
+        }
+        char *loc = zap_http_resp_header_cstr(resp, "Location");
+        if (!loc) {
+            break; /* 3xx without a usable Location — return it as-is */
+        }
+        if (hop >= ZAP_HTTP_MAX_REDIRECTS) {
+            free(loc);
+            for (size_t k = 0; k < nchain; k++) {
+                free(chain[k]);
+            }
+            free(chain);
+            free(cur);
+            free(curm);
+            zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                            zap_str_new("http: too many redirects",
+                                        (int64_t)sizeof("http: too many redirects") - 1));
+            return NULL;
+        }
+
+        /* Resolve Location against the current URL (RFC-3986 §5.2). The transient
+         * ZapStrs and the join result are pure-CPU work with no park, copied to a
+         * malloc string before the next request. */
+        ZapStr *baseZ = (ZapStr *)zap_str_new(cur, (int64_t)strlen(cur));
+        ZapStr *refZ = (ZapStr *)zap_str_new(loc, (int64_t)strlen(loc));
+        ZapStr *joined = (ZapStr *)zap_url_join(baseZ, refZ);
+        char *newurl = zap_net_dupz(joined);
+        free(loc);
+        if (!newurl) {
+            for (size_t k = 0; k < nchain; k++) {
+                free(chain[k]);
+            }
+            free(chain);
+            free(cur);
+            free(curm);
+            zap_net_panic("http: out of memory");
+            return NULL;
+        }
+
+        /* Record the hop. */
+        char **grown = (char **)realloc(chain, (nchain + 1) * sizeof(char *));
+        if (!grown) {
+            free(newurl);
+            for (size_t k = 0; k < nchain; k++) {
+                free(chain[k]);
+            }
+            free(chain);
+            free(cur);
+            free(curm);
+            zap_net_panic("http: out of memory");
+            return NULL;
+        }
+        chain = grown;
+        chain[nchain] = zap_http_cstr_dup(newurl);
+        nchain++;
+
+        /* Method/body across the hop (see the block comment). */
+        if (st == 303) {
+            if (!zap_http_method_is(curm, "HEAD")) {
+                free(curm);
+                curm = zap_http_cstr_dup("GET");
+                drop_body = 1;
+            }
+        } else if (st == 301 || st == 302) {
+            if (zap_http_method_is(curm, "POST")) {
+                free(curm);
+                curm = zap_http_cstr_dup("GET");
+                drop_body = 1;
+            }
+        } /* 307 / 308: preserve method and body */
+        suppress_ctype = drop_body;
+
+        free(cur);
+        cur = newurl;
+    }
+
+    /* Terminal response in hand: no further park, so build the GC results now. */
+    resp->final_url = (const ZapStr *)zap_str_new(cur, (int64_t)strlen(cur));
+    void *chainlist = zap_list_new();
+    for (size_t k = 0; k < nchain; k++) {
+        zap_list_push_ptr(chainlist, zap_str_new(chain[k], (int64_t)strlen(chain[k])));
+        free(chain[k]);
+    }
+    free(chain);
+    free(cur);
+    free(curm);
+    resp->chain = chainlist;
+    return resp;
+}
+
+/* http.final_url(resp) -> str. The URL the returned response came from: the last
+ * URL dialed after any redirects, or the original request URL (#987). */
+void *zap_http_final_url(void *resp_) { return (void *)((ZapHttpResp *)resp_)->final_url; }
+
+/* http.redirects(resp) -> list[str]. The redirect targets followed, in order;
+ * the empty list when none were (#987). */
+void *zap_http_redirects(void *resp_) { return ((ZapHttpResp *)resp_)->chain; }
 
 /* http.request(method, url, body) — no caller headers. */
 void *zap_http_request(void *method_, void *url_, void *body_) {

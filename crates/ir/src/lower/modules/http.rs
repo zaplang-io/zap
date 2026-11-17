@@ -36,6 +36,9 @@ fn lower(
         "status" => call_ret(lowerer, "zap_http_status", a, Ty::I64, false),
         "body" => call_ret(lowerer, "zap_http_body", a, Ty::Ptr, false),
         "header" => call_ret(lowerer, "zap_http_header", a, Ty::Ptr, false),
+        // redirect-following accessors (#987): pure reads on the response handle.
+        "final_url" => call_ret(lowerer, "zap_http_final_url", a, Ty::Ptr, false),
+        "redirects" => call_ret(lowerer, "zap_http_redirects", a, Ty::Ptr, false),
         "url" => call_ret(lowerer, "zap_http_url", a, Ty::Ptr, false),
         // server
         "read_request" => call_ret(lowerer, "zap_http_read_request", a, Ty::Ptr, true),

@@ -11120,3 +11120,55 @@ before/after/equal); sema shape + arity/type tests; seam-kwargs binding.
 
 Relates to [[D-0056]] / #99 (the datetime seam), #338 (strftime/strptime),
 [[D-0213]] (seam rows), epic #966, and Discussion #965 (gap #7).
+
+## D-0222 — stdlib http: follow 3xx redirects by default (#987 / sub-epic #984 / epic #966)
+
+**Context.** The `http` client (#104) issued exactly one request/response: a
+caller that got a 301/302/307/308 had to read `Location` and re-request by hand,
+and could not even resolve a relative `Location` before URL parsing landed
+(#970). With `url.join` now available (RFC-3986 resolution), redirect following
+is the natural next slice (#965 gap #9). Python `requests` follows redirects by
+default (`allow_redirects`, max 30); Go exposes `http.Client.CheckRedirect`.
+
+**Decision.** The client verbs `get`/`post`/`request` **follow 3xx redirects by
+default**. The single-shot core (`zap_http_do_once`) is unchanged; a wrapper
+(`zap_http_do`) loops:
+- Follow `301/302/303/307/308` that carry a `Location`, up to a fixed cap of
+  **10** hops; a 3xx without a usable `Location` is returned as-is; exceeding the
+  cap raises a catchable `ValueError` ("too many redirects").
+- Each `Location` (absolute or relative) is resolved against the current URL with
+  `zap_url_join` — the same RFC-3986 §5.2 resolution as `url.join`.
+- Method/body across a hop follow the browser/`requests` rules: **303 → GET**
+  (body dropped); **301/302** downgrade only a **POST → GET** (body dropped),
+  other methods preserved; **307/308** preserve method and body. A downgraded GET
+  also suppresses a stale caller `Content-Type`.
+- Two additive accessors expose the outcome: `http.final_url(resp) -> str` (the
+  URL the final response came from — the last URL dialed, or the original when
+  nothing was followed) and `http.redirects(resp) -> list[str]` (the resolved
+  targets followed, in order; empty when none).
+
+**Why default-on, fixed cap.** Zap's seam calling convention has no behavior-flag
+keywords and `http` has no `Session`/config object, so `requests`-style
+`allow_redirects=` / `max_redirects=` cannot ride on the call. Following by
+default (the `requests` behavior) is the high-value 90%; a **configurable cap and
+an opt-out** are deferred to a follow-up (they need a config surface `http` does
+not yet have). No existing golden relied on a 3xx being returned unfollowed.
+
+**GC safety.** The redirect loop performs several network round-trips, each with
+netpoller parks (safepoints). Every URL followed is accumulated in malloc'd C
+strings — never a GC object held across a park — and the GC `chain` list and
+`final_url` are built only after the final response, where no further park
+occurs, mirroring the existing "build GC results at the end" rule in the client
+core. The method/body decision reads a status captured into a C local before any
+later allocation. The `ZapHttpResp` handle gains two precise-GC pointer slots
+(`final_url`, `chain`), set to `NULL` on every single-shot response.
+
+**Tests.** Golden `http_redirect` (one-shot local server: `/start` → 302 with a
+**relative** `Location: /final`, `/final` → 200; a single `http.get` must resolve
+the relative target to the right ephemeral host:port to arrive — deterministic
+output: status 200, body, redirect count 1); sema shape/arity/type tests;
+seam-kwargs binding for the new accessors (D-0213 rows).
+
+Relates to [[D-0056]] / #104 (the http seam), [[D-0197]] (#960 header
+enumeration), #970 / D-0209 (`url.join`), [[D-0213]] (seam rows), sub-epic #984,
+epic #966, and Discussion #965 (gap #9).
