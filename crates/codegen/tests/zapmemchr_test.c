@@ -14,8 +14,8 @@
  *   cc -DZAP_CPU_TEST crates/codegen/tests/zapmemchr_test.c -o t && ./t */
 
 #define ZAP_CPU_TEST 1
-#include "../src/zapcpu.inc.c"
-#include "../src/zapmemchr.inc.c"
+#include "../src/runtime/accel/cpu.inc.c"
+#include "../src/runtime/accel/memchr.inc.c"
 
 #include <stdio.h>
 #include <stdlib.h>
