@@ -1,3 +1,9 @@
+/* zap runtime fragment: accel/arch.inc.c -- one translation unit: #include'd by zaprt.c at a
+ * fixed position (order is semantic). NOT a standalone TU; it relies on declarations
+ * made earlier in zaprt.c (and may leave a preprocessor #if open for a later
+ * fragment). Registered in crates/codegen/src/runtime_manifest.rs; see
+ * crates/codegen/FOLDER_ARCHITECTURE.md for the add-a-fragment checklist.
+ */
 /* zaparch.inc.c — the `arch.x86_64` / `arch.aarch64` intrinsic shims and the
  * portable `hash.crc32c` wrapper (I#139 Tier 2, #962, D-0199).
  *

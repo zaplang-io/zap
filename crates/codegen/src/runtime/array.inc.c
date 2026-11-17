@@ -1,3 +1,9 @@
+/* zap runtime fragment: array.inc.c -- one translation unit: #include'd by zaprt.c at a
+ * fixed position (order is semantic). NOT a standalone TU; it relies on declarations
+ * made earlier in zaprt.c (and may leave a preprocessor #if open for a later
+ * fragment). Registered in crates/codegen/src/runtime_manifest.rs; see
+ * crates/codegen/FOLDER_ARCHITECTURE.md for the add-a-fragment checklist.
+ */
 /* ===========================================================================
  * Numeric-array sort / argsort — own floor (#932, D-0190)
  *

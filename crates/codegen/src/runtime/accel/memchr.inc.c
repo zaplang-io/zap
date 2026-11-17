@@ -1,3 +1,9 @@
+/* zap runtime fragment: accel/memchr.inc.c -- one translation unit: #include'd by zaprt.c at a
+ * fixed position (order is semantic). NOT a standalone TU; it relies on declarations
+ * made earlier in zaprt.c (and may leave a preprocessor #if open for a later
+ * fragment). Registered in crates/codegen/src/runtime_manifest.rs; see
+ * crates/codegen/FOLDER_ARCHITECTURE.md for the add-a-fragment checklist.
+ */
 /* zapmemchr.inc.c — SIMD byte/substring search (ISA-acceleration epic #139,
  * sub-issue #945, D-0194; design snapshot Discussion #920 §4). The FIRST
  * multiversioned kernel: it proves the clone + resolver + `cpu_features` dispatch

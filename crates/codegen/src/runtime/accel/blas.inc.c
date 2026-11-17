@@ -1,3 +1,9 @@
+/* zap runtime fragment: accel/blas.inc.c -- one translation unit: #include'd by zaprt.c at a
+ * fixed position (order is semantic). NOT a standalone TU; it relies on declarations
+ * made earlier in zaprt.c (and may leave a preprocessor #if open for a later
+ * fragment). Registered in crates/codegen/src/runtime_manifest.rs; see
+ * crates/codegen/FOLDER_ARCHITECTURE.md for the add-a-fragment checklist.
+ */
 /* Numeric acceleration seam (#912, D-0179) — part of the array performance &
  * acceleration epic (#914). Provider-neutral hooks the array dispatcher (#904)
  * consults to choose between the own-kernel FLOOR (simple, exact, always linked)
