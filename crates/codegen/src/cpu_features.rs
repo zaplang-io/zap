@@ -149,7 +149,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     /// The exact text of the shared header, embedded at compile time.
-    const HEADER: &str = include_str!("zap_cpu_features.h");
+    const HEADER: &str = include_str!("runtime/accel/zap_cpu_features.h");
 
     /// Parse every `#define ZAP_CPU_<ARCH>_<NAME> <int>` line whose arch is X86
     /// or AARCH64 (the feature-index block), returning macro -> value. The
