@@ -109,6 +109,8 @@ fn lower(
         "read_bytes" => call_ret(lowerer, "zap_fs_read_bytes", a, Ty::Bytes, true),
         "write_bytes" => call_void(lowerer, "zap_fs_write_bytes", a, true),
         "append" => call_void(lowerer, "zap_fs_append", a, true),
+        // Line-oriented input (#969, D-0212): whole-file read split into lines.
+        "lines" => call_ret(lowerer, "zap_fs_lines", a, Ty::List(Elem::Ptr), true),
         _ => return Ok(None),
     }))
 }

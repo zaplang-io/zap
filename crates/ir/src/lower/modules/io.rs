@@ -20,6 +20,14 @@ fn lower(
         "read" => call_ret(lowerer, "zap_io_read", a, Ty::Ptr, true),
         "write" => call_ret(lowerer, "zap_io_write", a, Ty::I64, true),
         "close_fd" => call_void(lowerer, "zap_io_close", a, true),
+        // Buffered line-oriented input (#969, D-0212). The handle is an opaque
+        // pointer (a `bytes` value whose buffer is a pointer-free reader state,
+        // the crypto-streaming pattern). `reader` only allocates; the reads do
+        // I/O and raise on error, so they are throwing calls.
+        "reader" => call_ret(lowerer, "zap_io_reader_new", a, Ty::Ptr, false),
+        "readline" => call_ret(lowerer, "zap_io_readline", a, Ty::Ptr, true),
+        "readall" => call_ret(lowerer, "zap_io_readall", a, Ty::Ptr, true),
+        "readn" => call_ret(lowerer, "zap_io_readn", a, Ty::Ptr, true),
         _ => return Ok(None),
     }))
 }

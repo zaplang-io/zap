@@ -10717,3 +10717,61 @@ worse workaround than what ships here.
 Relates to [[D-0056]] / #97 (the original os/fs seam), [[D-0126]] (`KeyInfo`, the
 value-struct precedent), [[D-0204]] (seam kwargs), epic #966, and Discussion #965
 (gap #4).
+
+## D-0212 — stdlib line-oriented input: `input()`, a buffered reader, `fs.lines` (#969 / epic #966)
+
+**Context.** Zap had no line-oriented input. `io` was raw `open`/`read(fd,n)`/
+`write`/`close_fd`, and `fs.read_file` slurps a whole file into a `str`. So there
+was no interactive prompt read, no way to consume a file line by line, and no way
+to stream input larger than memory. Gap #3 of Discussion #965, under the
+stdlib-gaps epic #966.
+
+**Decision.** Add the Python/Go-faithful line surface as flat functions plus one
+opaque reader handle.
+
+- **`input([prompt]) -> str`** — a global builtin (alongside `print`). Writes the
+  optional `str` prompt to stdout with no trailing newline, then reads one line
+  from stdin; the result excludes the trailing `\n` (and a preceding `\r`). 0 or 1
+  argument. CPython's `input()`; Go's `bufio.Scanner` over `os.Stdin`.
+- **Buffered reader.** `io.reader(fd) -> reader` wraps an fd in an 8 KiB read-ahead
+  buffer; `io.readline(reader) -> str` returns the next line **including** its
+  trailing `\n` (so a blank line reads as `"\n"` and only true EOF reads as `""` —
+  the loop-termination signal), `io.readall(reader) -> str` returns the rest of
+  the stream, and `io.readn(reader, n) -> str` returns up to `n` bytes. The
+  streaming idiom is a read-ahead `while line != "":` loop — no whole-file slurp,
+  so an input bigger than RAM is fine.
+- **`fs.lines(path) -> list[str]`** — convenience: whole-file read split into lines
+  with terminators stripped (`str.splitlines` semantics, reusing [[D-0210]]'s
+  runtime). For files that fit in memory; stream larger ones with the reader.
+
+**Reader shape — opaque seam handle, not a prelude value struct.** The reader
+carries mutable state (fd + buffer + fill/pos + EOF), which a `value struct`
+(immutable field semantics, like `UrlParts`/`Stat`) does not model. It follows the
+**crypto streaming-hash precedent** ([[D-0133]]): the handle is a `bytes` value
+whose buffer is a **pointer-free** C struct, so the precise/moving collector traces
+and frees it with no finalizer, and the read functions take the handle as their
+first argument. This is the #965 "prelude struct vs seam handle" question, resolved
+to the handle by precedent.
+
+**EOF semantics.** `io.readline`/`readall`/`readn` signal end-of-input by returning
+`""` / a short read (never raising), which is what the streaming loop wants.
+`input()`, being interactive, **raises** at EOF (Ctrl-D) like CPython — but Zap has
+no `EOFError` yet, so it raises a catchable `RuntimeError` today (see deferred).
+
+**Positional by design (no seam-kwargs rows).** Every entry is a single logical
+argument over a handle/fd/path (plus `input`'s lone optional prompt and `readn`'s
+count), so there is nothing a keyword clarifies; they stay positional ([[D-0204]]),
+matching `io.read(fd, n)`.
+
+**Deferred (documented follow-ups).** (1) Native `for line in file` — making a
+stdlib handle participate in the iterator protocol ([[D-0048]]'s `__iter__`/
+`__next__`) is a deeper integration than this slice; the read-ahead `readline`
+loop covers the need meanwhile. (2) `sys.stdin`/`stdout`/`stderr` as stream
+objects (the #965 nice-to-have). (3) A real `EOFError` builtin exception, after
+which `input()` switches to it from `RuntimeError`. Each is filed as its own issue;
+none has a worse workaround than what ships here.
+
+Relates to [[D-0056]] / #97 (the io/fs seam), [[D-0133]] (crypto streaming handle,
+the opaque-handle precedent), [[D-0210]] (`str.splitlines`), [[D-0211]] (the #968
+fs gaps this builds on), [[D-0204]] (seam kwargs), epic #966, and Discussion #965
+(gap #3).

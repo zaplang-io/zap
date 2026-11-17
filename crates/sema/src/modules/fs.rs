@@ -30,6 +30,13 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "fs", method, args, 1, span);
             Ty::List(Box::new(Ty::Str))
         }
+        // fs.lines(path) -> list[str] (#969, D-0212): whole-file read split into
+        // lines with the terminators stripped. Convenience for in-memory files;
+        // stream larger inputs with io.reader + io.readline.
+        "lines" => {
+            expect_argc(checker, "fs", method, args, 1, span);
+            Ty::List(Box::new(Ty::Str))
+        }
         "mkdtemp" => {
             expect_argc(checker, "fs", method, args, 0, span);
             Ty::Str

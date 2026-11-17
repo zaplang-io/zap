@@ -31,6 +31,30 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "io", method, args, 1, span);
             Ty::Unit
         }
+        // Buffered line-oriented input (#969, D-0212). `reader(fd)` returns an
+        // opaque handle (a `bytes` value wrapping a pointer-free reader state,
+        // the crypto-streaming pattern); the read methods take that handle.
+        // io.reader(fd) -> reader
+        "reader" => {
+            expect_argc(checker, "io", method, args, 1, span);
+            Ty::Bytes
+        }
+        // io.readline(reader) -> str (line incl. trailing '\n'; "" at EOF)
+        "readline" => {
+            expect_argc(checker, "io", method, args, 1, span);
+            Ty::Str
+        }
+        // io.readall(reader) -> str (rest of the stream)
+        "readall" => {
+            expect_argc(checker, "io", method, args, 1, span);
+            Ty::Str
+        }
+        // io.readn(reader, n) -> str (up to n bytes; "" once drained). As with
+        // `io.read(fd, n)`, the count flows positionally and coerces to i64.
+        "readn" => {
+            expect_argc(checker, "io", method, args, 2, span);
+            Ty::Str
+        }
         _ => return None,
     })
 }

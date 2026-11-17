@@ -482,6 +482,7 @@ const GENEXPR_ITER_TYPE: &str = "$genexpr";
 
 const BUILTINS: &[&str] = &[
     "print",
+    "input",
     "range",
     "len",
     "sum",
@@ -6735,6 +6736,29 @@ impl Checker {
                     }
                     return Ty::Unit;
                 }
+                // input([prompt]) -> str (#969, D-0212): read one line from
+                // stdin. The optional prompt is written to stdout first and must
+                // be a string. 0 or 1 argument; a second argument is rejected.
+                "input" => {
+                    if args.len() > 1 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!("input() takes at most one argument, found {}", args.len()),
+                            span,
+                        );
+                    }
+                    for a in args {
+                        let t = self.infer(&a.value);
+                        if !matches!(t, Ty::Str | Ty::Unknown) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!("input() prompt must be a str, found {}", t.display()),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::Str;
+                }
                 // REPL session-binding slot intrinsics (I#159, design/0025-repl.md).
                 // Synthesized only by the `zap repl` driver, never written by
                 // users. A load yields `Unknown` so it coerces into the binding's
@@ -9943,6 +9967,59 @@ def main():
             "crypto.ed25519_verify(\"pem\", \"msg\")",
         ] {
             let src = format!("def main():\n    auto x = {bad}\n");
+            let e = errors(&src);
+            assert!(!e.is_empty(), "expected an arity error for `{bad}`");
+        }
+    }
+
+    // ---- line-oriented input (#969, D-0212) -------------------------------
+
+    #[test]
+    fn line_input_surface_type_checks() {
+        // input([prompt]) -> str; the buffered reader methods and fs.lines.
+        ok(r#"def main():
+    auto s = input()
+    auto t = input("name> ")
+    auto fd = io.open("/dev/null", "r")
+    auto r = io.reader(fd)
+    str line = io.readline(r)
+    str rest = io.readall(r)
+    str chunk = io.readn(r, 8)
+    io.close_fd(fd)
+    auto ls = fs.lines("/dev/null")
+    str first = ls[0]
+    print(s + t + line + rest + chunk + first)
+    print(len(ls))
+"#);
+    }
+
+    #[test]
+    fn line_input_arity_and_prompt_type_are_checked() {
+        // input() takes at most one argument (ZAP4025)...
+        let e = errors("def main():\n    auto x = input(\"a\", \"b\")\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4025),
+            "input/2 should be ZAP4025, got {e:?}"
+        );
+        // ...and its prompt must be a str (ZAP4024).
+        let e = errors("def main():\n    auto x = input(5)\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4024),
+            "input(int) should be ZAP4024, got {e:?}"
+        );
+        // Reader methods reject wrong arity.
+        for bad in [
+            "io.reader()",
+            "io.reader(fd, 1)",
+            "io.readline(r, 1)",
+            "io.readall()",
+            "io.readn(r)",
+            "io.readn(r, 1, 2)",
+            "fs.lines()",
+        ] {
+            let src = format!(
+                "def main():\n    auto fd = io.open(\"x\", \"r\")\n    auto r = io.reader(fd)\n    auto z = {bad}\n"
+            );
             let e = errors(&src);
             assert!(!e.is_empty(), "expected an arity error for `{bad}`");
         }
