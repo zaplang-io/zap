@@ -10,7 +10,7 @@
 
 use zapc_syntax::ast;
 
-use super::support::{call_bool, call_ret, call_void, lower_args};
+use super::support::{call_bool, call_ret, call_void, line_reader_wrap, lower_args};
 use super::ModuleLower;
 use crate::ir::*;
 use crate::lower::{err, FnLower, LowerError};
@@ -79,6 +79,28 @@ fn lower_stat(lowerer: &mut FnLower, arg: &ast::Arg) -> Result<(Value, Ty), Lowe
     Ok((dest, Ty::Struct(sid)))
 }
 
+/// `fs.open_reader(path)`: open `path` read-only and wrap the buffered reader in
+/// the prelude `LineReader` (#1031, D-0223). Composes the existing `io.open` +
+/// `io.reader` runtime entries — `open` is the validating gate, so a missing or
+/// unreadable path raises a catchable error before the wrap.
+fn lower_open_reader(lowerer: &mut FnLower, arg: &ast::Arg) -> Result<(Value, Ty), LowerError> {
+    let (path, _) = lowerer.expr(&arg.value)?;
+    let mode = lowerer.new_value(Ty::Ptr);
+    lowerer.emit(Inst::StrConst {
+        dest: mode,
+        bytes: b"r".to_vec(),
+    });
+    let fd = lowerer.new_value(Ty::I64);
+    lowerer.throwing_call(Some(fd), "zap_io_open", vec![path, mode]);
+    let handle = lowerer.new_value(Ty::Ptr);
+    lowerer.emit(Inst::Call {
+        dest: Some(handle),
+        func: "zap_io_reader_new".to_string(),
+        args: vec![fd],
+    });
+    line_reader_wrap(lowerer, handle)
+}
+
 fn lower(
     lowerer: &mut FnLower,
     method: &str,
@@ -88,6 +110,14 @@ fn lower(
     // calls over the lowered argument words.
     if method == "stat" {
         return Ok(Some(lower_stat(lowerer, &args[0])?));
+    }
+    // open_reader composes io.open + io.reader and wraps the handle in the
+    // prelude `LineReader` iterable (#1031, D-0223) — not a single flat call.
+    if method == "open_reader" {
+        let arg = args
+            .first()
+            .ok_or_else(|| err("fs.open_reader expects 1 argument"))?;
+        return Ok(Some(lower_open_reader(lowerer, arg)?));
     }
     let a = lower_args(lowerer, args)?;
     Ok(Some(match method {

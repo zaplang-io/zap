@@ -9,7 +9,36 @@
 use zapc_syntax::ast;
 
 use crate::ir::*;
-use crate::lower::{FnLower, LowerError};
+use crate::lower::{err, FnLower, LowerError};
+
+/// Resolve the prelude `LineReader` struct id (injected by the parser's prelude
+/// whenever the surface is used). Shared by `io.lines` / `fs.open_reader`.
+fn line_reader_sid(lowerer: &FnLower) -> Result<u32, LowerError> {
+    lowerer
+        .ctx
+        .ids
+        .get("LineReader")
+        .copied()
+        .ok_or_else(|| err("LineReader struct unavailable (built-in prelude missing)"))
+}
+
+/// Wrap a buffered reader handle `h` in a freshly-constructed prelude
+/// `LineReader` (field 0 = `_h`) — the iterable returned by `io.lines(reader)`
+/// and `fs.open_reader(path)` (#1031, D-0223). The handle is rooted by the new
+/// struct, which then drives the D-0048 iterator protocol via `LineReader`'s
+/// `__next__` (one `io.readline` per step).
+pub(super) fn line_reader_wrap(lowerer: &mut FnLower, h: Value) -> Result<(Value, Ty), LowerError> {
+    let sid = line_reader_sid(lowerer)?;
+    let dest = lowerer.new_value(Ty::Struct(sid));
+    lowerer.emit(Inst::StructNew { dest, sid });
+    lowerer.emit(Inst::FieldSet {
+        base: dest,
+        sid,
+        idx: 0,
+        val: h,
+    });
+    Ok((dest, Ty::Struct(sid)))
+}
 
 /// Lower each argument expression: integer arguments (fds, counts) are coerced
 /// to `i64`; reference arguments (`str`, `list`) pass through as their pointer

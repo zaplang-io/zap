@@ -11172,3 +11172,54 @@ seam-kwargs binding for the new accessors (D-0213 rows).
 Relates to [[D-0056]] / #104 (the http seam), [[D-0197]] (#960 header
 enumeration), #970 / D-0209 (`url.join`), [[D-0213]] (seam rows), sub-epic #984,
 epic #966, and Discussion #965 (gap #9).
+
+## D-0223 — stdlib io/fs: native `for line in file` via a prelude LineReader (#1031 / epic #966)
+
+**Context.** #969 (D-0212) shipped a buffered reader (`io.reader`/`readline`/
+`readall`/`readn`) and `fs.lines`, but the streaming idiom was an explicit
+read-ahead `while` loop. Python's natural form is `for line in open(path):`. The
+enabler flagged in Discussion #965 is making a **stdlib (seam) handle participate
+in the D-0048 iterator protocol** — the reader handle is an opaque `bytes` value
+shared with other handles (`http`/`crypto`), so it cannot itself be made iterable
+without a distinct type threaded through the whole compiler.
+
+**Decision.** Add a prelude reference struct **`LineReader { bytes _h }`** with
+`__iter__(self) -> LineReader` and comma-ok `__next__(self) -> (str, bool)` whose
+body calls `io.readline(self._h)` and reports `("", false)` at EOF — exactly the
+way the prelude `Lock`/`Thread` wrap the `sync`/`threading` handles. Two seam
+entry points build one:
+- `io.lines(reader) -> LineReader` — wrap an existing `io.reader` handle;
+- `fs.open_reader(path) -> LineReader` — open `path` read-only and wrap (composes
+  the existing `io.open` + `io.reader` runtime entries in the lowering facet).
+
+So `for line in fs.open_reader(path):` and `for line in io.lines(io.reader(fd)):`
+stream a file a line at a time. Each line keeps its trailing newline (as
+`io.readline` returns it); a blank line reads as `"\n"` and is preserved, since
+`io.readline` returns `""` only at true EOF.
+
+**Why a prelude wrapper, not a new core type.** The reader handle sharing the
+opaque `bytes` type means the only way `for` can target it specifically is a
+distinct type identity. Rather than introduce a new `Ty` variant threaded through
+sema → IR → codegen plus a new `for`-loop driver (the invasive "hard part" the
+issue flags), the wrapper struct reuses the **entire** existing D-0048 machinery
+(`iterable_elem` over a `Named` struct's `__iter__`/`__next__`; the `drive_iteration`
+lowering) with **zero** core type-system, lowering, or runtime-C change. The
+construction mirrors `url.split` → `UrlParts` (`StructNew` + `FieldSet` in the
+lowering facet). The raw `io.reader` / `io.readline` surface is unchanged; the
+handle is not itself iterable (iterate it via `io.lines`). A *configurable* or
+auto-closing file object is a possible future refinement.
+
+**Prelude injection.** `LineReader` is injected (via `references_prelude`) for any
+program that names the `io` module, `open_reader`, or the struct — `fs` already
+triggers injection. Over-injection for an `io.read`-only program is harmless (the
+unused struct emits no code), matching the existing `UrlParts`/`Stat` rationale.
+
+**Tests.** Golden `for_line_in_file` (multi-line incl. a final unterminated line,
+a preserved blank line, both entry points, early `break`, an empty file = zero
+iterations, and nested iteration with independent readers — deterministic
+output); sema iterability + arity tests; seam-kwargs binding for the new entries
+(D-0213 rows).
+
+Relates to [[D-0056]] / #97 (the io/fs seams), [[D-0212]] (#969 buffered reader),
+D-0048 (the iterator protocol), [[D-0213]] (seam rows), epic #966, and Discussion
+#965 (gap #8). The same wrapper pattern unblocks `fs.walk`/`scandir` (#1032).

@@ -409,6 +409,25 @@ struct Condition:
     def notify_all(self):
         sync.cond_notify_all(self._h)
 
+# LineReader — a line iterator over a buffered io.reader handle (#1031, D-0223).
+# A thin reference struct over the opaque reader (like Lock/Thread wrap the
+# sync/threading handles) so `for line in ...` works through the D-0048 iterator
+# protocol. __next__ yields the next line WITH its trailing newline, and the
+# empty string with false at EOF — io.readline returns the empty string only at
+# end of stream, so a blank line (which reads as a lone newline) is preserved,
+# not mistaken for EOF. Built by io.lines(reader) / fs.open_reader(path).
+struct LineReader:
+    bytes _h
+
+    def __iter__(self) -> LineReader:
+        return self
+
+    def __next__(self) -> (str, bool):
+        auto line = io.readline(self._h)
+        if line == \"\":
+            return (\"\", False)
+        return (line, True)
+
 enum JsonValue:
     Null
     Bool(bool b)
@@ -1284,6 +1303,14 @@ fn references_prelude(module: &Module) -> bool {
         // `fs.read_file`-only program is harmless (the unused struct emits no code).
         "\"Stat\"",
         "\"fs\"",
+        // The `io.lines(reader)` / `fs.open_reader(path)` line iterator returns
+        // the `LineReader` struct (#1031, D-0223): injected for any program that
+        // names the `io` module, `open_reader`, or the struct (`fs` already
+        // covers `fs.open_reader`). Over-injection for an `io.read`-only program
+        // is harmless — the unused struct emits no code.
+        "\"io\"",
+        "\"open_reader\"",
+        "\"LineReader\"",
         "\"JsonValue\"",
         "\"json\"",
         "\"Json\"",

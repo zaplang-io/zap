@@ -2,10 +2,10 @@
 
 use zapc_syntax::ast;
 
-use super::support::{call_ret, call_void, lower_args};
+use super::support::{call_ret, call_void, line_reader_wrap, lower_args};
 use super::ModuleLower;
 use crate::ir::*;
-use crate::lower::{FnLower, LowerError};
+use crate::lower::{err, FnLower, LowerError};
 
 pub(super) const MODULE: ModuleLower = ModuleLower { name: "io", lower };
 
@@ -14,6 +14,14 @@ fn lower(
     method: &str,
     args: &[ast::Arg],
 ) -> Result<Option<(Value, Ty)>, LowerError> {
+    // `io.lines(reader)` wraps an existing reader handle in the prelude
+    // `LineReader` so `for line in io.lines(r)` iterates (#1031, D-0223). Its
+    // argument is the handle itself; lower it and wrap — no flat runtime call.
+    if method == "lines" {
+        let arg = args.first().ok_or_else(|| err("io.lines expects 1 argument"))?;
+        let (h, _) = lowerer.expr(&arg.value)?;
+        return Ok(Some(line_reader_wrap(lowerer, h)?));
+    }
     let a = lower_args(lowerer, args)?;
     Ok(Some(match method {
         "open" => call_ret(lowerer, "zap_io_open", a, Ty::I64, true),

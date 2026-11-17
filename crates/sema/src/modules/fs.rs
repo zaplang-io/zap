@@ -37,6 +37,14 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "fs", method, args, 1, span);
             Ty::List(Box::new(Ty::Str))
         }
+        // fs.open_reader(path) -> LineReader (#1031, D-0223): open `path` for
+        // reading and wrap it in the prelude `LineReader`, so `for line in
+        // fs.open_reader(path)` streams the file a line at a time (lines keep
+        // their trailing newline) via the D-0048 iterator protocol.
+        "open_reader" => {
+            expect_argc(checker, "fs", method, args, 1, span);
+            Ty::Named("LineReader".to_string())
+        }
         // Path matching (#1033, D-0216).
         // fs.fnmatch(name, pattern) -> bool: shell-glob string match.
         "fnmatch" => {

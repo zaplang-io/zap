@@ -55,6 +55,14 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "io", method, args, 2, span);
             Ty::Str
         }
+        // io.lines(reader) -> LineReader (#1031, D-0223). Wrap a buffered reader
+        // handle in the prelude `LineReader` so `for line in io.lines(r)` streams
+        // lines through the D-0048 iterator protocol. The raw `io.reader` /
+        // `io.readline` surface is unchanged.
+        "lines" => {
+            expect_argc(checker, "io", method, args, 1, span);
+            Ty::Named("LineReader".to_string())
+        }
         _ => return None,
     })
 }
