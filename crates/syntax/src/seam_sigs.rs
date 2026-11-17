@@ -36,6 +36,16 @@
 //! ignored), so migration is incremental and the eventual global default of
 //! *"an un-listed method rejects keywords"* can be turned on once every
 //! keyword-taking method has a row.
+//!
+//! **Authoring rule (D-0213): every NEW seam function with ≥1 argument gets a
+//! row here — single-argument functions included.** Zap's call syntax is
+//! Pythonic and some callers prefer named arguments (`fs.read_file(path=…)`), so
+//! the whole stdlib surface is kept uniformly keyword-capable; a one-line row is
+//! cheap. Only a **zero-argument** function has no row (nothing to name, e.g.
+//! `fs.mkdtemp`, `time.monotonic`). Builtins (`print`, `input`, …) are not seam
+//! functions and never appear here. This rule is forward-going; it does not force
+//! an immediate back-fill of pre-D-0204 modules, but no new single-argument seam
+//! function should ship rowless again.
 
 /// `(module, method, declared positional parameter names)`. The module name is
 /// the seam registry name as dispatched (`"zlib"`, `"gzip"`, `"http"`, …), i.e.
@@ -195,6 +205,8 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("fs", "read_bytes", &["path"]),
     ("fs", "write_bytes", &["path", "data"]),
     ("fs", "append", &["path", "data"]),
+    // Line-oriented input (#969, D-0212): whole-file read split into lines.
+    ("fs", "lines", &["path"]),
     // ---- time (ticket #99): sleeps + Duration constructors/accessors ----
     // (monotonic/monotonic_ns/time/time_ns take no args, so no row.)
     ("time", "sleep", &["seconds"]),
@@ -234,6 +246,15 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("io", "read", &["fd", "n"]),
     ("io", "write", &["fd", "data"]),
     ("io", "close_fd", &["fd"]),
+    // Buffered line-oriented input (#969, D-0212). `readn` materially benefits
+    // from keywords (`io.readn(reader=r, n=8)`); the single-argument reader
+    // verbs are rowed only for a uniform keyword-capable surface. The reader
+    // handle parameter is named `reader`. (`input` is a global builtin, not a
+    // seam function, so it has no row — like `print`.)
+    ("io", "reader", &["fd"]),
+    ("io", "readline", &["reader"]),
+    ("io", "readall", &["reader"]),
+    ("io", "readn", &["reader", "n"]),
     // ---- signal (ticket #77): subscribe to a Signal ----
     ("signal", "notify", &["sig"]),
     // ---- math (ticket #98): scalar transcendentals + 2/3-arg forms ----
