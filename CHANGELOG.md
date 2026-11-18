@@ -1534,7 +1534,13 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   across independent processes (Python-like). `ZAPHASHSEED=<uint>` pins a fixed
   seed for reproducible runs (à la `PYTHONHASHSEED`); unset keeps a random seed.
   `@derive(Hash)` field mixing (`hash_combine`) also moved to wyhash-style mixing.
-  The fork/exec/multiprocessing seed-domain semantics are recorded in `DECISIONS.md`.
+  **Consequence:** `dict`/`set` iteration order is unspecified and (for str/bytes
+  keys) now varies across processes — a map guarantees no order, matching Go /
+  Rust `HashMap` / Java `HashMap` rather than Python's insertion-ordered `dict`
+  (decided against insertion order, #1066). So `print`/`repr`/`str` of a str-keyed
+  `dict`/`set` is not order-stable across runs; sort the keys, or use the
+  insertion-ordered `oset` (#983), for deterministic output. The fork/exec/
+  multiprocessing seed-domain semantics are recorded in `DECISIONS.md`.
 - **`DECISIONS.md` consistency pass: stale/amended decisions marked in place**
   (docs-only). Every decision whose stated ruling was later reversed or superseded
   now carries a `⚠️`/`⛔` status banner pointing at the governing decision, and a new
