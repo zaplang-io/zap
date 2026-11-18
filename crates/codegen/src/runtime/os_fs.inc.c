@@ -879,6 +879,299 @@ void zap_fs_rmtree(void *path_) {
     zap_fs_rmtree_cstr(zap_sys_cstr((ZapStr *)path_));
 }
 
+/* --- directory traversal: scandir / walk / copytree (#1032, D-0224) --------- *
+ * All three classify each entry as dir(1) / file(2) / other(0). The classifier
+ * prefers readdir's `d_type` (no per-entry stat) and falls back to stat() only
+ * when the filesystem reports DT_UNKNOWN or a symlink (so `is_dir` follows a
+ * symlink, like CPython's DirEntry default). Entries are returned SORTED by name
+ * (Go `filepath.WalkDir` order) so results are deterministic across platforms —
+ * a deliberate difference from CPython's unordered `os.scandir`/`os.walk`. */
+
+/* 1 = directory, 2 = regular file, 0 = anything else. `dirpath` is the parent,
+ * needed to build the full path for the stat fallback. */
+static int zap_fs_entry_kind(const char *dirpath, struct dirent *e) {
+#if defined(DT_DIR)
+    if (e->d_type == DT_DIR) {
+        return 1;
+    }
+    if (e->d_type == DT_REG) {
+        return 2;
+    }
+    if (e->d_type != DT_UNKNOWN && e->d_type != DT_LNK) {
+        return 0;
+    }
+    /* DT_UNKNOWN / DT_LNK: stat the full path (follow symlinks). */
+#endif
+    {
+        size_t need = strlen(dirpath) + 1 + strlen(e->d_name) + 1;
+        char *full = (char *)malloc(need);
+        if (full == NULL) {
+            return 0;
+        }
+        snprintf(full, need, "%s/%s", dirpath, e->d_name);
+        struct stat st;
+        int ok = stat(full, &st) == 0;
+        free(full);
+        if (!ok) {
+            return 0;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            return 1;
+        }
+        if (S_ISREG(st.st_mode)) {
+            return 2;
+        }
+        return 0;
+    }
+}
+
+/* One directory entry: an owned NUL-terminated name plus its kind. */
+typedef struct {
+    char *name;
+    int kind;
+} ZapDirRec;
+
+static int zap_dirrec_cmp(const void *a, const void *b) {
+    return strcmp(((const ZapDirRec *)a)->name, ((const ZapDirRec *)b)->name);
+}
+
+/* Read `dirpath` into a malloc'd array of (name, kind), sorted by name, skipping
+ * "."/"..". Returns 0 and sets *out/*n_out on success (caller frees each `name`
+ * and the array); -1 if the directory cannot be opened. Raises (never returns)
+ * only on out-of-memory, after closing the handle. */
+static int zap_fs_read_dir_sorted(const char *dirpath, const char *op, ZapDirRec **out,
+                                  int64_t *n_out) {
+    DIR *d = opendir(dirpath);
+    if (d == NULL) {
+        return -1;
+    }
+    ZapDirRec *arr = NULL;
+    int64_t n = 0, cap = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+            continue;
+        }
+        if (n == cap) {
+            cap = cap ? cap * 2 : 16;
+            ZapDirRec *grown = (ZapDirRec *)realloc(arr, (size_t)cap * sizeof(ZapDirRec));
+            if (grown == NULL) {
+                for (int64_t k = 0; k < n; k++) {
+                    free(arr[k].name);
+                }
+                free(arr);
+                closedir(d);
+                zap_sys_fail(op, "out of memory");
+            }
+            arr = grown;
+        }
+        size_t nl = strlen(e->d_name);
+        char *nm = (char *)malloc(nl + 1);
+        if (nm == NULL) {
+            for (int64_t k = 0; k < n; k++) {
+                free(arr[k].name);
+            }
+            free(arr);
+            closedir(d);
+            zap_sys_fail(op, "out of memory");
+        }
+        memcpy(nm, e->d_name, nl + 1);
+        arr[n].name = nm;
+        arr[n].kind = zap_fs_entry_kind(dirpath, e);
+        n++;
+    }
+    closedir(d);
+    qsort(arr, (size_t)n, sizeof(ZapDirRec), zap_dirrec_cmp);
+    *out = arr;
+    *n_out = n;
+    return 0;
+}
+
+static void zap_fs_dirrecs_free(ZapDirRec *arr, int64_t n) {
+    for (int64_t i = 0; i < n; i++) {
+        free(arr[i].name);
+    }
+    free(arr);
+}
+
+/* fs.copytree(src, dst): recursively copy the tree rooted at `src` into `dst`
+ * (Python `shutil.copytree`). `dst` and missing parents are created; an existing
+ * `dst` is merged into (the `dirs_exist_ok=True` behaviour). Regular files are
+ * copied with `zap_fs_copy_file`; a symlink is copied as the content of its
+ * target (the file-copy policy of #968). */
+static void zap_fs_copytree_cstr(const char *src, const char *dst) {
+    struct stat st;
+    if (stat(src, &st) != 0) {
+        zap_sys_fail("fs.copytree", strerror(errno));
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        if (zap_fs_copy_file(src, dst) != 0) {
+            zap_sys_fail("fs.copytree", strerror(errno));
+        }
+        return;
+    }
+#if defined(ZAP_PLATFORM_WINDOWS)
+    int rc = _mkdir(dst);
+#else
+    int rc = mkdir(dst, 0777);
+#endif
+    if (rc != 0 && errno != EEXIST) {
+        zap_sys_fail("fs.copytree", strerror(errno));
+    }
+    ZapDirRec *recs = NULL;
+    int64_t n = 0;
+    if (zap_fs_read_dir_sorted(src, "fs.copytree", &recs, &n) != 0) {
+        zap_sys_fail("fs.copytree", strerror(errno));
+    }
+    for (int64_t i = 0; i < n; i++) {
+        size_t sneed = strlen(src) + 1 + strlen(recs[i].name) + 1;
+        size_t dneed = strlen(dst) + 1 + strlen(recs[i].name) + 1;
+        char *cs = (char *)malloc(sneed);
+        char *cd = (char *)malloc(dneed);
+        if (cs == NULL || cd == NULL) {
+            free(cs);
+            free(cd);
+            zap_fs_dirrecs_free(recs, n);
+            zap_sys_fail("fs.copytree", "out of memory");
+        }
+        snprintf(cs, sneed, "%s/%s", src, recs[i].name);
+        snprintf(cd, dneed, "%s/%s", dst, recs[i].name);
+        zap_fs_copytree_cstr(cs, cd);
+        free(cs);
+        free(cd);
+    }
+    zap_fs_dirrecs_free(recs, n);
+}
+void zap_fs_copytree(void *src_, void *dst_) {
+    zap_fs_copytree_cstr(zap_sys_cstr((ZapStr *)src_), zap_sys_cstr((ZapStr *)dst_));
+}
+
+/* fs.scandir(path) -> handle (Python `os.scandir`): read one directory level
+ * into a handle carrying a parallel list of names (str) and kinds (i64), which
+ * the lowering enumerates into a `list[DirEntry]`. `is_dir`/`is_file` come from
+ * `d_type` where the filesystem provides it — no per-entry stat in the common
+ * case. */
+typedef struct {
+    void *names; /* ZapList[str] */
+    void *kinds; /* ZapList[i64]: 1 dir / 2 file / 0 other */
+} ZapScan;
+static const int32_t zap_off_scan[] = {
+    (int32_t)offsetof(ZapScan, names),
+    (int32_t)offsetof(ZapScan, kinds),
+};
+static const ZapTypeDesc zap_desc_scan = {(int64_t)sizeof(ZapScan), ZAP_TD_PRECISE, 2,
+                                          zap_off_scan};
+
+void *zap_fs_scandir(void *path_) {
+    char *path = zap_sys_cstr((ZapStr *)path_);
+    ZapDirRec *recs = NULL;
+    int64_t n = 0;
+    if (zap_fs_read_dir_sorted(path, "fs.scandir", &recs, &n) != 0) {
+        zap_sys_fail("fs.scandir", strerror(errno));
+    }
+    void *names = zap_list_new();
+    void *kinds = zap_list_new();
+    for (int64_t i = 0; i < n; i++) {
+        zap_list_push_ptr(names, zap_str_new(recs[i].name, (int64_t)strlen(recs[i].name)));
+        zap_list_push_i64(kinds, (int64_t)recs[i].kind);
+    }
+    zap_fs_dirrecs_free(recs, n);
+    ZapScan *s = (ZapScan *)zap_obj(&zap_desc_scan);
+    s->names = names;
+    s->kinds = kinds;
+    return s;
+}
+int64_t zap_fs_scandir_count(void *h) { return zap_list_len(((ZapScan *)h)->names); }
+void *zap_fs_scandir_name(void *h, int64_t i) { return zap_list_get_ptr(((ZapScan *)h)->names, i); }
+int64_t zap_fs_scandir_is_dir(void *h, int64_t i) {
+    return zap_list_get_i64(((ZapScan *)h)->kinds, i) == 1;
+}
+int64_t zap_fs_scandir_is_file(void *h, int64_t i) {
+    return zap_list_get_i64(((ZapScan *)h)->kinds, i) == 2;
+}
+
+/* fs.walk(root) -> handle (Python `os.walk`, top-down): a parallel list per
+ * visited directory of its path (str), its subdirectory names (list[str]) and
+ * its file names (list[str]), which the lowering enumerates into a
+ * `list[(str, list[str], list[str])]`. The whole tree is materialised eagerly.
+ * An unreadable SUBdirectory is skipped silently (os.walk's default `onerror`);
+ * an unreadable ROOT raises. Recursion follows the sorted subdir order. */
+typedef struct {
+    void *dirpaths; /* ZapList[str] */
+    void *dirs;     /* ZapList[list[str]] */
+    void *files;    /* ZapList[list[str]] */
+} ZapWalk;
+static const int32_t zap_off_walk[] = {
+    (int32_t)offsetof(ZapWalk, dirpaths),
+    (int32_t)offsetof(ZapWalk, dirs),
+    (int32_t)offsetof(ZapWalk, files),
+};
+static const ZapTypeDesc zap_desc_walk = {(int64_t)sizeof(ZapWalk), ZAP_TD_PRECISE, 3,
+                                          zap_off_walk};
+
+static void zap_fs_walk_rec(const char *dirpath, void *dirpaths, void *dirs, void *files) {
+    ZapDirRec *recs = NULL;
+    int64_t n = 0;
+    if (zap_fs_read_dir_sorted(dirpath, "fs.walk", &recs, &n) != 0) {
+        return; /* unreadable subdirectory: skip (os.walk default) */
+    }
+    void *dnames = zap_list_new();
+    void *fnames = zap_list_new();
+    for (int64_t i = 0; i < n; i++) {
+        void *nm = zap_str_new(recs[i].name, (int64_t)strlen(recs[i].name));
+        if (recs[i].kind == 1) {
+            zap_list_push_ptr(dnames, nm);
+        } else {
+            zap_list_push_ptr(fnames, nm);
+        }
+    }
+    /* Record THIS directory first (top-down order). */
+    zap_list_push_ptr(dirpaths, zap_str_new(dirpath, (int64_t)strlen(dirpath)));
+    zap_list_push_ptr(dirs, dnames);
+    zap_list_push_ptr(files, fnames);
+    /* Then recurse into each subdirectory, in sorted order. */
+    for (int64_t i = 0; i < n; i++) {
+        if (recs[i].kind != 1) {
+            continue;
+        }
+        size_t need = strlen(dirpath) + 1 + strlen(recs[i].name) + 1;
+        char *child = (char *)malloc(need);
+        if (child == NULL) {
+            zap_fs_dirrecs_free(recs, n);
+            zap_sys_fail("fs.walk", "out of memory");
+        }
+        snprintf(child, need, "%s/%s", dirpath, recs[i].name);
+        zap_fs_walk_rec(child, dirpaths, dirs, files);
+        free(child);
+    }
+    zap_fs_dirrecs_free(recs, n);
+}
+void *zap_fs_walk(void *root_) {
+    char *root = zap_sys_cstr((ZapStr *)root_);
+    /* The root must be a readable directory — surface a typo/permission error
+     * at the call rather than silently yielding nothing. */
+    DIR *probe = opendir(root);
+    if (probe == NULL) {
+        zap_sys_fail("fs.walk", strerror(errno));
+    }
+    closedir(probe);
+    void *dirpaths = zap_list_new();
+    void *dirs = zap_list_new();
+    void *files = zap_list_new();
+    zap_fs_walk_rec(root, dirpaths, dirs, files);
+    ZapWalk *w = (ZapWalk *)zap_obj(&zap_desc_walk);
+    w->dirpaths = dirpaths;
+    w->dirs = dirs;
+    w->files = files;
+    return w;
+}
+int64_t zap_fs_walk_count(void *h) { return zap_list_len(((ZapWalk *)h)->dirpaths); }
+void *zap_fs_walk_dirpath(void *h, int64_t i) {
+    return zap_list_get_ptr(((ZapWalk *)h)->dirpaths, i);
+}
+void *zap_fs_walk_dirs(void *h, int64_t i) { return zap_list_get_ptr(((ZapWalk *)h)->dirs, i); }
+void *zap_fs_walk_files(void *h, int64_t i) { return zap_list_get_ptr(((ZapWalk *)h)->files, i); }
+
 /* fs.read_bytes(path) -> bytes: the whole file as raw bytes (physically a
  * `ZapStr` buffer, typed `bytes` by the lowerer). */
 void *zap_fs_read_bytes(void *path_) {

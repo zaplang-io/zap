@@ -10378,6 +10378,44 @@ def main():
         );
     }
 
+    // ---- fs: directory traversal — scandir / walk / copytree (#1032, D-0224) --
+
+    #[test]
+    fn fs_traversal_type_checks() {
+        // scandir -> list[DirEntry]: iterate and read the named fields.
+        ok(r#"def main():
+    for e in fs.scandir("x"):
+        if e.is_dir:
+            print(e.name)
+        str nm = e.name
+        bool f = e.is_file
+        print(nm)
+"#);
+        // walk -> list[(str, list[str], list[str])]: tuple-destructuring loop; the
+        // dirs/files components iterate as list[str].
+        ok(r#"def main():
+    for dirpath, dirs, files in fs.walk("x"):
+        print(dirpath)
+        for d in dirs:
+            print(d)
+        for f in files:
+            print(f)
+"#);
+        // copytree -> unit.
+        ok("def main():\n    fs.copytree(\"a\", \"b\")\n");
+        // Arity.
+        let e = errors("def main():\n    auto x = fs.scandir()\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4025),
+            "fs.scandir/0 should be ZAP4025, got {e:?}"
+        );
+        let e = errors("def main():\n    fs.copytree(\"a\")\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4025),
+            "fs.copytree/1 should be ZAP4025, got {e:?}"
+        );
+    }
+
     // ---- list: mutation methods (#977, D-0220) ----------------------------
 
     #[test]

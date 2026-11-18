@@ -44,4 +44,27 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     // Path matching (#1033, D-0216): fnmatch -> int64 bool; glob -> list[str].
     cg.declare_rt("zap_fs_fnmatch", &[p.into(), p.into()], Some(i.into()));
     cg.declare_rt("zap_fs_glob", &[p.into(), p.into()], Some(p.into()));
+    // Directory traversal (#1032, D-0224). copytree may raise (unit). scandir /
+    // walk return an opaque handle the lowering enumerates via count + indexed
+    // getters (the req_headers pattern): the getters are infallible pointer /
+    // int64 reads over the already-materialised handle.
+    cg.declare_rt("zap_fs_copytree", &[p.into(), p.into()], None);
+    cg.declare_rt("zap_fs_scandir", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_fs_scandir_count", &[p.into()], Some(i.into()));
+    cg.declare_rt("zap_fs_scandir_name", &[p.into(), i.into()], Some(p.into()));
+    cg.declare_rt(
+        "zap_fs_scandir_is_dir",
+        &[p.into(), i.into()],
+        Some(i.into()),
+    );
+    cg.declare_rt(
+        "zap_fs_scandir_is_file",
+        &[p.into(), i.into()],
+        Some(i.into()),
+    );
+    cg.declare_rt("zap_fs_walk", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_fs_walk_count", &[p.into()], Some(i.into()));
+    cg.declare_rt("zap_fs_walk_dirpath", &[p.into(), i.into()], Some(p.into()));
+    cg.declare_rt("zap_fs_walk_dirs", &[p.into(), i.into()], Some(p.into()));
+    cg.declare_rt("zap_fs_walk_files", &[p.into(), i.into()], Some(p.into()));
 }

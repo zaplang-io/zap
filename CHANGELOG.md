@@ -25,6 +25,17 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`fs` directory traversal — `scandir` / `walk` / `copytree`** (#1032, D-0224).
+  `fs.scandir(path)` returns a `list[DirEntry]` (one directory level; each entry
+  carries `name` + `is_dir`/`is_file`, taken from `readdir`'s `d_type` where
+  available, so no per-entry stat). `fs.walk(root)` returns a
+  `list[(dirpath, dirs, files)]` for `for (dirpath, dirs, files) in fs.walk(root):`
+  (os.walk-shaped, top-down; the whole tree is materialised). `fs.copytree(src,
+  dst)` recursively copies a directory, merging into an existing `dst`. Entries
+  are returned **sorted by name** (Go `filepath.WalkDir` order), so results are
+  deterministic across platforms — a deliberate difference from CPython's
+  unordered `os.scandir`/`os.walk`.
+
 - **Native `for line in file`** (#1031, D-0223). A buffered reader now
   participates in the D-0048 iterator protocol through the prelude `LineReader`:
   `for line in fs.open_reader(path):` and `for line in io.lines(reader):` stream

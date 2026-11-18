@@ -145,6 +145,13 @@ fn lower(
         // unreadable directory simply yields no match.
         "fnmatch" => call_bool(lowerer, "zap_fs_fnmatch", a),
         "glob" => call_ret(lowerer, "zap_fs_glob", a, Ty::List(Elem::Ptr), false),
+        // Directory traversal (#1032, D-0224). scandir / walk call the runtime for
+        // an opaque handle, then enumerate it into a list[DirEntry] / list of
+        // (dirpath, dirs, files) tuples (the req_headers pattern). copytree is a
+        // plain throwing void call.
+        "scandir" => lowerer.lower_fs_scandir(a[0]),
+        "walk" => lowerer.lower_fs_walk(a[0]),
+        "copytree" => call_void(lowerer, "zap_fs_copytree", a, true),
         _ => return Ok(None),
     }))
 }
