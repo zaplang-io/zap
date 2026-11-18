@@ -17279,7 +17279,11 @@ impl<'a> FnLower<'a> {
     /// it with a count + indexed getters (the `req_headers` pattern), building one
     /// prelude `DirEntry { name, is_dir, is_file }` per entry. The `is_*` getters
     /// return a C `int64` 0/1, normalised to `i1` for the `bool` fields.
-    fn lower_fs_scandir(&mut self, handle: Value) -> (Value, Ty) {
+    fn lower_fs_scandir(&mut self, path: Value) -> (Value, Ty) {
+        // Materialise the directory into a handle first (raises on a bad path),
+        // then enumerate it — the arg is the path, not the handle.
+        let handle = self.new_value(Ty::Ptr);
+        self.throwing_call(Some(handle), "zap_fs_scandir", vec![path]);
         let de_sid = *self
             .ctx
             .ids
@@ -17395,7 +17399,11 @@ impl<'a> FnLower<'a> {
     /// enumerates it with a count + indexed getters, building one
     /// `(dirpath, dirs, files)` tuple per visited directory. `dirs`/`files` are
     /// `list[str]` the runtime already built, handed back as pointers.
-    fn lower_fs_walk(&mut self, handle: Value) -> (Value, Ty) {
+    fn lower_fs_walk(&mut self, root: Value) -> (Value, Ty) {
+        // Materialise the whole tree into a handle first (raises on an unreadable
+        // root), then enumerate it — the arg is the root path, not the handle.
+        let handle = self.new_value(Ty::Ptr);
+        self.throwing_call(Some(handle), "zap_fs_walk", vec![root]);
         // Intern the tuple with the REAL field types — `(str, list[str],
         // list[str])` — not three bare `Ptr`s. `bind_tuple_loop_target` types the
         // destructured `dirs`/`files` from these field types, so a bare `Ptr`
