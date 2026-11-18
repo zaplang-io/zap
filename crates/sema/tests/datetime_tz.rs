@@ -354,3 +354,46 @@ fn datetime_add_takes_duration_diff_returns_duration() {
          auto delta = datetime.diff(b, a)\n    auto doubled = delta * 2\n    float64 s = time.to_seconds(doubled)\n",
     ));
 }
+
+// ---------------------------------------------------------------------------
+// #1055 — deferred refinements: Duration formatting + since, Date/Time
+// comparisons + field helpers.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn time_format_and_since() {
+    assert_ok(&prog(
+        "    auto d = time.seconds(90)\n    str s = time.format(d)\n",
+    ));
+    assert_ok(&prog(
+        "    auto start = time.monotonic_ns()\n    Duration e = time.since(start)\n",
+    ));
+    // format wants a Duration; since wants a number.
+    assert_code(&prog("    auto s = time.format(90)\n"), "ZAP4024");
+}
+
+#[test]
+fn date_time_comparisons_via_derive() {
+    assert_ok(&prog(
+        "    auto a = datetime.date(2020, 1, 1)\n    auto b = datetime.date(2021, 6, 1)\n    \
+         bool lt = a < b\n    bool eq = a == a\n",
+    ));
+    assert_ok(&prog(
+        "    auto a = datetime.time(1, 0, 0)\n    auto b = datetime.time(2, 30, 0)\n    \
+         bool le = a <= b\n",
+    ));
+}
+
+#[test]
+fn date_field_helpers() {
+    assert_ok(&prog(
+        "    auto d = datetime.date(2021, 1, 1)\n    int64 w = datetime.date_weekday(d)\n    \
+         int64 iw = datetime.date_isoweekday(d)\n    int64 doy = datetime.date_day_of_year(d)\n",
+    ));
+    // They want a Date, not a DateTime or int.
+    assert_code(&prog("    auto w = datetime.date_weekday(5)\n"), "ZAP4024");
+    assert_code(
+        &prog("    auto dt = datetime.from_timestamp(0)\n    auto w = datetime.date_weekday(dt)\n"),
+        "ZAP4024",
+    );
+}

@@ -132,6 +132,35 @@ fn lower(
             let n = arg1(lowerer, args, Ty::I64)?;
             return wrap_duration(lowerer, n).map(Some);
         }
+        // time.format(d) -> str: Go-style human-readable Duration (#1055).
+        "format" => {
+            let nanos = unwrap_duration(lowerer, &args[0])?;
+            let d = lowerer.new_value(Ty::Ptr);
+            lowerer.emit(Inst::Call {
+                dest: Some(d),
+                func: "zap_duration_format".to_string(),
+                args: vec![nanos],
+            });
+            (d, Ty::Ptr)
+        }
+        // time.since(start_ns) -> Duration: (monotonic_ns() - start_ns), wrapped.
+        "since" => {
+            let start = arg1(lowerer, args, Ty::I64)?;
+            let now = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(now),
+                func: "zap_time_monotonic_ns".to_string(),
+                args: vec![],
+            });
+            let delta = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Bin {
+                dest: delta,
+                op: BinOp::Sub,
+                lhs: now,
+                rhs: start,
+            });
+            return wrap_duration(lowerer, delta).map(Some);
+        }
         // duration unit converters (Duration -> unit as float, #1047): unwrap
         // nanos, reuse the existing ns->unit runtime entries.
         "to_seconds" | "to_millis" | "to_micros" => {

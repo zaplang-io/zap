@@ -1079,6 +1079,24 @@ fn datetime_date_time_types_keyword_and_positional() {
 }
 
 #[test]
+fn datetime_time_refinements_keyword_and_positional() {
+    // #1055 refinements: keyword binding for the new 1-arg helpers.
+    assert_ok(&prog(
+        "    auto d = time.seconds(1)\n    auto s = time.format(d=d)\n",
+    ));
+    assert_ok(&prog(
+        "    auto st = time.monotonic_ns()\n    auto e = time.since(start=st)\n",
+    ));
+    assert_ok(&prog(
+        "    auto dd = datetime.date(2021, 1, 1)\n    auto w = datetime.date_weekday(d=dd)\n",
+    ));
+    assert_code(
+        &prog("    auto dd = datetime.date(2021, 1, 1)\n    auto w = datetime.date_weekday(date=dd)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
 fn fs_glob_fnmatch_keyword_and_positional() {
     // Path matching (#1033, D-0216): keyword binding, reordering, positional.
     assert_ok(&prog(

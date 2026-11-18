@@ -337,26 +337,38 @@ void *zap_datetime_strftime(int64_t y, int64_t mo, int64_t d, int64_t h,
             break;
         }
         case 'z':
-            /* Aware: numeric UTC offset `±HHMM` (Python's `%z`, no colon).
-             * Naive: empty, as before (#1045, D-0225). Sub-minute offsets
-             * (e.g. a historical LMT) render to whole minutes. */
+            /* Aware: numeric UTC offset `±HHMM` (Python's `%z`, no colon), with
+             * trailing `SS` when the offset is not a whole minute — a historical
+             * LMT like +05:53:28 -> `+055328` (#1055, D-0228). Naive: empty. */
             if (is_aware) {
                 long long a = offset < 0 ? -offset : offset;
-                w = snprintf(tmp, sizeof tmp, "%c%02d%02d",
-                             offset < 0 ? '-' : '+', (int)(a / 3600),
-                             (int)((a % 3600) / 60));
+                int hh = (int)(a / 3600), mm = (int)((a % 3600) / 60),
+                    ss = (int)(a % 60);
+                char sign = offset < 0 ? '-' : '+';
+                if (ss != 0) {
+                    w = snprintf(tmp, sizeof tmp, "%c%02d%02d%02d", sign, hh, mm,
+                                 ss);
+                } else {
+                    w = snprintf(tmp, sizeof tmp, "%c%02d%02d", sign, hh, mm);
+                }
                 memcpy(out + n, tmp, (size_t)w);
                 n += (size_t)w;
             }
             break;
         case 'Z':
-            /* Aware: `UTC±HH:MM` (no zone abbreviation is carried on the value,
-             * so the numeric-UTC name form is used). Naive: empty. */
+            /* Aware: `UTC±HH:MM` (no zone abbreviation is carried on the value),
+             * with `:SS` for a sub-minute offset (#1055). Naive: empty. */
             if (is_aware) {
                 long long a = offset < 0 ? -offset : offset;
-                w = snprintf(tmp, sizeof tmp, "UTC%c%02d:%02d",
-                             offset < 0 ? '-' : '+', (int)(a / 3600),
-                             (int)((a % 3600) / 60));
+                int hh = (int)(a / 3600), mm = (int)((a % 3600) / 60),
+                    ss = (int)(a % 60);
+                char sign = offset < 0 ? '-' : '+';
+                if (ss != 0) {
+                    w = snprintf(tmp, sizeof tmp, "UTC%c%02d:%02d:%02d", sign, hh,
+                                 mm, ss);
+                } else {
+                    w = snprintf(tmp, sizeof tmp, "UTC%c%02d:%02d", sign, hh, mm);
+                }
                 memcpy(out + n, tmp, (size_t)w);
                 n += (size_t)w;
             }
@@ -663,9 +675,17 @@ void *zap_datetime_isoformat(int64_t y, int64_t mo, int64_t d, int64_t h,
     }
     if (is_aware) {
         long long a = offset < 0 ? -offset : offset;
-        int m = snprintf(buf + n, sizeof buf - (size_t)n, "%c%02d:%02d",
-                         offset < 0 ? '-' : '+', (int)(a / 3600),
-                         (int)((a % 3600) / 60));
+        int hh = (int)(a / 3600), mm = (int)((a % 3600) / 60), ss = (int)(a % 60);
+        char sign = offset < 0 ? '-' : '+';
+        int m;
+        if (ss != 0) {
+            /* Sub-minute offset (a historical LMT): RFC-3339 `±HH:MM:SS` (#1055). */
+            m = snprintf(buf + n, sizeof buf - (size_t)n, "%c%02d:%02d:%02d", sign,
+                         hh, mm, ss);
+        } else {
+            m = snprintf(buf + n, sizeof buf - (size_t)n, "%c%02d:%02d", sign, hh,
+                         mm);
+        }
         if (m > 0) {
             n += m;
         }
@@ -821,6 +841,89 @@ void *zap_time_isoformat(int64_t h, int64_t mi, int64_t s) {
                      (long long)mi, (long long)s);
     if (n < 0) {
         n = 0;
+    }
+    return zap_str_new(buf, (int64_t)n);
+}
+
+/* Human-readable Duration formatting (Go `time.Duration.String()` style, #1055,
+ * D-0228). "0s"; sub-second uses ns / us / ms with a trimmed fraction
+ * ("7.5us", "250ms"); >=1s is "<h>h<m>m<s>s" with a trimmed fractional-second
+ * ("1.5s", "1m30.5s", "1h1m1s"). ASCII "us" (not "µs") for golden/terminal
+ * portability. Negative durations get a leading '-'. */
+void *zap_duration_format(int64_t nanos) {
+    if (nanos == 0) {
+        return zap_str_new("0s", 2);
+    }
+    int neg = nanos < 0;
+    /* abs into uint64, INT64_MIN-safe */
+    uint64_t u = neg ? ((uint64_t)(-(nanos + 1)) + 1u) : (uint64_t)nanos;
+    char buf[64];
+    int n = 0;
+    if (u < 1000000000ULL) {
+        const char *unit;
+        uint64_t scale;
+        int digits;
+        if (u < 1000ULL) {
+            unit = "ns";
+            scale = 1;
+            digits = 0;
+        } else if (u < 1000000ULL) {
+            unit = "us";
+            scale = 1000;
+            digits = 3;
+        } else {
+            unit = "ms";
+            scale = 1000000;
+            digits = 6;
+        }
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "%llu",
+                      (unsigned long long)(u / scale));
+        uint64_t frac = u % scale;
+        if (frac != 0) {
+            char fb[16];
+            int fw = snprintf(fb, sizeof fb, "%0*llu", digits,
+                              (unsigned long long)frac);
+            while (fw > 0 && fb[fw - 1] == '0') {
+                fw--;
+            }
+            n += snprintf(buf + n, sizeof buf - (size_t)n, ".%.*s", fw, fb);
+        }
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "%s", unit);
+    } else {
+        uint64_t sec_total = u / 1000000000ULL;
+        uint64_t frac = u % 1000000000ULL;
+        uint64_t s = sec_total % 60;
+        uint64_t min_total = sec_total / 60;
+        uint64_t m = min_total % 60;
+        uint64_t h = min_total / 60;
+        if (h > 0) {
+            n += snprintf(buf + n, sizeof buf - (size_t)n, "%lluh",
+                          (unsigned long long)h);
+        }
+        if (min_total > 0) {
+            n += snprintf(buf + n, sizeof buf - (size_t)n, "%llum",
+                          (unsigned long long)m);
+        }
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "%llu",
+                      (unsigned long long)s);
+        if (frac != 0) {
+            char fb[16];
+            int fw = snprintf(fb, sizeof fb, "%09llu", (unsigned long long)frac);
+            while (fw > 0 && fb[fw - 1] == '0') {
+                fw--;
+            }
+            n += snprintf(buf + n, sizeof buf - (size_t)n, ".%.*s", fw, fb);
+        }
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "s");
+    }
+    if (n < 0) {
+        n = 0;
+    }
+    if (neg) {
+        char out[66];
+        out[0] = '-';
+        memcpy(out + 1, buf, (size_t)n);
+        return zap_str_new(out, (int64_t)n + 1);
     }
     return zap_str_new(buf, (int64_t)n);
 }
