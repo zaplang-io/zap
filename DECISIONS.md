@@ -8,7 +8,7 @@ time sink in language projects.
 Status legend: **Locked** · **Proposed** (baked into docs, pending confirmation)
 · **Open** · **Superseded**
 
-_Last updated: 2026-11-16_
+_Last updated: 2026-11-18_
 
 ---
 
@@ -11881,3 +11881,46 @@ variants, kept consistent), [[D-0196]] (`math.fma`), [[D-0204]] / [[D-0213]]
 (the seam binder + the one-row-per-arg rule), [[D-0007]] (catchable runtime
 faults), [[D-0219]] (the tuple-returning `os.path_split` build pattern), and
 Discussion #965 (gap #6).
+
+---
+
+## D-0235 — `dict`/`set` iteration order is unspecified (no insertion-order guarantee) (#1066)
+
+**Status: Locked.**
+
+**Context.** #1064 seeded the `dict`/`set` string-key hash (wyhash) per process,
+which — because Zap iterates these in hash-slot order — makes the iteration (and
+therefore `print`/`repr`/`str`/f-string) order of a str/bytes-keyed `dict`/`set`
+**vary across processes**. #1066 asked whether Zap should adopt Python's
+insertion-ordered `dict` so that order (and `repr`) is deterministic regardless
+of the seed.
+
+**Decision — no. `dict`/`set` iteration order is explicitly unspecified.** A map,
+by definition, guarantees no ordering, and programs should not depend on dict key
+order. Zap follows the mainstream: **Go** (`map` iteration is deliberately
+randomized, per-range), **Rust** (`HashMap`, randomized seed), and **Java**
+(`HashMap`, bucket order). **Python's insertion-ordered `dict` is the outlier**,
+and even Python's `set` is unordered. So:
+
+- `for k in d`, `.keys()`/`.values()`/`.items()`, and the `Display`/`repr`
+  rendering of a `dict`/`set` iterate in an **unspecified** order.
+- For str/bytes keys that order is **seed-dependent across processes** (#1064);
+  within a single run it is stable. Integer-keyed order is stable across runs
+  (the integer hash is unseeded) but is still "slot order", not insertion order,
+  and is equally unspecified.
+- **Deterministic output** is obtained by sorting the keys, or by using the
+  insertion-ordered **`oset`** (#983) — the opt-in analog of Python's
+  `OrderedDict` / Java's `LinkedHashMap` / Rust's `indexmap`. An ordered *dict*
+  variant may be added later if a concrete need appears; it is not the default
+  `dict`.
+
+**Consequence for tests/docs.** A golden/doctest must never print a multi-entry
+str-keyed `dict`/`set` and assert a fixed order (it flakes under the seed);
+precedent: `tests/golden/repr_containers.zap` was reduced to a single-entry dict
+when #1064 landed. Recorded in [[PYTHON_DIFFERENCES]] (Part B, Statements) and
+`CHANGELOG.md`.
+
+Relates to [[D-0056]] (collections; "iteration is hash order"), #1064 (the
+seeded wyhash string-key hash that surfaced this), and #983 (`oset`, the ordered
+opt-in). The #1064 seed-domain semantics (fork / exec / multiprocessing) are a
+separate decision.
