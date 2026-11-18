@@ -17396,11 +17396,17 @@ impl<'a> FnLower<'a> {
     /// `(dirpath, dirs, files)` tuple per visited directory. `dirs`/`files` are
     /// `list[str]` the runtime already built, handed back as pointers.
     fn lower_fs_walk(&mut self, handle: Value) -> (Value, Ty) {
+        // Intern the tuple with the REAL field types — `(str, list[str],
+        // list[str])` — not three bare `Ptr`s. `bind_tuple_loop_target` types the
+        // destructured `dirs`/`files` from these field types, so a bare `Ptr`
+        // would make the inner `for d in dirs` iterate a string instead of the
+        // list (#1032).
+        let str_list = Ty::List(Elem::Ptr);
         let tuple_sid = self
             .ctx
             .tuples
             .borrow_mut()
-            .intern(vec![Ty::Ptr, Ty::Ptr, Ty::Ptr]);
+            .intern(vec![Ty::Ptr, str_list, str_list]);
         let out_elem = Elem::Struct(tuple_sid);
         let out = self.new_value(Ty::List(out_elem));
         self.emit(Inst::Call {
@@ -17443,13 +17449,13 @@ impl<'a> FnLower<'a> {
             func: "zap_fs_walk_dirpath".to_string(),
             args: vec![handle, i],
         });
-        let dirs = self.new_value(Ty::Ptr);
+        let dirs = self.new_value(Ty::List(Elem::Ptr));
         self.emit(Inst::Call {
             dest: Some(dirs),
             func: "zap_fs_walk_dirs".to_string(),
             args: vec![handle, i],
         });
-        let files = self.new_value(Ty::Ptr);
+        let files = self.new_value(Ty::List(Elem::Ptr));
         self.emit(Inst::Call {
             dest: Some(files),
             func: "zap_fs_walk_files".to_string(),
