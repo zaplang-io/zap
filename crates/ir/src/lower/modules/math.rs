@@ -8,6 +8,7 @@
 
 use zapc_syntax::ast;
 
+use super::support::call_ret;
 use super::{ModuleConst, ModuleLower};
 use crate::ir::*;
 use crate::lower::{err, FnLower, LowerError};
@@ -61,11 +62,62 @@ fn lower(
         "round" => ("zap_math_round", None),
         "trunc" => ("zap_math_trunc", None),
         "fabs" => ("zap_math_fabs", Some(ArrayMathOp::Fabs)),
+        // #973 unary scalar `f64 -> f64` (no array mapping wired yet).
+        "degrees" => ("zap_math_degrees", None),
+        "radians" => ("zap_math_radians", None),
+        "sinh" => ("zap_math_sinh", None),
+        "cosh" => ("zap_math_cosh", None),
+        "tanh" => ("zap_math_tanh", None),
+        "asinh" => ("zap_math_asinh", None),
+        "acosh" => ("zap_math_acosh", None),
+        "atanh" => ("zap_math_atanh", None),
+        "expm1" => ("zap_math_expm1", None),
+        "log1p" => ("zap_math_log1p", None),
+        "exp2" => ("zap_math_exp2", None),
+        "cbrt" => ("zap_math_cbrt", None),
+        "gamma" => ("zap_math_gamma", None),
+        "lgamma" => ("zap_math_lgamma", None),
+        "erf" => ("zap_math_erf", None),
+        "erfc" => ("zap_math_erfc", None),
         // `pow` reuses the `**`-operator libm wrapper (ticket #19).
         "pow" => return Ok(Some(binary(lowerer, "zap_powf", args)?)),
         "atan2" => return Ok(Some(binary(lowerer, "zap_math_atan2", args)?)),
         "hypot" => return Ok(Some(binary(lowerer, "zap_math_hypot", args)?)),
         "fmod" => return Ok(Some(binary(lowerer, "zap_math_fmod", args)?)),
+        // #973 binary / compose forms.
+        "copysign" => return Ok(Some(binary(lowerer, "zap_math_copysign", args)?)),
+        "nextafter" => return Ok(Some(binary(lowerer, "zap_math_nextafter", args)?)),
+        "remainder" => return Ok(Some(binary(lowerer, "zap_math_remainder", args)?)),
+        "ldexp" => return Ok(Some(ldexp(lowerer, args)?)),
+        "isfinite" => return Ok(Some(predicate(lowerer, "zap_math_isfinite", args)?)),
+        "isclose" => return Ok(Some(isclose(lowerer, args)?)),
+        // Integer math. `gcd` is total; the rest raise (domain / overflow) and so
+        // route through `throwing_call` (the `true` flag) to be catchable.
+        "gcd" => return Ok(Some(int_binary(lowerer, "zap_math_gcd", args, false)?)),
+        "lcm" => return Ok(Some(int_binary(lowerer, "zap_math_lcm", args, true)?)),
+        "comb" => return Ok(Some(int_binary(lowerer, "zap_math_comb", args, true)?)),
+        "perm" => return Ok(Some(int_binary(lowerer, "zap_math_perm", args, true)?)),
+        "factorial" => return Ok(Some(int_unary(lowerer, "zap_math_factorial", args, true)?)),
+        "isqrt" => return Ok(Some(int_unary(lowerer, "zap_math_isqrt", args, true)?)),
+        // Tuple-returning decompositions.
+        "modf" => return Ok(Some(modf(lowerer, args)?)),
+        "frexp" => return Ok(Some(frexp(lowerer, args)?)),
+        // List reductions.
+        "prod" => return Ok(Some(reduce_one(lowerer, "prod", args)?)),
+        // `fsum` only raises on OOM (a catchable RuntimeError), so it still
+        // routes through `throwing_call` to stay catchable (D-0234 / the
+        // "raising runtime calls need throwing_call" rule).
+        "fsum" => {
+            return Ok(Some(reduce_list(
+                lowerer,
+                "zap_math_fsum",
+                args,
+                Ty::F64,
+                true,
+            )?))
+        }
+        "dist" => return Ok(Some(reduce_two(lowerer, "dist", args)?)),
+        "sumprod" => return Ok(Some(reduce_two(lowerer, "sumprod", args)?)),
         // `fma(x, y, z)` — explicit fused multiply-add (#946, D-0196): a single
         // rounding of `x*y + z`, independent of the implicit-`x*y+z` contraction
         // policy. Lowers to a libm `fma` wrapper (correctly rounded, hardware FMA
@@ -193,4 +245,232 @@ fn f64_arg(
         .ok_or_else(|| err(format!("math.{func} missing argument {i}")))?;
     let (v, t) = lowerer.expr(&arg.value)?;
     Ok(lowerer.coerce(v, t, Ty::F64))
+}
+
+/// Lower argument `i` and narrow/widen it to `i64` (the integer-math group).
+fn i64_arg(
+    lowerer: &mut FnLower,
+    func: &str,
+    args: &[ast::Arg],
+    i: usize,
+) -> Result<Value, LowerError> {
+    let arg = args
+        .get(i)
+        .ok_or_else(|| err(format!("math.{func} missing argument {i}")))?;
+    let (v, t) = lowerer.expr(&arg.value)?;
+    Ok(lowerer.coerce(v, t, Ty::I64))
+}
+
+/// `ldexp(x, e)` -> `f64`: x widens to `f64`, e to `i64` (clamped to the C `int`
+/// range inside the runtime wrapper).
+fn ldexp(lowerer: &mut FnLower, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
+    let x = f64_arg(lowerer, "ldexp", args, 0)?;
+    let e = i64_arg(lowerer, "ldexp", args, 1)?;
+    Ok(call_ret(
+        lowerer,
+        "zap_math_ldexp",
+        vec![x, e],
+        Ty::F64,
+        false,
+    ))
+}
+
+/// `isclose(a, b, rel_tol=1e-9, abs_tol=0.0)` -> bool. The tolerances default
+/// when omitted (seam defaults fill an interior hole; a trailing omit is filled
+/// here). A negative tolerance raises `ValueError`, so the runtime call is a
+/// `throwing_call`; its `i64` 0/1 result reduces to the `i1` sema assigned.
+fn isclose(lowerer: &mut FnLower, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
+    let a = f64_arg(lowerer, "isclose", args, 0)?;
+    let b = f64_arg(lowerer, "isclose", args, 1)?;
+    let rel_tol = match args.get(2) {
+        Some(_) => f64_arg(lowerer, "isclose", args, 2)?,
+        None => lowerer.fconst(Ty::F64, 1e-9),
+    };
+    let abs_tol = match args.get(3) {
+        Some(_) => f64_arg(lowerer, "isclose", args, 3)?,
+        None => lowerer.fconst(Ty::F64, 0.0),
+    };
+    let word = lowerer.new_value(Ty::I64);
+    lowerer.throwing_call(Some(word), "zap_math_isclose", vec![a, b, rel_tol, abs_tol]);
+    let zero = lowerer.iconst(Ty::I64, 0);
+    let d = lowerer.new_value(Ty::I1);
+    lowerer.emit(Inst::ICmp {
+        dest: d,
+        pred: CmpPred::Ne,
+        lhs: word,
+        rhs: zero,
+    });
+    Ok((d, Ty::I1))
+}
+
+/// `func(i64, i64) -> i64` (gcd/lcm/comb/perm). `throwing` is set for the forms
+/// that raise on a domain violation or an overflowing result.
+fn int_binary(
+    lowerer: &mut FnLower,
+    func: &str,
+    args: &[ast::Arg],
+    throwing: bool,
+) -> Result<(Value, Ty), LowerError> {
+    let a = i64_arg(lowerer, func, args, 0)?;
+    let b = i64_arg(lowerer, func, args, 1)?;
+    Ok(call_ret(lowerer, func, vec![a, b], Ty::I64, throwing))
+}
+
+/// `func(i64) -> i64` (factorial/isqrt); both raise, so `throwing` is `true`.
+fn int_unary(
+    lowerer: &mut FnLower,
+    func: &str,
+    args: &[ast::Arg],
+    throwing: bool,
+) -> Result<(Value, Ty), LowerError> {
+    let a = i64_arg(lowerer, func, args, 0)?;
+    Ok(call_ret(lowerer, func, vec![a], Ty::I64, throwing))
+}
+
+/// `modf(x)` -> `(frac, int_part)`: two `f64` component calls assembled into a
+/// `(float64, float64)` tuple (the `os.path_split` build pattern).
+fn modf(lowerer: &mut FnLower, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
+    let x = f64_arg(lowerer, "modf", args, 0)?;
+    let frac = lowerer.new_value(Ty::F64);
+    lowerer.emit(Inst::Call {
+        dest: Some(frac),
+        func: "zap_math_modf_frac".to_string(),
+        args: vec![x],
+    });
+    let ipart = lowerer.new_value(Ty::F64);
+    lowerer.emit(Inst::Call {
+        dest: Some(ipart),
+        func: "zap_math_modf_ipart".to_string(),
+        args: vec![x],
+    });
+    Ok(build_pair(lowerer, frac, Ty::F64, ipart, Ty::F64))
+}
+
+/// `frexp(x)` -> `(mantissa, exponent)` as a `(float64, int)` tuple.
+fn frexp(lowerer: &mut FnLower, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
+    let x = f64_arg(lowerer, "frexp", args, 0)?;
+    let mant = lowerer.new_value(Ty::F64);
+    lowerer.emit(Inst::Call {
+        dest: Some(mant),
+        func: "zap_math_frexp_mant".to_string(),
+        args: vec![x],
+    });
+    let exp = lowerer.new_value(Ty::I64);
+    lowerer.emit(Inst::Call {
+        dest: Some(exp),
+        func: "zap_math_frexp_exp".to_string(),
+        args: vec![x],
+    });
+    Ok(build_pair(lowerer, mant, Ty::F64, exp, Ty::I64))
+}
+
+/// Assemble a two-field tuple value `(a: at, b: bt)` (the interned-tuple struct
+/// shape the sema `Ty::Tuple` lowers to).
+fn build_pair(lowerer: &mut FnLower, a: Value, at: Ty, b: Value, bt: Ty) -> (Value, Ty) {
+    let sid = lowerer.ctx.tuples.borrow_mut().intern(vec![at, bt]);
+    let dest = lowerer.new_value(Ty::Struct(sid));
+    lowerer.emit(Inst::StructNew { dest, sid });
+    lowerer.emit(Inst::FieldSet {
+        base: dest,
+        sid,
+        idx: 0,
+        val: a,
+    });
+    lowerer.emit(Inst::FieldSet {
+        base: dest,
+        sid,
+        idx: 1,
+        val: b,
+    });
+    (dest, Ty::Struct(sid))
+}
+
+/// Map a numeric list element kind to its runtime suffix + result type
+/// (`int` -> `_i64`, `float64` -> `_f64`). Used by `prod`/`sumprod`. Integer
+/// widths / `bool` / `char` / enum share the `i64` word, so they fold to `i64`.
+fn list_elem_suffix(method: &str, elem: Elem) -> Result<(&'static str, Ty), LowerError> {
+    match elem {
+        Elem::I64 | Elem::Bool | Elem::Char | Elem::Enum(_) => Ok(("i64", Ty::I64)),
+        Elem::F64 => Ok(("f64", Ty::F64)),
+        _ => Err(err(format!(
+            "math.{method}() needs a list of int or float64"
+        ))),
+    }
+}
+
+/// `prod(xs)` -> element-typed scalar: dispatch on the element kind of the list
+/// argument and call the matching `zap_math_prod_{i64,f64}` (never raises).
+fn reduce_one(
+    lowerer: &mut FnLower,
+    method: &str,
+    args: &[ast::Arg],
+) -> Result<(Value, Ty), LowerError> {
+    let arg = args
+        .first()
+        .ok_or_else(|| err(format!("math.{method} missing its list argument")))?;
+    let (v, t) = lowerer.expr(&arg.value)?;
+    let Ty::List(elem) = t else {
+        return Err(err(format!(
+            "math.{method}() expects a list argument, found {t:?}"
+        )));
+    };
+    let (suffix, ret) = list_elem_suffix(method, elem)?;
+    Ok(call_ret(
+        lowerer,
+        &format!("zap_math_{method}_{suffix}"),
+        vec![v],
+        ret,
+        false,
+    ))
+}
+
+/// A single-list reduction over a `float64` list (`fsum`): the list handle is a
+/// `ptr`, the result `ret`.
+fn reduce_list(
+    lowerer: &mut FnLower,
+    func: &str,
+    args: &[ast::Arg],
+    ret: Ty,
+    throwing: bool,
+) -> Result<(Value, Ty), LowerError> {
+    let arg = args
+        .first()
+        .ok_or_else(|| err(format!("{func} missing its list argument")))?;
+    let (v, _t) = lowerer.expr(&arg.value)?;
+    Ok(call_ret(lowerer, func, vec![v], ret, throwing))
+}
+
+/// Two-list reductions. `dist(p, q)` -> `float64` (both lists are `float64`);
+/// `sumprod(p, q)` is element-typed from the first list. Both raise on a length
+/// mismatch, so they route through `throwing_call`.
+fn reduce_two(
+    lowerer: &mut FnLower,
+    method: &str,
+    args: &[ast::Arg],
+) -> Result<(Value, Ty), LowerError> {
+    let (p, pt) = lowerer.expr(&args[0].value)?;
+    let (q, _qt) = lowerer.expr(&args[1].value)?;
+    if method == "dist" {
+        return Ok(call_ret(
+            lowerer,
+            "zap_math_dist",
+            vec![p, q],
+            Ty::F64,
+            true,
+        ));
+    }
+    // sumprod — element-typed from the first list's element kind.
+    let Ty::List(elem) = pt else {
+        return Err(err(format!(
+            "math.{method}() expects list arguments, found {pt:?}"
+        )));
+    };
+    let (suffix, ret) = list_elem_suffix(method, elem)?;
+    Ok(call_ret(
+        lowerer,
+        &format!("zap_math_sumprod_{suffix}"),
+        vec![p, q],
+        ret,
+        true,
+    ))
 }

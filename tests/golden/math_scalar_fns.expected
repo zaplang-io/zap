@@ -1,0 +1,39 @@
+gcd 0 4 4 1
+lcm 12 0 42
+fact 1 120 2432902008176640000
+comb 10 2598960 1 1 1 0
+perm 20 1 120 0
+isqrt 0 4 4 9
+modf 0.5 3.0
+frexp 0.5 4
+ldexp 8.0
+remainder 1.0 -1.0
+copysign -3.0 3.0 -1.0
+nextafter 1.0000000000000002
+exp2 1024.0
+expm1 0.0
+log1p 0.0
+prod_i 24
+prod_f 5.0
+fsum_tenths 1.0
+fsum_cancel 0.0
+dist 5.0
+sumprod_i 32
+sumprod_f 11.0
+degrees_ok
+radians_ok
+cbrt_ok
+hyper_ok
+hyper_inv_ok
+gamma_ok
+erf_ok
+isfinite_ok
+isclose_basic_ok
+isclose_tol_ok
+isclose_special_ok
+factorial_neg
+factorial_overflow
+isqrt_neg
+comb_neg
+dist_mismatch
+isclose_negtol

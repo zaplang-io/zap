@@ -28,6 +28,8 @@ fn seam_default_arg(def: SeamDefault, span: Span) -> Arg {
         // `{}` — an empty dict display; infers to `dict[?, ?]` and lowers to an
         // empty dict (the runtime reads it as "no caller headers").
         SeamDefault::EmptyDict => Expr::Dict(Vec::new(), span),
+        // A float literal (its raw lexeme), e.g. `math.isclose`'s `rel_tol=1e-9`.
+        SeamDefault::Float(lexeme) => Expr::Float(lexeme.to_string(), span),
     };
     Arg {
         name: None,

@@ -43,6 +43,372 @@ double zap_math_fma(double x, double y, double z) { return fma(x, y, z); }
 int64_t zap_math_isnan(double x) { return isnan(x) ? 1 : 0; }
 int64_t zap_math_isinf(double x) { return isinf(x) ? 1 : 0; }
 
+/* --- math: #973 everyday scalar additions ---------------------------------
+ * Hyperbolics / accurate variants / special functions are thin libm wrappers;
+ * like the elementary set above, a domain error yields NaN/inf (libm) rather
+ * than raising — consistent with `sqrt(-1.0)` etc. The integer-math group and
+ * the list reductions *do* raise catchable errors (routed via `throwing_call`
+ * in lowering): a ValueError for a domain violation, an ArithmeticError for a
+ * result that overflows the 64-bit integer range. (ticket #973, D-0234.) */
+
+/* Angles. Multiply by the exact 180/pi (and its reciprocal) rather than call
+ * out to libm, so `degrees(radians(x))` round-trips and `degrees(pi)` is 180. */
+double zap_math_degrees(double x) { return x * (180.0 / 3.14159265358979323846); }
+double zap_math_radians(double x) { return x * (3.14159265358979323846 / 180.0); }
+
+/* Hyperbolic. */
+double zap_math_sinh(double x) { return sinh(x); }
+double zap_math_cosh(double x) { return cosh(x); }
+double zap_math_tanh(double x) { return tanh(x); }
+double zap_math_asinh(double x) { return asinh(x); }
+double zap_math_acosh(double x) { return acosh(x); }
+double zap_math_atanh(double x) { return atanh(x); }
+
+/* Accurate variants (small-argument-stable exp/log, base-2 exp, cube root). */
+double zap_math_expm1(double x) { return expm1(x); }
+double zap_math_log1p(double x) { return log1p(x); }
+double zap_math_exp2(double x) { return exp2(x); }
+double zap_math_cbrt(double x) { return cbrt(x); }
+
+/* Special functions (#973): true gamma, ln|gamma|, error function + complement.
+ * libm's `lgamma` returns ln of the absolute value of gamma (the `signgam`
+ * global holds the sign, which `math.lgamma` does not expose, matching CPython). */
+double zap_math_gamma(double x) { return tgamma(x); }
+double zap_math_lgamma(double x) { return lgamma(x); }
+double zap_math_erf(double x) { return erf(x); }
+double zap_math_erfc(double x) { return erfc(x); }
+
+/* Classification / sign / adjacency. */
+int64_t zap_math_isfinite(double x) { return isfinite(x) ? 1 : 0; }
+double zap_math_copysign(double x, double y) { return copysign(x, y); }
+double zap_math_nextafter(double x, double y) { return nextafter(x, y); }
+double zap_math_remainder(double x, double y) { return remainder(x, y); }
+
+/* ldexp(x, e) = x * 2**e. The exponent is a Zap `int`; clamp to the C `int`
+ * range so an out-of-range magnitude saturates to 0/inf (as libm already would
+ * for any representable but extreme exponent) instead of invoking UB on the
+ * narrowing conversion. */
+double zap_math_ldexp(double x, int64_t e) {
+    if (e > 2147483647LL) {
+        e = 2147483647LL;
+    } else if (e < -2147483648LL) {
+        e = -2147483648LL;
+    }
+    return ldexp(x, (int)e);
+}
+
+/* modf(x) -> (frac, int_part); frexp(x) -> (mantissa, exponent). Each component
+ * is a separate wrapper so lowering can build the tuple from two scalar calls
+ * (the os.path_split pattern), with no out-parameter ABI. */
+double zap_math_modf_frac(double x) {
+    double ip;
+    return modf(x, &ip);
+}
+double zap_math_modf_ipart(double x) {
+    double ip;
+    (void)modf(x, &ip);
+    return ip;
+}
+double zap_math_frexp_mant(double x) {
+    int e;
+    return frexp(x, &e);
+}
+int64_t zap_math_frexp_exp(double x) {
+    int e;
+    (void)frexp(x, &e);
+    return (int64_t)e;
+}
+
+/* isclose(a, b, rel_tol, abs_tol) — CPython `math.isclose` semantics:
+ * |a-b| <= max(rel_tol * max(|a|, |b|), abs_tol). Identical values (incl. two
+ * equal infinities) are always close; a lone infinity never is; a NaN operand
+ * is never close (the `<=` is false). A negative tolerance raises ValueError. */
+int64_t zap_math_isclose(double a, double b, double rel_tol, double abs_tol) {
+    if (rel_tol < 0.0 || abs_tol < 0.0) {
+        const char *m = "math.isclose(): tolerances must be non-negative";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
+    if (a == b) {
+        return 1; /* exact equality, including +inf==+inf and -inf==-inf */
+    }
+    if (isinf(a) || isinf(b)) {
+        return 0; /* a != b with an infinity involved is never close */
+    }
+    double diff = fabs(b - a);
+    double tol = rel_tol * fmax(fabs(a), fabs(b));
+    if (tol < abs_tol) {
+        tol = abs_tol;
+    }
+    return (diff <= tol) ? 1 : 0; /* a NaN operand makes diff NaN -> false -> 0 */
+}
+
+/* Integer-math helpers. gcd over unsigned words (INT64_MIN-safe magnitudes). */
+static uint64_t zap_math_abs_u64(int64_t v) {
+    return (v < 0) ? (~(uint64_t)v + 1ULL) : (uint64_t)v; /* two's-complement |v| */
+}
+static uint64_t zap_math_gcd_u64(uint64_t a, uint64_t b) {
+    while (b != 0ULL) {
+        uint64_t t = a % b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
+/* Raise the shared "result does not fit in a 64-bit integer" ArithmeticError. */
+__attribute__((noreturn)) static void zap_math_int_overflow(const char *who) {
+    char buf[96];
+    int n = snprintf(buf, sizeof buf, "%s: result exceeds the 64-bit integer range", who);
+    if (n < 0) {
+        n = 0;
+    }
+    zap_panic_typed(ZAP_EXC_ARITHMETIC_ERROR, zap_str_new(buf, (int64_t)n));
+    abort(); /* unreachable: zap_panic_typed unwinds */
+}
+
+/* gcd(a, b): greatest common divisor of the magnitudes, always >= 0 (Python
+ * `math.gcd`). gcd(0, 0) == 0. Total — never raises. (The sole unrepresentable
+ * result, gcd(INT64_MIN, 0) == 2**63, wraps to INT64_MIN; documented.) */
+int64_t zap_math_gcd(int64_t a, int64_t b) {
+    return (int64_t)zap_math_gcd_u64(zap_math_abs_u64(a), zap_math_abs_u64(b));
+}
+
+/* lcm(a, b): least common multiple of the magnitudes, always >= 0. lcm with a
+ * zero operand is 0 (Python). Raises ArithmeticError if the result overflows. */
+int64_t zap_math_lcm(int64_t a, int64_t b) {
+    if (a == 0 || b == 0) {
+        return 0;
+    }
+    uint64_t x = zap_math_abs_u64(a);
+    uint64_t y = zap_math_abs_u64(b);
+    uint64_t q = x / zap_math_gcd_u64(x, y); /* x / gcd, exact */
+    if (q > (uint64_t)INT64_MAX / y) {
+        zap_math_int_overflow("math.lcm()");
+    }
+    return (int64_t)(q * y);
+}
+
+/* factorial(n): n! for n >= 0. n < 0 raises ValueError; n > 20 overflows the
+ * 64-bit range (21! > INT64_MAX) and raises ArithmeticError. */
+int64_t zap_math_factorial(int64_t n) {
+    if (n < 0) {
+        const char *m = "math.factorial(): argument must be non-negative";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
+    if (n > 20) {
+        zap_math_int_overflow("math.factorial()");
+    }
+    int64_t r = 1;
+    for (int64_t i = 2; i <= n; i++) {
+        r *= i; /* exact: 20! fits */
+    }
+    return r;
+}
+
+/* comb(n, k): binomial coefficient "n choose k". n, k >= 0 (else ValueError);
+ * k > n yields 0. Exact and overflow-checked in pure uint64: each step keeps
+ * `r == C(n, i+1)` by multiplying by (n-i) and dividing by (i+1), reducing the
+ * two by their gcd first so `r` never exceeds the running coefficient (hence no
+ * spurious overflow when the final value fits). ArithmeticError on true
+ * overflow. */
+int64_t zap_math_comb(int64_t n, int64_t k) {
+    if (n < 0 || k < 0) {
+        const char *m = "math.comb(): n and k must be non-negative";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
+    if (k > n) {
+        return 0;
+    }
+    if (k > n - k) {
+        k = n - k; /* symmetry: C(n, k) == C(n, n-k); minimize the loop */
+    }
+    uint64_t r = 1ULL;
+    for (int64_t i = 0; i < k; i++) {
+        uint64_t a = (uint64_t)(n - i); /* n-i > 0 for i < k <= n */
+        uint64_t b = (uint64_t)(i + 1);
+        uint64_t g = zap_math_gcd_u64(a, b);
+        a /= g;
+        b /= g;
+        r /= b; /* exact: with gcd(a,b)==1 and b | r*a, b divides r */
+        if (a != 0ULL && r > (uint64_t)INT64_MAX / a) {
+            zap_math_int_overflow("math.comb()");
+        }
+        r *= a; /* r == C(n, i+1) <= final result, so this never overflows u64 */
+    }
+    return (int64_t)r;
+}
+
+/* perm(n, k): falling factorial n*(n-1)*...*(n-k+1) = n! / (n-k)!. n, k >= 0
+ * (else ValueError); k > n yields 0. Overflow-checked -> ArithmeticError. */
+int64_t zap_math_perm(int64_t n, int64_t k) {
+    if (n < 0 || k < 0) {
+        const char *m = "math.perm(): n and k must be non-negative";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
+    if (k > n) {
+        return 0;
+    }
+    uint64_t r = 1ULL;
+    for (int64_t i = 0; i < k; i++) {
+        uint64_t a = (uint64_t)(n - i);
+        if (a != 0ULL && r > (uint64_t)INT64_MAX / a) {
+            zap_math_int_overflow("math.perm()");
+        }
+        r *= a;
+    }
+    return (int64_t)r;
+}
+
+/* isqrt(n): floor(sqrt(n)) for n >= 0 (n < 0 raises ValueError). The double
+ * seed is corrected by at most a couple of integer steps, so the result is
+ * exact across the whole 64-bit range (all divisions avoid r*r overflow). */
+int64_t zap_math_isqrt(int64_t n) {
+    if (n < 0) {
+        const char *m = "math.isqrt(): argument must be non-negative";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
+    uint64_t x = (uint64_t)n;
+    if (x == 0ULL) {
+        return 0;
+    }
+    uint64_t r = (uint64_t)sqrt((double)x);
+    if (r == 0ULL) {
+        r = 1ULL; /* guard the x/r divisions below */
+    }
+    while (r > x / r) {
+        r--; /* r*r > x: shrink until r*r <= x (division avoids overflow) */
+    }
+    while ((r + 1ULL) <= x / (r + 1ULL)) {
+        r++; /* (r+1)^2 <= x: grow to the true floor */
+    }
+    return (int64_t)r;
+}
+
+/* List reductions over a ZapList[T] (element word count = list->len). The int
+ * forms wrap on overflow, matching the `*`/`+` operators on `int`; the float
+ * forms read each word back as a double. */
+int64_t zap_math_prod_i64(void *l) {
+    ZapList *list = (ZapList *)l;
+    int64_t r = 1;
+    for (int64_t i = 0; i < list->len; i++) {
+        r *= list->data[i]; /* two's-complement wrap, as for `int` `*` */
+    }
+    return r;
+}
+double zap_math_prod_f64(void *l) {
+    ZapList *list = (ZapList *)l;
+    double r = 1.0;
+    for (int64_t i = 0; i < list->len; i++) {
+        r *= zap_f64_from_bits(list->data[i]);
+    }
+    return r;
+}
+
+/* fsum(xs): Shewchuk's exact floating-point summation (CPython `math.fsum`).
+ * Maintains a set of non-overlapping partial sums whose exact total equals the
+ * running sum; the final add of the partials rounds once. Defeats the rounding
+ * error a naive left-to-right sum accumulates (e.g. [0.1]*10 -> exactly 1.0). */
+double zap_math_fsum(void *l) {
+    ZapList *list = (ZapList *)l;
+    double stackbuf[64];
+    double *partials = stackbuf;
+    int cap = 64;
+    int np = 0;
+    int on_heap = 0;
+    for (int64_t idx = 0; idx < list->len; idx++) {
+        double x = zap_f64_from_bits(list->data[idx]);
+        int i = 0;
+        for (int j = 0; j < np; j++) {
+            double y = partials[j];
+            if (fabs(x) < fabs(y)) {
+                double t = x;
+                x = y;
+                y = t;
+            }
+            double hi = x + y;
+            double lo = y - (hi - x); /* exact round-off of x + y */
+            if (lo != 0.0) {
+                partials[i++] = lo;
+            }
+            x = hi;
+        }
+        np = i;
+        if (np + 1 > cap) {
+            int ncap = cap * 2;
+            double *nb = (double *)malloc((size_t)ncap * sizeof(double));
+            if (nb == NULL) {
+                if (on_heap) {
+                    free(partials);
+                }
+                const char *m = "math.fsum(): out of memory";
+                zap_panic_typed(ZAP_EXC_RUNTIME_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+            }
+            memcpy(nb, partials, (size_t)np * sizeof(double));
+            if (on_heap) {
+                free(partials);
+            }
+            partials = nb;
+            cap = ncap;
+            on_heap = 1;
+        }
+        partials[np++] = x;
+    }
+    double total = 0.0;
+    for (int j = 0; j < np; j++) {
+        total += partials[j];
+    }
+    if (on_heap) {
+        free(partials);
+    }
+    return total;
+}
+
+/* dist(p, q): Euclidean distance sqrt(sum((p_i - q_i)**2)) over two equal-length
+ * float lists. A length mismatch raises ValueError (Python). */
+double zap_math_dist(void *pp, void *qq) {
+    ZapList *p = (ZapList *)pp;
+    ZapList *q = (ZapList *)qq;
+    if (p->len != q->len) {
+        const char *m = "math.dist(): both points must have the same number of dimensions";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
+    double s = 0.0;
+    for (int64_t i = 0; i < p->len; i++) {
+        double d = zap_f64_from_bits(p->data[i]) - zap_f64_from_bits(q->data[i]);
+        s += d * d;
+    }
+    return sqrt(s);
+}
+
+/* sumprod(p, q): sum of the element-wise products of two equal-length lists.
+ * A length mismatch raises ValueError. The int form wraps on overflow. */
+int64_t zap_math_sumprod_i64(void *pp, void *qq) {
+    ZapList *p = (ZapList *)pp;
+    ZapList *q = (ZapList *)qq;
+    if (p->len != q->len) {
+        const char *m = "math.sumprod(): the sequences must have the same length";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
+    int64_t s = 0;
+    for (int64_t i = 0; i < p->len; i++) {
+        s += p->data[i] * q->data[i]; /* two's-complement wrap */
+    }
+    return s;
+}
+double zap_math_sumprod_f64(void *pp, void *qq) {
+    ZapList *p = (ZapList *)pp;
+    ZapList *q = (ZapList *)qq;
+    if (p->len != q->len) {
+        const char *m = "math.sumprod(): the sequences must have the same length";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
+    double s = 0.0;
+    for (int64_t i = 0; i < p->len; i++) {
+        s += zap_f64_from_bits(p->data[i]) * zap_f64_from_bits(q->data[i]);
+    }
+    return s;
+}
+
 /* --- random: xoshiro256** -------------------------------------------------- */
 static uint64_t zap_rng_s[4];
 static int zap_rng_seeded = 0;
