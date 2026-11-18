@@ -962,6 +962,28 @@ fn io_lines_and_fs_open_reader_unknown_keyword_rejected() {
     );
 }
 
+// Directory traversal (#1032, D-0224): scandir / walk / copytree.
+#[test]
+fn fs_traversal_keyword_and_positional() {
+    assert_ok(&prog("    auto es = fs.scandir(path=\"/tmp/x\")\n"));
+    assert_ok(&prog("    auto es = fs.scandir(\"/tmp/x\")\n"));
+    assert_ok(&prog("    auto w = fs.walk(root=\"/tmp/x\")\n"));
+    assert_ok(&prog("    fs.copytree(src=\"/tmp/a\", dst=\"/tmp/b\")\n"));
+    assert_ok(&prog("    fs.copytree(dst=\"/tmp/b\", src=\"/tmp/a\")\n"));
+}
+
+#[test]
+fn fs_traversal_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto es = fs.scandir(dir=\"/tmp/x\")\n"),
+        "ZAP4023",
+    );
+    assert_code(
+        &prog("    fs.copytree(from=\"/tmp/a\", to=\"/tmp/b\")\n"),
+        "ZAP4023",
+    );
+}
+
 #[test]
 fn sys_write_keyword_and_positional() {
     // Standard-stream write (#1035, D-0217). stdin/stdout/stderr take no args.

@@ -17274,6 +17274,233 @@ impl<'a> FnLower<'a> {
         (out, Ty::List(out_elem))
     }
 
+    /// Lower `fs.scandir(path)` to a `list[DirEntry]` (#1032, D-0224). The runtime
+    /// `zap_fs_scandir` materialises the directory into a handle; this enumerates
+    /// it with a count + indexed getters (the `req_headers` pattern), building one
+    /// prelude `DirEntry { name, is_dir, is_file }` per entry. The `is_*` getters
+    /// return a C `int64` 0/1, normalised to `i1` for the `bool` fields.
+    fn lower_fs_scandir(&mut self, path: Value) -> (Value, Ty) {
+        // Materialise the directory into a handle first (raises on a bad path),
+        // then enumerate it — the arg is the path, not the handle.
+        let handle = self.new_value(Ty::Ptr);
+        self.throwing_call(Some(handle), "zap_fs_scandir", vec![path]);
+        let de_sid = *self
+            .ctx
+            .ids
+            .get("DirEntry")
+            .expect("DirEntry struct unavailable (built-in prelude missing)");
+        let out_elem = Elem::Struct(de_sid);
+        let out = self.new_value(Ty::List(out_elem));
+        self.emit(Inst::Call {
+            dest: Some(out),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        let count = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(count),
+            func: "zap_fs_scandir_count".to_string(),
+            args: vec![handle],
+        });
+        let idx = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let end_bb = self.new_block();
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let c = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: c,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: count,
+        });
+        self.set_term(Term::BrIf {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let name = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(name),
+            func: "zap_fs_scandir_name".to_string(),
+            args: vec![handle, i],
+        });
+        let is_dir = self.scandir_bool("zap_fs_scandir_is_dir", handle, i);
+        let is_file = self.scandir_bool("zap_fs_scandir_is_file", handle, i);
+        let de = self.new_value(Ty::Struct(de_sid));
+        self.emit(Inst::StructNew {
+            dest: de,
+            sid: de_sid,
+        });
+        self.emit(Inst::FieldSet {
+            base: de,
+            sid: de_sid,
+            idx: 0,
+            val: name,
+        });
+        self.emit(Inst::FieldSet {
+            base: de,
+            sid: de_sid,
+            idx: 1,
+            val: is_dir,
+        });
+        self.emit(Inst::FieldSet {
+            base: de,
+            sid: de_sid,
+            idx: 2,
+            val: is_file,
+        });
+        self.emit(Inst::Call {
+            dest: None,
+            func: "zap_list_push_ptr".to_string(),
+            args: vec![out, de],
+        });
+        let next = self.new_value(Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: i,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+        self.position(end_bb);
+        (out, Ty::List(out_elem))
+    }
+
+    /// Call an infallible `int64` 0/1 scandir getter and normalise it to `i1`.
+    fn scandir_bool(&mut self, func: &str, handle: Value, i: Value) -> Value {
+        let word = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(word),
+            func: func.to_string(),
+            args: vec![handle, i],
+        });
+        let zero = self.iconst(Ty::I64, 0);
+        let b = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: b,
+            pred: CmpPred::Ne,
+            lhs: word,
+            rhs: zero,
+        });
+        b
+    }
+
+    /// Lower `fs.walk(root)` to a `list[(str, list[str], list[str])]` (#1032,
+    /// D-0224). `zap_fs_walk` materialises the whole tree into a handle; this
+    /// enumerates it with a count + indexed getters, building one
+    /// `(dirpath, dirs, files)` tuple per visited directory. `dirs`/`files` are
+    /// `list[str]` the runtime already built, handed back as pointers.
+    fn lower_fs_walk(&mut self, root: Value) -> (Value, Ty) {
+        // Materialise the whole tree into a handle first (raises on an unreadable
+        // root), then enumerate it — the arg is the root path, not the handle.
+        let handle = self.new_value(Ty::Ptr);
+        self.throwing_call(Some(handle), "zap_fs_walk", vec![root]);
+        // Intern the tuple with the REAL field types — `(str, list[str],
+        // list[str])` — not three bare `Ptr`s. `bind_tuple_loop_target` types the
+        // destructured `dirs`/`files` from these field types, so a bare `Ptr`
+        // would make the inner `for d in dirs` iterate a string instead of the
+        // list (#1032).
+        let str_list = Ty::List(Elem::Ptr);
+        let tuple_sid = self
+            .ctx
+            .tuples
+            .borrow_mut()
+            .intern(vec![Ty::Ptr, str_list, str_list]);
+        let out_elem = Elem::Struct(tuple_sid);
+        let out = self.new_value(Ty::List(out_elem));
+        self.emit(Inst::Call {
+            dest: Some(out),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        let count = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(count),
+            func: "zap_fs_walk_count".to_string(),
+            args: vec![handle],
+        });
+        let idx = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let end_bb = self.new_block();
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let c = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: c,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: count,
+        });
+        self.set_term(Term::BrIf {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let dirpath = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(dirpath),
+            func: "zap_fs_walk_dirpath".to_string(),
+            args: vec![handle, i],
+        });
+        let dirs = self.new_value(Ty::List(Elem::Ptr));
+        self.emit(Inst::Call {
+            dest: Some(dirs),
+            func: "zap_fs_walk_dirs".to_string(),
+            args: vec![handle, i],
+        });
+        let files = self.new_value(Ty::List(Elem::Ptr));
+        self.emit(Inst::Call {
+            dest: Some(files),
+            func: "zap_fs_walk_files".to_string(),
+            args: vec![handle, i],
+        });
+        let tup = self.new_value(Ty::Struct(tuple_sid));
+        self.emit(Inst::StructNew {
+            dest: tup,
+            sid: tuple_sid,
+        });
+        for (fidx, val) in [(0u32, dirpath), (1, dirs), (2, files)] {
+            self.emit(Inst::FieldSet {
+                base: tup,
+                sid: tuple_sid,
+                idx: fidx,
+                val,
+            });
+        }
+        self.emit(Inst::Call {
+            dest: None,
+            func: "zap_list_push_ptr".to_string(),
+            args: vec![out, tup],
+        });
+        let next = self.new_value(Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: i,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+        self.position(end_bb);
+        (out, Ty::List(out_elem))
+    }
+
     /// Lower `heap[T]()` / `heap[T](cmp="max")` (D-0057). The element kind is the
     /// subscript; the only argument is the keyword `cmp` selecting direction
     /// (`"min"` is the default min-heap, `"max"` a max-heap). Lowers to a

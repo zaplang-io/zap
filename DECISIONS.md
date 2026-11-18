@@ -11223,3 +11223,58 @@ output); sema iterability + arity tests; seam-kwargs binding for the new entries
 Relates to [[D-0056]] / #97 (the io/fs seams), [[D-0212]] (#969 buffered reader),
 D-0048 (the iterator protocol), [[D-0213]] (seam rows), epic #966, and Discussion
 #965 (gap #8). The same wrapper pattern unblocks `fs.walk`/`scandir` (#1032).
+
+## D-0224 — stdlib fs: directory traversal — scandir / walk / copytree (#1032 / epic #966)
+
+**Context.** `fs` had only single-level `fs.listdir` (#968, D-0211) — no recursive
+walk, no `scandir` (entries with their type, without a stat-per-entry), no
+recursive copy. Build tools, installers and bundlers need all three (#965 gap).
+
+**Decision.** Add three `fs` entries:
+- `fs.scandir(path) -> list[DirEntry]` — one directory level; each entry is the
+  prelude reference struct `DirEntry { str name; bool is_dir; bool is_file }`.
+- `fs.walk(root) -> list[(str, list[str], list[str])]` — os.walk-shaped,
+  top-down: `for (dirpath, dirs, files) in fs.walk(root)`.
+- `fs.copytree(src, dst)` — recursive directory copy (shutil.copytree), merging
+  into an existing `dst` (`dirs_exist_ok=True`), reusing the #968 file-copy +
+  `mkdir` primitives.
+
+**walk/scandir are eager lists, not lazy iterators.** `fs.walk` returns a
+materialised `list` of os.walk tuples rather than a lazy generator. `for
+(dirpath, dirs, files) in fs.walk(root)` then iterates a **list of tuples**,
+which already supports tuple-destructuring targets — so no new core iteration
+machinery was needed (the #1031 `LineReader` enabler is unrelated here). The cost
+is that the whole tree is held in memory; a lazy walk is a possible future
+refinement. The runtime builds the handle; the lowering enumerates it with a
+count + indexed getters into the `list` (the `http.req_headers` pattern).
+`DirEntry` is a **reference** struct so a `list[DirEntry]` holds heap pointers,
+built one `StructNew` + `FieldSet` per entry — identical to how a tuple element
+is built, so no value-struct-in-list question arises.
+
+**Entries are sorted; symlinks followed for typing.** `scandir`/`walk` return
+entries **sorted by name** (Go `filepath.WalkDir` order), a deliberate departure
+from CPython's unordered `os.scandir`/`os.walk`, so output is deterministic
+across filesystems (and goldens are stable). Entry type comes from `readdir`'s
+`d_type` with a `stat` fallback on `DT_UNKNOWN`/`DT_LNK` (so `is_dir` follows a
+symlink, like CPython's `DirEntry` default); `copytree` classifies with `stat`
+and copies a symlink as its target's content (the #968 file-copy policy). An
+unreadable **sub**directory in `walk` is skipped silently (os.walk's default
+`onerror`); an unreadable **root** raises, as does a bad `scandir`/`copytree`
+path.
+
+**GC.** The handles (`ZapScan`, `ZapWalk`) are precise-GC objects over the
+already-built `ZapList`s; the lists are assembled in the runtime C call with no
+intervening safepoint (filesystem syscalls are not netpoller parks, and
+allocation never collects mid-call), exactly as `zap_os_listdir` builds its
+`list[str]`.
+
+**Tests.** Golden `fs_traversal` (mixed directory → sorted `scandir` type flags;
+top-down `walk` over a nested tree incl. an empty directory; `copytree` into a
+new then an existing/merged dst; deterministic — the temp path is never printed;
+cleanup via `rmtree`); sema field-access / tuple-destructuring / arity tests;
+seam-kwargs binding (D-0213 rows). Symlink creation has no `fs` surface yet, so
+the symlink policy is documented rather than golden-tested.
+
+Relates to [[D-0056]] / #97 (the fs seam), [[D-0211]] (#968 filesystem gaps —
+`fs.copy`/`makedirs`/`rmtree`, the `Stat` struct), [[D-0213]] (seam rows), epic
+#966, and Discussion #965.

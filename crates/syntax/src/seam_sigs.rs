@@ -224,6 +224,9 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     // Line-oriented input (#969, D-0212): whole-file read split into lines.
     ("fs", "lines", &["path"]),
     ("fs", "open_reader", &["path"]),
+    ("fs", "scandir", &["path"]),
+    ("fs", "walk", &["root"]),
+    ("fs", "copytree", &["src", "dst"]),
     // Path matching (#1033, D-0216).
     ("fs", "fnmatch", &["name", "pattern"]),
     ("fs", "glob", &["root", "pattern"]),

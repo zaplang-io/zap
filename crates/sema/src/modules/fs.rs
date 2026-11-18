@@ -45,6 +45,30 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "fs", method, args, 1, span);
             Ty::Named("LineReader".to_string())
         }
+        // Directory traversal (#1032, D-0224).
+        // fs.scandir(path) -> list[DirEntry]: one directory level, each entry a
+        // prelude `DirEntry` (name + is_dir/is_file) typed from readdir d_type.
+        "scandir" => {
+            expect_argc(checker, "fs", method, args, 1, span);
+            Ty::List(Box::new(Ty::Named("DirEntry".to_string())))
+        }
+        // fs.walk(root) -> list[(dirpath, dirs, files)]: os.walk-shaped, top-down,
+        // `for (dirpath, dirs, files) in fs.walk(root)`. dirs/files are the
+        // entry names at `dirpath` (sorted); the whole tree is materialised.
+        "walk" => {
+            expect_argc(checker, "fs", method, args, 1, span);
+            Ty::List(Box::new(Ty::Tuple(vec![
+                Ty::Str,
+                Ty::List(Box::new(Ty::Str)),
+                Ty::List(Box::new(Ty::Str)),
+            ])))
+        }
+        // fs.copytree(src, dst) -> unit: recursive directory copy (shutil.copytree,
+        // merging into an existing dst). Reuses the #968 file-copy primitives.
+        "copytree" => {
+            expect_argc(checker, "fs", method, args, 2, span);
+            Ty::Unit
+        }
         // Path matching (#1033, D-0216).
         // fs.fnmatch(name, pattern) -> bool: shell-glob string match.
         "fnmatch" => {

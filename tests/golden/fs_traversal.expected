@@ -1,0 +1,18 @@
+scandir:
+a.txt file
+b.txt file
+empty dir
+sub dir
+walk:
+dirs=2 files=2
+  d:empty
+  d:sub
+  f:a.txt
+  f:b.txt
+dirs=0 files=0
+dirs=0 files=1
+  f:c.txt
+copytree-new:
+c.txt
+copytree-existing:
+1

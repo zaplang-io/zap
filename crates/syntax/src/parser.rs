@@ -185,6 +185,16 @@ value struct Stat:
     bool is_file
     bool is_symlink
 
+# One entry from fs.scandir (#1032, D-0224): the entry name plus its type, taken
+# from readdir's d_type where available (no per-entry stat). A reference struct
+# (a heap object), so a `list[DirEntry]` holds pointers — built element by element
+# in the lowering (crates/ir/src/lower.rs), the `http.req_headers` pattern. Field
+# order matches that lowering.
+struct DirEntry:
+    str name
+    bool is_dir
+    bool is_file
+
 enum Optional[T]:
     Some(T value)
     None
@@ -1303,6 +1313,10 @@ fn references_prelude(module: &Module) -> bool {
         // `fs.read_file`-only program is harmless (the unused struct emits no code).
         "\"Stat\"",
         "\"fs\"",
+        // The `fs.scandir` directory entry (#1032, D-0224): the `DirEntry` value
+        // struct ships in the prelude, injected for any program that names the
+        // struct (`fs` already covers `fs.scandir`/`fs.walk`/`fs.copytree`).
+        "\"DirEntry\"",
         // The `io.lines(reader)` / `fs.open_reader(path)` line iterator returns
         // the `LineReader` struct (#1031, D-0223): injected for any program that
         // names the `io` module, `open_reader`, or the struct (`fs` already
