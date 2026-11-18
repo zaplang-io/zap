@@ -1197,6 +1197,67 @@ mod tests {
     }
 
     #[test]
+    fn lower_heap_heapify_from_list() {
+        // `heap[T](xs)` (#978, D-0236) lowers to the O(n) `zap_heap_from_list`
+        // builder instead of an empty `zap_heap_new` + N pushes.
+        let m = lower_ok(
+            "def main():\n    \
+                 auto h = heap[int64]([5, 1, 3])\n    \
+                 print(h.pop())\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("call @zap_heap_from_list"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_heap_replace_and_pushpop() {
+        // heapreplace / heappushpop lower to the element-kind-suffixed entry
+        // points (#978, D-0236).
+        let m = lower_ok(
+            "def main():\n    \
+                 auto h = heap[int64]([1, 2, 3])\n    \
+                 print(h.replace(5))\n    \
+                 print(h.pushpop(0))\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("call @zap_heap_replace_i64"), "text:\n{text}");
+        assert!(text.contains("call @zap_heap_pushpop_i64"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_heap_nlargest_nsmallest_no_key() {
+        // `heap.nlargest`/`nsmallest` without a key lower to a single
+        // `zap_heap_topk` (#978, D-0236).
+        let m = lower_ok(
+            "def main():\n    \
+                 auto xs = [5, 1, 3, 2, 4]\n    \
+                 print(heap.nlargest(2, xs))\n    \
+                 print(heap.nsmallest(2, xs))\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("call @zap_heap_topk"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_heap_nlargest_with_key() {
+        // With a `key=` selector the lowering builds a parallel key list (calling
+        // the selector closure per element) and orders via `zap_heap_topk_keyed`.
+        let m = lower_ok(
+            "def negate(int64 x) -> int64:\n    \
+                 return -x\n\n\
+             def main():\n    \
+                 auto xs = [5, 1, 3, 2, 4]\n    \
+                 print(heap.nlargest(2, xs, key=negate))\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("call @zap_heap_topk_keyed"), "text:\n{text}");
+        assert!(
+            text.contains("callclosure") || text.contains("call_closure"),
+            "key= must invoke the selector through a closure call:\n{text}"
+        );
+    }
+
+    #[test]
     fn heap_of_tier1_enum_selects_the_i64_comparator_not_str() {
         // I#818: a `heap[Color]` (tier-1 enum) is an `i64`-word heap — the enum is
         // its backing discriminant — so `zap_heap_new(kind, dir)` must pass

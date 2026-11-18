@@ -2535,6 +2535,18 @@ fn deque_elem_tag(elem: Elem) -> i64 {
     }
 }
 
+/// Whether the heap can impose a total order on this element kind at runtime
+/// (ticket #978): an `i64` word (integer/bool/char/enum), an `f64` (total-order
+/// comparator), or a `str` (byte-wise). A struct, nested collection, or complex
+/// element has no runtime ordering — `heap.nlargest`/`nsmallest` must be given a
+/// `key=` that maps it to an orderable key, and `heap[T]` rejects it outright.
+fn heap_orderable(elem: Elem) -> bool {
+    matches!(
+        elem,
+        Elem::I64 | Elem::Bool | Elem::Char | Elem::Enum(_) | Elem::F64 | Elem::Ptr
+    )
+}
+
 /// The `OSET_ELEM_*` runtime tag for an oset element kind (#983): 0 = i64 word,
 /// 1 = pointer (str). v1 admits only these (floats are not `Hashable`; structs
 /// are a follow-up), enforced by [`FnLower::reject_nonprimitive_elem`].
@@ -17647,7 +17659,10 @@ impl<'a> FnLower<'a> {
         // follow-up.)
         let elem = heap_elem_of(&expr_to_type(elem_expr)?, &self.ctx.tyenv())?;
         let mut dir = 0i64; // 0 = min-heap (default), 1 = max-heap
-        for a in args {
+                            // A single leading positional argument is the initial items list to
+                            // heapify in O(n) (#978, D-0236): `heap[T](xs)` / `heap[T](xs, cmp=...)`.
+        let mut items: Option<&Expr> = None;
+        for (i, a) in args.iter().enumerate() {
             match a.name.as_deref() {
                 Some("cmp") => {
                     let Expr::Str { value, .. } = &a.value else {
@@ -17670,9 +17685,11 @@ impl<'a> FnLower<'a> {
                         "heap[T](...) has no keyword argument '{other}' (only 'cmp')"
                     )))
                 }
+                None if i == 0 && items.is_none() => items = Some(&a.value),
                 None => {
                     return Err(err(
-                        "heap[T](...) takes only the keyword argument 'cmp' (e.g. cmp=\"max\")",
+                        "heap[T](...) takes at most one positional argument (the items \
+                         list to heapify) plus the keyword 'cmp' (e.g. cmp=\"max\")",
                     ))
                 }
             }
@@ -17695,6 +17712,32 @@ impl<'a> FnLower<'a> {
             },
         );
         let d = self.iconst(Ty::I64, dir);
+        // Heapify form `heap[T](xs)`: build the heap from the list's element
+        // words in O(n) via `zap_heap_from_list` (Floyd), instead of an empty
+        // `zap_heap_new` + N sift-up pushes. The element word representation must
+        // match (sema has already checked the list is `list[T]`; the `val_suffix`
+        // assert guards the word-copy against any future kind drift).
+        if let Some(items_expr) = items {
+            let (lst, lty) = self.expr(items_expr)?;
+            let Ty::List(list_elem) = lty else {
+                return Err(err(
+                    "heap[T](items) expects a list of the element type as its \
+                     positional argument",
+                ));
+            };
+            if list_elem.val_suffix() != elem.val_suffix() {
+                return Err(err(
+                    "heap[T](items) list element type does not match the heap element type",
+                ));
+            }
+            let h = self.new_value(Ty::Heap(elem));
+            self.emit(Inst::Call {
+                dest: Some(h),
+                func: "zap_heap_from_list".to_string(),
+                args: vec![lst, kind, d],
+            });
+            return Ok((h, Ty::Heap(elem)));
+        }
         let h = self.new_value(Ty::Heap(elem));
         self.emit(Inst::Call {
             dest: Some(h),
@@ -17758,10 +17801,195 @@ impl<'a> FnLower<'a> {
                 });
                 Ok((d, elem.ty()))
             }
+            // `replace(x)` (heapreplace) and `pushpop(x)` (heappushpop): both pop
+            // one item and push one, differing in ORDER (#978, D-0236). replace
+            // pops the current root first then stores x (so it may return an item
+            // smaller than x, and requires a non-empty heap); pushpop pushes x
+            // first then pops (so it returns the min of `{x} ∪ heap` and is
+            // defined on the empty heap). Both return the popped element `T`.
+            "replace" | "pushpop" => {
+                if args.len() != 1 {
+                    return Err(err(format!("{name}() takes exactly one argument")));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                if value_elem_kind(vt, &self.ctx.nested)? != elem {
+                    return Err(err(format!("{name}() value has the wrong element type")));
+                }
+                let v = self.coerce(v, vt, elem.ty());
+                let d = self.new_value(elem.ty());
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: format!("zap_heap_{name}_{}", elem.val_suffix()),
+                    args: vec![recv, v],
+                });
+                Ok((d, elem.ty()))
+            }
             other => Err(err(format!(
-                "heap has no method '{other}' (supported: push, pop, peek)"
+                "heap has no method '{other}' \
+                 (supported: push, pop, peek, replace, pushpop)"
             ))),
         }
+    }
+
+    /// Lower `heap.nlargest(n, xs)` / `heap.nsmallest(n, xs)` with an optional
+    /// `key=` selector (#978, D-0236). `dir` is 1 (max-heap → largest-first) for
+    /// `nlargest` and 0 (min-heap → smallest-first) for `nsmallest`. `args` are
+    /// already in declared order `[n, iterable, key?]` (the seam binder). Returns
+    /// a `list[T]` of the selected elements in priority order.
+    ///
+    /// Without `key=` this is a single `zap_heap_topk(xs, n, dir, kind)` call
+    /// (heapify + pop-n). With `key=`, the selector is a first-class `fn(T) -> K`
+    /// value, so we evaluate it per element HERE — a lowered loop that calls the
+    /// closure and builds a parallel `list[K]` of keys — and hand both lists to
+    /// `zap_heap_topk_keyed`, which orders by key (stable on ties) and returns
+    /// the matching ELEMENTS. The runtime therefore never calls back into Zap.
+    fn lower_heap_topk(
+        &mut self,
+        dir: i64,
+        name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        if args.len() < 2 || args.len() > 3 {
+            return Err(err(format!(
+                "heap.{name}(n, iterable, key=...) takes 2 arguments plus an \
+                 optional key"
+            )));
+        }
+        let (nv, nt) = self.expr(&args[0].value)?;
+        let nv = self.coerce(nv, nt, Ty::I64);
+        let (lst, lty) = self.expr(&args[1].value)?;
+        let Ty::List(elem) = lty else {
+            return Err(err(format!(
+                "heap.{name}() expects a list as its iterable argument, found {lty:?}"
+            )));
+        };
+        let d = self.iconst(Ty::I64, dir);
+        let elem_tag = self.iconst(Ty::I64, deque_elem_tag(elem));
+
+        // No key: order the elements directly, so the element type itself must be
+        // one the heap can order (an `i64` word, `f64`, or `str`). A struct /
+        // nested-collection / complex element has no runtime ordering — it needs a
+        // `key=` that maps it to an orderable key (same rule as `heap[T]`).
+        if args.len() < 3 {
+            if !heap_orderable(elem) {
+                return Err(err(format!(
+                    "heap.{name}() needs a list of an orderable element \
+                     (integer, bool, char, enum, float64, or str), or a key= \
+                     selecting an orderable key"
+                )));
+            }
+            let out = self.new_value(Ty::List(elem));
+            self.emit(Inst::Call {
+                dest: Some(out),
+                func: "zap_heap_topk".to_string(),
+                args: vec![lst, nv, d, elem_tag],
+            });
+            return Ok((out, Ty::List(elem)));
+        }
+
+        // key=: a `fn(T) -> K` value. Resolve its signature to learn K.
+        let (keyfn, kft) = self.expr(&args[2].value)?;
+        let Ty::Func(sig_idx) = kft else {
+            return Err(err(format!(
+                "heap.{name}() key= must be a function value fn(T) -> K, found {kft:?}"
+            )));
+        };
+        let sig = self.ctx.fn_sigs.borrow().get(sig_idx).clone();
+        let param0 = sig.params.first().cloned().ok_or_else(|| {
+            err(format!(
+                "heap.{name}() key= function must take one argument"
+            ))
+        })?;
+        let kret = sig.ret;
+        let key_elem = value_elem_kind(kret, &self.ctx.nested)?;
+        if !heap_orderable(key_elem) {
+            return Err(err(format!(
+                "heap.{name}() key= must return an orderable key \
+                 (integer, bool, char, enum, float64, or str), found {kret:?}"
+            )));
+        }
+        let key_tag = self.iconst(Ty::I64, deque_elem_tag(key_elem));
+
+        // keys = [] ; for i in 0..len(xs): keys.push(key(xs[i]))
+        let keys = self.new_value(Ty::List(key_elem));
+        self.emit(Inst::Call {
+            dest: Some(keys),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        let len = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(len),
+            func: "zap_list_len".to_string(),
+            args: vec![lst],
+        });
+        let idx = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let end_bb = self.new_block();
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let c = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: c,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: len,
+        });
+        self.set_term(Term::BrIf {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let x = self.new_value(elem.ty());
+        self.emit(Inst::Call {
+            dest: Some(x),
+            func: format!("zap_list_get_{}", elem.val_suffix()),
+            args: vec![lst, i],
+        });
+        let xc = self.coerce(x, elem.ty(), param0);
+        let k = self.new_value(kret);
+        let unwind = self.landing_pads.last().copied();
+        if let Some(lp) = unwind {
+            self.used_lps.insert(lp);
+        }
+        self.emit(Inst::CallClosure {
+            dest: Some(k),
+            callee: keyfn,
+            args: vec![xc],
+            params: sig.params.clone(),
+            ret: kret,
+            unwind,
+        });
+        self.emit(Inst::Call {
+            dest: None,
+            func: format!("zap_list_push_{}", key_elem.val_suffix()),
+            args: vec![keys, k],
+        });
+        let next = self.new_value(Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: i,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+        self.position(end_bb);
+
+        let out = self.new_value(Ty::List(elem));
+        self.emit(Inst::Call {
+            dest: Some(out),
+            func: "zap_heap_topk_keyed".to_string(),
+            args: vec![lst, keys, nv, d, key_tag, elem_tag],
+        });
+        Ok((out, Ty::List(elem)))
     }
 
     /// Lower `deque[T]()` / `deque[T](maxlen=n)` (#983) to `zap_deque_new(kind)` /

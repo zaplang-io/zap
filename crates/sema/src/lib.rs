@@ -6420,7 +6420,7 @@ impl Checker {
             // selecting heap direction.
             if matches!(base.as_ref(), Expr::Name(n, _) if n == "heap") {
                 let elem = self.chan_elem_from_expr(index);
-                for a in args {
+                for (i, a) in args.iter().enumerate() {
                     let at = self.infer(&a.value);
                     match a.name.as_deref() {
                         Some("cmp") => {
@@ -6448,9 +6448,38 @@ impl Checker {
                             format!("heap[T](...) has no keyword argument '{other}' (only 'cmp')"),
                             expr_span(&a.value),
                         ),
+                        // A single leading positional argument is the initial
+                        // items list to heapify in O(n) (#978, D-0236):
+                        // `heap[T](xs)` / `heap[T](xs, cmp="max")`. It must be a
+                        // `list[T]` matching the heap's element type.
+                        None if i == 0 => match &at {
+                            Ty::List(le)
+                                if assignable(le, &elem) || matches!(**le, Ty::Unknown) => {}
+                            Ty::Unknown => {}
+                            Ty::List(le) => self.error(
+                                ErrorCode::ZAP5103,
+                                format!(
+                                    "heap[{}](items) items list holds {}, not {}",
+                                    elem.display(),
+                                    le.display(),
+                                    elem.display()
+                                ),
+                                expr_span(&a.value),
+                            ),
+                            _ => self.error(
+                                ErrorCode::ZAP5103,
+                                format!(
+                                    "heap[T](items) expects a list[{}] to heapify, found {}",
+                                    elem.display(),
+                                    at.display()
+                                ),
+                                expr_span(&a.value),
+                            ),
+                        },
                         None => self.error(
                             ErrorCode::ZAP5103,
-                            "heap[T](...) takes only the keyword argument 'cmp' (e.g. cmp=\"max\")"
+                            "heap[T](...) takes at most one positional argument (the items \
+                             list to heapify) plus the keyword 'cmp' (e.g. cmp=\"max\")"
                                 .to_string(),
                             expr_span(&a.value),
                         ),
@@ -14677,13 +14706,49 @@ def main():
     }
 
     #[test]
-    fn heap_positional_argument_errors() {
-        // A positional argument (no `cmp=`) is rejected.
+    fn heap_positional_argument_must_be_a_matching_list() {
+        // The one positional argument is the items list to heapify (#978,
+        // D-0236); a non-list positional is rejected with a clear "expects a
+        // list" error, and a list of the wrong element type is rejected too.
         let e = errors("def main():\n    auto h = heap[int64](3)\n");
         assert!(
-            e.iter()
-                .any(|x| x.message.contains("only the keyword argument")),
-            "expected a positional-argument error, got {e:?}"
+            e.iter().any(|x| x.message.contains("expects a list")),
+            "expected a 'needs a list to heapify' error, got {e:?}"
+        );
+        let e2 = errors("def main():\n    auto h = heap[int64]([\"a\", \"b\"])\n");
+        assert!(
+            e2.iter().any(|x| x.message.contains("items list holds")),
+            "expected an element-type-mismatch error, got {e2:?}"
+        );
+    }
+
+    #[test]
+    fn heap_heapify_from_list_type_checks() {
+        // `heap[T](xs)` / `heap[T](xs, cmp="max")` heapify a matching list.
+        ok("def main():\n    auto h = heap[int64]([5, 1, 3])\n    print(h.pop())\n");
+        ok("def main():\n    auto h = heap[int64]([5, 1, 3], cmp=\"max\")\n    print(h.pop())\n");
+    }
+
+    #[test]
+    fn heap_replace_and_pushpop_type_check() {
+        // heapreplace / heappushpop return the element type.
+        ok("def main():\n    auto h = heap[int64]([1, 2, 3])\n    print(h.replace(5))\n    print(h.pushpop(0))\n");
+    }
+
+    #[test]
+    fn heap_nlargest_nsmallest_type_check() {
+        // The top-K helpers return list[T] of the iterable's element type.
+        ok("def main():\n    auto xs = [5, 1, 3, 2, 4]\n    auto top = heap.nlargest(2, xs)\n    auto bot = heap.nsmallest(2, xs)\n    print(len(top) + len(bot))\n");
+    }
+
+    #[test]
+    fn heap_nlargest_non_orderable_without_key_errors() {
+        // Without a key=, a list of a non-orderable element type is rejected.
+        let e =
+            errors("def main():\n    auto xs = [[1], [2]]\n    auto top = heap.nlargest(2, xs)\n");
+        assert!(
+            e.iter().any(|x| x.message.contains("orderable")),
+            "expected a non-orderable error, got {e:?}"
         );
     }
 

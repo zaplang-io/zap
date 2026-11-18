@@ -926,6 +926,54 @@ fn bisect_positional_unchanged() {
 }
 
 // ---------------------------------------------------------------------------
+// heap — nlargest / nsmallest (#978, D-0236). Python names `n` / `iterable` /
+// `key`; `key` is the trailing optional selector.
+// ---------------------------------------------------------------------------
+
+const HEAP_XS: &str = "    auto xs = [5, 1, 3, 2, 4]\n";
+
+#[test]
+fn heap_topk_keyword_and_reorder() {
+    // Bind by name, in declared order and reversed.
+    assert_ok(&prog(&format!(
+        "{HEAP_XS}    auto top = heap.nlargest(n=2, iterable=xs)\n"
+    )));
+    assert_ok(&prog(&format!(
+        "{HEAP_XS}    auto bot = heap.nsmallest(iterable=xs, n=2)\n"
+    )));
+}
+
+#[test]
+fn heap_topk_key_keyword() {
+    // The `key=` selector binds by name alongside positional `n`/`iterable`.
+    let src = format!(
+        "def negate(int64 x) -> int64:\n    return -x\n\ndef f():\n{HEAP_XS}    auto top = heap.nlargest(2, xs, key=negate)\n"
+    );
+    assert_ok(&src);
+}
+
+#[test]
+fn heap_topk_unknown_keyword_rejected() {
+    // A misspelled keyword is the same ZAP4023 a user function emits.
+    assert_code(
+        &prog(&format!(
+            "{HEAP_XS}    auto top = heap.nlargest(count=2, iterable=xs)\n"
+        )),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn heap_topk_positional_unchanged() {
+    assert_ok(&prog(&format!(
+        "{HEAP_XS}    auto top = heap.nlargest(2, xs)\n"
+    )));
+    assert_ok(&prog(&format!(
+        "{HEAP_XS}    auto bot = heap.nsmallest(3, xs)\n"
+    )));
+}
+
+// ---------------------------------------------------------------------------
 // url parse / build (#970, D-0209). `join` is the two-argument method that most
 // benefits from keywords (`base` / `ref`); the rest are single-argument and
 // rowed for a uniform keyword-capable surface.
