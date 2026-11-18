@@ -12,7 +12,15 @@ def main():
     print("gcd", math.gcd(0, 0), math.gcd(12, 8), math.gcd(-12, 8), math.gcd(17, 5))
     print("lcm", math.lcm(4, 6), math.lcm(0, 5), math.lcm(21, 6))
     print("fact", math.factorial(0), math.factorial(5), math.factorial(20))
-    print("comb", math.comb(5, 2), math.comb(52, 5), math.comb(0, 0), math.comb(5, 0), math.comb(5, 5), math.comb(5, 7))
+    print(
+        "comb",
+        math.comb(5, 2),
+        math.comb(52, 5),
+        math.comb(0, 0),
+        math.comb(5, 0),
+        math.comb(5, 5),
+        math.comb(5, 7),
+    )
     print("perm", math.perm(5, 2), math.perm(5, 0), math.perm(5, 5), math.perm(5, 7))
     print("isqrt", math.isqrt(0), math.isqrt(16), math.isqrt(17), math.isqrt(99))
 
@@ -25,7 +33,12 @@ def main():
     print("remainder", math.remainder(7.0, 3.0), math.remainder(5.0, 3.0))
     # Sign propagation, including a runtime -0.0 (copysign(0.0, -5.0)) feeding
     # the third copysign, which must then yield -1.0.
-    print("copysign", math.copysign(3.0, -1.0), math.copysign(-3.0, 1.0), math.copysign(1.0, math.copysign(0.0, -5.0)))
+    print(
+        "copysign",
+        math.copysign(3.0, -1.0),
+        math.copysign(-3.0, 1.0),
+        math.copysign(1.0, math.copysign(0.0, -5.0)),
+    )
     print("nextafter", math.nextafter(1.0, 2.0))
 
     # --- accurate variants / exp2 (exact where representable) ---
