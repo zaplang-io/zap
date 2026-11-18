@@ -26,11 +26,18 @@ fn lower(
     let a = lower_args(lowerer, args)?;
     Ok(Some(match method {
         // client — the headers-bearing forms (one extra `dict[str,str]` arg,
-        // #280) lower to the `_h` runtime entry points; sema fixes the arities.
+        // #280) lower to the `_h` runtime entry points, and the timeout-bearing
+        // forms (a trailing `int64` ms total deadline, #986) to the `_ht` ones
+        // (headers always present — the seam binder fills it with `{}` when only
+        // `timeout` is supplied). Sema fixes the arities, so the arg count alone
+        // selects the entry point.
+        "get" if a.len() == 3 => call_ret(lowerer, "zap_http_get_ht", a, Ty::Ptr, true),
         "get" if a.len() == 2 => call_ret(lowerer, "zap_http_get_h", a, Ty::Ptr, true),
         "get" => call_ret(lowerer, "zap_http_get", a, Ty::Ptr, true),
+        "post" if a.len() == 4 => call_ret(lowerer, "zap_http_post_ht", a, Ty::Ptr, true),
         "post" if a.len() == 3 => call_ret(lowerer, "zap_http_post_h", a, Ty::Ptr, true),
         "post" => call_ret(lowerer, "zap_http_post", a, Ty::Ptr, true),
+        "request" if a.len() == 5 => call_ret(lowerer, "zap_http_request_ht", a, Ty::Ptr, true),
         "request" if a.len() == 4 => call_ret(lowerer, "zap_http_request_h", a, Ty::Ptr, true),
         "request" => call_ret(lowerer, "zap_http_request", a, Ty::Ptr, true),
         "status" => call_ret(lowerer, "zap_http_status", a, Ty::I64, false),

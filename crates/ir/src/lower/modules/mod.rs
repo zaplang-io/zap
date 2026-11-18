@@ -147,7 +147,7 @@ pub(super) fn lower_builtin_module_call(
             // with no registry row keeps legacy positional behavior.
             match zapc_syntax::seam_sigs::seam_method_params(module, method) {
                 Some(params) => {
-                    let reordered = reorder_seam_args(params, args);
+                    let reordered = reorder_seam_args(module, method, params, args);
                     (desc.lower)(lowerer, method, &reordered)
                 }
                 None => (desc.lower)(lowerer, method, args),
@@ -184,7 +184,12 @@ pub(super) fn lower_builtin_module_const(
 /// untouched. Spread arguments (`*`/`**`) and all-positional calls pass through
 /// unchanged. A migrated seam lowering calls this with its parameter names
 /// before reading arguments positionally.
-pub(super) fn reorder_seam_args(params: &[&str], args: &[ast::Arg]) -> Vec<ast::Arg> {
+pub(super) fn reorder_seam_args(
+    module: &str,
+    method: &str,
+    params: &[&str],
+    args: &[ast::Arg],
+) -> Vec<ast::Arg> {
     if args.iter().all(|a| a.name.is_none())
         || args
             .iter()
@@ -217,23 +222,48 @@ pub(super) fn reorder_seam_args(params: &[&str], args: &[ast::Arg]) -> Vec<ast::
             },
         }
     }
+    // Fill interior-optional holes with their declared default, exactly as the
+    // sema binder does (#986), so the emitted runtime call gets a value in the
+    // defaulted slot (e.g. an empty `headers` dict when only `timeout` is
+    // supplied). A trailing omitted parameter stays absent; an interior hole with
+    // no default is a sema-rejected footgun we defensively pass through unchanged.
+    let last_filled = slots.iter().rposition(|s| s.is_some());
     let mut out: Vec<ast::Arg> = Vec::new();
-    let mut omitted = false;
-    for slot in slots {
+    for (i, slot) in slots.into_iter().enumerate() {
         match slot {
-            Some(a) => {
-                // A filled parameter after an omitted earlier one is a hole that
-                // sema rejects; be defensive and keep source order if seen.
-                if omitted {
-                    return args.to_vec();
+            Some(a) => out.push(a),
+            None => {
+                if last_filled.is_some_and(|lf| i < lf) {
+                    match zapc_syntax::seam_sigs::seam_param_default(module, method, params[i]) {
+                        Some(def) => out.push(seam_default_arg(def, args)),
+                        None => return args.to_vec(),
+                    }
                 }
-                out.push(a);
             }
-            None => omitted = true,
         }
     }
     out.extend(overflow);
     out
+}
+
+/// Lowering twin of `zapc_sema::modules::seam_default_arg`: build the argument a
+/// [`SeamDefault`](zapc_syntax::seam_sigs::SeamDefault) stands for. The span is
+/// borrowed from the call's own arguments (purely for diagnostics, of which a
+/// well-formed default produces none).
+fn seam_default_arg(def: zapc_syntax::seam_sigs::SeamDefault, args: &[ast::Arg]) -> ast::Arg {
+    let span = args
+        .first()
+        .map(|a| a.span)
+        .unwrap_or_else(|| zapc_syntax::span::Span::new(0, 0));
+    let value = match def {
+        zapc_syntax::seam_sigs::SeamDefault::EmptyDict => ast::Expr::Dict(Vec::new(), span),
+    };
+    ast::Arg {
+        name: None,
+        value,
+        spread: ast::ArgSpread::None,
+        span,
+    }
 }
 
 pub(super) fn call0(lowerer: &mut FnLower, func: &str, ret: Ty) -> (Value, Ty) {

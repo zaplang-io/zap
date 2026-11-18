@@ -36,6 +36,25 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
         &[p.into(), p.into(), p.into(), p.into()],
         Some(p.into()),
     );
+    // timeout-bearing client forms (#986): a trailing `int64` total-deadline in
+    // milliseconds. Headers are always present (the seam binder defaults them to
+    // `{}` when a caller supplies only `timeout`), so each `_ht` entry is its
+    // `_h` twin plus the trailing `i64`.
+    cg.declare_rt(
+        "zap_http_get_ht",
+        &[p.into(), p.into(), i.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt(
+        "zap_http_post_ht",
+        &[p.into(), p.into(), p.into(), i.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt(
+        "zap_http_request_ht",
+        &[p.into(), p.into(), p.into(), p.into(), i.into()],
+        Some(p.into()),
+    );
     cg.declare_rt("zap_http_status", &[p.into()], Some(i.into()));
     cg.declare_rt("zap_http_body", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_http_header", &[p.into(), p.into()], Some(p.into()));

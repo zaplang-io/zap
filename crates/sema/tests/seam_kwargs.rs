@@ -177,9 +177,74 @@ fn http_get_url_by_name_headers_omitted() {
 
 #[test]
 fn http_get_unknown_keyword_rejected() {
+    // `bogus` is not a parameter of `http.get` (`timeout` now is — #986).
     assert_code(
-        &prog("    auto r = http.get(\"http://x\", timeout=5)\n"),
+        &prog("    auto r = http.get(\"http://x\", bogus=5)\n"),
         "ZAP4023",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-request `timeout` (#986): a trailing optional ms total-deadline on the
+// client verbs. `headers` sits before it and is an INTERIOR optional — the
+// binder fills it with `{}` when a caller supplies only `timeout`, so
+// `http.get(url, timeout=5000)` binds without the empty-dict wart.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn http_get_timeout_only() {
+    // Interior `headers` omitted, trailing `timeout` supplied by keyword.
+    assert_ok(&prog("    auto r = http.get(\"http://x\", timeout=5000)\n"));
+}
+
+#[test]
+fn http_get_headers_and_timeout() {
+    assert_ok(&prog(
+        "    auto h = {\"a\": \"b\"}\n    auto r = http.get(\"http://x\", headers=h, timeout=5000)\n",
+    ));
+}
+
+#[test]
+fn http_get_headers_positional_timeout_keyword() {
+    assert_ok(&prog(
+        "    auto h = {\"a\": \"b\"}\n    auto r = http.get(\"http://x\", h, timeout=5000)\n",
+    ));
+}
+
+#[test]
+fn http_post_timeout_only() {
+    assert_ok(&prog(
+        "    auto r = http.post(\"http://x\", \"n=zap\", timeout=2500)\n",
+    ));
+}
+
+#[test]
+fn http_post_headers_and_timeout_reordered() {
+    assert_ok(&prog(
+        "    auto h = {\"a\": \"b\"}\n    auto r = http.post(timeout=2500, url=\"http://x\", body=\"n=zap\", headers=h)\n",
+    ));
+}
+
+#[test]
+fn http_request_timeout_only() {
+    assert_ok(&prog(
+        "    auto r = http.request(\"GET\", \"http://x\", \"\", timeout=1000)\n",
+    ));
+}
+
+#[test]
+fn http_request_headers_and_timeout() {
+    assert_ok(&prog(
+        "    auto h = {\"a\": \"b\"}\n    auto r = http.request(\"GET\", \"http://x\", \"\", h, timeout=1000)\n",
+    ));
+}
+
+#[test]
+fn http_get_too_many_args_rejected() {
+    // url + headers + timeout is the max (3); a 4th positional is an arity error.
+    assert_code(
+        &prog("    auto r = http.get(\"http://x\", {}, 5000, 1)\n"),
+        "ZAP4025",
     );
 }
 

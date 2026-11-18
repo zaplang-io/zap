@@ -25,6 +25,15 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **HTTP client per-request timeouts** (#986, D-0229). `http.get`/`post`/`request`
+  take an optional `timeout` keyword — a **total deadline in milliseconds** for
+  the whole call (connect + reads + all redirect hops), e.g.
+  `http.get(url, timeout=5000)` or `http.post(url, body, headers, timeout=3000)`.
+  On expiry a blocked connect or read raises a catchable `TimeoutError` (the same
+  error `net` raises); `0`/omitted is unbounded (unchanged), a negative value is a
+  `ValueError`. Enabled by a small seam-binder extension — interior-optional
+  parameter defaults (`SeamDefault`, D-0204) — so `headers` may be omitted while
+  `timeout` is supplied.
 - **`datetime`/`time` refinements** (#1055, D-0228). Rounds out the #974 types:
   `time.format(d)` renders a `Duration` in Go `time.Duration` style (`"1m30.5s"`,
   `"250ms"`, `"42ns"`); `time.since(start_ns)` returns elapsed time as a typed

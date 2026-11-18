@@ -13,10 +13,29 @@
 //! the pre-seam twin `match` blocks.
 
 use zapc_diag::ErrorCode;
-use zapc_syntax::ast::Arg;
+use zapc_syntax::ast::{Arg, ArgSpread, Expr};
+use zapc_syntax::seam_sigs::{seam_param_default, SeamDefault};
 use zapc_syntax::span::Span;
 
 use crate::{Checker, Ty};
+
+/// Synthesize the argument a seam parameter's [`SeamDefault`] stands for, used
+/// to fill an *interior* optional hole (#986) so the per-method checker, which
+/// reads positionally, still finds the slot. The synthesized expression types
+/// and lowers like the literal a caller would have written.
+fn seam_default_arg(def: SeamDefault, span: Span) -> Arg {
+    let value = match def {
+        // `{}` — an empty dict display; infers to `dict[?, ?]` and lowers to an
+        // empty dict (the runtime reads it as "no caller headers").
+        SeamDefault::EmptyDict => Expr::Dict(Vec::new(), span),
+    };
+    Arg {
+        name: None,
+        value,
+        spread: ArgSpread::None,
+        span,
+    }
+}
 
 mod arch;
 mod argparse;
@@ -273,31 +292,37 @@ pub(super) fn bind_seam_args(
         }
     }
 
-    // Flatten declared order; a filled parameter after an omitted earlier one is
-    // a hole (e.g. `compress(level=9)` with `data` missing) — reject it rather
-    // than silently shifting `level` into the `data` slot (the old footgun).
+    // Flatten declared order. A filled parameter after an omitted earlier one is
+    // a hole (e.g. `compress(level=9)` with `data` missing): reject it rather
+    // than silently shifting `level` into the `data` slot (the old footgun) —
+    // UNLESS the omitted parameter carries a `SeamDefault`, in which case the
+    // hole is an *interior optional* we fill with its default (#986), so e.g.
+    // `http.get(url, timeout=5000)` binds with `headers` defaulted to `{}`.
+    // A trailing omitted parameter (nothing filled after it) stays simply absent.
+    let last_filled = slots.iter().rposition(|s| s.is_some());
     let mut out: Vec<Arg> = Vec::new();
-    let mut first_omitted: Option<usize> = None;
     for (i, slot) in slots.into_iter().enumerate() {
         match slot {
-            Some(a) => {
-                if let Some(missing) = first_omitted {
-                    checker.error(
-                        ErrorCode::ZAP4025,
-                        format!(
-                            "'{module}.{method}' is missing a value for parameter '{}' \
-                             (supplied later parameter '{}')",
-                            params[missing], params[i]
-                        ),
-                        span,
-                    );
-                    return args.to_vec();
-                }
-                out.push(a);
-            }
+            Some(a) => out.push(a),
             None => {
-                if first_omitted.is_none() {
-                    first_omitted = Some(i);
+                let interior = last_filled.is_some_and(|lf| i < lf);
+                if interior {
+                    match seam_param_default(module, method, params[i]) {
+                        Some(def) => out.push(seam_default_arg(def, span)),
+                        None => {
+                            let later = last_filled.map(|lf| params[lf]).unwrap_or("");
+                            checker.error(
+                                ErrorCode::ZAP4025,
+                                format!(
+                                    "'{module}.{method}' is missing a value for parameter '{}' \
+                                     (supplied later parameter '{later}')",
+                                    params[i]
+                                ),
+                                span,
+                            );
+                            return args.to_vec();
+                        }
+                    }
                 }
             }
         }
