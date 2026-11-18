@@ -25,6 +25,25 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`math` — everyday scalar functions** (#973, D-0234, epic #966). Fills the
+  gaps in the elementary libm set with ~40 functions that show up in ordinary
+  code and tests. **Integer math → `int`:** `gcd`/`lcm`/`factorial`/`comb`/`perm`/
+  `isqrt` (a `float` argument is a type error; `gcd(0, 0) == 0`,
+  `factorial(0) == 1`). **Angles / hyperbolics / accurate variants / special
+  functions → `float64`:** `degrees`/`radians`; `sinh`/`cosh`/`tanh`/`asinh`/
+  `acosh`/`atanh`; `expm1`/`log1p`/`exp2`/`cbrt`; `gamma`/`lgamma`/`erf`/`erfc`.
+  **Classify / compare / compose:** `isfinite` and
+  `isclose(a, b, rel_tol=1e-9, abs_tol=0.0)` → `bool`;
+  `copysign`/`nextafter`/`remainder`/`ldexp` → `float64`; and the
+  tuple-returning `modf(x)` → `(float, float)` / `frexp(x)` → `(float, int)`.
+  **List reductions:** `prod`/`sumprod` are element-typed (an `int` list yields
+  `int`, a `float64` list `float64`), while `fsum`/`dist` take `float64` list(s)
+  and return `float64`; `fsum` uses Shewchuk exact summation (`[0.1]*10` sums to
+  exactly `1.0`). Overflowing integer results raise a catchable `ArithmeticError`
+  and domain / length-mismatch violations a catchable `ValueError`. `floor`/`ceil`
+  keep returning `float64` (use `int(math.floor(x))` for the integer). All are
+  keyword-capable; `isclose`'s tolerances are optional keyword arguments.
+  **Experimental** (`math`, STABILITY §4).
 - **`uuid` module — RFC 4122 / RFC 9562 UUIDs + NanoID** (#975, D-0232/D-0233).
   A prelude `Uuid` value struct (`str(u)` gives the canonical `8-4-4-4-12` form
   via the Display protocol; `u.hex()`/`u.urn()`/`u.to_bytes()`/`u.version()`/

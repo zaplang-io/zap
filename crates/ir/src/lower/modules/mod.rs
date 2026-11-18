@@ -259,6 +259,9 @@ fn seam_default_arg(def: zapc_syntax::seam_sigs::SeamDefault, args: &[ast::Arg])
         .unwrap_or_else(|| zapc_syntax::span::Span::new(0, 0));
     let value = match def {
         zapc_syntax::seam_sigs::SeamDefault::EmptyDict => ast::Expr::Dict(Vec::new(), span),
+        zapc_syntax::seam_sigs::SeamDefault::Float(lexeme) => {
+            ast::Expr::Float(lexeme.to_string(), span)
+        }
     };
     ast::Arg {
         name: None,

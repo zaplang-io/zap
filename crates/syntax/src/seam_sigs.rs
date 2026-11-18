@@ -352,6 +352,47 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("math", "hypot", &["x", "y"]),
     ("math", "fmod", &["x", "y"]),
     ("math", "fma", &["x", "y", "z"]),
+    // ---- math (#973, D-0234): everyday scalar additions ----
+    // Unary f64 -> f64 (angles, hyperbolics, accurate variants, special funcs).
+    ("math", "degrees", &["x"]),
+    ("math", "radians", &["x"]),
+    ("math", "sinh", &["x"]),
+    ("math", "cosh", &["x"]),
+    ("math", "tanh", &["x"]),
+    ("math", "asinh", &["x"]),
+    ("math", "acosh", &["x"]),
+    ("math", "atanh", &["x"]),
+    ("math", "expm1", &["x"]),
+    ("math", "log1p", &["x"]),
+    ("math", "exp2", &["x"]),
+    ("math", "cbrt", &["x"]),
+    ("math", "gamma", &["x"]),
+    ("math", "lgamma", &["x"]),
+    ("math", "erf", &["x"]),
+    ("math", "erfc", &["x"]),
+    ("math", "isfinite", &["x"]),
+    ("math", "modf", &["x"]),
+    ("math", "frexp", &["x"]),
+    // Binary / compose forms.
+    ("math", "copysign", &["x", "y"]),
+    ("math", "nextafter", &["x", "y"]),
+    ("math", "remainder", &["x", "y"]),
+    ("math", "ldexp", &["x", "i"]),
+    // isclose(a, b, rel_tol=1e-9, abs_tol=0.0): the tolerances are optional
+    // keyword args with defaults (see `SEAM_METHOD_DEFAULTS`).
+    ("math", "isclose", &["a", "b", "rel_tol", "abs_tol"]),
+    // Integer math (int -> int).
+    ("math", "gcd", &["a", "b"]),
+    ("math", "lcm", &["a", "b"]),
+    ("math", "factorial", &["n"]),
+    ("math", "comb", &["n", "k"]),
+    ("math", "perm", &["n", "k"]),
+    ("math", "isqrt", &["n"]),
+    // List reductions.
+    ("math", "prod", &["xs"]),
+    ("math", "fsum", &["xs"]),
+    ("math", "dist", &["p", "q"]),
+    ("math", "sumprod", &["p", "q"]),
     // ---- net (ticket #104): plaintext TCP over opaque socket handles ----
     // (connect_ip_deadline is left on the legacy path pending a settled name
     // for its deadline parameter.)
@@ -426,6 +467,10 @@ pub enum SeamDefault {
     /// An empty `dict` display (`{}`): the default for an omitted `headers` map,
     /// which the runtime treats as "no caller headers".
     EmptyDict,
+    /// A `float` literal, carried as its raw source lexeme (e.g. `"1e-9"`) so it
+    /// types + lowers exactly like the literal a caller would have written. The
+    /// default for `math.isclose`'s interior `rel_tol` (#973, D-0234).
+    Float(&'static str),
 }
 
 /// Parameters that carry a [`SeamDefault`], keyed by `(module, method,
@@ -438,6 +483,12 @@ pub const SEAM_METHOD_DEFAULTS: &[(&str, &str, &str, SeamDefault)] = &[
     ("http", "get", "headers", SeamDefault::EmptyDict),
     ("http", "post", "headers", SeamDefault::EmptyDict),
     ("http", "request", "headers", SeamDefault::EmptyDict),
+    // `math.isclose(a, b, rel_tol=1e-9, abs_tol=0.0)`: `rel_tol` sits before the
+    // trailing `abs_tol`, so it must default when a caller supplies only
+    // `abs_tol` (`isclose(a, b, abs_tol=0.1)`). `abs_tol` is trailing and is
+    // filled in lowering, but is listed for symmetry (#973, D-0234).
+    ("math", "isclose", "rel_tol", SeamDefault::Float("1e-9")),
+    ("math", "isclose", "abs_tol", SeamDefault::Float("0.0")),
 ];
 
 /// The [`SeamDefault`] for `(module, method, param)`, or `None` when the

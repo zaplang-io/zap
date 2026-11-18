@@ -629,6 +629,82 @@ fn math_unknown_keyword_rejected() {
     assert_code(&prog("    auto y = math.sqrt(value=2.0)\n"), "ZAP4023");
 }
 
+// --- #973 scalar additions: keyword binding across the new surface ----------
+
+#[test]
+fn math_new_scalar_keywords() {
+    // Unary f64 -> f64 additions bind their `x`.
+    assert_ok(&prog("    auto a = math.degrees(x=3.14)\n"));
+    assert_ok(&prog("    auto b = math.radians(x=180.0)\n"));
+    assert_ok(&prog("    auto c = math.sinh(x=1.0)\n"));
+    assert_ok(&prog("    auto d = math.cbrt(x=27.0)\n"));
+    assert_ok(&prog("    auto e = math.gamma(x=5.0)\n"));
+    // Binary compose forms, including reordering.
+    assert_ok(&prog("    auto f = math.copysign(x=1.0, y=-2.0)\n"));
+    assert_ok(&prog("    auto g = math.copysign(y=-2.0, x=1.0)\n"));
+    assert_ok(&prog("    auto h = math.ldexp(x=1.5, i=3)\n"));
+}
+
+#[test]
+fn math_integer_math_keywords() {
+    assert_ok(&prog("    auto a = math.gcd(a=12, b=8)\n"));
+    assert_ok(&prog("    auto b = math.gcd(b=8, a=12)\n"));
+    assert_ok(&prog("    auto c = math.comb(n=5, k=2)\n"));
+    assert_ok(&prog("    auto d = math.perm(k=2, n=5)\n"));
+    assert_ok(&prog("    auto e = math.factorial(n=6)\n"));
+    assert_ok(&prog("    auto f = math.isqrt(n=17)\n"));
+}
+
+// isclose: the two tolerances are optional keyword args with defaults. All four
+// supply patterns must bind, including the interior-hole case (abs_tol given,
+// rel_tol defaulted via SeamDefault::Float).
+
+#[test]
+fn math_isclose_default_tolerances() {
+    assert_ok(&prog("    auto a = math.isclose(1.0, 1.0)\n"));
+}
+
+#[test]
+fn math_isclose_rel_tol_only() {
+    assert_ok(&prog("    auto a = math.isclose(1.0, 1.1, rel_tol=0.2)\n"));
+}
+
+#[test]
+fn math_isclose_abs_tol_only_fills_interior_rel_tol() {
+    // `rel_tol` is an INTERIOR optional here — the binder fills it from its
+    // SeamDefault::Float("1e-9") so the call binds (the #986 interior-hole path
+    // generalized to a float default, D-0234).
+    assert_ok(&prog("    auto a = math.isclose(1.0, 1.0, abs_tol=0.1)\n"));
+}
+
+#[test]
+fn math_isclose_both_tolerances_reordered() {
+    assert_ok(&prog(
+        "    auto a = math.isclose(a=1.0, b=1.1, abs_tol=0.1, rel_tol=0.2)\n",
+    ));
+}
+
+#[test]
+fn math_isclose_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto a = math.isclose(1.0, 1.0, tol=0.1)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn math_reduction_keywords() {
+    assert_ok(&prog(
+        "    auto xs = [1.0, 2.0, 3.0]\n    auto s = math.fsum(xs=xs)\n",
+    ));
+    assert_ok(&prog(
+        "    auto p = [1.0, 2.0]\n    auto q = [3.0, 4.0]\n    auto d = math.dist(p=p, q=q)\n",
+    ));
+    assert_ok(&prog(
+        "    auto p = [1.0, 2.0]\n    auto q = [3.0, 4.0]\n    auto s = math.sumprod(q=q, p=p)\n",
+    ));
+}
+
 #[test]
 fn net_keyword_reorder_and_unknown() {
     assert_ok(&prog(

@@ -11799,3 +11799,85 @@ forms bind.
 
 Relates to [[D-0232]] (the `uuid` module it joins), [[D-0204]] / [[D-0213]] (the
 seam binder + the rule this is the exception to), and Discussion #965 (gap #8).
+
+## D-0234 — stdlib `math`: everyday scalar functions — int math, hyperbolics, classify/compose, reductions (#973 / epic #966)
+
+**Context.** `math` shipped the elementary libm set (`sqrt`/`exp`/`log`/trig/
+`floor`/`ceil`/… + `pi`/`e`/`tau`/`inf`/`nan`, with the #505 array-mapped
+variants) but was missing ~40 everyday functions that show up in ordinary code
+and tests, not just scientific work (Discussion #965, gap #6). All are
+libm/one-liners; the work was wiring them through the three seam facets
+(sema check → ir lowering → codegen `declare_rt` + the `math_random.inc.c`
+runtime fragment) and the `seam_sigs` + `seam_kwargs` calling-convention
+registry.
+
+**Decision — add the full set, in one PR.**
+- **Integer math → `int`.** `gcd(a, b)`, `lcm(a, b)`, `factorial(n)`,
+  `comb(n, k)`, `perm(n, k)`, `isqrt(n)`. These take integer arguments and
+  return `int`; a `float` argument is a type error (`ZAP4024`). `gcd`/`lcm`
+  operate on the *magnitudes* and are non-negative (`gcd(0, 0) == 0`,
+  `lcm(·, 0) == 0`), matching Python 3.9+.
+- **Angles / hyperbolics / accurate variants / special functions → `float64`.**
+  `degrees`/`radians`; `sinh`/`cosh`/`tanh`/`asinh`/`acosh`/`atanh`;
+  `expm1`/`log1p`/`exp2`/`cbrt`; and `gamma`/`lgamma`/`erf`/`erfc` (`gamma` is
+  libm `tgamma`; `lgamma` returns `ln|Γ|`, matching CPython). Like the existing
+  elementary set, a domain error yields `NaN`/`inf` (libm) rather than raising —
+  `sinh` etc. stay consistent with `sqrt(-1.0)`. These are scalar-only (no array
+  mapping is wired, so an `array` argument is rejected cleanly in lowering).
+- **Classify / compare / compose.** `isfinite(x)` and
+  `isclose(a, b, rel_tol=1e-9, abs_tol=0.0)` → `bool`;
+  `copysign(x, y)`/`nextafter(x, y)`/`remainder(x, y)`/`ldexp(x, i)` → `float64`;
+  and the tuple-returning `modf(x)` → `(float, float)` (fractional, integer
+  parts) and `frexp(x)` → `(float, int)` (mantissa in `[0.5, 1)`, exponent).
+- **List reductions.** `prod`/`sumprod` are **element-typed** — an `int` list
+  yields `int`, a `float64` list `float64` (dispatched on the element kind, like
+  `bisect`); `fsum`/`dist` take `float64` list(s) and return `float64`. `fsum`
+  uses Shewchuk exact summation (CPython `math.fsum`), so e.g. `[0.1]*10` sums to
+  exactly `1.0` and `[1e100, 1, -1e100, -1]` to `0.0`. `dist`/`sumprod` raise
+  `ValueError` on a length mismatch.
+
+**`floor`/`ceil` stay `float64` (not Python's `int`).** The scalar form and the
+#505 array-mapped form keep a single return type, and changing the scalar form
+would be a breaking change; `int(math.floor(x))` provides the integer when
+wanted. (`trunc` already existed and is unchanged.)
+
+**Overflow / domain policy.** A fixed-width-`int` result that cannot be
+represented raises a catchable `ArithmeticError` (`lcm`, `factorial` for `n > 20`,
+`comb`/`perm`); a domain violation raises a catchable `ValueError`
+(`factorial`/`isqrt`/`comb`/`perm` on a negative argument, `isclose` on a
+negative tolerance, `dist`/`sumprod` on a length mismatch). This matches the rest
+of the stdlib (`array`, `crypto`, …), which raise catchable errors rather than
+aborting. `comb` is computed exactly in `uint64` with gcd-reduction so the
+running coefficient never exceeds the final value — no spurious overflow when the
+result fits. `prod`/`sumprod` on an `int` list *wrap* on overflow, matching the
+`*`/`+` operators on `int`. The integer-math and reduction lowerings route
+through `throwing_call` so the raises are catchable in `try`/`except` ([[D-0007]]).
+
+**`isclose` keyword tolerances.** `rel_tol`/`abs_tol` are optional keyword
+arguments with defaults, expressed in the seam registry. `rel_tol` sits before
+the trailing `abs_tol`, so it is an *interior* optional ([[D-0204]] / #986): the
+`SeamDefault` mechanism is generalized from the single `EmptyDict` shape to also
+carry a **float literal** (`SeamDefault::Float("1e-9")`), so
+`isclose(a, b, abs_tol=0.1)` binds with `rel_tol` filled from its default.
+
+**Positional vs keyword.** Every new function with ≥1 argument has a `seam_sigs`
+row ([[D-0213]]) with Python-conventional parameter names, so all are
+keyword-capable (`gcd(a=…, b=…)`, `copysign(x=…, y=…)`, `isclose(…, abs_tol=…)`).
+
+**Tests.** Golden `math_scalar_fns` (exact integer results incl. `gcd(0,0)`,
+`factorial(0/5/20)`, `comb`/`perm` identities + `k>n`, `isqrt` boundaries; exact
+float results for `modf`/`frexp`/`ldexp`/`remainder`/`copysign`/`nextafter`/
+`exp2`; `fsum` of sequences that defeat naive summation; `dist`; isclose
+semantics incl. `inf`/`nan`/tiny/huge; and the raising paths via `try`/`except`),
+with the irrational / round-trip cases asserted through `math.isclose` so the
+golden is platform-deterministic; sema type/arity for every function + the
+float-argument rejection; `seam_kwargs` binding incl. `isclose`'s interior
+default and unknown-keyword rejection; and a ZIR lowering test asserting the
+element-typed reductions and tuple decompositions dispatch to the right runtime
+symbols. The end-to-end runtime (values, both collectors, arm64) runs on CI.
+
+Relates to [[D-0056]] (the `math` module), [[D-0168]] (#505 array-mapped
+variants, kept consistent), [[D-0196]] (`math.fma`), [[D-0204]] / [[D-0213]]
+(the seam binder + the one-row-per-arg rule), [[D-0007]] (catchable runtime
+faults), [[D-0219]] (the tuple-returning `os.path_split` build pattern), and
+Discussion #965 (gap #6).
