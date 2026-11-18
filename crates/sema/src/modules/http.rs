@@ -158,6 +158,28 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc_or_headers(checker, method, args, 3, span);
             Ty::Unit
         }
+        // --- internal client-pool primitives (#990, prelude-only) -----------
+        // Backing the prelude `http.Client`: a keep-alive connection pool
+        // addressed by a stable non-GC int64 handle. Underscore-prefixed and
+        // positional-only (no seam_sigs rows), like `json._lex_*`.
+        // http._pool_new(max_idle) -> int64 handle.
+        "_pool_new" => {
+            expect_argc(checker, "http", method, args, 1, span);
+            Ty::Int64
+        }
+        // http._pool_do(handle, method, url, body, headers, timeout, follow,
+        // max_redirects) -> response handle. Does the whole exchange: pooled
+        // dial/reuse, single-response framing, and redirect following per
+        // `follow` / `max_redirects` (#1049).
+        "_pool_do" => {
+            expect_argc(checker, "http", method, args, 8, span);
+            Ty::Bytes
+        }
+        // http._pool_close(handle) -> unit. Drains + frees the pool.
+        "_pool_close" => {
+            expect_argc(checker, "http", method, args, 1, span);
+            Ty::Unit
+        }
         _ => return None,
     })
 }

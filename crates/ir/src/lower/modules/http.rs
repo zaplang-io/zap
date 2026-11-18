@@ -64,6 +64,12 @@ fn lower(
         // #279) lowers to the `_h` entry point; sema fixes the arities.
         "respond" if a.len() == 4 => call_void(lowerer, "zap_http_respond_h", a, true),
         "respond" => call_void(lowerer, "zap_http_respond", a, true),
+        // internal client-pool primitives (#990): keep-alive pool behind the
+        // prelude `http.Client`. `_pool_new`/`_pool_do` can raise (OOM / network
+        // / too-many-redirects), so they use throwing calls; `_pool_close` cannot.
+        "_pool_new" => call_ret(lowerer, "zap_http_pool_new", a, Ty::I64, true),
+        "_pool_do" => call_ret(lowerer, "zap_http_pool_do", a, Ty::Ptr, true),
+        "_pool_close" => call_void(lowerer, "zap_http_pool_close", a, false),
         _ => return Ok(None),
     }))
 }

@@ -3634,6 +3634,829 @@ void *zap_http_post_ht(void *url_, void *body_, void *headers_, int64_t timeout_
     return zap_http_do(p, url_, body_, headers_, timeout_ms);
 }
 
+/* ===== keep-alive connection pool + single-response framing (#990/#1049) =====
+ *
+ * `http.Client` (a prelude struct) owns a `ZapHttpPool` addressed by an int64
+ * handle. The pool is NON-GC malloc memory — a stable address never moved by the
+ * precise-Immix collector — so the C code may hold it across network parks
+ * safely; it owns only non-GC resources (the idle-connection list and the live
+ * fd/pd/SSL in each), freed by `http.Client.close()`. The GC `ZapHttpResp` is
+ * built only at the very end, after the last park, exactly as `zap_http_do_once`.
+ *
+ * Reuse requires reading EXACTLY one response (so the socket is left at a clean
+ * message boundary): `zap_http_read_one` frames the body by `Content-Length` or
+ * decodes `Transfer-Encoding: chunked`. A connection is returned to the pool only
+ * when the response was fully framed AND keep-alive applies (HTTP/1.1 without
+ * `Connection: close`, or HTTP/1.0 with `Connection: keep-alive`). A pooled
+ * connection the peer has since closed is detected (EOF before any response
+ * byte) and retried once on a fresh dial. */
+
+typedef struct {
+    int tls;
+    char *host;      /* malloc'd, NUL-terminated, no port */
+    long port;
+    const char *path; /* into the url_cstr (or the literal "/") */
+    size_t hostend;   /* host length (for the Host header) */
+    const char *hoststart; /* host start within url_cstr */
+} ZapHttpUrl;
+
+/* Parse an absolute URL into scheme/host/port/path. Returns 0, or -1 on OOM. */
+static int zap_http_url_parse(const char *url_cstr, ZapHttpUrl *u) {
+    u->tls = 0;
+    const char *rest = url_cstr;
+    if (strncmp(url_cstr, "https://", 8) == 0) {
+        u->tls = 1;
+        rest = url_cstr + 8;
+    } else if (strncmp(url_cstr, "http://", 7) == 0) {
+        rest = url_cstr + 7;
+    }
+    size_t he = 0;
+    while (rest[he] && rest[he] != '/' && rest[he] != ':') {
+        he++;
+    }
+    u->host = (char *)malloc(he + 1);
+    if (!u->host) {
+        return -1;
+    }
+    memcpy(u->host, rest, he);
+    u->host[he] = '\0';
+    u->hostend = he;
+    u->hoststart = rest;
+    long port = u->tls ? 443 : 80;
+    const char *after = rest + he;
+    if (*after == ':') {
+        after++;
+        port = 0;
+        while (*after >= '0' && *after <= '9') {
+            port = port * 10 + (*after - '0');
+            after++;
+        }
+    }
+    u->port = port;
+    u->path = (*after == '/') ? after : "/";
+    return 0;
+}
+
+/* Dial a fresh transport for `u`, bounded by the absolute `deadline_ns`. Raises
+ * (net/TLS) on failure, exactly like the one-shot client. */
+static void zap_http_dial(const ZapHttpUrl *u, int64_t deadline_ns, ZapHttpConn *hc) {
+    memset(hc, 0, sizeof *hc);
+    hc->deadline_ns = deadline_ns;
+    ZapStr *hostz = (ZapStr *)zap_str_new(u->host, (int64_t)strlen(u->host));
+    if (u->tls) {
+        SSL_CTX *ctx = NULL;
+        int fd = -1;
+        void *pd = NULL;
+        SSL *ssl =
+            zap_tls_dial_raw_impl(hostz, NULL, u->port, 1, deadline_ns, NULL, &ctx, &fd, &pd);
+        hc->tls = 1;
+        hc->ssl = ssl;
+        hc->ctx = ctx;
+        hc->fd = fd;
+        hc->pd = pd;
+    } else {
+        ZapSock *conn = (ZapSock *)zap_net_connect_impl((void *)hostz, u->port, deadline_ns, 0);
+        hc->fd = conn->fd;
+        hc->pd = conn->pd;
+    }
+}
+
+/* Find header `name` (case-insensitive) in a header block, returning its value
+ * range [*vp, *vp+*vlen) within `hbuf` (no allocation). Returns 1 if found. */
+static int zap_http_hdr_raw(const char *hbuf, size_t hlen, const char *name, const char **vp,
+                            size_t *vlen) {
+    size_t nlen = strlen(name);
+    size_t i = 0;
+    while (i < hlen) {
+        size_t ls = i;
+        while (i < hlen && hbuf[i] != '\n') {
+            i++;
+        }
+        size_t le = i; /* line [ls, le) (may include trailing '\r') */
+        if (i < hlen) {
+            i++;
+        }
+        size_t llen = (le > ls && hbuf[le - 1] == '\r') ? (le - 1 - ls) : (le - ls);
+        if (llen > nlen && hbuf[ls + nlen] == ':') {
+            int eq = 1;
+            for (size_t k = 0; k < nlen; k++) {
+                char a = hbuf[ls + k];
+                char b = name[k];
+                if (a >= 'A' && a <= 'Z') {
+                    a = (char)(a - 'A' + 'a');
+                }
+                if (b >= 'A' && b <= 'Z') {
+                    b = (char)(b - 'A' + 'a');
+                }
+                if (a != b) {
+                    eq = 0;
+                    break;
+                }
+            }
+            if (eq) {
+                size_t vs = ls + nlen + 1;
+                size_t ve = ls + llen;
+                while (vs < ve && (hbuf[vs] == ' ' || hbuf[vs] == '\t')) {
+                    vs++;
+                }
+                *vp = hbuf + vs;
+                *vlen = ve - vs;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Does header `name` carry `token` (case-insensitive, comma/space tolerant)? */
+static int zap_http_hdr_has_token(const char *hbuf, size_t hlen, const char *name,
+                                  const char *token) {
+    const char *vp;
+    size_t vlen;
+    if (!zap_http_hdr_raw(hbuf, hlen, name, &vp, &vlen)) {
+        return 0;
+    }
+    size_t tlen = strlen(token);
+    for (size_t i = 0; i + tlen <= vlen; i++) {
+        int eq = 1;
+        for (size_t k = 0; k < tlen; k++) {
+            char a = vp[i + k];
+            char b = token[k];
+            if (a >= 'A' && a <= 'Z') {
+                a = (char)(a - 'A' + 'a');
+            }
+            if (b >= 'A' && b <= 'Z') {
+                b = (char)(b - 'A' + 'a');
+            }
+            if (a != b) {
+                eq = 0;
+                break;
+            }
+        }
+        if (eq) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Build and send a request on `hc`, keep-alive (no `Connection: close`). The
+ * buffer building mirrors `zap_http_do_once` minus the close header. Returns 0,
+ * or a negative transport status (caller maps to an exception). */
+static int zap_http_send_req(ZapHttpConn *hc, const char *method, const ZapHttpUrl *u,
+                             const ZapStr *body, const ZapDict *hdrs, int suppress_ctype) {
+    size_t blen = (size_t)(body->len < 0 ? 0 : body->len);
+    size_t hdrbytes = 0;
+    int caller_content_type = 0;
+    if (hdrs) {
+        for (int64_t e = 0; e < hdrs->cap; e++) {
+            if (zap_d_tags(hdrs)[e] < 2) {
+                continue;
+            }
+            const ZapStr *name = (const ZapStr *)(intptr_t)zap_d_keys(hdrs)[e];
+            const ZapStr *val = (const ZapStr *)(intptr_t)zap_d_vals(hdrs)[e];
+            if (zap_http_hdr_managed(name)) {
+                continue;
+            }
+            if (zap_http_name_eq(name, "Content-Type")) {
+                caller_content_type = 1;
+            }
+            size_t nl = (size_t)(name->len < 0 ? 0 : name->len);
+            size_t vl = (size_t)(val->len < 0 ? 0 : val->len);
+            hdrbytes += nl + vl + 4;
+        }
+    }
+    size_t reqcap = strlen(method) + strlen(u->path) + u->hostend + blen + hdrbytes + 256;
+    char *req = (char *)malloc(reqcap);
+    if (!req) {
+        zap_net_panic("http: out of memory");
+        return -1;
+    }
+    int hdr = snprintf(req, reqcap, "%s %s HTTP/1.1\r\nHost: %.*s\r\n", method, u->path,
+                       (int)u->hostend, u->hoststart);
+    if (blen > 0) {
+        hdr += snprintf(req + hdr, reqcap - (size_t)hdr, "Content-Length: %zu\r\n", blen);
+        if (!caller_content_type) {
+            hdr += snprintf(req + hdr, reqcap - (size_t)hdr,
+                            "Content-Type: text/plain; charset=utf-8\r\n");
+        }
+    }
+    if (hdrs) {
+        for (int64_t e = 0; e < hdrs->cap; e++) {
+            if (zap_d_tags(hdrs)[e] < 2) {
+                continue;
+            }
+            const ZapStr *name = (const ZapStr *)(intptr_t)zap_d_keys(hdrs)[e];
+            const ZapStr *val = (const ZapStr *)(intptr_t)zap_d_vals(hdrs)[e];
+            if (zap_http_hdr_managed(name)) {
+                continue;
+            }
+            if (suppress_ctype && zap_http_name_eq(name, "Content-Type")) {
+                continue;
+            }
+            size_t nl = (size_t)(name->len < 0 ? 0 : name->len);
+            size_t vl = (size_t)(val->len < 0 ? 0 : val->len);
+            hdr += snprintf(req + hdr, reqcap - (size_t)hdr, "%.*s: %.*s\r\n", (int)nl, name->data,
+                            (int)vl, val->data);
+        }
+    }
+    hdr += snprintf(req + hdr, reqcap - (size_t)hdr, "\r\n");
+    if (blen > 0) {
+        memcpy(req + hdr, body->data, blen);
+        hdr += (int)blen;
+    }
+    int sent = zap_httpconn_send_all(hc, req, (size_t)hdr);
+    free(req);
+    return sent;
+}
+
+/* Read exactly one response off `hc`. On success returns 0 and sets the out
+ * params: `status`, a malloc'd first-line-stripped header block
+ * (`headers`/`headers_len`, like `ZapHttpResp.headers`), a malloc'd decoded body
+ * (`body`/`body_len`), and `reusable` (the connection may be pooled). Returns 1
+ * — "stale" — when the peer closed before sending any byte (a dead pooled
+ * connection the caller retries once). Raises on a read deadline / cancellation /
+ * malformed response. The buffer lives across parks (never GC). */
+static int zap_http_read_one(ZapHttpConn *hc, long *status_out, char **headers_out,
+                             size_t *headers_len_out, char **body_out, size_t *body_len_out,
+                             int *reusable_out) {
+    ZapDynBuf b = {NULL, 0, 0};
+    size_t hlen = 0, body_off = 0;
+    int have_headers = 0;
+    for (;;) {
+        if (b.len > 0 && zap_http_split(&b, &hlen, &body_off) == 0) {
+            have_headers = 1;
+            break;
+        }
+        ssize_t r = zap_httpconn_fill(hc, &b);
+        if (r == -2 || r == -3) {
+            zap_dyn_free(&b);
+            zap_io_panic((int)r, "http: read timed out");
+            return -1;
+        }
+        if (r == 0) {
+            int empty = (b.len == 0);
+            zap_dyn_free(&b);
+            if (empty) {
+                return 1; /* stale: peer closed before any byte */
+            }
+            zap_io_panic(-1, "http: incomplete response");
+            return -1;
+        }
+        if (r < 0) {
+            zap_dyn_free(&b);
+            zap_io_panic((int)r, "http: read failed");
+            return -1;
+        }
+    }
+    (void)have_headers;
+
+    /* status code: first space, then the digits */
+    long status = 0;
+    size_t sp = 0;
+    while (sp < hlen && b.buf[sp] != ' ') {
+        sp++;
+    }
+    sp++;
+    while (sp < hlen && b.buf[sp] >= '0' && b.buf[sp] <= '9') {
+        status = status * 10 + (b.buf[sp] - '0');
+        sp++;
+    }
+    int http11 = (hlen >= 8 && memcmp(b.buf, "HTTP/1.1", 8) == 0);
+
+    /* header block for lookups starts after the status line */
+    size_t hstart = 0;
+    while (hstart < hlen && b.buf[hstart] != '\n') {
+        hstart++;
+    }
+    if (hstart < hlen) {
+        hstart++;
+    }
+    const char *hblk = b.buf + hstart;
+    size_t hblk_len = hlen > hstart ? hlen - hstart : 0;
+
+    int chunked = zap_http_hdr_has_token(hblk, hblk_len, "Transfer-Encoding", "chunked");
+    int conn_close = zap_http_hdr_has_token(hblk, hblk_len, "Connection", "close");
+    int conn_ka = zap_http_hdr_has_token(hblk, hblk_len, "Connection", "keep-alive");
+    long clen = chunked ? -1 : zap_http_content_length(hblk, hblk_len);
+
+    char *body = NULL;
+    size_t blen = 0;
+    int framed = 0;
+
+    if (chunked) {
+        ZapDynBuf out = {NULL, 0, 0};
+        size_t pos = body_off;
+        int ok = 1;
+        for (;;) {
+            const char *crlf;
+            while (!(crlf = zap_memfind(b.buf + pos, b.len - pos, "\r\n", 2))) {
+                ssize_t r = zap_httpconn_fill(hc, &b);
+                if (r == -2 || r == -3) {
+                    zap_dyn_free(&out);
+                    zap_dyn_free(&b);
+                    zap_io_panic((int)r, "http: read timed out");
+                    return -1;
+                }
+                if (r <= 0) {
+                    ok = 0;
+                    break;
+                }
+            }
+            if (!ok) {
+                break;
+            }
+            size_t line = (size_t)(crlf - (b.buf + pos));
+            long csize = 0;
+            for (size_t k = 0; k < line; k++) {
+                char c = b.buf[pos + k];
+                int d;
+                if (c >= '0' && c <= '9') {
+                    d = c - '0';
+                } else if (c >= 'a' && c <= 'f') {
+                    d = c - 'a' + 10;
+                } else if (c >= 'A' && c <= 'F') {
+                    d = c - 'A' + 10;
+                } else {
+                    break; /* ';' chunk-ext or stray char ends the size */
+                }
+                csize = csize * 16 + d;
+            }
+            if (csize == 0) {
+                /* final chunk: consume through the terminating blank line so the
+                 * socket is left clean for reuse (handles optional trailers). */
+                while (!zap_memfind(b.buf + pos, b.len - pos, "\r\n\r\n", 4)) {
+                    ssize_t r = zap_httpconn_fill(hc, &b);
+                    if (r == -2 || r == -3) {
+                        zap_dyn_free(&out);
+                        zap_dyn_free(&b);
+                        zap_io_panic((int)r, "http: read timed out");
+                        return -1;
+                    }
+                    if (r <= 0) {
+                        break; /* tolerate a missing final CRLF at EOF */
+                    }
+                }
+                framed = 1;
+                break;
+            }
+            size_t data_start = pos + line + 2;
+            while (b.len < data_start + (size_t)csize + 2) {
+                ssize_t r = zap_httpconn_fill(hc, &b);
+                if (r == -2 || r == -3) {
+                    zap_dyn_free(&out);
+                    zap_dyn_free(&b);
+                    zap_io_panic((int)r, "http: read timed out");
+                    return -1;
+                }
+                if (r <= 0) {
+                    ok = 0;
+                    break;
+                }
+            }
+            if (!ok) {
+                break;
+            }
+            if (zap_dyn_reserve(&out, (size_t)csize) != 0) {
+                zap_dyn_free(&out);
+                zap_dyn_free(&b);
+                zap_net_panic("http: out of memory");
+                return -1;
+            }
+            memcpy(out.buf + out.len, b.buf + data_start, (size_t)csize);
+            out.len += (size_t)csize;
+            pos = data_start + (size_t)csize + 2; /* data + trailing CRLF */
+        }
+        if (!framed) {
+            zap_dyn_free(&out);
+            zap_dyn_free(&b);
+            zap_io_panic(-1, "http: malformed chunked response");
+            return -1;
+        }
+        blen = out.len;
+        body = out.buf ? out.buf : (char *)malloc(1);
+        /* ownership of out.buf transferred to `body` */
+    } else if (clen >= 0) {
+        while ((long)(b.len - body_off) < clen) {
+            ssize_t r = zap_httpconn_fill(hc, &b);
+            if (r == -2 || r == -3) {
+                zap_dyn_free(&b);
+                zap_io_panic((int)r, "http: read timed out");
+                return -1;
+            }
+            if (r <= 0) {
+                zap_dyn_free(&b);
+                zap_io_panic(-1, "http: truncated response body");
+                return -1;
+            }
+        }
+        blen = (size_t)clen;
+        body = (char *)malloc(blen ? blen : 1);
+        if (!body) {
+            zap_dyn_free(&b);
+            zap_net_panic("http: out of memory");
+            return -1;
+        }
+        memcpy(body, b.buf + body_off, blen);
+        framed = 1;
+    } else {
+        /* no framing: read to EOF (never reusable) */
+        for (;;) {
+            ssize_t r = zap_httpconn_fill(hc, &b);
+            if (r == -2 || r == -3) {
+                zap_dyn_free(&b);
+                zap_io_panic((int)r, "http: read timed out");
+                return -1;
+            }
+            if (r <= 0) {
+                break;
+            }
+        }
+        blen = b.len > body_off ? b.len - body_off : 0;
+        body = (char *)malloc(blen ? blen : 1);
+        if (!body) {
+            zap_dyn_free(&b);
+            zap_net_panic("http: out of memory");
+            return -1;
+        }
+        memcpy(body, b.buf + body_off, blen);
+        framed = 0;
+    }
+
+    char *headers = (char *)malloc(hblk_len ? hblk_len : 1);
+    if (!headers) {
+        free(body);
+        zap_dyn_free(&b);
+        zap_net_panic("http: out of memory");
+        return -1;
+    }
+    memcpy(headers, hblk, hblk_len);
+
+    *status_out = status;
+    *headers_out = headers;
+    *headers_len_out = hblk_len;
+    *body_out = body;
+    *body_len_out = blen;
+    *reusable_out = framed && !conn_close && (http11 || conn_ka);
+    zap_dyn_free(&b);
+    return 0;
+}
+
+/* ---- the pool ------------------------------------------------------------- */
+typedef struct ZapHttpIdle {
+    char *key; /* "p|host|port" or "t|host|port" */
+    ZapHttpConn hc;
+    struct ZapHttpIdle *next;
+} ZapHttpIdle;
+
+typedef struct {
+    ZapHttpIdle *idle; /* LIFO */
+    int64_t n_idle;
+    int64_t max_idle;
+    pthread_mutex_t mu;
+} ZapHttpPool;
+
+static char *zap_http_pool_key(const ZapHttpUrl *u) {
+    char *k = (char *)malloc(strlen(u->host) + 32);
+    if (k) {
+        snprintf(k, strlen(u->host) + 32, "%c|%s|%ld", u->tls ? 't' : 'p', u->host, u->port);
+    }
+    return k;
+}
+
+/* Pop an idle connection for `key`, or return 0. */
+static int zap_http_pool_acquire(ZapHttpPool *p, const char *key, ZapHttpConn *hc) {
+    int got = 0;
+    pthread_mutex_lock(&p->mu);
+    ZapHttpIdle **pp = &p->idle;
+    while (*pp) {
+        if (strcmp((*pp)->key, key) == 0) {
+            ZapHttpIdle *n = *pp;
+            *pp = n->next;
+            p->n_idle--;
+            *hc = n->hc;
+            free(n->key);
+            free(n);
+            got = 1;
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&p->mu);
+    return got;
+}
+
+/* Return a connection to the pool, or close it if the pool is full / OOM. */
+static void zap_http_pool_release(ZapHttpPool *p, const char *key, const ZapHttpConn *hc) {
+    pthread_mutex_lock(&p->mu);
+    int room = p->n_idle < p->max_idle;
+    pthread_mutex_unlock(&p->mu);
+    if (!room) {
+        ZapHttpConn tmp = *hc;
+        zap_httpconn_close(&tmp);
+        return;
+    }
+    ZapHttpIdle *n = (ZapHttpIdle *)malloc(sizeof *n);
+    char *k = (char *)malloc(strlen(key) + 1);
+    if (!n || !k) {
+        free(n);
+        free(k);
+        ZapHttpConn tmp = *hc;
+        zap_httpconn_close(&tmp);
+        return;
+    }
+    memcpy(k, key, strlen(key) + 1);
+    n->key = k;
+    n->hc = *hc;
+    pthread_mutex_lock(&p->mu);
+    n->next = p->idle;
+    p->idle = n;
+    p->n_idle++;
+    pthread_mutex_unlock(&p->mu);
+}
+
+/* http.Client pool constructor. Returns the pool as an int64 handle (a stable
+ * non-GC pointer), or raises on OOM. `max_idle <= 0` uses the default (8). */
+int64_t zap_http_pool_new(int64_t max_idle) {
+    ZapHttpPool *p = (ZapHttpPool *)malloc(sizeof *p);
+    if (!p) {
+        zap_net_panic("http: out of memory");
+        return 0;
+    }
+    p->idle = NULL;
+    p->n_idle = 0;
+    p->max_idle = max_idle > 0 ? max_idle : 8;
+    pthread_mutex_init(&p->mu, NULL);
+    return (int64_t)(intptr_t)p;
+}
+
+/* Drain and close every idle connection, then free the pool. After this the
+ * handle is dangling; the prelude `Client.close()` is the only caller and does
+ * not reuse it. */
+void zap_http_pool_close(int64_t handle) {
+    ZapHttpPool *p = (ZapHttpPool *)(intptr_t)handle;
+    if (!p) {
+        return;
+    }
+    pthread_mutex_lock(&p->mu);
+    ZapHttpIdle *n = p->idle;
+    p->idle = NULL;
+    p->n_idle = 0;
+    pthread_mutex_unlock(&p->mu);
+    while (n) {
+        ZapHttpIdle *next = n->next;
+        zap_httpconn_close(&n->hc);
+        free(n->key);
+        free(n);
+        n = next;
+    }
+    pthread_mutex_destroy(&p->mu);
+    free(p);
+}
+
+/* One request over the pool, with redirect following honoring `follow` /
+ * `max_redirects` (#1049) and connection reuse (#990). `timeout_ms` is the #986
+ * total deadline. Returns a `ZapHttpResp`. */
+void *zap_http_pool_do(int64_t handle, void *method_, void *url_, void *body_, void *headers_,
+                       int64_t timeout_ms, int64_t follow, int64_t max_redirects) {
+    ZapHttpPool *p = (ZapHttpPool *)(intptr_t)handle;
+    const ZapStr *body = (const ZapStr *)body_;
+    const ZapDict *hdrs = (const ZapDict *)headers_;
+
+    if (timeout_ms < 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("http: timeout must be non-negative",
+                                    (int64_t)sizeof("http: timeout must be non-negative") - 1));
+        return NULL;
+    }
+    if (max_redirects < 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("http: max_redirects must be non-negative",
+                                    (int64_t)sizeof("http: max_redirects must be non-negative") - 1));
+        return NULL;
+    }
+
+    char *cur = zap_net_dupz((const ZapStr *)url_);
+    char *curm = zap_net_dupz((const ZapStr *)method_);
+    if (!cur || !curm) {
+        free(cur);
+        free(curm);
+        zap_net_panic("http: out of memory");
+        return NULL;
+    }
+
+    char **chain = NULL;
+    size_t nchain = 0;
+    int drop_body = 0;
+    int suppress_ctype = 0;
+    ZAP_STACK_STR(empty, "", 0);
+
+    long status = 0;
+    char *resp_headers = NULL;
+    size_t resp_headers_len = 0;
+    char *resp_body = NULL;
+    size_t resp_body_len = 0;
+
+    for (int hop = 0;; hop++) {
+        int64_t deadline_ns = (timeout_ms > 0) ? zap_deadline_after_ms(timeout_ms) : 0;
+        ZapHttpUrl u;
+        if (zap_http_url_parse(cur, &u) != 0) {
+            free(cur);
+            free(curm);
+            zap_net_panic("http: out of memory");
+            return NULL;
+        }
+        char *key = zap_http_pool_key(&u);
+        const ZapStr *bodyArg = drop_body ? (const ZapStr *)empty : body;
+
+        /* Try a pooled connection; on a stale one (peer already closed) dial a
+         * fresh connection and retry exactly once. */
+        int rc = 1; /* 1 == stale, forces the first iteration to (re)send */
+        for (int attempt = 0; attempt < 2 && rc == 1; attempt++) {
+            ZapHttpConn hc;
+            int from_pool = key && zap_http_pool_acquire(p, key, &hc);
+            if (from_pool) {
+                hc.deadline_ns = deadline_ns;
+            } else {
+                zap_http_dial(&u, deadline_ns, &hc); /* raises on failure */
+            }
+            int sent = zap_http_send_req(&hc, curm, &u, bodyArg, hdrs, suppress_ctype);
+            if (sent < 0) {
+                zap_httpconn_close(&hc);
+                if (from_pool && attempt == 0) {
+                    rc = 1; /* stale: retry with a fresh dial */
+                    continue;
+                }
+                free(key);
+                free(u.host);
+                free(cur);
+                free(curm);
+                for (size_t k = 0; k < nchain; k++) {
+                    free(chain[k]);
+                }
+                free(chain);
+                free(resp_headers);
+                free(resp_body);
+                zap_io_panic(sent, "http: send failed");
+                return NULL;
+            }
+            int reusable = 0;
+            free(resp_headers);
+            free(resp_body);
+            resp_headers = NULL;
+            resp_body = NULL;
+            rc = zap_http_read_one(&hc, &status, &resp_headers, &resp_headers_len, &resp_body,
+                                   &resp_body_len, &reusable);
+            if (rc == 1) {
+                /* stale pooled connection (EOF before a byte) */
+                zap_httpconn_close(&hc);
+                if (from_pool && attempt == 0) {
+                    continue; /* retry fresh */
+                }
+                free(key);
+                free(u.host);
+                free(cur);
+                free(curm);
+                for (size_t k = 0; k < nchain; k++) {
+                    free(chain[k]);
+                }
+                free(chain);
+                zap_io_panic(-1, "http: incomplete response");
+                return NULL;
+            }
+            if (reusable && key) {
+                zap_http_pool_release(p, key, &hc);
+            } else {
+                zap_httpconn_close(&hc);
+            }
+        }
+        free(key);
+
+        if (g_is_cancelled()) {
+            free(u.host);
+            free(cur);
+            free(curm);
+            for (size_t k = 0; k < nchain; k++) {
+                free(chain[k]);
+            }
+            free(chain);
+            free(resp_headers);
+            free(resp_body);
+            zap_raise(cancelled_exc());
+            return NULL;
+        }
+
+        int is_redirect = zap_http_is_redirect(status);
+        char *loc = NULL;
+        if (is_redirect && follow) {
+            const char *vp;
+            size_t vlen;
+            if (zap_http_hdr_raw(resp_headers, resp_headers_len, "Location", &vp, &vlen) &&
+                vlen > 0) {
+                loc = (char *)malloc(vlen + 1);
+                if (loc) {
+                    memcpy(loc, vp, vlen);
+                    loc[vlen] = '\0';
+                }
+            }
+        }
+        if (!loc) {
+            free(u.host);
+            break; /* terminal response (or follow disabled / no Location) */
+        }
+        if (hop >= max_redirects) {
+            free(loc);
+            free(u.host);
+            free(cur);
+            free(curm);
+            for (size_t k = 0; k < nchain; k++) {
+                free(chain[k]);
+            }
+            free(chain);
+            free(resp_headers);
+            free(resp_body);
+            zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                            zap_str_new("http: too many redirects",
+                                        (int64_t)sizeof("http: too many redirects") - 1));
+            return NULL;
+        }
+
+        ZapStr *baseZ = (ZapStr *)zap_str_new(cur, (int64_t)strlen(cur));
+        ZapStr *refZ = (ZapStr *)zap_str_new(loc, (int64_t)strlen(loc));
+        ZapStr *joined = (ZapStr *)zap_url_join(baseZ, refZ);
+        char *newurl = zap_net_dupz(joined);
+        free(loc);
+        free(u.host);
+        if (!newurl) {
+            free(cur);
+            free(curm);
+            for (size_t k = 0; k < nchain; k++) {
+                free(chain[k]);
+            }
+            free(chain);
+            free(resp_headers);
+            free(resp_body);
+            zap_net_panic("http: out of memory");
+            return NULL;
+        }
+        char **grown = (char **)realloc(chain, (nchain + 1) * sizeof(char *));
+        if (!grown) {
+            free(newurl);
+            free(cur);
+            free(curm);
+            for (size_t k = 0; k < nchain; k++) {
+                free(chain[k]);
+            }
+            free(chain);
+            free(resp_headers);
+            free(resp_body);
+            zap_net_panic("http: out of memory");
+            return NULL;
+        }
+        chain = grown;
+        chain[nchain] = zap_http_cstr_dup(newurl);
+        nchain++;
+
+        if (status == 303) {
+            if (!zap_http_method_is(curm, "HEAD")) {
+                free(curm);
+                curm = zap_http_cstr_dup("GET");
+                drop_body = 1;
+            }
+        } else if (status == 301 || status == 302) {
+            if (zap_http_method_is(curm, "POST")) {
+                free(curm);
+                curm = zap_http_cstr_dup("GET");
+                drop_body = 1;
+            }
+        }
+        suppress_ctype = drop_body;
+        free(cur);
+        cur = newurl;
+    }
+
+    /* Terminal response: build the GC results now (no further park). */
+    ZapHttpResp *resp = (ZapHttpResp *)zap_obj(&zap_desc_httpresp);
+    resp->status = (int64_t)status;
+    resp->headers = (const ZapStr *)zap_str_new(resp_headers ? resp_headers : "",
+                                                (int64_t)resp_headers_len);
+    resp->body =
+        (const ZapStr *)zap_str_new(resp_body ? resp_body : "", (int64_t)resp_body_len);
+    resp->final_url = (const ZapStr *)zap_str_new(cur, (int64_t)strlen(cur));
+    void *chainlist = zap_list_new();
+    for (size_t k = 0; k < nchain; k++) {
+        zap_list_push_ptr(chainlist, zap_str_new(chain[k], (int64_t)strlen(chain[k])));
+        free(chain[k]);
+    }
+    free(chain);
+    free(cur);
+    free(curm);
+    free(resp_headers);
+    free(resp_body);
+    resp->chain = chainlist;
+    return resp;
+}
+
 int64_t zap_http_status(void *resp_) { return ((ZapHttpResp *)resp_)->status; }
 void *zap_http_body(void *resp_) { return (void *)((ZapHttpResp *)resp_)->body; }
 

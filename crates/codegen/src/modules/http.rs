@@ -55,6 +55,25 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
         &[p.into(), p.into(), p.into(), p.into(), i.into()],
         Some(p.into()),
     );
+    // internal client-pool primitives (#990): the keep-alive pool behind the
+    // prelude `http.Client`. The pool is a stable non-GC pointer passed as an
+    // int64 handle.
+    cg.declare_rt("zap_http_pool_new", &[i.into()], Some(i.into()));
+    cg.declare_rt(
+        "zap_http_pool_do",
+        &[
+            i.into(), // pool handle
+            p.into(), // method
+            p.into(), // url
+            p.into(), // body
+            p.into(), // headers (dict, may be empty)
+            i.into(), // timeout_ms
+            i.into(), // follow (0/1)
+            i.into(), // max_redirects
+        ],
+        Some(p.into()),
+    );
+    cg.declare_rt("zap_http_pool_close", &[i.into()], None);
     cg.declare_rt("zap_http_status", &[p.into()], Some(i.into()));
     cg.declare_rt("zap_http_body", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_http_header", &[p.into(), p.into()], Some(p.into()));

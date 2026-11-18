@@ -658,8 +658,16 @@ verbs also take an **optional `timeout` keyword** (#986, D-0229): a per-request
 **total deadline in milliseconds** bounding the whole call (connect + reads +
 redirects), raising a catchable `TimeoutError` on expiry (`0`/omitted =
 unbounded, a negative value is a `ValueError`); `headers` may be omitted while
-`timeout` is supplied (an interior-optional seam default, D-0204). Because `http`
-is **Experimental**, all of these are additive surface changes requiring no
+`timeout` is supplied (an interior-optional seam default, D-0204). A reusable
+**`http.Client`** (#990/#1049, D-0230) adds keep-alive connection pooling and a
+configurable redirect policy: `auto c = http.Client(max_redirects=…, follow=…,
+timeout=…)` then `c.get`/`c.post`/`c.request` reuse pooled connections per host
+(over `http://` and `https://`) and follow redirects per `follow` (requests'
+`allow_redirects`) / `max_redirects` (exceeding it raises `ValueError`;
+`follow=false` returns the 3xx unfollowed); `c.shutdown()` drains the pool
+(`shutdown`, since `close` is a reserved word). The bare `http.get`/`post`/
+`request` verbs are unchanged (one-shot, unpooled). Because `http` is
+**Experimental**, all of these are additive surface changes requiring no
 stability promise.
 
 **CLI (`SPEC.md` §17, `crates/driver/src/cli.rs`).**

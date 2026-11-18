@@ -40,6 +40,13 @@ use crate::ast::Expr;
 pub const SEAM_GENERIC_CTORS: &[(&str, &str, &str)] = &[
     // The lock-free MPSC `Queue[T]` (I#184, D-0078) — built by `new_queue[T]()`.
     ("concurrent", "Queue", "new_queue"),
+    // The keep-alive HTTP client `http.Client(...)` (#990) — a non-generic
+    // prelude struct built by the prelude factory `__http_client(...)`, which
+    // creates the connection pool. Same callee-rewrite sugar: `http.Client(...)`
+    // → `__http_client(...)`, args (the config keywords) carried through. Used
+    // via `auto client = http.Client(...)`, so the dotted type head is not spelled
+    // as an annotation (the bare prelude type is `HttpClient`, not `Client`).
+    ("http", "Client", "__http_client"),
 ];
 
 /// If the dotted type head `dotted` (`"concurrent.Queue"`) names a seam generic,
