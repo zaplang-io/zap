@@ -10,7 +10,7 @@
 # sidecar). MAXPROCS=4 so both children run concurrently with the main thread.
 def sleeper(channel[int64] ready):
     ready <- 1
-    time.sleep_ns(time.millis(400))  # blocking syscall: never reaches a cancel point
+    time.sleep_for(time.millis(400))  # blocking syscall: never reaches a cancel point
 
 def spinner(channel[int64] ready, list[int64] stop):
     ready <- 1

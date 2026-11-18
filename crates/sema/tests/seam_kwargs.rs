@@ -1004,9 +1004,10 @@ fn sys_write_keyword_and_positional() {
 
 #[test]
 fn datetime_arith_keyword_and_positional() {
-    // Arithmetic / comparison / field helpers (#974, D-0221).
+    // Arithmetic / comparison / field helpers (#974, D-0221; add takes a
+    // Duration since #1047, D-0227).
     assert_ok(&prog(
-        "    auto t = datetime.from_timestamp(0)\n    auto b = datetime.add(dt=t, seconds=1)\n",
+        "    auto t = datetime.from_timestamp(0)\n    auto one = time.seconds(1)\n    auto b = datetime.add(dt=t, delta=one)\n",
     ));
     assert_ok(&prog(
         "    auto t = datetime.from_timestamp(0)\n    auto d = datetime.diff(a=t, b=t)\n",
@@ -1015,7 +1016,7 @@ fn datetime_arith_keyword_and_positional() {
         "    auto t = datetime.from_timestamp(0)\n    auto w = datetime.weekday(dt=t)\n",
     ));
     assert_code(
-        &prog("    auto t = datetime.from_timestamp(0)\n    auto b = datetime.add(dt=t, secs=1)\n"),
+        &prog("    auto t = datetime.from_timestamp(0)\n    auto one = time.seconds(1)\n    auto b = datetime.add(dt=t, secs=one)\n"),
         "ZAP4023",
     );
 }

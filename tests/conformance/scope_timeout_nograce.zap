@@ -8,7 +8,7 @@
 # exit 0 (the default `.exit`, which also proves it never reaches `_exit(1)`).
 def wont_drain(channel[int64] ready):
     ready <- 1
-    time.sleep_ns(time.millis(500))  # blocking syscall: never reaches a cancel point
+    time.sleep_for(time.millis(500))  # blocking syscall: never reaches a cancel point
 
 def main():
     auto ready = channel[int64](1)

@@ -22,14 +22,14 @@
 # the moving Immix collector and non-moving Boehm.
 
 def sleeper(Atomic[int64] c, bytes wg):
-    time.sleep_ns(time.micros(300))
+    time.sleep_for(time.micros(300))
     auto junk = [1, 2, 3]  # a little heap churn to feed the collector
     c.add(1)
     sync.done(wg)
 
 def locker(bytes mu, Atomic[int64] c, bytes wg):
     sync.lock(mu)
-    time.sleep_ns(time.micros(100))  # hold the lock across a blocking sleep
+    time.sleep_for(time.micros(100))  # hold the lock across a blocking sleep
     c.add(1)
     sync.unlock(mu)
     sync.done(wg)

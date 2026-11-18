@@ -10282,10 +10282,11 @@ def main():
 
     #[test]
     fn datetime_arith_methods_type_check() {
+        // add takes a Duration, diff returns one (#1047, D-0227).
         ok(r#"def main():
     auto a = datetime.from_timestamp(0)
-    auto b = datetime.add(a, 86400)
-    int64 d = datetime.diff(b, a)
+    auto b = datetime.add(a, time.seconds(86400))
+    int64 d = datetime.diff(b, a).nanos
     bool lt = datetime.before(a, b)
     bool eq = datetime.equal(a, a)
     int64 w = datetime.weekday(a)
@@ -10295,7 +10296,7 @@ def main():
     if lt and eq:
         print("ok")
 "#);
-        // add: (DateTime, int) — arity -> ZAP4025, non-int seconds -> ZAP4024.
+        // add: (DateTime, Duration) — arity -> ZAP4025, non-Duration delta -> ZAP4024.
         let e = errors(
             "def main():\n    auto a = datetime.from_timestamp(0)\n    auto x = datetime.add(a)\n",
         );

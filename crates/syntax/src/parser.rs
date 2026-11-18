@@ -167,6 +167,19 @@ value struct TimeZone:
     int64 offset
     bool fixed
 
+@derive(Eq, Ord, Repr)
+value struct Duration:
+    int64 nanos
+
+    def __add__(self, Duration other) -> Duration:
+        return Duration(nanos=self.nanos + other.nanos)
+
+    def __sub__(self, Duration other) -> Duration:
+        return Duration(nanos=self.nanos - other.nanos)
+
+    def __mul__(self, int64 k) -> Duration:
+        return Duration(nanos=self.nanos * k)
+
 value struct Date:
     int64 year
     int64 month
@@ -1321,6 +1334,10 @@ fn references_prelude(module: &Module) -> bool {
         // program that names the module or either struct.
         "\"Date\"",
         "\"Time\"",
+        // The reconciled `Duration` type (#1047, D-0227): a nanosecond value
+        // struct shared by `time` and `datetime`, injected for any program that
+        // names either module or the struct.
+        "\"Duration\"",
         "\"time\"",
         "\"datetime\"",
         // The validated asymmetric-key metadata `crypto.key_info()` returns

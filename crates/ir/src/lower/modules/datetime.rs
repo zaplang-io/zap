@@ -417,8 +417,19 @@ fn lower(
         // D-0221; offset-aware since #1045). `add` keeps the source zone.
         "add" => {
             let (inst, off, aware) = instant_of(lowerer, &args[0])?;
-            let (sv, st) = lowerer.expr(&args[1].value)?;
-            let sec = lowerer.coerce(sv, st, Ty::I64);
+            // delta is a Duration (ns); DateTime is whole-second, so use
+            // nanos / 1_000_000_000 (truncating any sub-second part) (#1047).
+            let dur_sid = struct_sid(lowerer, "Duration")?;
+            let (dbase, _) = lowerer.expr(&args[1].value)?;
+            let nanos = lowerer.field_get(dbase, dur_sid, 0, Ty::I64);
+            let billion = lowerer.iconst(Ty::I64, 1_000_000_000);
+            let sec = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Bin {
+                dest: sec,
+                op: BinOp::Div,
+                lhs: nanos,
+                rhs: billion,
+            });
             let inst2 = lowerer.new_value(Ty::I64);
             lowerer.emit(Inst::Bin {
                 dest: inst2,
@@ -439,14 +450,32 @@ fn lower(
         "diff" => {
             let (a, _, _) = instant_of(lowerer, &args[0])?;
             let (b, _, _) = instant_of(lowerer, &args[1])?;
-            let d = lowerer.new_value(Ty::I64);
+            let secs = lowerer.new_value(Ty::I64);
             lowerer.emit(Inst::Bin {
-                dest: d,
+                dest: secs,
                 op: BinOp::Sub,
                 lhs: a,
                 rhs: b,
             });
-            (d, Ty::I64)
+            // -> Duration (whole-second datetimes, so ns = seconds × 1e9) (#1047).
+            let dur_sid = struct_sid(lowerer, "Duration")?;
+            let billion = lowerer.iconst(Ty::I64, 1_000_000_000);
+            let nanos = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Bin {
+                dest: nanos,
+                op: BinOp::Mul,
+                lhs: secs,
+                rhs: billion,
+            });
+            let dest = lowerer.new_value(Ty::Struct(dur_sid));
+            lowerer.emit(Inst::StructNew { dest, sid: dur_sid });
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid: dur_sid,
+                idx: 0,
+                val: nanos,
+            });
+            (dest, Ty::Struct(dur_sid))
         }
         "before" | "after" | "equal" => {
             let (a, _, _) = instant_of(lowerer, &args[0])?;

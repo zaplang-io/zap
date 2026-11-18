@@ -20,6 +20,33 @@ pub(super) const MODULE: ModuleCheck = ModuleCheck {
     check,
 };
 
+/// The prelude type name for a duration (#1047, D-0227): shared by `time` and
+/// `datetime`, an `int64`-nanosecond value struct.
+const DURATION: &str = "Duration";
+
+/// Require exactly one `Duration` argument, inferring it so it is type-checked.
+fn expect_duration1(checker: &mut Checker, method: &str, args: &[Arg], span: Span) {
+    if args.len() != 1 {
+        checker.error(
+            ErrorCode::ZAP4025,
+            format!("time.{method}() takes 1 argument, found {}", args.len()),
+            span,
+        );
+        for a in args {
+            checker.infer(&a.value);
+        }
+        return;
+    }
+    let at = checker.infer(&args[0].value);
+    if !matches!(&at, Ty::Named(n) if n == DURATION) && !matches!(at, Ty::Unknown) {
+        checker.error(
+            ErrorCode::ZAP4024,
+            format!("time.{method}() expects a Duration, found {}", at.display()),
+            expr_span(&args[0].value),
+        );
+    }
+}
+
 /// Require exactly one numeric argument (`int64` or `float64`), inferring it so
 /// it is still type-checked. Used by the duration-unit helpers and `sleep`.
 fn expect_numeric1(checker: &mut Checker, method: &str, args: &[Arg], span: Span) {
@@ -71,19 +98,24 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_numeric1(checker, "sleep", args, span);
             Some(Ty::Unit)
         }
-        // time.sleep_ns(ns): nanosecond-precision sleep.
+        // time.sleep_ns(ns): nanosecond-precision sleep (raw int).
         "sleep_ns" => {
             expect_numeric1(checker, "sleep_ns", args, span);
             Some(Ty::Unit)
         }
-        // --- duration unit constructors (-> nanoseconds) ---
+        // time.sleep_for(d): sleep for a Duration (#1047, D-0227).
+        "sleep_for" => {
+            expect_duration1(checker, "sleep_for", args, span);
+            Some(Ty::Unit)
+        }
+        // --- duration unit constructors (-> Duration, #1047) ---
         "seconds" | "millis" | "micros" | "nanos" => {
             expect_numeric1(checker, method, args, span);
-            Some(Ty::Int64)
+            Some(Ty::Named(DURATION.to_string()))
         }
-        // --- duration unit converters (nanoseconds -> unit as float) ---
+        // --- duration unit converters (Duration -> unit as float, #1047) ---
         "to_seconds" | "to_millis" | "to_micros" => {
-            expect_numeric1(checker, method, args, span);
+            expect_duration1(checker, method, args, span);
             Some(Ty::Float64)
         }
         _ => None,

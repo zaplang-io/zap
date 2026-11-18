@@ -11444,3 +11444,73 @@ Relates to [[D-0056]] / #99 (the datetime seam), [[D-0221]] (#974 arithmetic),
 [[D-0225]] (the aware `DateTime`), [[D-0204]] (the seam binder's trailing-only
 limit this method works around), [[D-0213]] (seam rows), epic #966, and
 Discussion #965 (gap #7).
+
+## D-0227 — stdlib duration: a reconciled `Duration` type across `datetime` + `time` (#1047 / #974 / epic #966)
+
+**Context.** The same concept — "a duration" — was an untyped `int64` in **two
+units**: `time` modelled it as `int64` **nanoseconds** (clocks / sleep / the
+`seconds`/`millis`/`micros`/`nanos` unit helpers), while `datetime`'s [[D-0221]]
+`add`/`diff` used `int64` **whole seconds**. Nothing stopped a caller passing a
+`time` ns duration into `datetime.add` (off by 10⁹) or vice-versa. #974 asked for
+*either* a real `timedelta` type *or* a documented reconciled int64 convention;
+slice 1 delivered neither.
+
+**Decision — a real `Duration` value type.** A single int64 unit cannot serve
+both domains cleanly (`time` needs nanosecond precision for clocks/sleep;
+`datetime` is whole-second — a shared ns unit burdens `datetime.add` with
+10⁹-scale magnitudes, a shared second unit strips `time` of its precision). So
+durations become a **type**, not a convention:
+
+```
+@derive(Eq, Ord, Repr)
+value struct Duration:
+    int64 nanos          # Go time.Duration style — int64 ns, ±292-year range
+    def __add__(self, Duration other) -> Duration   # + / -  (Duration op Duration)
+    def __sub__(self, Duration other) -> Duration
+    def __mul__(self, int64 k) -> Duration            # scalar scaling
+```
+
+Arithmetic and comparisons are real operators via the [[D-0047]] dunder protocol
+(`+`/`-`/`*`, and `<`/`<=`/`==`/… from `@derive(Eq, Ord)`); `@derive(Repr)` gives
+a debug `str`. `Duration` ships in the built-in prelude alongside `DateTime` —
+the **first prelude struct to carry methods**, which the prelude parser + sema
+handle like any struct. The unit now lives in the type, so the ns↔s mix-up is
+impossible by construction.
+
+**`time` moves to it.** `time.seconds(n)` / `millis` / `micros` / `nanos(n)` now
+return a `Duration` (was `int64` ns); `time.to_seconds` / `to_millis` /
+`to_micros` now take a `Duration` and return `float`. A new
+`time.sleep_for(d: Duration)` sleeps a `Duration`. The low-level raw-number forms
+stay for convenience — `time.sleep(seconds)` (Python float seconds),
+`time.sleep_ns(ns)` (raw int) — and the clock readings `monotonic_ns` / `time_ns`
+/ `monotonic` / `time` are unchanged (they are *timestamps*, not durations; a raw
+ns delta becomes a `Duration` via `Duration(nanos=…)`).
+
+**`datetime` moves to it.** `datetime.add(dt, delta: Duration) -> DateTime`
+(parameter renamed from `seconds`) shifts by `delta.nanos / 1_000_000_000` whole
+seconds (DateTime is whole-second; sub-second nanos truncate). `datetime.diff(a,
+b) -> Duration` returns `(instant(a) − instant(b)) × 1_000_000_000` ns. Both are
+**breaking** changes to the [[D-0221]] int-seconds API — fine pre-1.0, and the
+point of the reconciliation.
+
+**No new runtime / codegen.** `Duration` is a single-field value struct, so
+construction/field-read and the dunder arithmetic lower as pure IR; the `time`
+helpers reuse the existing `zap_time_*_to_ns` / `zap_time_ns_to_*` runtime
+entries (wrapping/unwrapping the `nanos` field), and `datetime.add`/`diff` are
+pure IR. No `zaprt.c` fragment or `declare_rt` change.
+
+**Deferred.** A human-readable `Duration` formatter (Go-style `1h2m3s`) — `Repr`
+(`Duration(nanos=…)`) and `time.to_seconds` cover debug/numeric rendering for
+now. Letting the clock deltas return `Duration` directly is a possible follow-up.
+
+**Tests.** Golden `duration` (deterministic: constructors → `nanos`, `+`/`-`/`*`,
+comparisons, `to_seconds`; `datetime.add(dt, time.seconds(…))` and
+`datetime.diff → Duration`); sema type/arity for the new surface + the dunder
+arithmetic; seam-kwargs for the rowed helpers. Existing goldens `datetime_arith`,
+`time_basic`, and the four `sleep_ns(time.…)` stress fixtures are updated to the
+`Duration` surface.
+
+Relates to [[D-0056]] / #99, [[D-0221]] (#974 arithmetic this reconciles),
+[[D-0047]] (the operator-overloading protocol `Duration` uses), [[D-0225]] /
+[[D-0226]] (the sibling #974 slices), [[D-0213]] (seam rows), epic #966, and
+Discussion #965 (gap #7).
