@@ -1021,6 +1021,36 @@ fn datetime_arith_keyword_and_positional() {
 }
 
 #[test]
+fn datetime_timezone_keyword_and_positional() {
+    // Timezone surface (#1045, D-0225): keyword binding + reordering.
+    assert_ok(&prog("    auto z = datetime.zone(name=\"UTC\")\n"));
+    assert_ok(&prog("    auto z = datetime.fixed_offset(minutes=330)\n"));
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    auto s = datetime.isoformat(dt=t)\n",
+    ));
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    auto s = datetime.rfc3339(dt=t)\n",
+    ));
+    assert_ok(&prog(
+        "    auto t = datetime.rfc3339_parse(s=\"2021-01-01T00:00:00Z\")\n",
+    ));
+    // astimezone — bind the DateTime/TimeZone to vars first (a nested call as a
+    // kwarg value does not parse), then reorder the two keywords.
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    auto z = datetime.fixed_offset(330)\n    auto a = datetime.astimezone(dt=t, tz=z)\n",
+    ));
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    auto z = datetime.fixed_offset(330)\n    auto a = datetime.astimezone(tz=z, dt=t)\n",
+    ));
+    // Positional unchanged.
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    auto z = datetime.fixed_offset(330)\n    auto a = datetime.astimezone(t, z)\n",
+    ));
+    // A misspelled keyword is rejected (no longer silently ignored).
+    assert_code(&prog("    auto z = datetime.zone(nm=\"UTC\")\n"), "ZAP4023");
+}
+
+#[test]
 fn fs_glob_fnmatch_keyword_and_positional() {
     // Path matching (#1033, D-0216): keyword binding, reordering, positional.
     assert_ok(&prog(

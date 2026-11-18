@@ -100,6 +100,13 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("datetime", "weekday", &["dt"]),
     ("datetime", "isoweekday", &["dt"]),
     ("datetime", "day_of_year", &["dt"]),
+    // ---- datetime timezones (#1045, D-0225) ----
+    ("datetime", "zone", &["name"]),
+    ("datetime", "fixed_offset", &["minutes"]),
+    ("datetime", "astimezone", &["dt", "tz"]),
+    ("datetime", "isoformat", &["dt"]),
+    ("datetime", "rfc3339", &["dt"]),
+    ("datetime", "rfc3339_parse", &["s"]),
     // ---- random (ticket #98): only the non-numpy-overloaded verbs ----
     // `random`/`uniform`/`choice`/`shuffle` are overloaded with the NumPy
     // `Generator` surface (a distinct second signature keyed on an arg-0

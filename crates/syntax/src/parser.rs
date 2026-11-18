@@ -159,6 +159,13 @@ value struct DateTime:
     int64 hour
     int64 minute
     int64 second
+    int64 offset
+    bool is_aware
+
+value struct TimeZone:
+    str name
+    int64 offset
+    bool fixed
 
 value struct KeyInfo:
     str kind
@@ -1295,6 +1302,10 @@ fn references_prelude(module: &Module) -> bool {
         "\"cancel_on\"",
         "\"grace\"",
         "\"DateTime\"",
+        // The `datetime` timezone surface (#1045, D-0225): the `TimeZone` value
+        // struct ships in the prelude (named/fixed zones for `astimezone`),
+        // injected for any program that names the module or the struct.
+        "\"TimeZone\"",
         "\"time\"",
         "\"datetime\"",
         // The validated asymmetric-key metadata `crypto.key_info()` returns

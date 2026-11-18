@@ -25,6 +25,22 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`datetime` timezone database — bundled IANA, aware `DateTime`** (#1045,
+  D-0225). The IANA tz database is now **bundled into the toolchain** (vendored,
+  generated transition tables), so zones resolve identically on every target
+  with no host `/usr/share/zoneinfo` dependency. `DateTime` gains an `offset`
+  (seconds east of UTC) and `is_aware` field: naive values (`from_timestamp` /
+  `now` / `parse` / `strptime`) are unchanged, while `datetime.zone(name)` /
+  `datetime.fixed_offset(minutes)` build a prelude `TimeZone` and
+  `datetime.astimezone(dt, tz)` converts an instant into that zone's wall clock.
+  Offsets are looked up **by instant**, so a named zone is correct per-date —
+  `Asia/Kolkata` at a 2021 instant is `+05:30`, at a 1900 instant the historical
+  `+05:21:10` — and never surfaces its LMT for a modern date (the classic pytz
+  footgun). Adds offset-aware `datetime.isoformat` / `datetime.rfc3339` +
+  `datetime.rfc3339_parse` (RFC-3339 `±HH:MM` / `Z`) and makes `%z` / `%Z`
+  meaningful on an aware value. Attaching a zone to a *naive wall clock* (the
+  `fold` disambiguation) is a deliberate follow-up.
+
 - **`fs` directory traversal — `scandir` / `walk` / `copytree`** (#1032, D-0224).
   `fs.scandir(path)` returns a `list[DirEntry]` (one directory level; each entry
   carries `name` + `is_dir`/`is_file`, taken from `readdir`'s `d_type` where

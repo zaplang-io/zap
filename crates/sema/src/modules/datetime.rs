@@ -26,6 +26,10 @@ pub(super) const MODULE: ModuleCheck = ModuleCheck {
 /// `zapc_syntax::parser::PRELUDE_SRC`.
 const DATETIME: &str = "DateTime";
 
+/// The prelude type name for a time zone (named or fixed-offset), returned by
+/// `zone`/`fixed_offset` and consumed by `astimezone` (#1045, D-0225).
+const TIMEZONE: &str = "TimeZone";
+
 /// Require exactly one argument of the named kind, inferring it so it is still
 /// type-checked. `want` is a human description for the diagnostic; `ok` decides
 /// whether the inferred type is acceptable.
@@ -60,6 +64,10 @@ fn expect1(
 
 fn is_datetime(t: &Ty) -> bool {
     matches!(t, Ty::Named(n) if n == DATETIME)
+}
+
+fn is_timezone(t: &Ty) -> bool {
+    matches!(t, Ty::Named(n) if n == TIMEZONE)
 }
 
 /// Check a `(DateTime, str)` custom-format call (`strftime` / 2-arg `format`),
@@ -264,6 +272,75 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "weekday" | "isoweekday" | "day_of_year" => {
             expect1(checker, method, args, span, "a DateTime", is_datetime);
             Some(Ty::Int64)
+        }
+        // Timezone database (#1045, D-0225).
+        // zone(name) -> TimeZone: a named-zone handle (IANA bundle).
+        "zone" => {
+            expect1(checker, method, args, span, "a str zone name", |t| {
+                matches!(t, Ty::Str)
+            });
+            Some(Ty::Named(TIMEZONE.to_string()))
+        }
+        // fixed_offset(minutes) -> TimeZone: a constant-offset zone.
+        "fixed_offset" => {
+            expect1(checker, method, args, span, "an int minutes offset", |t| {
+                t.is_int()
+            });
+            Some(Ty::Named(TIMEZONE.to_string()))
+        }
+        // astimezone(dt, tz) -> DateTime: convert an instant into `tz`'s wall
+        // clock, attaching its offset (an aware DateTime).
+        "astimezone" => {
+            if args.len() != 2 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "datetime.astimezone() takes 2 arguments, found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                let dt = checker.infer(&args[0].value);
+                if !is_datetime(&dt) && !matches!(dt, Ty::Unknown) {
+                    checker.error(
+                        ErrorCode::ZAP4024,
+                        format!(
+                            "datetime.astimezone() expects a DateTime, found {}",
+                            dt.display()
+                        ),
+                        expr_span(&args[0].value),
+                    );
+                }
+                let tz = checker.infer(&args[1].value);
+                if !is_timezone(&tz) && !matches!(tz, Ty::Unknown) {
+                    checker.error(
+                        ErrorCode::ZAP4024,
+                        format!(
+                            "datetime.astimezone() expects a TimeZone, found {}",
+                            tz.display()
+                        ),
+                        expr_span(&args[1].value),
+                    );
+                }
+            }
+            Some(Ty::Named(DATETIME.to_string()))
+        }
+        // (DateTime) -> str: RFC-3339 with an offset suffix when aware
+        // (`isoformat` is the Python name; `rfc3339` the same renderer).
+        "isoformat" | "rfc3339" => {
+            expect1(checker, method, args, span, "a DateTime", is_datetime);
+            Some(Ty::Str)
+        }
+        // rfc3339_parse(s) -> DateTime: parse `...(Z|±HH:MM)` to an aware value.
+        "rfc3339_parse" => {
+            expect1(checker, method, args, span, "a str", |t| {
+                matches!(t, Ty::Str)
+            });
+            Some(Ty::Named(DATETIME.to_string()))
         }
         _ => None,
     }

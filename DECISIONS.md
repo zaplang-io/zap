@@ -11278,3 +11278,110 @@ the symlink policy is documented rather than golden-tested.
 Relates to [[D-0056]] / #97 (the fs seam), [[D-0211]] (#968 filesystem gaps —
 `fs.copy`/`makedirs`/`rmtree`, the `Stat` struct), [[D-0213]] (seam rows), epic
 #966, and Discussion #965.
+
+## D-0225 — stdlib datetime: timezone database — bundled IANA, aware `DateTime`, instant-based offsets (#1045 / #974 slice 2 / epic #966)
+
+**Context.** `datetime` was UTC + host-local only (D-0056): no timezone
+database, so cross-zone logic was impossible and offset-bearing timestamps could
+not be rendered or parsed (#965 gap #7). This is the heavy, correctness-critical
+piece deferred from #974's first slice ([[D-0221]]). The naive whole-second
+`value struct DateTime` carried no zone.
+
+**Decision — bundle IANA tzdata.** The IANA time-zone database is **bundled into
+the toolchain** (a vendored, generated set of transition tables), not read from
+the host's `/usr/share/zoneinfo`. Rationale: reproducible, self-contained
+binaries that behave identically on Linux, macOS, musl and Windows (which has no
+zoneinfo), with no host-tzdata-version skew. Binary size is accepted — LTO drops
+the tables of zones a program never names, and a stale-tzdata refresh is a
+mechanical regeneration step (below). This is the deliberate opposite of the
+host-tzdata option, chosen for determinism over auto-currency.
+
+**Decision — aware `DateTime` (offset + aware flag).** `DateTime` gains two
+fields: `int64 offset` (seconds **east of UTC**; seconds, not minutes, so Asia/
+Kolkata's historical LMT `+05:53:28` = 21208 and MMT `+05:21:10` = 19270 are
+represented exactly) and `bool is_aware`. The civil fields
+(`year…second`) are the **wall-clock in that offset**; the UTC instant is
+`timegm(civil) − offset`. Naive constructors (`from_timestamp`/`now`/`parse`/
+`strptime`) set `offset = 0, is_aware = false` — so existing behaviour is
+byte-for-byte unchanged (a naive value formats without a zone suffix and
+`%z`/`%Z` stay empty, per the Python naive/aware split and the frozen
+`datetime_strftime` golden). The `*_local` constructors now set the host offset
+at the instant and `is_aware = true`, which incidentally **fixes** the previously
+lossy timestamp→local→timestamp round trip (naive-local `to_timestamp` used to
+treat local wall-clock as UTC). All D-0221 arithmetic/comparisons generalise to
+operate on the true instant (`timegm(civil) − offset`) and reduce exactly to the
+old UTC math when `offset = 0`; `weekday`/`day_of_year` keep using the local
+civil fields (Python semantics).
+
+**Decision — offset is a pure function of `(zone, instant)`.** The load-bearing
+invariant that avoids the classic pytz footgun. The user reported seeing
+`Asia/Kolkata` resolve to `+05:53` instead of `+05:30` for an everyday date: that
+`+05:53:28` is the zone's genuine **LMT** (Local Mean Time), the *first* entry in
+its history (LMT → HMT `+05:53:20` → MMT `+05:21:10` → IST `+05:30`, with a WWII
+`+06:30`). pytz surfaces it for modern dates only because
+`datetime(…, tzinfo=pytz.timezone("Asia/Kolkata"))` applies the zone's *first*
+offset with **no instant** to look up against (`tz.localize(dt)` is the correct
+pytz call; stdlib `zoneinfo` has no such trap). Zap therefore never exposes a
+"zone default offset": a zone handle is only a lookup key, and every offset is
+materialised by **binary-searching the zone's transition table for the interval
+containing the UTC instant**. A 2020 instant resolves to `+05:30`; a 1900 instant
+to `+05:53:20` (HMT); a pre-1854 instant to `+05:53:28` (LMT). History is
+preserved and still reachable *for the dates where it is real*, while modern
+dates are correct by construction.
+
+**Surface (Python `zoneinfo`/`datetime`, Go `time`).**
+- `datetime.zone(name) -> TimeZone` — a named-zone handle; raises
+  (catchable) if the name is not in the bundle (Python `ZoneInfoNotFoundError`).
+- `datetime.fixed_offset(minutes) -> TimeZone` — a constant-offset zone
+  (Python `timezone(timedelta(minutes=…))`); whole-minute offsets, stored as
+  seconds.
+- `datetime.astimezone(dt, tz) -> DateTime` — convert an instant into `tz`'s
+  wall clock, attaching its offset (aware result). The one conversion path for
+  both named and fixed zones.
+- `datetime.isoformat(dt) -> str` — RFC-3339: `…±HH:MM` when aware (`+00:00`
+  for a UTC-aware zero offset), bare civil ISO when naive (Python-faithful).
+- `datetime.rfc3339(dt) -> str` — alias emphasising the offset-aware render.
+- `datetime.rfc3339_parse(s) -> DateTime` — parse `…(Z|±HH:MM)`, producing an
+  aware `DateTime` whose civil fields are the string's wall clock and whose
+  offset is the parsed zone.
+- `strftime`'s `%z`/`%Z` become meaningful once a value is aware (`%z` → the
+  numeric offset, `%Z` → `UTC±HH:MM`; both still empty on a naive value, as
+  before). Named-zone abbreviations (`IST`, `EST`) are **not** carried on the
+  value, so `%Z` renders the numeric-UTC form — documented, not a silent wrong
+  abbrev.
+
+**`TimeZone` is a prelude struct.** `value struct TimeZone { str name; int64
+offset; bool fixed }` ships in the built-in prelude alongside `DateTime` (gated
+by the existing `"datetime"` needle). `fixed_offset` sets `fixed = true` and a
+constant `offset`; `zone` sets `name` (validated) and defers the offset to the
+instant-based lookup at `astimezone` time.
+
+**Bundled data is generated, pre-expanded, and validated offline.** A committed
+generator (`crates/codegen/tools/gen_tzdata.py`) parses TZif files into flat
+`(transition_utc, offset_seconds, is_dst)` tables and **pre-expands the POSIX TZ
+footer rule to year 2100**, so the runtime C contains *only a binary search* — no
+TZif or POSIX-string parser runs at execution time (the parsing that could be
+subtly wrong is done once, offline, and checked against the system `zdump`). The
+generated `crates/codegen/src/runtime/tzdata_generated.inc.c` is committed and is
+the sole build input; regeneration is a documented manual step, keeping the build
+reproducible and tzdata-free. For an instant before a zone's first transition the
+first (LMT) interval applies; after 2100, the last.
+
+**Deferred.** Attaching a zone to a *naive wall-clock* in a named zone (Python's
+`localize`/`fold` disambiguation across DST gaps/overlaps) is **not** built here:
+`astimezone` converts an already-unambiguous instant, and offset-aware
+parse/format are unambiguous. Named-zone abbreviations on the value, a `tzdata`
+auto-refresh, and sub-second offsets are possible future refinements.
+
+**Tests.** Golden `datetime_timezone` (fixed UTC instants + fixed offsets and a
+vendored named zone, so output is deterministic against the *bundled* data, not
+the host: `astimezone` across a fixed offset and across `Asia/Kolkata` at a
+modern instant = `+05:30` and an early-20th-century instant = `+05:53`, aware
+`isoformat`/`rfc3339` with `±HH:MM` and `+00:00`, `rfc3339_parse` round-trip,
+`%z`/`%Z` on an aware value); sema shape/arity/type tests for the new surface;
+seam-kwargs binding (D-0213 rows). The generator is validated against `zdump`
+offline (not in CI, which has no network/tzdata guarantee).
+
+Relates to [[D-0056]] / #99 (the datetime seam), [[D-0221]] (#974 slice 1 — the
+arithmetic this builds on), #338 (strftime/strptime), [[D-0213]] (seam rows),
+epic #966, and Discussion #965 (gap #7).
