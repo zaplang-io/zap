@@ -4727,6 +4727,254 @@ void *zap_http_req_header_val(void *req_, int64_t idx) {
     return zap_str_new("", 0);
 }
 
+/* ---- client response header enumeration (#989) --------------------------- *
+ * The response twin of `zap_http_req_header_{count,name,val}`: enumerate the
+ * response header block (`ZapHttpResp.headers`, first-line-stripped) as it
+ * arrived, duplicates preserved — so multiple `Set-Cookie` lines are each
+ * visible. Backs `http.headers(resp)`; the list[(str,str)] is assembled in
+ * lowering (the `req_headers` pattern). */
+int64_t zap_http_resp_header_count(void *resp_) {
+    const ZapHttpResp *r = (const ZapHttpResp *)resp_;
+    const char *hbuf = r->headers->data;
+    size_t hlen = (size_t)r->headers->len;
+    int64_t n = 0;
+    size_t i = 0, line, colon, end;
+    while (zap_http_next_header_line(hbuf, hlen, &i, &line, &colon, &end)) {
+        if (zap_http_is_field_line(line, colon, end)) {
+            n++;
+        }
+    }
+    return n;
+}
+
+void *zap_http_resp_header_name(void *resp_, int64_t idx) {
+    const ZapHttpResp *r = (const ZapHttpResp *)resp_;
+    const char *hbuf = r->headers->data;
+    size_t hlen = (size_t)r->headers->len;
+    int64_t k = 0;
+    size_t i = 0, line, colon, end;
+    while (zap_http_next_header_line(hbuf, hlen, &i, &line, &colon, &end)) {
+        if (!zap_http_is_field_line(line, colon, end)) {
+            continue;
+        }
+        if (k == idx) {
+            return zap_str_new(hbuf + line, (int64_t)(colon - line));
+        }
+        k++;
+    }
+    return zap_str_new("", 0);
+}
+
+void *zap_http_resp_header_val(void *resp_, int64_t idx) {
+    const ZapHttpResp *r = (const ZapHttpResp *)resp_;
+    const char *hbuf = r->headers->data;
+    size_t hlen = (size_t)r->headers->len;
+    int64_t k = 0;
+    size_t i = 0, line, colon, end;
+    while (zap_http_next_header_line(hbuf, hlen, &i, &line, &colon, &end)) {
+        if (!zap_http_is_field_line(line, colon, end)) {
+            continue;
+        }
+        if (k == idx) {
+            size_t v = colon + 1;
+            while (v < end && (hbuf[v] == ' ' || hbuf[v] == '\t')) {
+                v++;
+            }
+            return zap_str_new(hbuf + v, (int64_t)(end - v));
+        }
+        k++;
+    }
+    return zap_str_new("", 0);
+}
+
+/* ---- Set-Cookie parsing (#989) ------------------------------------------- *
+ * Parse ONE `Set-Cookie` header value into its components (the value as read
+ * from `http.header(resp, "Set-Cookie")` or one entry of `http.headers(resp)`).
+ * The first `name=value` pair is the cookie; the remaining `;`-separated
+ * attributes set Domain / Path / Expires / Max-Age / SameSite (values) and
+ * Secure / HttpOnly (flags). Everything indexes into the input (no allocation
+ * until the per-field getters build the GC strings). Backs the prelude
+ * `http.parse_set_cookie(value) -> Cookie`; lowering builds the struct with one
+ * getter per field (the `url.split` / `UrlParts` pattern). */
+typedef struct {
+    const char *name;
+    size_t name_len;
+    const char *value;
+    size_t value_len;
+    const char *domain;
+    size_t domain_len;
+    const char *path;
+    size_t path_len;
+    const char *expires;
+    size_t expires_len;
+    const char *same_site;
+    size_t same_site_len;
+    long max_age; /* -1 = absent */
+    int secure;
+    int http_only;
+} ZapCookieFields;
+
+/* Trim leading/trailing spaces+tabs of [*p, *p+*n). */
+static void zap_cookie_trim(const char **p, size_t *n) {
+    const char *s = *p;
+    size_t len = *n;
+    while (len > 0 && (s[0] == ' ' || s[0] == '\t')) {
+        s++;
+        len--;
+    }
+    while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t')) {
+        len--;
+    }
+    *p = s;
+    *n = len;
+}
+
+/* Case-insensitive compare of [p,p+n) against a NUL-terminated ASCII literal. */
+static int zap_cookie_ci_eq(const char *p, size_t n, const char *lit) {
+    if (n != strlen(lit)) {
+        return 0;
+    }
+    for (size_t k = 0; k < n; k++) {
+        char a = p[k];
+        char b = lit[k];
+        if (a >= 'A' && a <= 'Z') {
+            a = (char)(a - 'A' + 'a');
+        }
+        if (b >= 'A' && b <= 'Z') {
+            b = (char)(b - 'A' + 'a');
+        }
+        if (a != b) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void zap_http_parse_cookie_fields(const ZapStr *s, ZapCookieFields *f) {
+    memset(f, 0, sizeof *f);
+    f->name = "";
+    f->value = "";
+    f->domain = "";
+    f->path = "";
+    f->expires = "";
+    f->same_site = "";
+    f->max_age = -1;
+    if (!s || s->len <= 0) {
+        return;
+    }
+    const char *data = s->data;
+    size_t len = (size_t)s->len;
+    size_t pos = 0;
+    int first = 1;
+    while (pos < len) {
+        size_t semi = pos;
+        while (semi < len && data[semi] != ';') {
+            semi++;
+        }
+        const char *seg = data + pos;
+        size_t seglen = semi - pos;
+        zap_cookie_trim(&seg, &seglen);
+        /* split on the first '=' */
+        size_t eq = 0;
+        while (eq < seglen && seg[eq] != '=') {
+            eq++;
+        }
+        const char *key = seg;
+        size_t keylen = eq;
+        const char *val = (eq < seglen) ? seg + eq + 1 : seg + seglen;
+        size_t vallen = (eq < seglen) ? seglen - eq - 1 : 0;
+        zap_cookie_trim(&key, &keylen);
+        zap_cookie_trim(&val, &vallen);
+        if (first) {
+            f->name = key;
+            f->name_len = keylen;
+            f->value = val;
+            f->value_len = vallen;
+            first = 0;
+        } else if (zap_cookie_ci_eq(key, keylen, "domain")) {
+            f->domain = val;
+            f->domain_len = vallen;
+        } else if (zap_cookie_ci_eq(key, keylen, "path")) {
+            f->path = val;
+            f->path_len = vallen;
+        } else if (zap_cookie_ci_eq(key, keylen, "expires")) {
+            f->expires = val;
+            f->expires_len = vallen;
+        } else if (zap_cookie_ci_eq(key, keylen, "samesite")) {
+            f->same_site = val;
+            f->same_site_len = vallen;
+        } else if (zap_cookie_ci_eq(key, keylen, "max-age")) {
+            long m = 0;
+            int any = 0, neg = 0;
+            size_t k = 0;
+            if (vallen > 0 && val[0] == '-') {
+                neg = 1;
+                k = 1;
+            }
+            for (; k < vallen; k++) {
+                if (val[k] < '0' || val[k] > '9') {
+                    any = 0;
+                    break;
+                }
+                m = m * 10 + (val[k] - '0');
+                any = 1;
+            }
+            f->max_age = any ? (neg ? -m : m) : -1;
+        } else if (zap_cookie_ci_eq(key, keylen, "secure")) {
+            f->secure = 1;
+        } else if (zap_cookie_ci_eq(key, keylen, "httponly")) {
+            f->http_only = 1;
+        }
+        pos = (semi < len) ? semi + 1 : len;
+    }
+}
+
+void *zap_http_cookie_name(void *v) {
+    ZapCookieFields f;
+    zap_http_parse_cookie_fields((const ZapStr *)v, &f);
+    return zap_str_new(f.name, (int64_t)f.name_len);
+}
+void *zap_http_cookie_value(void *v) {
+    ZapCookieFields f;
+    zap_http_parse_cookie_fields((const ZapStr *)v, &f);
+    return zap_str_new(f.value, (int64_t)f.value_len);
+}
+void *zap_http_cookie_domain(void *v) {
+    ZapCookieFields f;
+    zap_http_parse_cookie_fields((const ZapStr *)v, &f);
+    return zap_str_new(f.domain, (int64_t)f.domain_len);
+}
+void *zap_http_cookie_path(void *v) {
+    ZapCookieFields f;
+    zap_http_parse_cookie_fields((const ZapStr *)v, &f);
+    return zap_str_new(f.path, (int64_t)f.path_len);
+}
+void *zap_http_cookie_expires(void *v) {
+    ZapCookieFields f;
+    zap_http_parse_cookie_fields((const ZapStr *)v, &f);
+    return zap_str_new(f.expires, (int64_t)f.expires_len);
+}
+void *zap_http_cookie_same_site(void *v) {
+    ZapCookieFields f;
+    zap_http_parse_cookie_fields((const ZapStr *)v, &f);
+    return zap_str_new(f.same_site, (int64_t)f.same_site_len);
+}
+int64_t zap_http_cookie_max_age(void *v) {
+    ZapCookieFields f;
+    zap_http_parse_cookie_fields((const ZapStr *)v, &f);
+    return (int64_t)f.max_age;
+}
+int64_t zap_http_cookie_secure(void *v) {
+    ZapCookieFields f;
+    zap_http_parse_cookie_fields((const ZapStr *)v, &f);
+    return (int64_t)f.secure;
+}
+int64_t zap_http_cookie_http_only(void *v) {
+    ZapCookieFields f;
+    zap_http_parse_cookie_fields((const ZapStr *)v, &f);
+    return (int64_t)f.http_only;
+}
+
 /* Reason phrase for a status code (a small common set; "OK" otherwise). */
 static const char *zap_http_reason(int64_t status) {
     switch (status) {

@@ -11676,3 +11676,47 @@ configurable), [[D-0229]] (the per-request `timeout` the `Client` carries as a
 default), [[D-0202]] (seam-ctor sugar for `http.Client`), [[D-0204]] (seam
 binder), #988 / zaplang-io/requests#2 (the core-vs-requests split), epic #984,
 and Discussion #965 (gap #9).
+
+## D-0231 — http-client: cookie primitives — `http.headers` + `http.parse_set_cookie`; jar in `requests` (#989 / epic #984)
+
+**Context.** #989 (the last #984 slice) wanted cookies: parse `Set-Cookie`, send
+`Cookie`, and a session jar. The jar — persistence + RFC-6265 domain/path/Secure/
+expiry matching + automatic `Cookie` injection — is exactly the stateful,
+policy-laden ergonomics the #988 split (zaplang-io/requests#2) assigns to
+`requests`, not core `http`. Core's job is the protocol primitives. Reading
+cookies off a response also exposed a real core gap: the client had only the
+single-value `http.header(resp, name)`, no way to see multiple `Set-Cookie`
+lines (the server side already had `http.req_headers` enumeration).
+
+**Decision — core ships two primitives; the jar goes to `requests`.**
+- **`http.headers(resp) -> list[(str, str)]`** — the client twin of
+  `http.req_headers` ([[D-0197]]): enumerate the response header block as
+  received, in order, duplicates preserved, so every `Set-Cookie` is visible
+  (single-value by-name lookup stays `http.header`). Assembled in lowering via
+  `zap_http_resp_header_{count,name,val}` (the `req_headers` pattern). Useful
+  beyond cookies.
+- **`http.parse_set_cookie(value) -> Cookie`** — parse one `Set-Cookie` value
+  into the prelude `Cookie` **value struct** (`name`, `value`, `domain`, `path`,
+  `expires`, `max_age`, `secure`, `http_only`, `same_site`). Pure string parsing
+  (Python puts `http.cookies` parsing in the stdlib); the first `name=value` pair
+  is the cookie, the rest `;`-separated attributes. Absent → empty / `max_age`
+  `-1` / false; `expires` is the raw HTTP-date string (the jar parses it with
+  `datetime`). Built in lowering (`StructNew` + one `zap_http_cookie_<field>`
+  getter per field — the `url.split` / `UrlParts` pattern, D-0209; the two bool
+  flags are C `int64` 0/1 normalized to the struct's `bool`).
+- **The jar lives in `zaplang-io/requests`** (zaplang-io/requests#3): a cookie jar
+  on `requests.Session` that persists across requests and matches by
+  domain/path/Secure/expiry, built on these two primitives — no further core
+  change (Python's `requests` owns the automatic jar the same way).
+
+**Tests.** Golden `http_cookies` (a server sets two `Set-Cookie` headers + a body;
+the client enumerates `http.headers`, parses each cookie, and prints
+name/value + Secure/HttpOnly); sema arity + `seam_kwargs` for `headers` /
+`parse_set_cookie`; the prelude parses + a program using `http.headers` and all
+nine `Cookie` fields sema-checks on the host. The runtime parsing + enumeration
+run end-to-end on CI.
+
+Relates to [[D-0197]] (`req_headers`, the enumeration pattern), [[D-0209]]
+(`url.split` / `UrlParts`, the struct-build pattern), [[D-0056]] (http client),
+#988 / zaplang-io/requests#2 (the core-vs-requests split), zaplang-io/requests#3
+(the jar), epic #984, and Discussion #965 (gap #9).

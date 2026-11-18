@@ -105,6 +105,23 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "http", method, args, 1, span);
             Ty::List(Box::new(Ty::Str))
         }
+        // http.headers(resp) -> list[(str, str)]. Enumerate the response header
+        // block as received, in order, duplicates preserved (#989) — so multiple
+        // `Set-Cookie` lines are each visible (the single-value `http.header`
+        // keeps by-name lookup). The client twin of server `http.req_headers`.
+        "headers" => {
+            expect_argc(checker, "http", method, args, 1, span);
+            Ty::List(Box::new(Ty::Tuple(vec![Ty::Str, Ty::Str])))
+        }
+        // http.parse_set_cookie(value) -> Cookie. Parse one `Set-Cookie` header
+        // value into the prelude `Cookie` value struct (name/value/domain/path/
+        // expires/max_age/secure/http_only/same_site) (#989). The cookie jar
+        // (persistence + domain/path matching + auto-send) lives in
+        // zaplang-io/requests, built on this primitive.
+        "parse_set_cookie" => {
+            expect_argc(checker, "http", method, args, 1, span);
+            Ty::Named("Cookie".to_string())
+        }
         // http.url(host, port, path) -> "http://host:port/path". A convenience
         // for dialing an ephemeral server whose port is only known at runtime,
         // since there is no int->str conversion in the language yet.

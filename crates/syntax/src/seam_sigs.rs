@@ -80,6 +80,10 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     // uniform keyword-capable surface (D-0213).
     ("http", "final_url", &["resp"]),
     ("http", "redirects", &["resp"]),
+    // client response header enumeration + Set-Cookie parsing (#989). Single-arg,
+    // rowed for a uniform keyword-capable surface (D-0213).
+    ("http", "headers", &["resp"]),
+    ("http", "parse_set_cookie", &["value"]),
     ("http", "url", &["host", "port", "path"]),
     ("http", "read_request", &["conn"]),
     ("http", "method", &["req"]),

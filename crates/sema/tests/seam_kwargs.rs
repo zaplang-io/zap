@@ -287,6 +287,28 @@ fn http_redirect_accessor_unknown_keyword_rejected() {
     );
 }
 
+// Client response header enumeration + Set-Cookie parsing (#989).
+#[test]
+fn http_headers_and_parse_set_cookie_keywords() {
+    assert_ok(&prog(
+        "    auto r = http.get(\"http://x\")\n    auto hs = http.headers(resp=r)\n",
+    ));
+    assert_ok(&prog(
+        "    auto c = http.parse_set_cookie(value=\"a=b; Path=/; Secure\")\n",
+    ));
+    assert_ok(&prog(
+        "    auto c = http.parse_set_cookie(\"a=b\")\n    auto nm = c.name\n    auto sec = c.secure\n",
+    ));
+}
+
+#[test]
+fn http_parse_set_cookie_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto c = http.parse_set_cookie(cookie=\"a=b\")\n"),
+        "ZAP4023",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // datetime — timestamp conversions + format/parse (#99/#338).
 // ---------------------------------------------------------------------------

@@ -666,9 +666,14 @@ timeout=…)` then `c.get`/`c.post`/`c.request` reuse pooled connections per hos
 `allow_redirects`) / `max_redirects` (exceeding it raises `ValueError`;
 `follow=false` returns the 3xx unfollowed); `c.shutdown()` drains the pool
 (`shutdown`, since `close` is a reserved word). The bare `http.get`/`post`/
-`request` verbs are unchanged (one-shot, unpooled). Because `http` is
-**Experimental**, all of these are additive surface changes requiring no
-stability promise.
+`request` verbs are unchanged (one-shot, unpooled). Cookie **primitives**
+(#989, D-0231) add **`http.headers(resp) -> list[(str, str)]`** (enumerate every
+response header in order, duplicates preserved — the client twin of
+`http.req_headers`, so multiple `Set-Cookie` lines are visible) and
+**`http.parse_set_cookie(value) -> Cookie`** (parse one `Set-Cookie` into the
+prelude `Cookie` value struct); the stateful cookie *jar* lives in
+`zaplang-io/requests`, built on these. Because `http` is **Experimental**, all of
+these are additive surface changes requiring no stability promise.
 
 **CLI (`SPEC.md` §17, `crates/driver/src/cli.rs`).**
 
