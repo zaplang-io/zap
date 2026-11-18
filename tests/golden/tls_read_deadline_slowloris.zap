@@ -114,7 +114,7 @@ def main():
             tls.send(c, "x")
         except Exception:
             break
-        time.sleep_ns(time.millis(50))
+        time.sleep_for(time.millis(50))
     auto ack = <-done
     tls.close_conn(c)
     print("done")

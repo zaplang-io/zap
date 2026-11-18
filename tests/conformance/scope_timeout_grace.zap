@@ -9,7 +9,7 @@
 # orphan finishes on its own and the program exits cleanly.
 def uncooperative(channel[int64] ready):
     ready <- 1
-    time.sleep_ns(time.millis(400))  # never reaches a cancellation point
+    time.sleep_for(time.millis(400))  # never reaches a cancellation point
 
 def main():
     auto ready = channel[int64](1)

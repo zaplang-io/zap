@@ -92,7 +92,7 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("datetime", "parse", &["s"]),
     ("datetime", "strptime", &["s", "fmt"]),
     // Arithmetic / comparisons / field helpers (#974, D-0221).
-    ("datetime", "add", &["dt", "seconds"]),
+    ("datetime", "add", &["dt", "delta"]),
     ("datetime", "diff", &["a", "b"]),
     ("datetime", "before", &["a", "b"]),
     ("datetime", "after", &["a", "b"]),
@@ -250,6 +250,7 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     // (monotonic/monotonic_ns/time/time_ns take no args, so no row.)
     ("time", "sleep", &["seconds"]),
     ("time", "sleep_ns", &["ns"]),
+    ("time", "sleep_for", &["d"]),
     ("time", "seconds", &["n"]),
     ("time", "millis", &["n"]),
     ("time", "micros", &["n"]),

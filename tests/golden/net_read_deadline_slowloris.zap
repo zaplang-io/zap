@@ -48,7 +48,7 @@ def main():
             net.send(c, "x")
         except Exception:
             break
-        time.sleep_ns(time.millis(50))
+        time.sleep_for(time.millis(50))
     auto ack = <-done
     net.close_conn(c)
     print("done")

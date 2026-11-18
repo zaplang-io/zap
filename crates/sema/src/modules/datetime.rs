@@ -35,6 +35,10 @@ const TIMEZONE: &str = "TimeZone";
 const DATE: &str = "Date";
 const TIME: &str = "Time";
 
+/// The prelude `Duration` type (#1047, D-0227): the `int64`-ns duration shared
+/// with `time`, consumed by `add` and returned by `diff`.
+const DURATION: &str = "Duration";
+
 /// The `DateTime` civil fields that `replace` may override, in field order.
 const REPLACE_FIELDS: [&str; 6] = ["year", "month", "day", "hour", "minute", "second"];
 
@@ -84,6 +88,10 @@ fn is_date(t: &Ty) -> bool {
 
 fn is_time(t: &Ty) -> bool {
     matches!(t, Ty::Named(n) if n == TIME)
+}
+
+fn is_duration(t: &Ty) -> bool {
+    matches!(t, Ty::Named(n) if n == DURATION)
 }
 
 /// Require exactly `n` integer arguments (the `date`/`time` constructors), each
@@ -244,8 +252,10 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             check_strptime(checker, args, span);
             Some(Ty::Named(DATETIME.to_string()))
         }
-        // Date arithmetic + comparisons + field helpers (#974, D-0221).
-        // add(dt, seconds) -> DateTime (naive, whole-second, UTC-timestamp math).
+        // Date arithmetic + comparisons + field helpers (#974, D-0221; the
+        // duration is now a `Duration`, #1047/D-0227).
+        // add(dt, delta: Duration) -> DateTime (whole-second instant math; the
+        // Duration's sub-second nanos truncate).
         "add" => {
             if args.len() != 2 {
                 checker.error(
@@ -265,13 +275,13 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
                         expr_span(&args[0].value),
                     );
                 }
-                let sec = checker.infer(&args[1].value);
-                if !sec.is_int() && !matches!(sec, Ty::Unknown) {
+                let delta = checker.infer(&args[1].value);
+                if !is_duration(&delta) && !matches!(delta, Ty::Unknown) {
                     checker.error(
                         ErrorCode::ZAP4024,
                         format!(
-                            "datetime.add() seconds must be an int, found {}",
-                            sec.display()
+                            "datetime.add() delta must be a Duration, found {}",
+                            delta.display()
                         ),
                         expr_span(&args[1].value),
                     );
@@ -279,7 +289,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             }
             Some(Ty::Named(DATETIME.to_string()))
         }
-        // (DateTime, DateTime): diff -> int64 seconds (a - b); the comparisons
+        // (DateTime, DateTime): diff -> Duration (a - b, #1047); the comparisons
         // -> bool.
         "diff" | "before" | "after" | "equal" => {
             if args.len() != 2 {
@@ -310,7 +320,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
                 }
             }
             Some(if method == "diff" {
-                Ty::Int64
+                Ty::Named(DURATION.to_string())
             } else {
                 Ty::Bool
             })

@@ -300,3 +300,57 @@ fn date_time_constructor_type_and_arity() {
     assert_code(&prog("    auto t = datetime.time(1, 2, 3, 4)\n"), "ZAP4025");
     assert_code(&prog("    auto d = datetime.date_today(1)\n"), "ZAP4025");
 }
+
+// ---------------------------------------------------------------------------
+// #1047 — the reconciled Duration type across time + datetime.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn duration_dunder_arithmetic_and_comparisons() {
+    // The prelude Duration's operators (D-0047 dunders) type-check.
+    assert_ok(&prog(
+        "    auto a = Duration(nanos=1000)\n    auto b = Duration(nanos=500)\n    \
+         Duration c = a + b\n    Duration d = a - b\n    Duration e = a * 3\n    \
+         auto lt = a < b\n    auto eq = a == b\n",
+    ));
+}
+
+#[test]
+fn time_constructors_return_duration() {
+    assert_ok(&prog("    Duration d = time.seconds(5)\n"));
+    assert_ok(&prog("    Duration d = time.millis(250)\n"));
+    assert_ok(&prog("    Duration d = time.micros(7)\n"));
+    assert_ok(&prog("    Duration d = time.nanos(42)\n"));
+    // Converters take a Duration and return float.
+    assert_ok(&prog(
+        "    auto d = time.seconds(2)\n    float64 s = time.to_seconds(d)\n",
+    ));
+    // sleep_for takes a Duration; a raw int is rejected.
+    assert_ok(&prog(
+        "    auto d = time.millis(10)\n    time.sleep_for(d)\n",
+    ));
+    assert_code(&prog("    time.sleep_for(10)\n"), "ZAP4024");
+    assert_code(&prog("    auto s = time.to_seconds(10)\n"), "ZAP4024");
+}
+
+#[test]
+fn datetime_add_takes_duration_diff_returns_duration() {
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    auto d = time.seconds(86400)\n    \
+         DateTime t2 = datetime.add(t, d)\n",
+    ));
+    assert_ok(&prog(
+        "    auto a = datetime.from_timestamp(0)\n    auto b = datetime.from_timestamp(1)\n    \
+         Duration delta = datetime.diff(b, a)\n",
+    ));
+    // add with a raw int (the old seconds API) is now a type error.
+    assert_code(
+        &prog("    auto t = datetime.from_timestamp(0)\n    auto t2 = datetime.add(t, 86400)\n"),
+        "ZAP4024",
+    );
+    // diff flows into Duration arithmetic.
+    assert_ok(&prog(
+        "    auto a = datetime.from_timestamp(0)\n    auto b = datetime.from_timestamp(1)\n    \
+         auto delta = datetime.diff(b, a)\n    auto doubled = delta * 2\n    float64 s = time.to_seconds(doubled)\n",
+    ));
+}

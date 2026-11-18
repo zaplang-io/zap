@@ -25,6 +25,17 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Reconciled `Duration` type across `datetime` + `time`** (#1047, D-0227).
+  Durations were an untyped `int64` in two units — `time` nanoseconds, `datetime`
+  whole seconds — with nothing stopping an off-by-10⁹ mix-up. They are now the
+  prelude `value struct Duration { int64 nanos }` (Go `time.Duration` style) with
+  real `+` / `-` / `*` / comparison operators (D-0047 dunders). `time.seconds` /
+  `millis` / `micros` / `nanos` return a `Duration`; `time.to_seconds` /
+  `to_millis` / `to_micros` take one; `time.sleep_for(d)` sleeps a `Duration`
+  (`sleep` / `sleep_ns` keep their raw-number forms). `datetime.add(dt, delta)`
+  now takes a `Duration` and `datetime.diff(a, b)` returns one — a breaking
+  change to the former int-seconds API (pre-1.0). `.nanos` reads the raw count.
+
 - **`datetime.replace()` + separate `Date` / `Time` types** (#1046, D-0226).
   `datetime.replace(dt, year=…, month=…, day=…, hour=…, minute=…, second=…)`
   returns a copy of a `DateTime` with the supplied civil fields changed and the

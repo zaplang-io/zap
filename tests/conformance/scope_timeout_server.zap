@@ -8,7 +8,7 @@
 # scope, so the outer scope does not wait on it. MAXPROCS=4.
 def faulty_handler(channel[int64] ready):
     ready <- 1
-    time.sleep_ns(time.millis(400))  # non-draining child
+    time.sleep_for(time.millis(400))  # non-draining child
 
 def faulty_endpoint() -> int64:
     auto ready = channel[int64](1)
