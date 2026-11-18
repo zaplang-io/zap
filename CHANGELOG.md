@@ -25,6 +25,15 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`datetime`/`time` refinements** (#1055, D-0228). Rounds out the #974 types:
+  `time.format(d)` renders a `Duration` in Go `time.Duration` style (`"1m30.5s"`,
+  `"250ms"`, `"42ns"`); `time.since(start_ns)` returns elapsed time as a typed
+  `Duration`. `Date` / `Time` gain comparison operators (`<`/`==`/…, chronological)
+  and `datetime.date_weekday` / `date_isoweekday` / `date_day_of_year`. Sub-minute
+  UTC offsets (a historical LMT like `Asia/Kolkata` `+05:21:10` in 1900) now
+  render to the second in `%z` / `%Z` / `isoformat` instead of truncating to the
+  minute.
+
 - **Reconciled `Duration` type across `datetime` + `time`** (#1047, D-0227).
   Durations were an untyped `int64` in two units — `time` nanoseconds, `datetime`
   whole seconds — with nothing stopping an off-by-10⁹ mix-up. They are now the

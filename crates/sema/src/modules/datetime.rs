@@ -542,6 +542,13 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "datetime", method, args, 0, span);
             Some(Ty::Named(DATE.to_string()))
         }
+        // (Date) -> int64 field helpers (#1055): weekday (Mon=0), isoweekday
+        // (Mon=1), day_of_year (1..=366) — the Date analogues of the DateTime
+        // helpers.
+        "date_weekday" | "date_isoweekday" | "date_day_of_year" => {
+            expect1(checker, method, args, span, "a Date", is_date);
+            Some(Ty::Int64)
+        }
         // rfc3339_parse(s) -> DateTime: parse `...(Z|±HH:MM)` to an aware value.
         "rfc3339_parse" => {
             expect1(checker, method, args, span, "a str", |t| {

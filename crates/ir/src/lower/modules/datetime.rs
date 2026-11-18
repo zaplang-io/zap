@@ -736,6 +736,45 @@ fn lower(
             ];
             build_triple(lowerer, sid, vals)?
         }
+        // (Date) -> int64 weekday / isoweekday / day_of_year (#1055). Reuse the
+        // DateTime runtime helpers over (y, mo, d, 0, 0, 0).
+        "date_weekday" | "date_isoweekday" | "date_day_of_year" => {
+            let date_sid = struct_sid(lowerer, "Date")?;
+            let (base, _) = lowerer.expr(&args[0].value)?;
+            let zero = lowerer.iconst(Ty::I64, 0);
+            let comps = vec![
+                lowerer.field_get(base, date_sid, 0, Ty::I64),
+                lowerer.field_get(base, date_sid, 1, Ty::I64),
+                lowerer.field_get(base, date_sid, 2, Ty::I64),
+                zero,
+                zero,
+                zero,
+            ];
+            let func = if method == "date_day_of_year" {
+                "zap_datetime_day_of_year"
+            } else {
+                "zap_datetime_weekday"
+            };
+            let w = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(w),
+                func: func.to_string(),
+                args: comps,
+            });
+            if method == "date_isoweekday" {
+                let one = lowerer.iconst(Ty::I64, 1);
+                let d = lowerer.new_value(Ty::I64);
+                lowerer.emit(Inst::Bin {
+                    dest: d,
+                    op: BinOp::Add,
+                    lhs: w,
+                    rhs: one,
+                });
+                (d, Ty::I64)
+            } else {
+                (w, Ty::I64)
+            }
+        }
         _ => return Ok(None),
     };
     Ok(Some(r))

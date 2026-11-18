@@ -116,6 +116,10 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("datetime", "to_date", &["dt"]),
     ("datetime", "to_time", &["dt"]),
     ("datetime", "combine", &["date", "time"]),
+    // Date field helpers (#1055).
+    ("datetime", "date_weekday", &["d"]),
+    ("datetime", "date_isoweekday", &["d"]),
+    ("datetime", "date_day_of_year", &["d"]),
     // ---- random (ticket #98): only the non-numpy-overloaded verbs ----
     // `random`/`uniform`/`choice`/`shuffle` are overloaded with the NumPy
     // `Generator` surface (a distinct second signature keyed on an arg-0
@@ -251,6 +255,8 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("time", "sleep", &["seconds"]),
     ("time", "sleep_ns", &["ns"]),
     ("time", "sleep_for", &["d"]),
+    ("time", "format", &["d"]),
+    ("time", "since", &["start"]),
     ("time", "seconds", &["n"]),
     ("time", "millis", &["n"]),
     ("time", "micros", &["n"]),

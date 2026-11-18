@@ -11514,3 +11514,41 @@ Relates to [[D-0056]] / #99, [[D-0221]] (#974 arithmetic this reconciles),
 [[D-0047]] (the operator-overloading protocol `Duration` uses), [[D-0225]] /
 [[D-0226]] (the sibling #974 slices), [[D-0213]] (seam rows), epic #966, and
 Discussion #965 (gap #7).
+
+## D-0228 — stdlib datetime/time: deferred refinements — Duration formatting, Date/Time ops, sub-minute offsets (#1055 / #974 / epic #966)
+
+**Context.** The four #974 slices ([[D-0221]]/[[D-0225]]/[[D-0226]]/[[D-0227]])
+shipped the full checklist but deferred a handful of bounded refinements that
+round out the types. This collects them; the heavier deferrals (naive-wall-clock
+`fold` localization, named-zone `%Z` abbreviations, `Time`-carried offsets,
+tzdata auto-refresh) remain their own future work (#1055 "Not in scope").
+
+**Decision.**
+- **`time.format(d) -> str`** — a human-readable `Duration` in Go
+  `time.Duration.String()` style: `"0s"`, `"42ns"`, `"7.5us"`, `"250ms"`,
+  `"1.5s"`, `"1m30.5s"`, `"1h1m1s"`, negatives with a leading `-`. ASCII `"us"`
+  (not `"µs"`) for golden/terminal portability. One new runtime formatter
+  `zap_duration_format`; replaces the debug `Repr` / bare `to_seconds` float for
+  display.
+- **`time.since(start_ns) -> Duration`** — `monotonic_ns() − start_ns` wrapped in
+  a `Duration`, so the "elapsed since a saved reading" pattern is typed and
+  composes with the operators. Pure IR (reuses `zap_time_monotonic_ns`).
+- **`Date` / `Time` comparisons + field helpers** — `@derive(Eq, Ord)` on the
+  prelude `Date` / `Time` structs (field-by-field = chronological for these
+  layouts), plus `datetime.date_weekday(d)` / `date_isoweekday(d)` /
+  `date_day_of_year(d)`, reusing the existing `zap_datetime_weekday` /
+  `day_of_year` runtime over `(y, mo, d, 0, 0, 0)`.
+- **Sub-minute UTC offsets in rendering** — `%z` / `%Z` / `isoformat` now emit the
+  seconds when an offset is not a whole minute (a historical LMT/MMT): `%z` →
+  `+055328`, `isoformat` → `+05:53:28`, `%Z` → `UTC+05:53:28` (matching CPython
+  `zoneinfo`). Whole-minute offsets are unchanged.
+
+**Tests.** Golden `datetime_refine` (deterministic: the `format` cases, the
+Date/Time operators + helpers, and `Asia/Kolkata` 1900 = `+05:21:10` rendered to
+the second vs a whole-minute fixed offset); sema type/arity + the derived
+comparisons; seam-kwargs for the new 1-arg helpers. `time.since` is clock-based,
+so it is sema-only.
+
+Relates to [[D-0221]]/[[D-0225]]/[[D-0226]]/[[D-0227]] (the #974 slices this
+refines), [[D-0047]] (the derived comparisons), [[D-0213]] (seam rows), epic
+#966, and Discussion #965 (gap #7).

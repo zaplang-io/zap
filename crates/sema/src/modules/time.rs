@@ -108,6 +108,17 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_duration1(checker, "sleep_for", args, span);
             Some(Ty::Unit)
         }
+        // time.format(d) -> str: a human-readable Duration (Go-style, #1055).
+        "format" => {
+            expect_duration1(checker, "format", args, span);
+            Some(Ty::Str)
+        }
+        // time.since(start_ns) -> Duration: elapsed since a saved monotonic_ns()
+        // reading, as a typed Duration (#1055).
+        "since" => {
+            expect_numeric1(checker, "since", args, span);
+            Some(Ty::Named(DURATION.to_string()))
+        }
         // --- duration unit constructors (-> Duration, #1047) ---
         "seconds" | "millis" | "micros" | "nanos" => {
             expect_numeric1(checker, method, args, span);

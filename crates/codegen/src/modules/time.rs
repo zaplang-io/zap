@@ -28,4 +28,7 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_time_ns_to_seconds", &[i.into()], Some(f.into()));
     cg.declare_rt("zap_time_ns_to_millis", &[i.into()], Some(f.into()));
     cg.declare_rt("zap_time_ns_to_micros", &[i.into()], Some(f.into()));
+    // human-readable Duration formatting (Go-style, #1055): nanos -> ZapStr*.
+    let p = cg.ctx.ptr_type(inkwell::AddressSpace::default());
+    cg.declare_rt("zap_duration_format", &[i.into()], Some(p.into()));
 }

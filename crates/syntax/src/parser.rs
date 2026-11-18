@@ -180,11 +180,13 @@ value struct Duration:
     def __mul__(self, int64 k) -> Duration:
         return Duration(nanos=self.nanos * k)
 
+@derive(Eq, Ord)
 value struct Date:
     int64 year
     int64 month
     int64 day
 
+@derive(Eq, Ord)
 value struct Time:
     int64 hour
     int64 minute
