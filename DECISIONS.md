@@ -11615,3 +11615,64 @@ Relates to [[D-0056]] (http client), [[D-0222]] (redirect loop this threads the
 deadline through), [[D-0204]]/[[D-0213]] (seam binder + rows this extends),
 #1049 (sibling redirect-policy / `Session` design), #1057 (this surface
 decision), epic #984, and Discussion #965 (gap #9).
+
+## D-0230 — http-client: keep-alive connection pool + configurable redirect policy via `http.Client` (#990 / #1049 / epic #984)
+
+**Context.** Two sub-epic #984 slices, decided and built together behind one
+object. #990: every client call opened and tore down its own TCP/TLS connection
+— no keep-alive reuse, a fresh handshake per request. #1049: redirect following
+([[D-0222]]) was non-configurable (always on, fixed cap of 10), with no way to
+cap, disable, or read a 3xx without following. Both wanted the same home — a
+client/`Session` object — which #1049 flagged as a once-for-the-sub-epic
+decision. The architecture split from #988 (zaplang-io/requests#2) applies:
+transport/protocol lives in core `http`, so the pool and redirect policy are core
+(the requests-style body sugar stays in `zaplang-io/requests`).
+
+**Decision — `http.Client`, a method-bearing client with a per-host keep-alive
+pool and a redirect policy.**
+- **Surface.** `auto c = http.Client(max_redirects=10, follow=true, timeout=0)`
+  then `c.get(url[, headers])` / `c.post(url, body[, headers])` /
+  `c.request(method, url, body[, headers])` / `c.shutdown()`. `http.Client(...)`
+  is the [[D-0202]] seam-ctor sugar over a prelude factory `__http_client`, which
+  creates the pool and returns the prelude `HttpClient` struct (methods over the
+  internal `http._pool_*` seam primitives, the `json._lex_*` layering). Spelled
+  `shutdown()` not `close()` — `close` is a reserved word (channel close). The
+  bare module verbs `http.get`/`post`/`request` are unchanged (one-shot, no
+  pool); a `Client` is explicit opt-in. Per-call redirect/timeout overrides on
+  `Client` methods are a deliberate fast-follow (client-level config for now).
+- **Keep-alive (#990).** A `Client` pools idle connections keyed by
+  scheme+host+port, reused across requests. A connection is pooled only when the
+  response is fully framed AND keep-alive applies (HTTP/1.1 without `Connection:
+  close`, or HTTP/1.0 with `Connection: keep-alive`); a pooled connection the peer
+  has closed is detected (EOF before any byte) and retried once on a fresh dial.
+  Works over `http://` (net) and `https://` (TLS). The pool is NON-GC malloc
+  memory addressed by an int64 handle — a stable address never moved by precise
+  Immix, safe to hold across parks — freed by `shutdown()`; `pthread_mutex`-guarded
+  for list ops only (never across I/O), so a `Client` is safe to share across
+  coroutines. A small default max-idle (8).
+- **Single-response framing (prerequisite).** Reuse requires reading exactly one
+  response, so the pooled path frames the body by `Content-Length` or decodes
+  `Transfer-Encoding: chunked` (replacing the one-shot read-to-EOF, which stays
+  for the bare verbs' `Connection: close`). The binary-body contract (#988
+  verification) carries through.
+- **Redirect policy (#1049).** `follow` (requests' `allow_redirects`) and
+  `max_redirects` (the cap) are `Client` config: `follow=false` returns the 3xx
+  as-is (empty `http.redirects`); exceeding `max_redirects` raises a catchable
+  `ValueError` (kept from [[D-0222]], not Go's return-last-response), with a
+  negative cap also a `ValueError`. The default-on, cap-10 behavior of D-0222 is
+  the `http.Client()` default.
+
+**Tests.** Goldens `http_client_keepalive` (a single-accept raw-net server serving
+two requests on one socket — reuse proven by the second GET succeeding),
+`http_client_chunked` (a two-chunk body decodes to `"foobar"`),
+`http_client_redirect` (`follow=false` returns the 302 unfollowed;
+`max_redirects=0` raises a caught `ValueError`); sema arity for the internal
+`http._pool_*` primitives; the prelude parses + a full `http.Client` program
+sema-checks on the host. The end-to-end pool/framing/TLS runs under both
+collectors + arm64 on CI.
+
+Relates to [[D-0056]] (http client), [[D-0222]] (redirect following this makes
+configurable), [[D-0229]] (the per-request `timeout` the `Client` carries as a
+default), [[D-0202]] (seam-ctor sugar for `http.Client`), [[D-0204]] (seam
+binder), #988 / zaplang-io/requests#2 (the core-vs-requests split), epic #984,
+and Discussion #965 (gap #9).

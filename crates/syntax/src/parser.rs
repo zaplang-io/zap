@@ -1280,6 +1280,44 @@ struct arena:
 
     def __exit__(self):
         pass
+
+
+# The keep-alive HTTP client (#990, D-0230). `http.Client(...)` desugars (D-0202
+# seam ctor sugar) to the `__http_client` factory, which creates a connection
+# pool (a stable non-GC handle) and returns this struct. Methods reuse pooled
+# keep-alive connections per host and follow redirects per the client's policy
+# (#1049: `follow` / `max_redirects`). The pool primitives (`http._pool_*`) are
+# internal, positional-only seam calls (like `json._lex_*`). Call `.close()` to
+# drain and free the pool.
+struct HttpClient:
+    int64 _pool
+    int64 _max_redirects
+    bool _follow
+    int64 _timeout
+
+    def _do(self, str method, str url, str body, dict[str, str] headers) -> bytes:
+        auto f = 0
+        if self._follow:
+            f = 1
+        return http._pool_do(self._pool, method, url, body, headers, self._timeout, f, self._max_redirects)
+
+    def get(self, str url, dict[str, str] headers = {}) -> bytes:
+        return self._do(\"GET\", url, \"\", headers)
+
+    def post(self, str url, str body, dict[str, str] headers = {}) -> bytes:
+        return self._do(\"POST\", url, body, headers)
+
+    def request(self, str method, str url, str body, dict[str, str] headers = {}) -> bytes:
+        return self._do(method, url, body, headers)
+
+    # `close` is a reserved word in Zap (channel close), so the pool-draining
+    # method is spelled `shutdown()`.
+    def shutdown(self):
+        http._pool_close(self._pool)
+
+
+def __http_client(int64 max_redirects=10, bool follow=True, int64 timeout=0) -> HttpClient:
+    return HttpClient(_pool=http._pool_new(8), _max_redirects=max_redirects, _follow=follow, _timeout=timeout)
 ";
 
 /// Parse the built-in [`PRELUDE_SRC`] into AST items. The prelude is authored to
@@ -1424,6 +1462,14 @@ fn references_prelude(module: &Module) -> bool {
         // `arena` struct ships in the prelude, injected for any program that names
         // it (`with arena(...) as a:`).
         "\"arena\"",
+        // The keep-alive `http.Client` (#990, D-0230): the `HttpClient` struct +
+        // `__http_client` factory ship in the prelude, injected for any program
+        // that names the `http` module (so `http.Client(...)` — which parses to
+        // `Attr{ base: Name("http"), name: "Client" }` — triggers it) or the
+        // struct directly. Over-injection for an `http.get`-only program is
+        // harmless: the unused struct/factory emit no code.
+        "\"http\"",
+        "\"HttpClient\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))

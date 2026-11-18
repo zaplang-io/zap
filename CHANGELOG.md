@@ -25,6 +25,14 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **HTTP keep-alive client + redirect policy** (#990, #1049, D-0230). A reusable
+  `http.Client(max_redirects=…, follow=…, timeout=…)` with `.get`/`.post`/
+  `.request`/`.shutdown` methods: it pools and reuses keep-alive connections per
+  host (over `http://` and `https://`, framing responses by `Content-Length` or
+  decoding `chunked`), and follows redirects per its policy — `follow=false`
+  returns a 3xx unfollowed, exceeding `max_redirects` raises `ValueError`. The
+  bare `http.get`/`post`/`request` stay one-shot (unpooled, follow-by-default).
+  `shutdown()` (not `close()`, a reserved word) drains the pool.
 - **HTTP client per-request timeouts** (#986, D-0229). `http.get`/`post`/`request`
   take an optional `timeout` keyword — a **total deadline in milliseconds** for
   the whole call (connect + reads + all redirect hops), e.g.
