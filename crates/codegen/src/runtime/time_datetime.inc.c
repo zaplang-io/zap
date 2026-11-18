@@ -202,7 +202,8 @@ void *zap_datetime_format_iso(int64_t y, int64_t mo, int64_t d, int64_t h,
  * `ZapStr*`. Weekday / day-of-year are derived by recomposing the instant in
  * UTC (`timegm` then `gmtime_r`), reusing the civil-time path above. */
 void *zap_datetime_strftime(int64_t y, int64_t mo, int64_t d, int64_t h,
-                            int64_t mi, int64_t s, void *fmt) {
+                            int64_t mi, int64_t s, void *fmt, int64_t offset,
+                            int64_t is_aware) {
     static const char *const MON_FULL[12] = {
         "January", "February", "March",     "April",   "May",      "June",
         "July",    "August",   "September", "October", "November", "December"};
@@ -335,9 +336,30 @@ void *zap_datetime_strftime(int64_t y, int64_t mo, int64_t d, int64_t h,
             n += l;
             break;
         }
-        case 'Z':
         case 'z':
-            /* Naive DateTime: no zone, so these expand empty (Python-faithful). */
+            /* Aware: numeric UTC offset `±HHMM` (Python's `%z`, no colon).
+             * Naive: empty, as before (#1045, D-0225). Sub-minute offsets
+             * (e.g. a historical LMT) render to whole minutes. */
+            if (is_aware) {
+                long long a = offset < 0 ? -offset : offset;
+                w = snprintf(tmp, sizeof tmp, "%c%02d%02d",
+                             offset < 0 ? '-' : '+', (int)(a / 3600),
+                             (int)((a % 3600) / 60));
+                memcpy(out + n, tmp, (size_t)w);
+                n += (size_t)w;
+            }
+            break;
+        case 'Z':
+            /* Aware: `UTC±HH:MM` (no zone abbreviation is carried on the value,
+             * so the numeric-UTC name form is used). Naive: empty. */
+            if (is_aware) {
+                long long a = offset < 0 ? -offset : offset;
+                w = snprintf(tmp, sizeof tmp, "UTC%c%02d:%02d",
+                             offset < 0 ? '-' : '+', (int)(a / 3600),
+                             (int)((a % 3600) / 60));
+                memcpy(out + n, tmp, (size_t)w);
+                n += (size_t)w;
+            }
             break;
         case '%':
             out[n++] = '%';
@@ -600,3 +622,183 @@ done:
     return zap_datetime_to_unix(y, mo, d, h, mi, sec);
 }
 
+
+/* ===========================================================================
+ * Timezone database (#1045, D-0225).
+ *
+ * Offsets are a pure function of (zone, UTC instant): there is NO "zone default
+ * offset", which is exactly what avoids the classic pytz footgun of surfacing a
+ * zone's first/LMT offset for a modern date. The bundled IANA tables live in
+ * `tzdata_generated.inc.c` (included by `zaprt.c` immediately before this
+ * fragment): `ZAP_TZ_ZONES[]` is sorted by name; each zone is a flat list of
+ * `(at, off)` intervals with `trans[0].at == INT64_MIN`, so a binary search for
+ * the last interval whose `at <= instant` always resolves. All TZif/POSIX-rule
+ * parsing was done offline by `tools/gen_tzdata.py`; the runtime only searches.
+ * ===========================================================================*/
+
+/* Host UTC offset (seconds east of UTC) at `ts`, computed portably as
+ * `timegm(localtime(ts)) - ts` (no reliance on the `tm_gmtoff` extension). Used
+ * by the `*_local` constructors to make a host-local `DateTime` zone-aware. */
+int64_t zap_datetime_local_offset(int64_t ts) {
+    time_t t = (time_t)ts;
+    struct tm lt;
+    localtime_r(&t, &lt);
+    return (int64_t)(timegm(&lt) - t);
+}
+
+/* Civil components + offset/aware -> RFC-3339 string. Aware values carry a
+ * `±HH:MM` suffix (`+00:00` for a zero offset); a naive value is the bare civil
+ * ISO form, byte-identical to `zap_datetime_format_iso`. Sub-minute offsets
+ * (a historical LMT) render to whole minutes. */
+void *zap_datetime_isoformat(int64_t y, int64_t mo, int64_t d, int64_t h,
+                             int64_t mi, int64_t s, int64_t offset,
+                             int64_t is_aware) {
+    char buf[48];
+    int n = snprintf(buf, sizeof buf,
+                     "%04lld-%02lld-%02lldT%02lld:%02lld:%02lld", (long long)y,
+                     (long long)mo, (long long)d, (long long)h, (long long)mi,
+                     (long long)s);
+    if (n < 0) {
+        n = 0;
+    }
+    if (is_aware) {
+        long long a = offset < 0 ? -offset : offset;
+        int m = snprintf(buf + n, sizeof buf - (size_t)n, "%c%02d:%02d",
+                         offset < 0 ? '-' : '+', (int)(a / 3600),
+                         (int)((a % 3600) / 60));
+        if (m > 0) {
+            n += m;
+        }
+    }
+    return zap_str_new(buf, (int64_t)n);
+}
+
+/* The trailing RFC-3339 zone of `s` (`Z`, `±HH:MM`, or `±HHMM`) in seconds east
+ * of UTC; 0 for `Z` or when no offset is present. Scans only the time portion
+ * (after the `T`/space separator) so the date's hyphens are never mistaken for
+ * an offset sign. Lenient, matching the `parse` family's v1 contract. */
+int64_t zap_datetime_rfc3339_offset(void *s) {
+    ZapStr *z = (ZapStr *)s;
+    int64_t len = z->len < 0 ? 0 : z->len;
+    const char *p = z->data;
+    int64_t start = 0;
+    for (int64_t i = 0; i < len; i++) {
+        char c = p[i];
+        if (c == 'T' || c == 't' || c == ' ') {
+            start = i + 1;
+            break;
+        }
+    }
+    for (int64_t i = start; i < len; i++) {
+        char c = p[i];
+        if (c == 'Z' || c == 'z') {
+            return 0;
+        }
+        if (c == '+' || c == '-') {
+            int sign = c == '-' ? -1 : 1;
+            int64_t j = i + 1;
+            int hh = 0, mm = 0, cnt = 0;
+            while (j < len && p[j] >= '0' && p[j] <= '9' && cnt < 2) {
+                hh = hh * 10 + (p[j] - '0');
+                j++;
+                cnt++;
+            }
+            if (j < len && p[j] == ':') {
+                j++;
+            }
+            cnt = 0;
+            while (j < len && p[j] >= '0' && p[j] <= '9' && cnt < 2) {
+                mm = mm * 10 + (p[j] - '0');
+                j++;
+                cnt++;
+            }
+            return (int64_t)sign * (hh * 3600 + mm * 60);
+        }
+    }
+    return 0;
+}
+
+/* Binary search the name-sorted zone index; NULL if the zone is not bundled. */
+static const zap_tz_zone *zap_tz_find_zone(const char *name) {
+    int lo = 0, hi = ZAP_TZ_NZONES - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        int c = strcmp(name, ZAP_TZ_ZONES[mid].name);
+        if (c == 0) {
+            return &ZAP_TZ_ZONES[mid];
+        }
+        if (c < 0) {
+            hi = mid - 1;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return NULL;
+}
+
+/* The zone's UTC offset (seconds) at `inst`: the `off` of the last interval
+ * whose `at <= inst`. `trans[0].at == INT64_MIN`, so this always resolves (an
+ * instant before the first real transition takes the LMT interval). */
+static int64_t zap_tz_offset_for(const zap_tz_zone *z, int64_t inst) {
+    int lo = 0, hi = z->n - 1, ans = 0;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (z->trans[mid].at <= inst) {
+            ans = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return (int64_t)z->trans[ans].off;
+}
+
+/* Copy a `ZapStr*` zone name into a NUL-terminated C buffer (bounded). */
+static void zap_tz_name_cstr(void *name, char *buf, size_t cap) {
+    ZapStr *z = (ZapStr *)name;
+    int64_t len = z->len < 0 ? 0 : z->len;
+    if ((size_t)len > cap - 1) {
+        len = (int64_t)(cap - 1);
+    }
+    memcpy(buf, z->data, (size_t)len);
+    buf[len] = '\0';
+}
+
+/* Resolve a zone's offset at `inst`. A fixed zone returns its constant offset;
+ * a named zone looks the instant up in the bundled table. An unknown named zone
+ * raises a catchable error (Python `ZoneInfoNotFoundError`). */
+int64_t zap_tz_resolve(void *name, int64_t fixed_off, int64_t is_fixed,
+                       int64_t inst) {
+    if (is_fixed) {
+        return fixed_off;
+    }
+    char buf[128];
+    zap_tz_name_cstr(name, buf, sizeof buf);
+    const zap_tz_zone *zn = zap_tz_find_zone(buf);
+    if (!zn) {
+        char msg[192];
+        int m = snprintf(msg, sizeof msg, "unknown time zone: %s", buf);
+        if (m < 0) {
+            m = 0;
+        }
+        zap_panic(zap_str_new(msg, (int64_t)m));
+        return 0; /* unreachable: zap_panic does not return */
+    }
+    return zap_tz_offset_for(zn, inst);
+}
+
+/* Validate a named zone against the bundled index, returning the name back so
+ * `zone(name)` can both check and carry it; raises for an unknown zone. */
+void *zap_tz_zone_require(void *name) {
+    char buf[128];
+    zap_tz_name_cstr(name, buf, sizeof buf);
+    if (!zap_tz_find_zone(buf)) {
+        char msg[192];
+        int m = snprintf(msg, sizeof msg, "unknown time zone: %s", buf);
+        if (m < 0) {
+            m = 0;
+        }
+        zap_panic(zap_str_new(msg, (int64_t)m));
+    }
+    return name;
+}

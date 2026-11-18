@@ -36,8 +36,9 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_datetime_weekday", &six, Some(i.into()));
     cg.declare_rt("zap_datetime_day_of_year", &six, Some(i.into()));
     cg.declare_rt("zap_datetime_format_iso", &six, Some(p.into()));
-    // (year, month, day, hour, minute, second, fmt: ZapStr*) -> ZapStr* (#286)
-    let six_and_fmt = [
+    // (year, month, day, hour, minute, second, fmt: ZapStr*, offset, is_aware)
+    // -> ZapStr* (#286; offset/aware feed %z/%Z, #1045).
+    let six_fmt_tz = [
         i.into(),
         i.into(),
         i.into(),
@@ -45,13 +46,45 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
         i.into(),
         i.into(),
         p.into(),
+        i.into(),
+        i.into(),
     ];
-    cg.declare_rt("zap_datetime_strftime", &six_and_fmt, Some(p.into()));
+    cg.declare_rt("zap_datetime_strftime", &six_fmt_tz, Some(p.into()));
     cg.declare_rt("zap_datetime_parse_iso", &[p.into()], Some(i.into()));
     // (str: ZapStr*, fmt: ZapStr*) -> unix seconds (#338)
     cg.declare_rt(
         "zap_datetime_strptime",
         &[p.into(), p.into()],
+        Some(i.into()),
+    );
+
+    // Timezone database (#1045, D-0225).
+    // Host UTC offset (seconds) at a given instant — for the `*_local` paths.
+    cg.declare_rt("zap_datetime_local_offset", &[i.into()], Some(i.into()));
+    // (y,mo,d,h,mi,s, offset, is_aware) -> RFC-3339 ZapStr* (offset suffix when
+    // aware, bare civil ISO when naive).
+    let six_and_tz = [
+        i.into(),
+        i.into(),
+        i.into(),
+        i.into(),
+        i.into(),
+        i.into(),
+        i.into(),
+        i.into(),
+    ];
+    cg.declare_rt("zap_datetime_isoformat", &six_and_tz, Some(p.into()));
+    // RFC-3339 trailing offset (`Z`/`±HH:MM`) of a string, in seconds (0 if none).
+    cg.declare_rt("zap_datetime_rfc3339_offset", &[p.into()], Some(i.into()));
+    // Validate a named zone against the bundled IANA index; returns the name
+    // back, raising a catchable error for an unknown zone (throwing).
+    cg.declare_rt("zap_tz_zone_require", &[p.into()], Some(p.into()));
+    // Resolve a zone's offset at an instant: (name: ZapStr*, fixed_offset,
+    // is_fixed, instant) -> offset seconds. Named zones binary-search the
+    // bundled tables; an unknown name raises a catchable error (throwing).
+    cg.declare_rt(
+        "zap_tz_resolve",
+        &[p.into(), i.into(), i.into(), i.into()],
         Some(i.into()),
     );
 }

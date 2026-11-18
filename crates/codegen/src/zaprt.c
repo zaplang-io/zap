@@ -9719,6 +9719,9 @@ int64_t zap_signal_selftest(void) {
 #include "runtime/os_fs.inc.c"
 #include "runtime/crypto.inc.c"
 #include "runtime/bytes.inc.c"
+/* Bundled IANA timezone tables (#1045, D-0225) — must precede time_datetime,
+ * which binary-searches ZAP_TZ_ZONES. */
+#include "runtime/tzdata_generated.inc.c"
 #include "runtime/time_datetime.inc.c"
 /* ===========================================================================
  * Type descriptors for the runtime's own heap types (ticket #48). Both GC

@@ -1,16 +1,25 @@
-//! `datetime` module — lowering facet (ticket #99, D-0056).
+//! `datetime` module — lowering facet (ticket #99, D-0056; timezones #1045,
+//! D-0225).
 //!
 //! A `DateTime` is the built-in prelude `value struct` (year/month/day/hour/
-//! minute/second). Building one from a timestamp mirrors `gc.stats()`'s
-//! `MemStats`: `StructNew` then a `FieldSet` per component, each fed by a
-//! `zap_datetime_<field>(ts, is_local)` runtime getter. `to_timestamp`/`format`
-//! read the six fields back with `FieldGet` and hand them to a single runtime
-//! call. `strftime` / 2-arg `format(dt, fmt)` read the same six fields and pass
-//! them plus the format `ZapStr*` to `zap_datetime_strftime` (#286). `parse`
-//! lowers an ISO-8601 string to a Unix timestamp and then builds a UTC
-//! `DateTime` from it, reusing the getters. `strptime(str, fmt)` is the inverse
-//! of `strftime`: it hands both strings to `zap_datetime_strptime` and builds a
-//! UTC `DateTime` from the resulting timestamp (#338).
+//! minute/second, plus `offset` and `is_aware`, #1045). Building one from a
+//! timestamp mirrors `gc.stats()`'s `MemStats`: `StructNew` then a `FieldSet`
+//! per component, each civil field fed by a `zap_datetime_<field>(ts, is_local)`
+//! runtime getter, then the `offset`/`is_aware` fields set directly.
+//!
+//! **Offset model (D-0225).** The civil fields are the *wall clock in `offset`*
+//! (seconds east of UTC); the UTC instant is `timegm(civil) − offset`. A naive
+//! value has `offset == 0, is_aware == false` and is byte-for-byte the old UTC
+//! behaviour (`from_timestamp`/`now`/`parse`/`strptime`). The `*_local`
+//! constructors attach the host offset and are aware. Arithmetic/comparisons
+//! ([[D-0221]]) operate on the true instant and reduce to the old UTC math when
+//! `offset == 0`; `weekday`/`day_of_year` keep using the local civil fields.
+//!
+//! **Zones.** `zone(name)`/`fixed_offset(minutes)` build the prelude `TimeZone`
+//! value struct; `astimezone(dt, tz)` resolves the offset at the instant
+//! (binary search over the bundled IANA tables, `zap_tz_resolve`) and rebuilds
+//! the wall clock. `isoformat`/`rfc3339` render RFC-3339 with the offset suffix
+//! when aware; `rfc3339_parse` parses `…(Z|±HH:MM)` to an aware value.
 
 use zapc_syntax::ast;
 
@@ -34,6 +43,16 @@ const GETTERS: [&str; 6] = [
     "zap_datetime_second",
 ];
 
+/// `DateTime` field index for the UTC offset (seconds east of UTC), #1045.
+const F_OFFSET: u32 = 6;
+/// `DateTime` field index for the aware flag (bool), #1045.
+const F_AWARE: u32 = 7;
+
+/// `TimeZone` field indices (name / offset-seconds / fixed-flag), #1045.
+const TZ_NAME: u32 = 0;
+const TZ_OFFSET: u32 = 1;
+const TZ_FIXED: u32 = 2;
+
 /// Resolve the prelude `DateTime` struct id (injected by the parser's prelude
 /// whenever the `datetime` surface is used).
 fn datetime_sid(lowerer: &FnLower) -> Result<u32, LowerError> {
@@ -45,13 +64,27 @@ fn datetime_sid(lowerer: &FnLower) -> Result<u32, LowerError> {
         .ok_or_else(|| err("DateTime struct unavailable (built-in prelude missing)"))
 }
 
-/// Build a `DateTime` value struct from a Unix-timestamp value, interpreting it
-/// in UTC (`is_local == 0`) or the host's local zone (`is_local == 1`). Each
-/// field comes from its `zap_datetime_<field>(ts, is_local)` getter.
+/// Resolve the prelude `TimeZone` struct id (#1045).
+fn timezone_sid(lowerer: &FnLower) -> Result<u32, LowerError> {
+    lowerer
+        .ctx
+        .ids
+        .get("TimeZone")
+        .copied()
+        .ok_or_else(|| err("TimeZone struct unavailable (built-in prelude missing)"))
+}
+
+/// Build a `DateTime` value struct. The six civil fields come from the
+/// `zap_datetime_<field>(getter_ts, is_local)` getters (so `getter_ts` is the
+/// wall-clock-as-epoch when `is_local == 0`, or a UTC timestamp decomposed into
+/// the host zone when `is_local == 1`). `offset` (seconds east of UTC) and
+/// `aware` (an `i1`) are set directly (#1045, D-0225).
 fn build_datetime(
     lowerer: &mut FnLower,
-    ts: Value,
+    getter_ts: Value,
     is_local: i64,
+    offset: Value,
+    aware: Value,
 ) -> Result<(Value, Ty), LowerError> {
     let sid = datetime_sid(lowerer)?;
     let local = lowerer.iconst(Ty::I64, is_local);
@@ -62,7 +95,7 @@ fn build_datetime(
         lowerer.emit(Inst::Call {
             dest: Some(v),
             func: (*func).to_string(),
-            args: vec![ts, local],
+            args: vec![getter_ts, local],
         });
         lowerer.emit(Inst::FieldSet {
             base: dest,
@@ -71,54 +104,84 @@ fn build_datetime(
             val: v,
         });
     }
+    lowerer.emit(Inst::FieldSet {
+        base: dest,
+        sid,
+        idx: F_OFFSET,
+        val: offset,
+    });
+    lowerer.emit(Inst::FieldSet {
+        base: dest,
+        sid,
+        idx: F_AWARE,
+        val: aware,
+    });
     Ok((dest, Ty::Struct(sid)))
 }
 
-/// Read the six `DateTime` fields of the (single) argument into a `[y,mo,d,h,mi,s]`
-/// value vector.
+/// Read the six civil `DateTime` fields of an already-lowered base value.
+fn civil_fields(lowerer: &mut FnLower, base: Value, sid: u32) -> Vec<Value> {
+    (0..6)
+        .map(|idx| lowerer.field_get(base, sid, idx, Ty::I64))
+        .collect()
+}
+
+/// Read the six `DateTime` fields of the (single) argument into `[y,mo,d,h,mi,s]`.
 fn read_components(lowerer: &mut FnLower, args: &[ast::Arg]) -> Result<Vec<Value>, LowerError> {
     let sid = datetime_sid(lowerer)?;
     let (base, _) = lowerer.expr(&args[0].value)?;
-    let mut comps = Vec::with_capacity(6);
-    for idx in 0..6 {
-        comps.push(lowerer.field_get(base, sid, idx, Ty::I64));
-    }
-    Ok(comps)
+    Ok(civil_fields(lowerer, base, sid))
 }
 
 /// Read the six `DateTime` fields of a single argument (#974).
 fn components_of(lowerer: &mut FnLower, arg: &ast::Arg) -> Result<Vec<Value>, LowerError> {
     let sid = datetime_sid(lowerer)?;
     let (base, _) = lowerer.expr(&arg.value)?;
-    let mut comps = Vec::with_capacity(6);
-    for idx in 0..6 {
-        comps.push(lowerer.field_get(base, sid, idx, Ty::I64));
-    }
-    Ok(comps)
+    Ok(civil_fields(lowerer, base, sid))
 }
 
-/// A `DateTime` argument's UTC Unix timestamp (`zap_datetime_to_unix` over its
-/// six fields). The shared basis for arithmetic and comparisons (#974, D-0221):
-/// `DateTime` is naive and whole-second, so these operate in the UTC-timestamp
-/// domain, which round-trips exactly through `to_unix`/the field getters.
-fn to_unix_of(lowerer: &mut FnLower, arg: &ast::Arg) -> Result<Value, LowerError> {
-    let comps = components_of(lowerer, arg)?;
-    let d = lowerer.new_value(Ty::I64);
+/// A `DateTime` argument's UTC Unix instant (`timegm(civil) − offset`) together
+/// with its stored `offset` (i64) and `is_aware` (i1). The shared basis for
+/// arithmetic and comparisons (#974, D-0221; offset-aware since #1045): for a
+/// naive value (`offset == 0`) the instant is exactly `zap_datetime_to_unix` of
+/// the civil fields, so the behaviour reduces to the pre-#1045 UTC math.
+fn instant_of(lowerer: &mut FnLower, arg: &ast::Arg) -> Result<(Value, Value, Value), LowerError> {
+    let sid = datetime_sid(lowerer)?;
+    let (base, _) = lowerer.expr(&arg.value)?;
+    let comps = civil_fields(lowerer, base, sid);
+    let local_ts = lowerer.new_value(Ty::I64);
     lowerer.emit(Inst::Call {
-        dest: Some(d),
+        dest: Some(local_ts),
         func: "zap_datetime_to_unix".to_string(),
         args: comps,
     });
-    Ok(d)
+    let off = lowerer.field_get(base, sid, F_OFFSET, Ty::I64);
+    let aware = lowerer.field_get(base, sid, F_AWARE, Ty::I1);
+    let inst = lowerer.new_value(Ty::I64);
+    lowerer.emit(Inst::Bin {
+        dest: inst,
+        op: BinOp::Sub,
+        lhs: local_ts,
+        rhs: off,
+    });
+    Ok((inst, off, aware))
 }
 
-/// Lower a `(DateTime, fmt)` custom-format call: read the six fields of the
-/// first argument, lower the format string, and hand both to the runtime
-/// `zap_datetime_strftime` (#286). The result is a fresh `str` (`Ty::Ptr`).
+/// Lower a `(DateTime, fmt)` custom-format call: read the six civil fields plus
+/// `offset`/`is_aware` of the first argument, lower the format string, and hand
+/// everything to `zap_datetime_strftime` (#286; `%z`/`%Z` are meaningful once a
+/// value is aware, #1045). The result is a fresh `str` (`Ty::Ptr`).
 fn strftime(lowerer: &mut FnLower, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
-    let mut call_args = read_components(lowerer, args)?;
+    let sid = datetime_sid(lowerer)?;
+    let (base, _) = lowerer.expr(&args[0].value)?;
+    let mut call_args = civil_fields(lowerer, base, sid);
     let (fmt, _) = lowerer.expr(&args[1].value)?;
+    let off = lowerer.field_get(base, sid, F_OFFSET, Ty::I64);
+    let aware_i1 = lowerer.field_get(base, sid, F_AWARE, Ty::I1);
+    let aware_i64 = lowerer.coerce(aware_i1, Ty::I1, Ty::I64);
     call_args.push(fmt);
+    call_args.push(off);
+    call_args.push(aware_i64);
     let d = lowerer.new_value(Ty::Ptr);
     lowerer.emit(Inst::Call {
         dest: Some(d),
@@ -126,6 +189,58 @@ fn strftime(lowerer: &mut FnLower, args: &[ast::Arg]) -> Result<(Value, Ty), Low
         args: call_args,
     });
     Ok((d, Ty::Ptr))
+}
+
+/// Lower `isoformat(dt)` / `rfc3339(dt)`: the six civil fields plus
+/// `offset`/`is_aware` to `zap_datetime_isoformat` (RFC-3339 with the offset
+/// suffix when aware, bare civil ISO when naive), #1045.
+fn isoformat(lowerer: &mut FnLower, arg: &ast::Arg) -> Result<(Value, Ty), LowerError> {
+    let sid = datetime_sid(lowerer)?;
+    let (base, _) = lowerer.expr(&arg.value)?;
+    let mut call_args = civil_fields(lowerer, base, sid);
+    let off = lowerer.field_get(base, sid, F_OFFSET, Ty::I64);
+    let aware_i1 = lowerer.field_get(base, sid, F_AWARE, Ty::I1);
+    let aware_i64 = lowerer.coerce(aware_i1, Ty::I1, Ty::I64);
+    call_args.push(off);
+    call_args.push(aware_i64);
+    let d = lowerer.new_value(Ty::Ptr);
+    lowerer.emit(Inst::Call {
+        dest: Some(d),
+        func: "zap_datetime_isoformat".to_string(),
+        args: call_args,
+    });
+    Ok((d, Ty::Ptr))
+}
+
+/// Lower `fixed_offset(minutes)` / `zone(name)` into a `TimeZone` value struct.
+fn build_timezone(
+    lowerer: &mut FnLower,
+    name: Value,
+    offset: Value,
+    fixed: Value,
+) -> Result<(Value, Ty), LowerError> {
+    let sid = timezone_sid(lowerer)?;
+    let dest = lowerer.new_value(Ty::Struct(sid));
+    lowerer.emit(Inst::StructNew { dest, sid });
+    lowerer.emit(Inst::FieldSet {
+        base: dest,
+        sid,
+        idx: TZ_NAME,
+        val: name,
+    });
+    lowerer.emit(Inst::FieldSet {
+        base: dest,
+        sid,
+        idx: TZ_OFFSET,
+        val: offset,
+    });
+    lowerer.emit(Inst::FieldSet {
+        base: dest,
+        sid,
+        idx: TZ_FIXED,
+        val: fixed,
+    });
+    Ok((dest, Ty::Struct(sid)))
 }
 
 fn lower(
@@ -143,8 +258,20 @@ fn lower(
             } else {
                 lowerer.coerce(v, vt, Ty::I64)
             };
-            let is_local = i64::from(method == "from_timestamp_local");
-            build_datetime(lowerer, ts, is_local)?
+            if method == "from_timestamp" {
+                let off = lowerer.iconst(Ty::I64, 0);
+                let aware = lowerer.bconst(false);
+                build_datetime(lowerer, ts, 0, off, aware)?
+            } else {
+                let off = lowerer.new_value(Ty::I64);
+                lowerer.emit(Inst::Call {
+                    dest: Some(off),
+                    func: "zap_datetime_local_offset".to_string(),
+                    args: vec![ts],
+                });
+                let aware = lowerer.bconst(true);
+                build_datetime(lowerer, ts, 1, off, aware)?
+            }
         }
         "now" | "now_local" => {
             let ts = lowerer.new_value(Ty::I64);
@@ -153,8 +280,20 @@ fn lower(
                 func: "zap_datetime_now_unix".to_string(),
                 args: vec![],
             });
-            let is_local = i64::from(method == "now_local");
-            build_datetime(lowerer, ts, is_local)?
+            if method == "now" {
+                let off = lowerer.iconst(Ty::I64, 0);
+                let aware = lowerer.bconst(false);
+                build_datetime(lowerer, ts, 0, off, aware)?
+            } else {
+                let off = lowerer.new_value(Ty::I64);
+                lowerer.emit(Inst::Call {
+                    dest: Some(off),
+                    func: "zap_datetime_local_offset".to_string(),
+                    args: vec![ts],
+                });
+                let aware = lowerer.bconst(true);
+                build_datetime(lowerer, ts, 1, off, aware)?
+            }
         }
         "parse" => {
             let (s, _) = lowerer.expr(&args[0].value)?;
@@ -164,9 +303,11 @@ fn lower(
                 func: "zap_datetime_parse_iso".to_string(),
                 args: vec![s],
             });
-            build_datetime(lowerer, ts, 0)?
+            let off = lowerer.iconst(Ty::I64, 0);
+            let aware = lowerer.bconst(false);
+            build_datetime(lowerer, ts, 0, off, aware)?
         }
-        // (str, strftime format) -> UTC Unix timestamp -> DateTime (#338).
+        // (str, strftime format) -> UTC Unix timestamp -> naive DateTime (#338).
         "strptime" => {
             let (s, _) = lowerer.expr(&args[0].value)?;
             let (fmt, _) = lowerer.expr(&args[1].value)?;
@@ -176,17 +317,13 @@ fn lower(
                 func: "zap_datetime_strptime".to_string(),
                 args: vec![s, fmt],
             });
-            build_datetime(lowerer, ts, 0)?
+            let off = lowerer.iconst(Ty::I64, 0);
+            let aware = lowerer.bconst(false);
+            build_datetime(lowerer, ts, 0, off, aware)?
         }
         "to_timestamp" => {
-            let comps = read_components(lowerer, args)?;
-            let d = lowerer.new_value(Ty::I64);
-            lowerer.emit(Inst::Call {
-                dest: Some(d),
-                func: "zap_datetime_to_unix".to_string(),
-                args: comps,
-            });
-            (d, Ty::I64)
+            let (inst, _off, _aware) = instant_of(lowerer, &args[0])?;
+            (inst, Ty::I64)
         }
         // One arg: ISO-8601. Two args: strftime-style custom format (#286).
         "format" if args.len() == 2 => strftime(lowerer, args)?,
@@ -201,24 +338,52 @@ fn lower(
             (d, Ty::Ptr)
         }
         "strftime" => strftime(lowerer, args)?,
-        // Date arithmetic + comparisons + field helpers (#974, D-0221). All
-        // over the UTC-timestamp domain (DateTime is naive, whole-second).
+        "isoformat" | "rfc3339" => isoformat(lowerer, &args[0])?,
+        "rfc3339_parse" => {
+            let (s, _) = lowerer.expr(&args[0].value)?;
+            // Civil wall clock as written (ISO parse ignores the zone suffix).
+            let local_ts = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(local_ts),
+                func: "zap_datetime_parse_iso".to_string(),
+                args: vec![s],
+            });
+            // The `(Z|±HH:MM)` offset, in seconds (0 if none / `Z`).
+            let off = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(off),
+                func: "zap_datetime_rfc3339_offset".to_string(),
+                args: vec![s],
+            });
+            let aware = lowerer.bconst(true);
+            build_datetime(lowerer, local_ts, 0, off, aware)?
+        }
+        // Date arithmetic + comparisons over the true UTC instant (#974,
+        // D-0221; offset-aware since #1045). `add` keeps the source zone.
         "add" => {
-            let ts = to_unix_of(lowerer, &args[0])?;
+            let (inst, off, aware) = instant_of(lowerer, &args[0])?;
             let (sv, st) = lowerer.expr(&args[1].value)?;
             let sec = lowerer.coerce(sv, st, Ty::I64);
-            let ts2 = lowerer.new_value(Ty::I64);
+            let inst2 = lowerer.new_value(Ty::I64);
             lowerer.emit(Inst::Bin {
-                dest: ts2,
+                dest: inst2,
                 op: BinOp::Add,
-                lhs: ts,
+                lhs: inst,
                 rhs: sec,
             });
-            build_datetime(lowerer, ts2, 0)?
+            // Rebuild the wall clock in the same offset: getter_ts = inst2 + off.
+            let local_ts2 = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Bin {
+                dest: local_ts2,
+                op: BinOp::Add,
+                lhs: inst2,
+                rhs: off,
+            });
+            build_datetime(lowerer, local_ts2, 0, off, aware)?
         }
         "diff" => {
-            let a = to_unix_of(lowerer, &args[0])?;
-            let b = to_unix_of(lowerer, &args[1])?;
+            let (a, _, _) = instant_of(lowerer, &args[0])?;
+            let (b, _, _) = instant_of(lowerer, &args[1])?;
             let d = lowerer.new_value(Ty::I64);
             lowerer.emit(Inst::Bin {
                 dest: d,
@@ -229,8 +394,8 @@ fn lower(
             (d, Ty::I64)
         }
         "before" | "after" | "equal" => {
-            let a = to_unix_of(lowerer, &args[0])?;
-            let b = to_unix_of(lowerer, &args[1])?;
+            let (a, _, _) = instant_of(lowerer, &args[0])?;
+            let (b, _, _) = instant_of(lowerer, &args[1])?;
             let pred = match method {
                 "before" => CmpPred::Lt,
                 "after" => CmpPred::Gt,
@@ -277,6 +442,59 @@ fn lower(
                 rhs: one,
             });
             (d, Ty::I64)
+        }
+        // Timezone database (#1045, D-0225).
+        "zone" => {
+            let (nm, _) = lowerer.expr(&args[0].value)?;
+            // Validate against the bundled zone index; returns the name back,
+            // raising a catchable error for an unknown zone.
+            let valid = lowerer.new_value(Ty::Ptr);
+            lowerer.throwing_call(Some(valid), "zap_tz_zone_require", vec![nm]);
+            let off = lowerer.iconst(Ty::I64, 0);
+            let fixed = lowerer.bconst(false);
+            build_timezone(lowerer, valid, off, fixed)?
+        }
+        "fixed_offset" => {
+            let (mv, mt) = lowerer.expr(&args[0].value)?;
+            let mins = lowerer.coerce(mv, mt, Ty::I64);
+            let sixty = lowerer.iconst(Ty::I64, 60);
+            let off = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Bin {
+                dest: off,
+                op: BinOp::Mul,
+                lhs: mins,
+                rhs: sixty,
+            });
+            let empty = lowerer.new_value(Ty::Ptr);
+            lowerer.emit(Inst::StrConst {
+                dest: empty,
+                bytes: Vec::new(),
+            });
+            let fixed = lowerer.bconst(true);
+            build_timezone(lowerer, empty, off, fixed)?
+        }
+        "astimezone" => {
+            let (inst, _off, _aware) = instant_of(lowerer, &args[0])?;
+            let tzsid = timezone_sid(lowerer)?;
+            let (tzbase, _) = lowerer.expr(&args[1].value)?;
+            let zname = lowerer.field_get(tzbase, tzsid, TZ_NAME, Ty::Ptr);
+            let zoff = lowerer.field_get(tzbase, tzsid, TZ_OFFSET, Ty::I64);
+            let zfixed_i1 = lowerer.field_get(tzbase, tzsid, TZ_FIXED, Ty::I1);
+            let zfixed = lowerer.coerce(zfixed_i1, Ty::I1, Ty::I64);
+            // Resolve the offset at the instant (fixed zone → its constant;
+            // named zone → binary search the bundled IANA table, raising a
+            // catchable error for an unknown name).
+            let off = lowerer.new_value(Ty::I64);
+            lowerer.throwing_call(Some(off), "zap_tz_resolve", vec![zname, zoff, zfixed, inst]);
+            let local_ts = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Bin {
+                dest: local_ts,
+                op: BinOp::Add,
+                lhs: inst,
+                rhs: off,
+            });
+            let aware = lowerer.bconst(true);
+            build_datetime(lowerer, local_ts, 0, off, aware)?
         }
         _ => return Ok(None),
     };
