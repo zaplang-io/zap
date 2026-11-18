@@ -2974,6 +2974,9 @@ typedef struct {
     void *pd;
     SSL *ssl;     /* NULL unless tls */
     SSL_CTX *ctx; /* NULL unless tls */
+    int64_t deadline_ns; /* absolute monotonic whole-request deadline (#986), 0 =
+                          * unbounded (today's behavior). Bounds every read park
+                          * on this connection via the fill seam below. */
 } ZapHttpConn;
 
 /* Read one chunk over an established SSL into `b`. Returns bytes read (0 = clean
@@ -3037,13 +3040,17 @@ static int zap_httpconn_send_all(ZapHttpConn *c, const char *data, size_t len) {
     return status < 0 ? (int)status : 0;
 }
 
-/* Read one chunk into `b`. Returns bytes read (0 = EOF), -1 on error. */
+/* Read one chunk into `b`. Returns bytes read (0 = EOF), -1 on error, or -2 when
+ * the whole-request deadline (#986) elapses — the sentinel the caller turns into
+ * a catchable TimeoutError. The per-park timeout stays 0 (the client has no
+ * between-byte read-timeout surface); `c->deadline_ns` is the absolute
+ * whole-request deadline shared by connect + every read across redirect hops
+ * (0 = unbounded, the pre-#986 behavior). */
 static ssize_t zap_httpconn_fill(ZapHttpConn *c, ZapDynBuf *b) {
     if (c->tls) {
-        /* client: no read-timeout/deadline surface (0/0 = unchanged) */
-        return zap_http_tls_fill(b, c->ssl, c->fd, c->pd, 0, 0);
+        return zap_http_tls_fill(b, c->ssl, c->fd, c->pd, 0, c->deadline_ns);
     }
-    return zap_dyn_fill(b, c->fd, c->pd, 0, 0); /* client: no read-timeout/deadline surface */
+    return zap_dyn_fill(b, c->fd, c->pd, 0, c->deadline_ns);
 }
 
 /* Shut down and close the connection (the TLS session + context when present). */
@@ -3150,7 +3157,7 @@ static int zap_http_hdr_managed(const ZapStr *name) {
  * only touched while it is still rooted by the caller's frame. */
 static void *zap_http_do_once(const ZapStr *method, const char *url_cstr,
                               const ZapStr *body, const ZapDict *hdrs,
-                              int suppress_ctype) {
+                              int suppress_ctype, int64_t deadline_ns) {
     char *mz = zap_net_dupz(method);
     if (!mz) {
         zap_net_panic("http: out of memory");
@@ -3198,18 +3205,26 @@ static void *zap_http_do_once(const ZapStr *method, const char *url_cstr,
     ZapStr *hostz = (ZapStr *)zap_str_new(host, (int64_t)strlen(host));
     ZapHttpConn hc;
     memset(&hc, 0, sizeof hc);
+    hc.deadline_ns = deadline_ns; /* bounds connect + every read (#986) */
     if (is_tls) {
         SSL_CTX *tctx = NULL;
         int tfd = -1;
         void *tpd = NULL;
-        SSL *ssl = zap_tls_dial_raw(hostz, port, 1, &tctx, &tfd, &tpd); /* raises on failure */
+        /* Bound the TLS dial (TCP connect + handshake parks) by the same absolute
+         * deadline (#986); raises TimeoutError on expiry, as on plain connect. */
+        SSL *ssl = zap_tls_dial_raw_impl(hostz, NULL, port, 1, deadline_ns, NULL, &tctx, &tfd,
+                                         &tpd); /* raises on failure */
         hc.tls = 1;
         hc.ssl = ssl;
         hc.ctx = tctx;
         hc.fd = tfd;
         hc.pd = tpd;
     } else {
-        ZapSock *conn = (ZapSock *)zap_net_connect(hostz, port); /* raises on failure */
+        /* Bound the plaintext connect by the deadline (#986); `numeric = 0` keeps
+         * hostname resolution (getaddrinfo is not itself deadline-bounded, but the
+         * connect parks are). Raises TimeoutError on expiry. */
+        ZapSock *conn =
+            (ZapSock *)zap_net_connect_impl((void *)hostz, port, deadline_ns, 0); /* raises */
         hc.fd = conn->fd;
         hc.pd = conn->pd;
     }
@@ -3297,6 +3312,15 @@ static void *zap_http_do_once(const ZapStr *method, const char *url_cstr,
     ZapDynBuf b = {NULL, 0, 0};
     for (;;) {
         ssize_t r = zap_httpconn_fill(&hc, &b);
+        if (r == -2 || r == -3) {
+            /* The whole-request deadline elapsed (#986, -2) or the coroutine was
+             * cancelled (-3): close the transport, free the buffer, and raise
+             * (TimeoutError / cancelled) rather than return a truncated response. */
+            zap_httpconn_close(&hc);
+            zap_dyn_free(&b);
+            zap_io_panic((int)r, "http: read timed out");
+            return NULL;
+        }
         if (r <= 0) {
             break;
         }
@@ -3413,10 +3437,25 @@ static char *zap_http_resp_header_cstr(ZapHttpResp *resp, const char *name) {
     return out;
 }
 
-/* HTTP/1.1 client with redirect following. See the block comment above. */
-void *zap_http_do(void *method_, void *url_, void *body_, void *headers_) {
+/* HTTP/1.1 client with redirect following. See the block comment above.
+ * `timeout_ms` is the per-request TOTAL deadline (#986): 0 = unbounded (the
+ * pre-#986 behavior), a positive value bounds connect + every read across ALL
+ * redirect hops by one absolute monotonic deadline computed here once, and a
+ * negative value is a ValueError (mirrors `net.set_read_timeout`). On expiry any
+ * blocked connect/read raises a catchable TimeoutError. */
+void *zap_http_do(void *method_, void *url_, void *body_, void *headers_, int64_t timeout_ms) {
     const ZapStr *body = (const ZapStr *)body_;
     const ZapDict *hdrs = (const ZapDict *)headers_;
+
+    if (timeout_ms < 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("http: timeout must be non-negative",
+                                    (int64_t)sizeof("http: timeout must be non-negative") - 1));
+        return NULL;
+    }
+    /* One absolute monotonic deadline shared by every hop, so the budget spans
+     * the whole exchange (connect + reads + redirects), not each hop afresh. */
+    int64_t deadline_ns = (timeout_ms > 0) ? zap_deadline_after_ms(timeout_ms) : 0;
 
     char *cur = zap_net_dupz((const ZapStr *)url_);   /* current absolute URL */
     char *curm = zap_net_dupz((const ZapStr *)method_); /* current method */
@@ -3440,7 +3479,7 @@ void *zap_http_do(void *method_, void *url_, void *body_, void *headers_) {
          * consumed into the malloc request buffer before do_once's first park. */
         ZapStr *mZ = (ZapStr *)zap_str_new(curm, (int64_t)strlen(curm));
         const ZapStr *bodyArg = drop_body ? (const ZapStr *)empty : body;
-        resp = (ZapHttpResp *)zap_http_do_once(mZ, cur, bodyArg, hdrs, suppress_ctype);
+        resp = (ZapHttpResp *)zap_http_do_once(mZ, cur, bodyArg, hdrs, suppress_ctype, deadline_ns);
         long st = resp->status; /* captured before any later allocation */
 
         if (!zap_http_is_redirect(st)) {
@@ -3544,34 +3583,55 @@ void *zap_http_redirects(void *resp_) { return ((ZapHttpResp *)resp_)->chain; }
 
 /* http.request(method, url, body) — no caller headers. */
 void *zap_http_request(void *method_, void *url_, void *body_) {
-    return zap_http_do(method_, url_, body_, NULL);
+    return zap_http_do(method_, url_, body_, NULL, 0);
 }
 
 /* http.request(method, url, body, headers) — with a `dict[str,str]` (#280). */
 void *zap_http_request_h(void *method_, void *url_, void *body_, void *headers_) {
-    return zap_http_do(method_, url_, body_, headers_);
+    return zap_http_do(method_, url_, body_, headers_, 0);
+}
+
+/* http.request(method, url, body, headers, timeout_ms) — with a total deadline
+ * (#986). `headers` is always present (the seam binder defaults it to `{}` when a
+ * caller supplies only `timeout`). */
+void *zap_http_request_ht(void *method_, void *url_, void *body_, void *headers_,
+                          int64_t timeout_ms) {
+    return zap_http_do(method_, url_, body_, headers_, timeout_ms);
 }
 
 void *zap_http_get(void *url_) {
     ZAP_STACK_STR(g, "GET", 3);
     ZAP_STACK_STR(empty, "", 0);
-    return zap_http_do(g, url_, empty, NULL);
+    return zap_http_do(g, url_, empty, NULL, 0);
 }
 
 void *zap_http_get_h(void *url_, void *headers_) {
     ZAP_STACK_STR(g, "GET", 3);
     ZAP_STACK_STR(empty, "", 0);
-    return zap_http_do(g, url_, empty, headers_);
+    return zap_http_do(g, url_, empty, headers_, 0);
+}
+
+/* http.get(url[, headers], timeout_ms) — total deadline (#986). */
+void *zap_http_get_ht(void *url_, void *headers_, int64_t timeout_ms) {
+    ZAP_STACK_STR(g, "GET", 3);
+    ZAP_STACK_STR(empty, "", 0);
+    return zap_http_do(g, url_, empty, headers_, timeout_ms);
 }
 
 void *zap_http_post(void *url_, void *body_) {
     ZAP_STACK_STR(p, "POST", 4);
-    return zap_http_do(p, url_, body_, NULL);
+    return zap_http_do(p, url_, body_, NULL, 0);
 }
 
 void *zap_http_post_h(void *url_, void *body_, void *headers_) {
     ZAP_STACK_STR(p, "POST", 4);
-    return zap_http_do(p, url_, body_, headers_);
+    return zap_http_do(p, url_, body_, headers_, 0);
+}
+
+/* http.post(url, body[, headers], timeout_ms) — total deadline (#986). */
+void *zap_http_post_ht(void *url_, void *body_, void *headers_, int64_t timeout_ms) {
+    ZAP_STACK_STR(p, "POST", 4);
+    return zap_http_do(p, url_, body_, headers_, timeout_ms);
 }
 
 int64_t zap_http_status(void *resp_) { return ((ZapHttpResp *)resp_)->status; }

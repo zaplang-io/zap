@@ -653,7 +653,12 @@ browser/`requests` method rules (303 → GET; 301/302 downgrade only POST → GE
 307/308 preserve method and body) and a catchable `ValueError` when the cap is
 exceeded; two additive accessors, **`http.final_url(resp) -> str`** and
 **`http.redirects(resp) -> list[str]`** (the targets followed, in order), expose
-the outcome. A configurable cap / opt-out is a deferred follow-up. Because `http`
+the outcome. A configurable cap / opt-out is a deferred follow-up. The client
+verbs also take an **optional `timeout` keyword** (#986, D-0229): a per-request
+**total deadline in milliseconds** bounding the whole call (connect + reads +
+redirects), raising a catchable `TimeoutError` on expiry (`0`/omitted =
+unbounded, a negative value is a `ValueError`); `headers` may be omitted while
+`timeout` is supplied (an interior-optional seam default, D-0204). Because `http`
 is **Experimental**, all of these are additive surface changes requiring no
 stability promise.
 

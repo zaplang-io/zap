@@ -60,11 +60,19 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("gzip", "compress", &["data", "level"]),
     ("gzip", "decompress", &["data"]),
     // ---- http (ticket #104): client verbs take an optional trailing headers ----
-    // dict[str,str]; accessors are fixed-arity. The optional `headers` is the
-    // last parameter (the former "n or n+1 args" overload).
-    ("http", "get", &["url", "headers"]),
-    ("http", "post", &["url", "body", "headers"]),
-    ("http", "request", &["method", "url", "body", "headers"]),
+    // dict[str,str] (#280) and an optional per-request total-deadline `timeout`
+    // in milliseconds (#986, D-0229). `headers` is an *interior* optional (a
+    // later `timeout` may be supplied without it, e.g. `http.get(url,
+    // timeout=5000)`): it carries a `SeamDefault::EmptyDict` in
+    // `SEAM_METHOD_DEFAULTS` so the binder fills the hole with `{}` instead of
+    // rejecting it. `timeout` is the trailing optional (0 / omitted = unbounded).
+    ("http", "get", &["url", "headers", "timeout"]),
+    ("http", "post", &["url", "body", "headers", "timeout"]),
+    (
+        "http",
+        "request",
+        &["method", "url", "body", "headers", "timeout"],
+    ),
     ("http", "status", &["resp"]),
     ("http", "body", &["resp"]),
     ("http", "header", &["resp", "name"]),
@@ -394,6 +402,41 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("bisect", "insort_right", &["a", "x"]),
 ];
 
+/// A default value a seam parameter takes when it is an *interior* optional —
+/// omitted while a later parameter is supplied (#986). Without a default, such a
+/// hole is rejected (the #998 footgun guard); with one, the binder and its
+/// lowering twin synthesize the value so the per-method facet, which reads
+/// positionally, still finds every slot filled. Kept tiny and explicit (one
+/// variant per shape actually needed) rather than a general expression default:
+/// the only consumer today is `http`'s interior `headers` dict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeamDefault {
+    /// An empty `dict` display (`{}`): the default for an omitted `headers` map,
+    /// which the runtime treats as "no caller headers".
+    EmptyDict,
+}
+
+/// Parameters that carry a [`SeamDefault`], keyed by `(module, method,
+/// parameter)`. A parameter absent from this table has no default: if it is an
+/// interior hole the binder rejects the call as before. Only interior optionals
+/// need an entry — a trailing optional is simply left absent when omitted.
+pub const SEAM_METHOD_DEFAULTS: &[(&str, &str, &str, SeamDefault)] = &[
+    // `http` client verbs: `headers` sits before the trailing `timeout` (#986),
+    // so it must default when a caller supplies only `timeout`.
+    ("http", "get", "headers", SeamDefault::EmptyDict),
+    ("http", "post", "headers", SeamDefault::EmptyDict),
+    ("http", "request", "headers", SeamDefault::EmptyDict),
+];
+
+/// The [`SeamDefault`] for `(module, method, param)`, or `None` when the
+/// parameter has no default (an interior hole there is an error, as before).
+pub fn seam_param_default(module: &str, method: &str, param: &str) -> Option<SeamDefault> {
+    SEAM_METHOD_DEFAULTS
+        .iter()
+        .find(|(m, me, p, _)| *m == module && *me == method && *p == param)
+        .map(|(_, _, _, d)| *d)
+}
+
 /// The declared positional parameter names of a seam method, or `None` when the
 /// method has no registered signature (then the caller keeps the legacy
 /// positional-only behavior). The `(module, method)` key is the seam registry
@@ -418,10 +461,41 @@ mod tests {
         );
         assert_eq!(
             seam_method_params("http", "get"),
-            Some(&["url", "headers"][..])
+            Some(&["url", "headers", "timeout"][..])
         );
         assert_eq!(seam_method_params("zlib", "no_such"), None);
         assert_eq!(seam_method_params("no_such", "compress"), None);
+    }
+
+    /// An interior-optional parameter resolves to its default; unmarked
+    /// parameters (and methods) have none (#986).
+    #[test]
+    fn interior_optional_defaults() {
+        assert_eq!(
+            seam_param_default("http", "get", "headers"),
+            Some(SeamDefault::EmptyDict)
+        );
+        assert_eq!(
+            seam_param_default("http", "request", "headers"),
+            Some(SeamDefault::EmptyDict)
+        );
+        assert_eq!(seam_param_default("http", "get", "timeout"), None);
+        assert_eq!(seam_param_default("http", "get", "url"), None);
+        assert_eq!(seam_param_default("zlib", "compress", "level"), None);
+    }
+
+    /// Every default row names a real parameter of its method (a typo would make
+    /// the binder never find the default and silently reject the hole).
+    #[test]
+    fn default_rows_name_real_params() {
+        for (m, me, p, _) in SEAM_METHOD_DEFAULTS {
+            let params = seam_method_params(m, me)
+                .unwrap_or_else(|| panic!("default row for unknown seam method {m}.{me}"));
+            assert!(
+                params.contains(p),
+                "default row {m}.{me} names parameter '{p}' not in its signature"
+            );
+        }
     }
 
     /// A `(module, method)` row is unique (a duplicate would make `find` ignore

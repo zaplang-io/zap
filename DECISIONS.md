@@ -11552,3 +11552,66 @@ so it is sema-only.
 Relates to [[D-0221]]/[[D-0225]]/[[D-0226]]/[[D-0227]] (the #974 slices this
 refines), [[D-0047]] (the derived comparisons), [[D-0213]] (seam rows), epic
 #966, and Discussion #965 (gap #7).
+
+## D-0229 — http-client: per-request total-deadline `timeout`, and seam interior-optional defaults (#986 / epic #984)
+
+**Context.** The HTTP client (`http.get`/`post`/`request`) had no per-request
+timeout: a slow or hung server blocked the call forever ([[D-0056]] client,
+[[D-0222]] redirects). `net` already has the machinery — a per-park read timeout
+([[D-0056]]/I#485), a whole-operation read deadline (I#567), a bounded connect
+(`zap_net_connect_impl` / `connect_ip_deadline`), and a catchable `TimeoutError`
+(`zap_io_panic(-2, …)`) — but the client opened its own socket and passed `0/0`
+(unbounded) to every dial and read. The open question was the **surface**, which
+collides with the seam calling convention: [[D-0204]] binds keywords by declared
+signature but **rejects an interior-optional hole**, so a new `timeout` could not
+simply become a second trailing optional next to the existing optional `headers`
+dict ([[D-0056]] #280) — `http.get(url, timeout=5000)` (headers omitted) would be
+rejected. The sibling design issue (#1049, redirect policy) flagged the same
+constraint and a possible sub-epic-wide `Session` object; the user's call for
+#986 was **per-call `timeout=`** (a deadline is a property of the call, not the
+socket — it must stay at the call site even once keep-alive #990 pools a shared
+connection), with a `Session` default-timeout an additive later option.
+
+**Decision.**
+- **Semantics — a single total deadline, in milliseconds (`int64`).** `timeout`
+  bounds the WHOLE call (connect + every read + every redirect hop) by ONE
+  absolute monotonic deadline computed once at the start of `zap_http_do` and
+  shared across hops (Go `http.Client{Timeout}`, not Python `requests`' per-park
+  `(connect, read)` which never bounds total elapsed). `0` / omitted = unbounded
+  (the pre-#986 behavior); a **negative** value is a `ValueError` (mirrors
+  `net.set_read_timeout`); on expiry a blocked connect/read raises a catchable
+  `TimeoutError` (the same `net` error, for a consistent surface). Milliseconds,
+  not `requests`' float seconds, to match `net`'s existing timeout units and
+  Zap's no-implicit-int→float rule. Separate connect/read knobs can be added
+  later additively without breaking this. (Send is bounded by the OS socket
+  buffer only — a request to a non-reading peer rarely blocks on write; a true
+  send deadline would be a `net`-core change, out of scope here.)
+- **Surface — a per-call `timeout` keyword** on `get`/`post`/`request`, lowering
+  to new `_ht` runtime entry points (`zap_http_get_ht` / `post_ht` /
+  `request_ht`), the `_h` twins plus a trailing `int64` ms deadline. Arities
+  widen to `get` 1..=3, `post` 2..=4, `request` 3..=5; the trailing arg is the
+  timeout.
+- **Enabling mechanism — seam interior-optional defaults.** To let
+  `http.get(url, timeout=5000)` bind with `headers` omitted (an interior hole),
+  the seam binder ([[D-0204]]) gains per-parameter **defaults**: a new
+  `SEAM_METHOD_DEFAULTS` table marks `http` `headers` with `SeamDefault::EmptyDict`,
+  and both facets (`bind_seam_args` and its lowering twin `reorder_seam_args`)
+  fill such a hole with the synthesized default (`{}`) instead of rejecting it.
+  A parameter with no registered default still rejects an interior hole exactly
+  as before, so no other module's binding changes. This is a small, reusable
+  core extension — the natural home for future interior optionals — kept minimal
+  (one default shape, the only one needed today).
+
+**Tests.** Golden `http_client_timeout` (deterministic: in-time GET succeeds; a
+stall server that reads but never replies makes a 50 ms `timeout` raise a caught
+`TimeoutError`; a negative timeout raises `ValueError` before any dial); sema
+arity for the widened `get`/`post`/`request` + `seam_kwargs` binding cases
+(`timeout` alone with `headers` defaulted, `headers`+`timeout`, reordered
+keywords, an over-arity reject, `bogus=` still rejected); `seam_sigs` unit tests
+for the default table. The runtime deadline threading (connect + reads across
+redirects) is exercised end-to-end by the golden under both collectors + arm64.
+
+Relates to [[D-0056]] (http client), [[D-0222]] (redirect loop this threads the
+deadline through), [[D-0204]]/[[D-0213]] (seam binder + rows this extends),
+#1049 (sibling redirect-policy / `Session` design), #1057 (this surface
+decision), epic #984, and Discussion #965 (gap #9).

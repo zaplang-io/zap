@@ -19,7 +19,7 @@ use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
 
-use super::{expect_argc, ModuleCheck};
+use super::{expect_argc, expect_argc_range, ModuleCheck};
 use crate::{Checker, Ty};
 
 /// Require either `n` or `n + 1` arguments (the extra one is the optional
@@ -51,21 +51,30 @@ pub(super) const MODULE: ModuleCheck = ModuleCheck {
 fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Option<Ty> {
     Some(match method {
         // --- client ---------------------------------------------------------
-        // http.get(url) / http.get(url, headers) -> response handle
+        // http.get(url) / http.get(url, headers) / http.get(url[, headers],
+        // timeout=ms) -> response handle. `timeout` is the per-request total
+        // deadline in milliseconds (#986): the whole call (connect + reads +
+        // redirects) must finish within it or it raises TimeoutError; 0 / omitted
+        // = unbounded, a negative value is a ValueError at runtime. `headers` is
+        // an interior optional — the seam binder fills it with `{}` when only
+        // `timeout` is supplied — so the argument count spans 1..=3.
         "get" => {
-            expect_argc_or_headers(checker, method, args, 1, span);
+            expect_argc_range(checker, "http", method, args, 1, 3, span);
             Ty::Bytes
         }
-        // http.post(url, body) / http.post(url, body, headers) -> response handle
+        // http.post(url, body) / http.post(url, body, headers) / http.post(url,
+        // body[, headers], timeout=ms) -> response handle. See `get` for the
+        // `timeout` total-deadline semantics (#986).
         "post" => {
-            expect_argc_or_headers(checker, method, args, 2, span);
+            expect_argc_range(checker, "http", method, args, 2, 4, span);
             Ty::Bytes
         }
-        // http.request(method, url, body) / http.request(method, url, body, headers)
-        // -> response handle. The optional trailing arg is a `dict[str,str]` of
-        // request headers sent on the wire (#280).
+        // http.request(method, url, body) / ..., headers) / ...[, headers],
+        // timeout=ms) -> response handle. The optional `headers` is a
+        // `dict[str,str]` of request headers sent on the wire (#280); `timeout` is
+        // the per-request total deadline in milliseconds (#986).
         "request" => {
-            expect_argc_or_headers(checker, method, args, 3, span);
+            expect_argc_range(checker, "http", method, args, 3, 5, span);
             Ty::Bytes
         }
         // http.status(resp) -> int64
