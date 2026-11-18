@@ -17185,7 +17185,37 @@ impl<'a> FnLower<'a> {
     /// ZIR, so the interned fields are `(Ptr, Ptr)` — byte-identical to a
     /// `dict[str, str].items()` element, which is also iterated as `for name,
     /// value in ...`.
+    /// `http.req_headers(req)` — enumerate a request's received header block.
     fn lower_http_req_headers(&mut self, req: Value) -> (Value, Ty) {
+        self.lower_http_header_pairs(
+            req,
+            "zap_http_req_header_count",
+            "zap_http_req_header_name",
+            "zap_http_req_header_val",
+        )
+    }
+
+    /// `http.headers(resp)` — enumerate a client response's received header block
+    /// (#989); the response twin of `req_headers`, so multiple `Set-Cookie` lines
+    /// are each visible.
+    fn lower_http_resp_headers(&mut self, resp: Value) -> (Value, Ty) {
+        self.lower_http_header_pairs(
+            resp,
+            "zap_http_resp_header_count",
+            "zap_http_resp_header_name",
+            "zap_http_resp_header_val",
+        )
+    }
+
+    /// Shared body for the header-block enumerators: build a `list[(str, str)]`
+    /// by looping `0..count_fn(handle)` and pushing `(name_fn, val_fn)` pairs.
+    fn lower_http_header_pairs(
+        &mut self,
+        req: Value,
+        count_fn: &str,
+        name_fn: &str,
+        val_fn: &str,
+    ) -> (Value, Ty) {
         let tuple_sid = self.ctx.tuples.borrow_mut().intern(vec![Ty::Ptr, Ty::Ptr]);
         let out_elem = Elem::Struct(tuple_sid);
         let out = self.new_value(Ty::List(out_elem));
@@ -17194,11 +17224,11 @@ impl<'a> FnLower<'a> {
             func: "zap_list_new".to_string(),
             args: vec![],
         });
-        // n = zap_http_req_header_count(req): loop-invariant, computed once.
+        // n = <count_fn>(handle): loop-invariant, computed once.
         let count = self.new_value(Ty::I64);
         self.emit(Inst::Call {
             dest: Some(count),
-            func: "zap_http_req_header_count".to_string(),
+            func: count_fn.to_string(),
             args: vec![req],
         });
 
@@ -17229,13 +17259,13 @@ impl<'a> FnLower<'a> {
         let name = self.new_value(Ty::Ptr);
         self.emit(Inst::Call {
             dest: Some(name),
-            func: "zap_http_req_header_name".to_string(),
+            func: name_fn.to_string(),
             args: vec![req, i],
         });
         let val = self.new_value(Ty::Ptr);
         self.emit(Inst::Call {
             dest: Some(val),
-            func: "zap_http_req_header_val".to_string(),
+            func: val_fn.to_string(),
             args: vec![req, i],
         });
         let tup = self.new_value(Ty::Struct(tuple_sid));
@@ -17272,6 +17302,83 @@ impl<'a> FnLower<'a> {
         self.set_term(Term::Br(cond_bb));
         self.position(end_bb);
         (out, Ty::List(out_elem))
+    }
+
+    /// `http.parse_set_cookie(value)` — parse one `Set-Cookie` header value into
+    /// the prelude `Cookie` value struct (#989), one
+    /// `zap_http_cookie_<field>(value)` getter per field (the `url.split` /
+    /// `UrlParts` pattern). Field order matches `PRELUDE_SRC`: name(0) value(1)
+    /// domain(2) path(3) expires(4) max_age(5) secure(6) http_only(7)
+    /// same_site(8). `secure` / `http_only` are C `int64` 0/1 normalized to the
+    /// struct's `bool` fields.
+    fn lower_http_parse_set_cookie(&mut self, v: Value) -> (Value, Ty) {
+        let sid = *self
+            .ctx
+            .ids
+            .get("Cookie")
+            .expect("Cookie struct unavailable (built-in prelude missing)");
+        let dest = self.new_value(Ty::Struct(sid));
+        self.emit(Inst::StructNew { dest, sid });
+        let str_fields: [(&str, u32); 6] = [
+            ("zap_http_cookie_name", 0),
+            ("zap_http_cookie_value", 1),
+            ("zap_http_cookie_domain", 2),
+            ("zap_http_cookie_path", 3),
+            ("zap_http_cookie_expires", 4),
+            ("zap_http_cookie_same_site", 8),
+        ];
+        for (func, idx) in str_fields {
+            let f = self.new_value(Ty::Ptr);
+            self.emit(Inst::Call {
+                dest: Some(f),
+                func: func.to_string(),
+                args: vec![v],
+            });
+            self.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx,
+                val: f,
+            });
+        }
+        let ma = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(ma),
+            func: "zap_http_cookie_max_age".to_string(),
+            args: vec![v],
+        });
+        self.emit(Inst::FieldSet {
+            base: dest,
+            sid,
+            idx: 5,
+            val: ma,
+        });
+        for (func, idx) in [
+            ("zap_http_cookie_secure", 6u32),
+            ("zap_http_cookie_http_only", 7u32),
+        ] {
+            let raw = self.new_value(Ty::I64);
+            self.emit(Inst::Call {
+                dest: Some(raw),
+                func: func.to_string(),
+                args: vec![v],
+            });
+            let zero = self.iconst(Ty::I64, 0);
+            let b = self.new_value(Ty::I1);
+            self.emit(Inst::ICmp {
+                dest: b,
+                pred: CmpPred::Ne,
+                lhs: raw,
+                rhs: zero,
+            });
+            self.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx,
+                val: b,
+            });
+        }
+        (dest, Ty::Struct(sid))
     }
 
     /// Lower `fs.scandir(path)` to a `list[DirEntry]` (#1032, D-0224). The runtime

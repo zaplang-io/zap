@@ -1282,6 +1282,23 @@ struct arena:
         pass
 
 
+# The parsed form of one `Set-Cookie` header value (#989, D-0231), returned by
+# `http.parse_set_cookie(value)`. Field order is load-bearing: the lowering sets
+# fields by index (name 0 … same_site 8). Absent attributes are empty / -1 /
+# false; `expires` is the raw HTTP-date string (the cookie jar parses it),
+# `max_age` is seconds (-1 = absent).
+value struct Cookie:
+    str name
+    str value
+    str domain
+    str path
+    str expires
+    int64 max_age
+    bool secure
+    bool http_only
+    str same_site
+
+
 # The keep-alive HTTP client (#990, D-0230). `http.Client(...)` desugars (D-0202
 # seam ctor sugar) to the `__http_client` factory, which creates a connection
 # pool (a stable non-GC handle) and returns this struct. Methods reuse pooled
@@ -1470,6 +1487,10 @@ fn references_prelude(module: &Module) -> bool {
         // harmless: the unused struct/factory emit no code.
         "\"http\"",
         "\"HttpClient\"",
+        // The parsed `Cookie` value struct (#989, D-0231) returned by
+        // `http.parse_set_cookie`; `http` already triggers it, this also covers a
+        // direct `Cookie` reference.
+        "\"Cookie\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))

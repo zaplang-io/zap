@@ -74,6 +74,32 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
         Some(p.into()),
     );
     cg.declare_rt("zap_http_pool_close", &[i.into()], None);
+    // client response header enumeration (#989): count + positional name/value,
+    // the list[(str,str)] assembled in lowering (the `req_headers` pattern).
+    cg.declare_rt("zap_http_resp_header_count", &[p.into()], Some(i.into()));
+    cg.declare_rt(
+        "zap_http_resp_header_name",
+        &[p.into(), i.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt(
+        "zap_http_resp_header_val",
+        &[p.into(), i.into()],
+        Some(p.into()),
+    );
+    // Set-Cookie parsing (#989): one getter per prelude `Cookie` field, the
+    // struct built in lowering (the `url.split` / `UrlParts` pattern). String
+    // fields return `str` (ptr); `max_age` an int64 (-1 absent); `secure` /
+    // `http_only` an int64 0/1 normalized to the struct's bool field in lowering.
+    cg.declare_rt("zap_http_cookie_name", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_http_cookie_value", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_http_cookie_domain", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_http_cookie_path", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_http_cookie_expires", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_http_cookie_same_site", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_http_cookie_max_age", &[p.into()], Some(i.into()));
+    cg.declare_rt("zap_http_cookie_secure", &[p.into()], Some(i.into()));
+    cg.declare_rt("zap_http_cookie_http_only", &[p.into()], Some(i.into()));
     cg.declare_rt("zap_http_status", &[p.into()], Some(i.into()));
     cg.declare_rt("zap_http_body", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_http_header", &[p.into(), p.into()], Some(p.into()));

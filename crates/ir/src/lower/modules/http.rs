@@ -58,6 +58,11 @@ fn lower(
         // tuple path) so the `(str, str)` GC layout matches codegen, exactly like
         // `dict[str, str].items()`.
         "req_headers" => lowerer.lower_http_req_headers(a[0]),
+        // client response header enumeration (#989): list[(str,str)] assembled in
+        // lowering, the `req_headers` twin.
+        "headers" => lowerer.lower_http_resp_headers(a[0]),
+        // Set-Cookie parsing (#989): build the prelude `Cookie` value struct.
+        "parse_set_cookie" => lowerer.lower_http_parse_set_cookie(a[0]),
         "req_body" => call_ret(lowerer, "zap_http_req_body", a, Ty::Ptr, false),
         "req_version" => call_ret(lowerer, "zap_http_req_version", a, Ty::Ptr, false),
         // respond — the headers-bearing form (one extra `dict[str,str]` arg,

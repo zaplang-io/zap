@@ -25,6 +25,14 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **HTTP cookie primitives** (#989, D-0231). `http.headers(resp)` enumerates every
+  response header as ordered `(name, value)` pairs (duplicates preserved — so
+  multiple `Set-Cookie` lines are each visible, which the single-value
+  `http.header` could not surface), and `http.parse_set_cookie(value)` parses one
+  `Set-Cookie` into a typed `Cookie` struct (name/value/domain/path/expires/
+  max_age/secure/http_only/same_site). The session cookie *jar* (persistence +
+  domain/path matching + auto-`Cookie`) lives in `zaplang-io/requests`, built on
+  these primitives.
 - **HTTP keep-alive client + redirect policy** (#990, #1049, D-0230). A reusable
   `http.Client(max_redirects=…, follow=…, timeout=…)` with `.get`/`.post`/
   `.request`/`.shutdown` methods: it pools and reuses keep-alive connections per
