@@ -9718,6 +9718,8 @@ int64_t zap_signal_selftest(void) {
 
 #include "runtime/os_fs.inc.c"
 #include "runtime/crypto.inc.c"
+/* uuid (#975, D-0232/D-0233): after crypto.inc.c — reuses its CSPRNG/MD5/SHA-1. */
+#include "runtime/uuid.inc.c"
 #include "runtime/bytes.inc.c"
 /* Bundled IANA timezone tables (#1045, D-0225) — must precede time_datetime,
  * which binary-searches ZAP_TZ_ZONES. */

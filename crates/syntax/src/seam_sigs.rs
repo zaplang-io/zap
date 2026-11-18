@@ -301,6 +301,14 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("url", "parse_query_first", &["q"]),
     ("url", "encode_query_multi", &["d"]),
     ("url", "join", &["base", "ref"]),
+    // ---- uuid (ticket #975, D-0232/D-0233): namespaced UUIDs + parse ----
+    // The generators (uuid4/uuid7/uuid1/nil/max/namespace_*) take no args, so no
+    // row. `nanoid` stays positional (its 0/1/2-arg forms bind different
+    // parameters, which the positional binder cannot express). `uuid3`/`uuid5`
+    // and `parse` are keyword-capable.
+    ("uuid", "uuid3", &["ns", "name"]),
+    ("uuid", "uuid5", &["ns", "name"]),
+    ("uuid", "parse", &["s"]),
     // ---- io (ticket #97): raw fd I/O ----
     ("io", "open", &["path", "mode"]),
     ("io", "read", &["fd", "n"]),

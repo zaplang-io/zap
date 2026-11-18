@@ -25,6 +25,18 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`uuid` module — RFC 4122 / RFC 9562 UUIDs + NanoID** (#975, D-0232/D-0233).
+  A prelude `Uuid` value struct (`str(u)` gives the canonical `8-4-4-4-12` form
+  via the Display protocol; `u.hex()`/`u.urn()`/`u.to_bytes()`/`u.version()`/
+  `u.variant()`; being a value struct it auto-derives structural equality + hash,
+  so UUIDs work as `dict`/`set` keys). Generators `uuid.uuid4()` (random),
+  `uuid.uuid7()` (time-ordered, RFC 9562), `uuid.uuid1()` (random-node v1),
+  `uuid.uuid3(ns, name)` / `uuid.uuid5(ns, name)` (MD5 / SHA-1) over the Appendix C
+  `uuid.namespace_dns/url/oid/x500()` constants, `uuid.parse(s)` (canonical /
+  `urn:uuid:` / braced / bare-hex, raising `ValueError` on anything else), and
+  `uuid.nil()` / `uuid.max()`. Plus **NanoID** `uuid.nanoid()` / `nanoid(size)` /
+  `nanoid(alphabet, size)` (ai/nanoid semantics). All randomness comes from the
+  OS CSPRNG (the existing `crypto` primitive); MD5/SHA-1 reuse crypto's contexts.
 - **HTTP cookie primitives** (#989, D-0231). `http.headers(resp)` enumerates every
   response header as ordered `(name, value)` pairs (duplicates preserved — so
   multiple `Set-Cookie` lines are each visible, which the single-value

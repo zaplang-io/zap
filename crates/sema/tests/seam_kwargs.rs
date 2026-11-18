@@ -1202,3 +1202,33 @@ fn fs_glob_fnmatch_keyword_and_positional() {
         "ZAP4023",
     );
 }
+
+#[test]
+fn uuid_namespaced_keyword_and_positional() {
+    // uuid3/uuid5 (#975, D-0232): keyword binding, reordering, positional.
+    assert_ok(&prog(
+        "    auto u = uuid.uuid5(ns=uuid.namespace_dns(), name=\"example.com\")\n",
+    ));
+    assert_ok(&prog(
+        "    auto u = uuid.uuid5(name=\"example.com\", ns=uuid.namespace_dns())\n",
+    ));
+    assert_ok(&prog(
+        "    auto u = uuid.uuid3(uuid.namespace_url(), \"https://example.com\")\n",
+    ));
+    // Unknown keyword → ZAP4023 (the same a user function emits).
+    assert_code(
+        &prog("    auto u = uuid.uuid5(namespace=uuid.namespace_dns(), name=\"x\")\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn uuid_parse_keyword_and_positional() {
+    assert_ok(&prog(
+        "    auto u = uuid.parse(s=\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\")\n",
+    ));
+    assert_ok(&prog(
+        "    auto u = uuid.parse(\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\")\n",
+    ));
+    assert_code(&prog("    auto u = uuid.parse(value=\"x\")\n"), "ZAP4023");
+}

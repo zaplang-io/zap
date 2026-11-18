@@ -11720,3 +11720,82 @@ Relates to [[D-0197]] (`req_headers`, the enumeration pattern), [[D-0209]]
 (`url.split` / `UrlParts`, the struct-build pattern), [[D-0056]] (http client),
 #988 / zaplang-io/requests#2 (the core-vs-requests split), zaplang-io/requests#3
 (the jar), epic #984, and Discussion #965 (gap #9).
+
+## D-0232 — stdlib `uuid`: a prelude `Uuid` value struct + RFC 4122/9562 generators (#975 / epic #966)
+
+**Context.** Zap had no UUIDs — request IDs, DB primary keys, idempotency and
+correlation keys are pervasive in service/web code, and without a module everyone
+would re-implement the version/variant bit-twiddling and `8-4-4-4-12` formatting
+(badly). `crypto.random_bytes` already provides OS-CSPRNG entropy and crypto's
+MD5/SHA-1 contexts already exist. Discussion #965 (gap #8) requested the module;
+the open question was the value *shape*.
+
+**Decision — a prelude `Uuid` value struct with Go-style accessor methods.**
+- **Shape.** `Uuid` is a `value struct { bytes raw }` shipped in `PRELUDE_SRC`
+  (the `KeyInfo`/`Stat` pattern), injected for any program that names the `uuid`
+  module or the struct. Being a value struct it **auto-derives structural Eq +
+  Hash** ([[D-0139]]), so `==`/`!=` and `dict`/`set` key use work by byte content
+  — the natural ergonomics a bare-`str` API would lose. Chosen over `str`-returning
+  helpers (which would re-parse on every accessor and give no type safety).
+- **Accessors.** `str`/`bytes` are type keywords and so cannot be member names
+  (the parser's `.name` position takes an ordinary identifier). The canonical
+  `8-4-4-4-12` lowercase form is therefore the **Display protocol** ([[D-0124]]):
+  `str(u)` / `print(u)` / f-strings. The rest are methods, matching Go's
+  `google/uuid`: `u.hex()` (32 hex, no hyphens), `u.urn()` (`urn:uuid:…`),
+  `u.to_bytes()` (the 16 raw bytes), `u.version()` / `u.variant()` (`int64`;
+  variant 0=NCS, 1=RFC 4122, 2=Microsoft, 3=future).
+- **Generators (all randomness via the OS CSPRNG).** `uuid.uuid4()` (random),
+  `uuid.uuid7()` (RFC 9562, 48-bit unix-ms + random — time-ordered, for DB keys),
+  `uuid.uuid1()` (RFC 4122 v1; 100-ns Gregorian timestamp, random 14-bit
+  clock-seq, and a **random 48-bit node with the multicast/local bit set** per
+  §4.5 so no hardware MAC is ever disclosed), `uuid.uuid3(ns, name)` (MD5) /
+  `uuid.uuid5(ns, name)` (SHA-1) over a `Uuid` namespace, `uuid.parse(s)`
+  (canonical / `urn:uuid:` / braced / bare-32-hex; raises `ValueError`
+  otherwise), `uuid.nil()` / `uuid.max()`, and the RFC 4122 Appendix C namespace
+  constants `uuid.namespace_dns/url/oid/x500()`.
+- **Runtime reuse.** `runtime/uuid.inc.c` is `#include`d after `crypto.inc.c` and
+  reuses its static CSPRNG (`zap_crypto_fill_random`) and MD5/SHA-1 hash contexts
+  — no second copy of any primitive.
+- **Keywords.** `uuid3`/`uuid5` (`ns`, `name`) and `parse` (`s`) are
+  keyword-capable ([[D-0204]]/[[D-0213]] `seam_sigs` rows + `seam_kwargs` tests);
+  the zero-argument generators/constants take no row.
+
+**Tests.** Golden `uuid_basic` (nil/max/namespace constants exact, the Python
+documented NAMESPACE_DNS + `python.org` v3/v5 vectors, parse round-trips across
+all surface forms, the version/variant nibbles, uuid4/7/1 shape + a parse→Eq
+round-trip, NanoID lengths + a deterministic single-char alphabet); sema
+type/arity for every function + the accessors + Eq/Hash key use; `seam_kwargs`
+binding for `uuid3`/`uuid5`/`parse`; the prelude parses and a full program
+sema-checks and lowers to ZIR on the host. The end-to-end runtime (values,
+collectors, arm64) runs on CI.
+
+Relates to [[D-0139]] (value-struct auto Eq/Hash), [[D-0124]] (Display protocol),
+[[D-0126]] (`KeyInfo`, the prelude value-struct-from-runtime pattern), [[D-0204]]
+/ [[D-0213]] (the seam binder + the one-row-per-arg rule), [[D-0233]] (NanoID),
+and Discussion #965 (gap #8).
+
+## D-0233 — stdlib `uuid`: NanoID folded into the `uuid` module, positional (#975 / epic #966)
+
+**Context.** #975 also asked for NanoID (a compact, URL-safe random ID; ai/nanoid
+semantics). Two sub-questions: which module it lives in, and how its three call
+forms bind.
+
+**Decision — `uuid.nanoid(...)`, positional.**
+- **Placement.** NanoID lives *in* the `uuid` module as `uuid.nanoid`, not a
+  separate `nanoid` module (maintainer's call: one fewer module for a related
+  "give me a short unique id" need).
+- **Surface (ai/nanoid semantics).** `uuid.nanoid()` → 21 chars from the default
+  URL-safe alphabet (the ai/nanoid `urlAlphabet`); `uuid.nanoid(size)` → `size`
+  chars, default alphabet; `uuid.nanoid(alphabet, size)` → custom alphabet +
+  size. Uniformity is masked rejection sampling over the OS CSPRNG. A negative
+  `size` or an alphabet length outside `1..256` raises `ValueError`; `size == 0`
+  yields `""`.
+- **Positional (not keyword-capable).** The single-argument form binds `size`
+  while the first of the two-argument form binds `alphabet` — a parameter *shift*
+  the positional seam keyword binder ([[D-0204]]) cannot express — so `nanoid`
+  has **no `seam_sigs` row** and is dispatched by arity + argument type in the
+  check/lower facets. This is the deliberate exception to the [[D-0213]]
+  one-row-per-arg rule, recorded here.
+
+Relates to [[D-0232]] (the `uuid` module it joins), [[D-0204]] / [[D-0213]] (the
+seam binder + the rule this is the exception to), and Discussion #965 (gap #8).
