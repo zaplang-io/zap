@@ -87,4 +87,10 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
         &[p.into(), i.into(), i.into(), i.into()],
         Some(i.into()),
     );
+
+    // Separate date / time-of-day renderers (#1046, D-0226).
+    // (year, month, day) -> "YYYY-MM-DD"; (hour, minute, second) -> "HH:MM:SS".
+    let three = [i.into(), i.into(), i.into()];
+    cg.declare_rt("zap_date_isoformat", &three, Some(p.into()));
+    cg.declare_rt("zap_time_isoformat", &three, Some(p.into()));
 }

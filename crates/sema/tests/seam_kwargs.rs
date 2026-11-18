@@ -1051,6 +1051,33 @@ fn datetime_timezone_keyword_and_positional() {
 }
 
 #[test]
+fn datetime_date_time_types_keyword_and_positional() {
+    // date/time constructors (#1046, D-0226): keyword binding + reorder.
+    assert_ok(&prog("    auto d = datetime.date(2020, 2, 29)\n"));
+    assert_ok(&prog(
+        "    auto d = datetime.date(day=1, year=2020, month=6)\n",
+    ));
+    assert_ok(&prog(
+        "    auto t = datetime.time(hour=1, minute=2, second=3)\n",
+    ));
+    assert_ok(&prog(
+        "    auto dt = datetime.from_timestamp(0)\n    auto d = datetime.to_date(dt=dt)\n",
+    ));
+    assert_ok(&prog(
+        "    auto dt = datetime.from_timestamp(0)\n    auto t = datetime.to_time(dt=dt)\n",
+    ));
+    // combine — bind the Date/Time to vars first, then reorder the keywords.
+    assert_ok(&prog(
+        "    auto d = datetime.date(2020, 1, 1)\n    auto t = datetime.time(1, 2, 3)\n    auto dt = datetime.combine(time=t, date=d)\n",
+    ));
+    // Unknown keyword rejected.
+    assert_code(
+        &prog("    auto d = datetime.date(yr=2020, month=1, day=1)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
 fn fs_glob_fnmatch_keyword_and_positional() {
     // Path matching (#1033, D-0216): keyword binding, reordering, positional.
     assert_ok(&prog(

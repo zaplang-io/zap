@@ -160,3 +160,143 @@ fn arity_errors() {
         "ZAP4025",
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1046 — replace() + separate Date/Time types.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn replace_accepts_any_subset_of_optional_fields() {
+    // No fields, one field, every field.
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    DateTime r = datetime.replace(t)\n",
+    ));
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    DateTime r = datetime.replace(t, year=2020)\n",
+    ));
+    // The interior-hole case the trailing-only seam binder (D-0204) would reject:
+    // `day` supplied, `year`/`month` omitted. Bespoke binding must accept it.
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    DateTime r = datetime.replace(t, day=1)\n",
+    ));
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    \
+         DateTime r = datetime.replace(t, year=2020, month=2, day=29, hour=1, minute=2, second=3)\n",
+    ));
+    // Any order.
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    DateTime r = datetime.replace(t, second=5, year=1999)\n",
+    ));
+}
+
+#[test]
+fn replace_rejects_bad_calls() {
+    // No DateTime at all.
+    assert_code(&prog("    auto r = datetime.replace()\n"), "ZAP4025");
+    // DateTime must be positional, not a keyword.
+    assert_code(
+        &prog("    auto t = datetime.from_timestamp(0)\n    auto r = datetime.replace(dt=t, year=1)\n"),
+        "ZAP4023",
+    );
+    // A field as a positional (must be keyword).
+    assert_code(
+        &prog("    auto t = datetime.from_timestamp(0)\n    auto r = datetime.replace(t, 2020)\n"),
+        "ZAP4023",
+    );
+    // Unknown field.
+    assert_code(
+        &prog(
+            "    auto t = datetime.from_timestamp(0)\n    auto r = datetime.replace(t, bogus=1)\n",
+        ),
+        "ZAP4023",
+    );
+    // Duplicate field.
+    assert_code(
+        &prog("    auto t = datetime.from_timestamp(0)\n    auto r = datetime.replace(t, year=1, year=2)\n"),
+        "ZAP4023",
+    );
+    // Non-int field value.
+    assert_code(
+        &prog("    auto t = datetime.from_timestamp(0)\n    auto r = datetime.replace(t, year=\"x\")\n"),
+        "ZAP4024",
+    );
+    // First arg not a DateTime.
+    assert_code(
+        &prog("    auto r = datetime.replace(\"x\", year=1)\n"),
+        "ZAP4024",
+    );
+}
+
+#[test]
+fn date_time_constructors_and_accessors() {
+    assert_ok(&prog("    Date d = datetime.date(2020, 2, 29)\n"));
+    assert_ok(&prog("    Time t = datetime.time(1, 2, 3)\n"));
+    assert_ok(&prog("    Date d = datetime.date_today()\n"));
+    // Keyword + reordered (seam binding).
+    assert_ok(&prog(
+        "    Date d = datetime.date(day=1, year=2020, month=6)\n",
+    ));
+    assert_ok(&prog(
+        "    Time t = datetime.time(second=3, hour=1, minute=2)\n",
+    ));
+    // Field access on the structs.
+    assert_ok(&prog(
+        "    auto d = datetime.date(2020, 1, 1)\n    auto y = d.year\n",
+    ));
+    assert_ok(&prog(
+        "    auto t = datetime.time(1, 2, 3)\n    auto s = t.second\n",
+    ));
+}
+
+#[test]
+fn to_date_to_time_combine() {
+    assert_ok(&prog(
+        "    auto dt = datetime.from_timestamp(0)\n    Date d = datetime.to_date(dt)\n",
+    ));
+    assert_ok(&prog(
+        "    auto dt = datetime.from_timestamp(0)\n    Time t = datetime.to_time(dt)\n",
+    ));
+    assert_ok(&prog(
+        "    auto d = datetime.date(2020, 1, 1)\n    auto t = datetime.time(1, 2, 3)\n    \
+         DateTime dt = datetime.combine(d, t)\n",
+    ));
+    // combine arg types enforced.
+    assert_code(
+        &prog("    auto d = datetime.date(2020, 1, 1)\n    auto dt = datetime.combine(d, d)\n"),
+        "ZAP4024",
+    );
+}
+
+#[test]
+fn isoformat_overloads_date_time_datetime() {
+    assert_ok(&prog(
+        "    auto dt = datetime.from_timestamp(0)\n    str s = datetime.isoformat(dt)\n",
+    ));
+    assert_ok(&prog(
+        "    auto d = datetime.date(2020, 1, 1)\n    str s = datetime.isoformat(d)\n",
+    ));
+    assert_ok(&prog(
+        "    auto t = datetime.time(1, 2, 3)\n    str s = datetime.isoformat(t)\n",
+    ));
+    // A TimeZone is not formattable by isoformat.
+    assert_code(
+        &prog("    auto z = datetime.fixed_offset(0)\n    auto s = datetime.isoformat(z)\n"),
+        "ZAP4024",
+    );
+    // rfc3339 stays DateTime-only (a Date is rejected).
+    assert_code(
+        &prog("    auto d = datetime.date(2020, 1, 1)\n    auto s = datetime.rfc3339(d)\n"),
+        "ZAP4024",
+    );
+}
+
+#[test]
+fn date_time_constructor_type_and_arity() {
+    assert_code(
+        &prog("    auto d = datetime.date(\"x\", 1, 1)\n"),
+        "ZAP4024",
+    );
+    assert_code(&prog("    auto d = datetime.date(2020, 1)\n"), "ZAP4025");
+    assert_code(&prog("    auto t = datetime.time(1, 2, 3, 4)\n"), "ZAP4025");
+    assert_code(&prog("    auto d = datetime.date_today(1)\n"), "ZAP4025");
+}
