@@ -68,6 +68,7 @@ mod threading;
 mod time;
 mod tls;
 mod url;
+mod uuid;
 mod xml;
 mod yaml;
 mod zlib;
@@ -118,6 +119,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     http::MODULE,
     tls::MODULE,
     url::MODULE,
+    uuid::MODULE,
     concurrent::MODULE,
     xml::MODULE,
     // Architecture-specific low-level intrinsics (I#139 Tier 2, D-0199). Dotted

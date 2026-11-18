@@ -126,6 +126,13 @@ pub(crate) static RUNTIME_FRAGMENTS: &[RuntimeFile] = &[
         in_tu: true,
     },
     RuntimeFile {
+        // `uuid` module (#975, D-0232/D-0233): must be `#include`d AFTER
+        // crypto.inc.c — it reuses that file's static CSPRNG / MD5 / SHA-1.
+        path: "runtime/uuid.inc.c",
+        text: include_str!("runtime/uuid.inc.c"),
+        in_tu: true,
+    },
+    RuntimeFile {
         path: "runtime/bytes.inc.c",
         text: include_str!("runtime/bytes.inc.c"),
         in_tu: true,

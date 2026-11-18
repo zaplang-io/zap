@@ -198,6 +198,39 @@ value struct KeyInfo:
     str curve
     bool is_private
 
+# Uuid — an RFC 4122 / RFC 9562 UUID value (#975, D-0232). A `value struct`
+# wrapping the 16 raw bytes, so it auto-derives structural Eq + Hash (D-0139):
+# `==`/`!=` and dict/set-key use work by byte content. Produced by the `uuid`
+# module (`uuid4`/`uuid7`/`uuid1`/`uuid3`/`uuid5`/`parse`/`nil`/`max`/the
+# namespace_* constants). The canonical 8-4-4-4-12 form is the Display protocol
+# (`str(u)` / `print(u)` / f-strings, #274); `str`/`bytes` are type keywords and
+# so cannot be member names — the raw bytes are `u.to_bytes()`, matching Go's
+# method-style accessors. The method bodies delegate to the `uuid` module's
+# `_format`/`_hex`/`_urn`/`_version`/`_variant` seam helpers.
+value struct Uuid:
+    bytes raw
+
+    def __str__(self) -> str:
+        return uuid._format(self.raw)
+
+    def __repr__(self) -> str:
+        return \"Uuid('\" + uuid._format(self.raw) + \"')\"
+
+    def hex(self) -> str:
+        return uuid._hex(self.raw)
+
+    def urn(self) -> str:
+        return uuid._urn(self.raw)
+
+    def to_bytes(self) -> bytes:
+        return self.raw
+
+    def version(self) -> int64:
+        return uuid._version(self.raw)
+
+    def variant(self) -> int64:
+        return uuid._variant(self.raw)
+
 value struct UrlParts:
     str scheme
     bool has_authority
@@ -1402,6 +1435,11 @@ fn references_prelude(module: &Module) -> bool {
         // injected for any program that names the method or the struct.
         "\"KeyInfo\"",
         "\"key_info\"",
+        // The `uuid` module (#975, D-0232/D-0233): the `Uuid` value struct ships
+        // in the prelude, injected for any program that names the module (so
+        // `uuid.uuid4()` / `uuid.nanoid()` trigger it) or the struct directly.
+        "\"uuid\"",
+        "\"Uuid\"",
         // The `url.split` decomposition returns the `UrlParts` value struct
         // (#970, D-0209): injected for any program that names the `url` module
         // or the struct. Over-injection for a `url.quote`-only program is
