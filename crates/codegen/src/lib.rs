@@ -2783,6 +2783,56 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_heap_pop_f64", &[p.into()], Some(f64t.into()));
         self.declare_rt("zap_heap_peek_f64", &[p.into()], Some(f64t.into()));
         self.declare_rt("zap_heap_items", &[p.into()], Some(p.into()));
+        // heap ergonomics (#978, D-0236): O(n) heapify from a list,
+        // heapreplace/heappushpop (pop-then-push / push-then-pop), and the
+        // top-/bottom-K helpers behind `heap.nlargest`/`heap.nsmallest`. The
+        // keyed top-K takes parallel element + key lists (lowering evaluates the
+        // `key=` closure per element) plus the key-word and element-word kinds.
+        self.declare_rt(
+            "zap_heap_from_list",
+            &[p.into(), i.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_heap_replace_i64",
+            &[p.into(), i.into()],
+            Some(i.into()),
+        );
+        self.declare_rt(
+            "zap_heap_replace_ptr",
+            &[p.into(), p.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_heap_replace_f64",
+            &[p.into(), f64t.into()],
+            Some(f64t.into()),
+        );
+        self.declare_rt(
+            "zap_heap_pushpop_i64",
+            &[p.into(), i.into()],
+            Some(i.into()),
+        );
+        self.declare_rt(
+            "zap_heap_pushpop_ptr",
+            &[p.into(), p.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_heap_pushpop_f64",
+            &[p.into(), f64t.into()],
+            Some(f64t.into()),
+        );
+        self.declare_rt(
+            "zap_heap_topk",
+            &[p.into(), i.into(), i.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_heap_topk_keyed",
+            &[p.into(), p.into(), i.into(), i.into(), i.into(), i.into()],
+            Some(p.into()),
+        );
         // Struct-key hashing helpers (operator overloading, D-0047).
         self.declare_rt("zap_str_cmp", &[p.into(), p.into()], Some(i.into()));
         self.declare_rt("zap_str_hash", &[p.into()], Some(i.into()));

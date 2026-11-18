@@ -25,6 +25,26 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`heap[T]` ergonomics — heapify, heapreplace/heappushpop, nlargest/nsmallest**
+  (#978, D-0236, epic #966). Rounds out the built-in min-heap ([[D-0057]]) with
+  the Python-`heapq` surface, keeping Zap's object model. **O(n) heapify** is a
+  construction form: `heap[T](xs)` / `heap[T](xs, cmp="max")` builds a heap from
+  a `list[T]` in one pass instead of N pushes (the source list is copied, not
+  aliased). **`h.replace(x)` (heapreplace)** pops the root then pushes `x`;
+  **`h.pushpop(x)` (heappushpop)** pushes `x` then pops — the two differ exactly
+  when `x` would become the new root (`replace` can return an item smaller than
+  `x` and needs a non-empty heap; `pushpop` returns `x` unchanged when it already
+  outranks the root and works on an empty heap). **`heap.nlargest(n, iterable[,
+  key])` / `heap.nsmallest(n, iterable[, key])`** return the top-/bottom-`n` as a
+  `list[T]` (largest-first / smallest-first); `n` is clamped to `[0, len]` (a
+  negative or oversize `n` is not an error, per Python), and the iterable is not
+  mutated. The optional **`key=`** is a first-class `fn(T) -> K` selector: the
+  elements are ordered by `key(x)` and the elements (not the keys) are returned,
+  **stable** on ties (earlier input wins). Without a `key=`, the element type must
+  be orderable (integer/bool/char/enum/`str`/`float64`); with one, only the key's
+  result type must be. Max-heap ordering stays the existing `cmp="max"` flag — a
+  `key=` on the heap *object* (ordering stored struct/ptr elements) remains a
+  documented follow-up.
 - **User-callable `__hash__()` on intrinsic values + a `hash_combine` builtin**
   (#1064). `str`, `bytes`, `int` (every width), `bool`, `char`, and `float`
   now answer `.__hash__() -> int64`, and `hash_combine(acc, h) -> int64` folds

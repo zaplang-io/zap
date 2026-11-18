@@ -29,6 +29,7 @@ mod fs;
 mod gc;
 mod gzip;
 mod hash;
+mod heap;
 mod hex;
 mod http;
 mod io;
@@ -96,6 +97,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     logging::MODULE,
     argparse::MODULE,
     bisect::MODULE,
+    heap::MODULE,
     zlib::MODULE,
     gzip::MODULE,
     sync::MODULE,

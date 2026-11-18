@@ -453,6 +453,12 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("bisect", "bisect_right", &["a", "x"]),
     ("bisect", "insort_left", &["a", "x"]),
     ("bisect", "insort_right", &["a", "x"]),
+    // ---- heap (ticket #978): top-K helpers (Python heapq.nlargest/nsmallest) ----
+    // `n` and `iterable` are naturally positional (count then sequence, the
+    // Python order); `key` is the trailing optional selector, usually passed as
+    // `key=`. All three are keyword-capable (D-0213).
+    ("heap", "nlargest", &["n", "iterable", "key"]),
+    ("heap", "nsmallest", &["n", "iterable", "key"]),
 ];
 
 /// A default value a seam parameter takes when it is an *interior* optional —

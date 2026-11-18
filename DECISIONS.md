@@ -11924,3 +11924,88 @@ Relates to [[D-0056]] (collections; "iteration is hash order"), #1064 (the
 seeded wyhash string-key hash that surfaced this), and #983 (`oset`, the ordered
 opt-in). The #1064 seed-domain semantics (fork / exec / multiprocessing) are a
 separate decision.
+
+## D-0236 — `heap[T]` ergonomics: heapify, heapreplace/heappushpop, nlargest/nsmallest, and where `key=`/max-heap live (#978 / epic #966)
+
+**Status: Locked.**
+
+**Context.** Zap already ships a generic `Comparable`-bound built-in `heap[T]`
+min-heap ([[D-0057]]) with `push`/`pop`/`peek`/`len` and priority-order
+iteration, plus a max-heap via `heap[T](cmp="max")`. #978 (basis: Discussion
+#965 gap #12) adds the remaining Python-`heapq` / Go-`container/heap` ergonomic
+surface. Two questions were explicitly left open in the issue's Notes: the
+`pop`/`peek` ordering semantics, and whether `key=`/max-heap are in scope. Both
+are resolved here.
+
+**Decision — add the full ergonomic surface in one shape that stays congruent
+with both Python and Zap's existing *object* model** (`heap[T]` is a type with
+methods, not a `heapq`-style module of free functions over a list):
+
+1. **O(n) heapify is a construction form:** `heap[T](xs)` /
+   `heap[T](xs, cmp="max")` builds a heap from an existing `list[T]` in O(n)
+   (Floyd), the Zap spelling of `heapq.heapify`. (Zap's heap is its own type, so
+   "heapify a list in place" becomes "build a `heap[T]` from a list".) The one
+   positional argument is the items list; `cmp` stays the only keyword.
+2. **`heapreplace` / `heappushpop` are methods:** `h.replace(x) -> T` pops the
+   current root **then** pushes `x` (may return an item smaller than `x`;
+   requires a non-empty heap, aborting on empty like `pop`); `h.pushpop(x) -> T`
+   pushes `x` **then** pops (returns the higher-priority of `{x} ∪ heap`, is a
+   no-op returning `x` when `x` already outranks the root, and is defined on the
+   empty heap). The strict `root < x` test matches CPython's `heapq`, so the two
+   differ exactly when `x` would become the new root.
+3. **`nlargest` / `nsmallest` are free functions under the `heap` namespace:**
+   `heap.nlargest(n, iterable[, key])` / `heap.nsmallest(n, iterable[, key])`
+   return a `list[T]` (largest-first / smallest-first). This mirrors Python,
+   where the top-K helpers live in the `heapq` module rather than on a heap
+   object; `heap.` (the type keyword used as a namespace) is the closest Zap
+   spelling to `heapq.`. `n` is clamped to `[0, len]` (a negative or oversize
+   `n` is not an error, per Python). They never mutate the iterable.
+
+**`key=` and max-heap scope (the issue's open question) — resolved:**
+
+- **Max-heap ordering is the `cmp="min"/"max"` flag on the object** ([[D-0057]],
+  already shipped). Python's public `heapq` has no clean max-heap object, so this
+  is Zap's congruent answer and it is kept as-is.
+- **`key=` is a selector on `nlargest`/`nsmallest` only** — a first-class
+  `fn(T) -> K` that maps each element to an orderable key `K`; the elements are
+  returned (not the keys), ordered by key. This is exactly Python's
+  `heapq.nlargest(n, it, key=…)`. Keyed top-K is **stable**: among equal keys the
+  earlier input element wins (an original-index tiebreak that is not flipped by
+  the min/max direction).
+- **`key=` is deliberately NOT added to the `heap[T]` object.** Ordering stored
+  elements by a derived key would require the heap to carry arbitrary (ptr /
+  struct) elements ordered through a key — exactly the struct/ptr-element heap
+  support [[D-0057]] deferred — so it stays a documented follow-up. The heap
+  object's ordering knob remains `cmp=`.
+
+**`pop`/`peek` ordering (the issue's other open question) — confirmed as
+[[D-0057]]:** the root is the highest-priority element (the minimum by default,
+the maximum under `cmp="max"`); `peek` reads it without removing it, `pop`
+removes and returns it, and priority-order iteration (`for x in h`) yields a
+non-destructive root-first snapshot. Unchanged; locked.
+
+**Element types.** The orderable element kinds are those `heap[T]` already
+admits: integer widths, `bool`, `char`, tier-1 `enum` (by discriminant), `str`
+(byte-wise), and `float64` (#800 total order, NaN greatest). `nlargest`/
+`nsmallest` **without** a `key=` require such an element; **with** a `key=` the
+element type is unconstrained and the key's result type must be orderable. A
+struct/tuple/nested-collection element without a key is rejected (the same rule
+as `heap[T]` construction).
+
+**Implementation.** New runtime entry points (`zap_heap_from_list`,
+`zap_heap_replace_{i64,ptr,f64}`, `zap_heap_pushpop_{i64,ptr,f64}`,
+`zap_heap_topk`, `zap_heap_topk_keyed`) reuse the existing binary-heap core (sift
+up/down, the `dir`-flipped comparator) — no new ordering model. The `key=`
+selector is evaluated **in lowering** (a loop that calls the closure per element
+and builds a parallel key list), so the runtime never calls back into Zap; the
+keyed top-K orders `(key, element, index)` triples and returns the elements.
+
+**Seam.** `heap.nlargest`/`nsmallest` are seam module functions with the declared
+parameter list `(n, iterable, key)` ([[D-0204]]/D-0213 — all three
+keyword-capable; `n` and `iterable` are the naturally positional count + sequence
+and `key` the trailing optional selector). Recorded in
+`crates/syntax/src/seam_sigs.rs` with `crates/sema/tests/seam_kwargs.rs` cases.
+
+Relates to [[D-0057]] (the base `heap[T]`), [[D-0067]] (first-class function
+values, used for `key=`), #800 (`float64` heaps), and #983 (`bisect`, the sibling
+`Comparable`-list helper). No grammar change — these are functions and methods.

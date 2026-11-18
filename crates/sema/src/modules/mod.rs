@@ -51,6 +51,7 @@ mod fs;
 mod gc;
 mod gzip;
 mod hash;
+mod heap;
 mod hex;
 mod http;
 mod io;
@@ -113,6 +114,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     logging::MODULE,
     argparse::MODULE,
     bisect::MODULE,
+    heap::MODULE,
     zlib::MODULE,
     gzip::MODULE,
     sync::MODULE,

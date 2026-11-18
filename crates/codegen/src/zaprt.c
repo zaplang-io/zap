@@ -3359,6 +3359,235 @@ void *zap_heap_items(void *hp) {
 }
 
 /* ---------------------------------------------------------------------------
+ * heap[T] ergonomics (ticket #978, D-0236): O(n) heapify, in-place
+ * `heapreplace`/`heappushpop`, and top-/bottom-K (`nlargest`/`nsmallest`,
+ * optionally keyed). These reuse the same binary-heap core as the base object
+ * (sift up/down, the `dir`-flipped comparator) — no new ordering model. The
+ * keyed top-K is *stable*: among elements whose keys tie, the one that came
+ * earlier in the input wins (Python `heapq.nlargest`/`nsmallest` semantics),
+ * achieved with a secondary original-index tiebreak that is NOT flipped by the
+ * min/max direction. Keys are precomputed by the caller (lowering invokes the
+ * `key=` closure per element and passes a parallel key list), so the runtime
+ * never calls back into Zap.
+ *
+ * `n` is clamped to `[0, len]` (a negative or oversize count is not an error,
+ * matching Python: `nlargest(-1, xs) == []`, `nlargest(len+5, xs)` is the whole
+ * sequence sorted). `heapreplace` requires a non-empty heap (aborts, like
+ * `pop`); `heappushpop` is defined on the empty heap (it returns the pushed
+ * value). ------------------------------------------------------------------ */
+
+/* O(n) bottom-up heapify: build a heap directly from a list's element words
+ * (Floyd's construction), rather than `n` sift-up pushes. `kind`/`dir` are as
+ * `zap_heap_new`. The list stores 8-byte element words in exactly the heap's
+ * representation (i64 value / `ZapStr` pointer bits / reinterpreted `double`),
+ * so the words copy across verbatim; we then sift down every internal node from
+ * the last parent back to the root. */
+void *zap_heap_from_list(void *lp, int64_t kind, int64_t dir) {
+    ZapList *xs = (ZapList *)lp;
+    int64_t len = xs->len;
+    ZapHeap *h = (ZapHeap *)zap_heap_new(kind, dir);
+    if (len == 0) {
+        return h;
+    }
+    while (h->cap < len) {
+        zap_heap_grow(h);
+    }
+    memcpy(h->data, xs->data, (size_t)len * sizeof(int64_t));
+    h->len = len;
+    for (int64_t i = len / 2 - 1; i >= 0; i--) {
+        zap_heap_sift_down(h, i);
+    }
+    return h;
+}
+
+/* heapreplace: pop the current root and push `x` in one step, returning the
+ * popped (old) root. Because `x` is written straight into the root slot and
+ * sifted down, the returned item may be SMALLER than `x` (that is the point of
+ * heapreplace, and what distinguishes it from heappushpop). */
+static int64_t zap_heap_replace_word(ZapHeap *h, int64_t x) {
+    int64_t old = h->data[0];
+    h->data[0] = x;
+    zap_heap_sift_down(h, 0);
+    return old;
+}
+
+/* heappushpop: push `x`, then pop the root — returning the higher-priority of
+ * `{x} ∪ heap`. If the heap is empty, or `x` already has priority over the root
+ * (so `x` would be the new root), `x` is returned and the heap is UNCHANGED;
+ * otherwise `x` displaces the root (which is returned) and sifts down. The
+ * strict `cmp(root, x) < 0` test mirrors Python's `heap[0] < item`, so a tie
+ * returns `x` and leaves the heap untouched. */
+static int64_t zap_heap_pushpop_word(ZapHeap *h, int64_t x) {
+    if (h->len == 0) {
+        return x;
+    }
+    if (zap_heap_cmp(h, h->data[0], x) < 0) {
+        int64_t old = h->data[0];
+        h->data[0] = x;
+        zap_heap_sift_down(h, 0);
+        return old;
+    }
+    return x;
+}
+
+int64_t zap_heap_replace_i64(void *hp, int64_t x) {
+    ZapHeap *h = (ZapHeap *)hp;
+    zap_heap_require(h, "replace");
+    return zap_heap_replace_word(h, x);
+}
+void *zap_heap_replace_ptr(void *hp, void *x) {
+    ZapHeap *h = (ZapHeap *)hp;
+    zap_heap_require(h, "replace");
+    return (void *)(intptr_t)zap_heap_replace_word(h, (int64_t)(intptr_t)x);
+}
+double zap_heap_replace_f64(void *hp, double x) {
+    ZapHeap *h = (ZapHeap *)hp;
+    zap_heap_require(h, "replace");
+    return zap_f64_from_bits(zap_heap_replace_word(h, zap_f64_bits(x)));
+}
+
+int64_t zap_heap_pushpop_i64(void *hp, int64_t x) {
+    return zap_heap_pushpop_word((ZapHeap *)hp, x);
+}
+void *zap_heap_pushpop_ptr(void *hp, void *x) {
+    return (void *)(intptr_t)zap_heap_pushpop_word((ZapHeap *)hp,
+                                                    (int64_t)(intptr_t)x);
+}
+double zap_heap_pushpop_f64(void *hp, double x) {
+    return zap_f64_from_bits(
+        zap_heap_pushpop_word((ZapHeap *)hp, zap_f64_bits(x)));
+}
+
+/* nlargest/nsmallest WITHOUT a key: heapify the whole input (O(n)) into a
+ * heap whose direction selects largest-first (max-heap, `dir == HEAP_MAX`) or
+ * smallest-first (min-heap), then pop `n` roots into a fresh list — so the
+ * result is already in priority order (descending for nlargest, ascending for
+ * nsmallest), matching Python. `n` is clamped to `[0, len]`. */
+void *zap_heap_topk(void *lp, int64_t n, int64_t dir, int64_t kind) {
+    ZapList *xs = (ZapList *)lp;
+    int64_t len = xs->len;
+    if (n < 0) {
+        n = 0;
+    }
+    if (n > len) {
+        n = len;
+    }
+    ZapList *out = (ZapList *)zap_list_new();
+    if (kind == HEAP_ELEM_STR) {
+        out->elem_ptr = 1; /* precise GC: result elements are pointers */
+    }
+    if (n == 0) {
+        return out;
+    }
+    ZapHeap *h = (ZapHeap *)zap_heap_from_list(lp, kind, dir);
+    for (int64_t k = 0; k < n; k++) {
+        zap_list_push(out, zap_heap_pop_word(h));
+    }
+    return out;
+}
+
+/* A (key, element, original-index) triple for keyed top-K. Stored in a scanned
+ * buffer so pointer-valued keys/elements stay live across any GC during the
+ * selection. */
+typedef struct {
+    int64_t key;  /* key word (i64 / ZapStr bits / double bits) */
+    int64_t elem; /* element word, returned verbatim */
+    int64_t idx;  /* original position, for a stable tiebreak */
+} ZapHeapKV;
+
+/* Priority compare for the keyed heap: by key under (`key_kind`, `dir`), with a
+ * secondary earlier-index-wins tiebreak that is deliberately NOT flipped by
+ * `dir` — so equal keys always surface in input order (stable) whether the
+ * caller asked for largest or smallest. Returns < 0 when `a` outranks `b`. */
+static int64_t zap_heap_kv_cmp(const ZapHeapKV *a, const ZapHeapKV *b,
+                               int64_t key_kind, int64_t dir) {
+    int64_t c;
+    if (key_kind == HEAP_ELEM_STR) {
+        c = zap_str_cmp((void *)(intptr_t)a->key, (void *)(intptr_t)b->key);
+    } else if (key_kind == HEAP_ELEM_F64) {
+        c = zap_f64_total_cmp(zap_f64_from_bits(a->key),
+                              zap_f64_from_bits(b->key));
+    } else {
+        c = (a->key < b->key) ? -1 : (a->key > b->key ? 1 : 0);
+    }
+    if (dir == HEAP_MAX) {
+        c = -c;
+    }
+    if (c != 0) {
+        return c;
+    }
+    return (a->idx < b->idx) ? -1 : (a->idx > b->idx ? 1 : 0);
+}
+
+static void zap_heap_kv_sift_down(ZapHeapKV *a, int64_t len, int64_t i,
+                                  int64_t key_kind, int64_t dir) {
+    for (;;) {
+        int64_t l = 2 * i + 1;
+        int64_t r = 2 * i + 2;
+        int64_t top = i;
+        if (l < len && zap_heap_kv_cmp(&a[l], &a[top], key_kind, dir) < 0) {
+            top = l;
+        }
+        if (r < len && zap_heap_kv_cmp(&a[r], &a[top], key_kind, dir) < 0) {
+            top = r;
+        }
+        if (top == i) {
+            break;
+        }
+        ZapHeapKV t = a[i];
+        a[i] = a[top];
+        a[top] = t;
+        i = top;
+    }
+}
+
+/* nlargest/nsmallest WITH a key: `elems` and `keys` are parallel lists (the
+ * caller has already evaluated `key=` on each element). Order the (key, elem,
+ * idx) triples by key under `dir`, stable on ties, pop `n` roots, and return a
+ * list of the corresponding ELEMENTS (not keys) in priority order. `elem_kind`
+ * tags the result list for GC. `n` is clamped to `[0, len]`. */
+void *zap_heap_topk_keyed(void *ep, void *kp, int64_t n, int64_t dir,
+                          int64_t key_kind, int64_t elem_kind) {
+    ZapList *elems = (ZapList *)ep;
+    ZapList *keys = (ZapList *)kp;
+    int64_t len = elems->len;
+    if (n < 0) {
+        n = 0;
+    }
+    if (n > len) {
+        n = len;
+    }
+    ZapList *out = (ZapList *)zap_list_new();
+    if (elem_kind == HEAP_ELEM_STR) {
+        out->elem_ptr = 1;
+    }
+    if (n == 0) {
+        return out;
+    }
+    ZapHeapKV *a =
+        (ZapHeapKV *)zap_ptrbuf((int64_t)len * (int64_t)sizeof(ZapHeapKV));
+    for (int64_t i = 0; i < len; i++) {
+        a[i].key = keys->data[i];
+        a[i].elem = elems->data[i];
+        a[i].idx = i;
+    }
+    for (int64_t i = len / 2 - 1; i >= 0; i--) {
+        zap_heap_kv_sift_down(a, len, i, key_kind, dir);
+    }
+    int64_t heaplen = len;
+    for (int64_t k = 0; k < n; k++) {
+        ZapHeapKV top = a[0];
+        heaplen--;
+        if (heaplen > 0) {
+            a[0] = a[heaplen];
+            zap_heap_kv_sift_down(a, heaplen, 0, key_kind, dir);
+        }
+        zap_list_push(out, top.elem);
+    }
+    return out;
+}
+
+/* ---------------------------------------------------------------------------
  * Numeric arrays (ticket #24, design/0002-arrays.md, design/RUNTIME-ABI.md
  * §"Collection layout": `array[T]`).
  *
