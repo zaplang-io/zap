@@ -25,6 +25,16 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **User-callable `__hash__()` on intrinsic values + a `hash_combine` builtin**
+  (#1064). `str`, `bytes`, `int` (every width), `bool`, `char`, and `float`
+  now answer `.__hash__() -> int64`, and `hash_combine(acc, h) -> int64` folds
+  one field hash into an accumulator. They lower to the **same** hashing the
+  dict/set key path and `@derive(Hash)` use, so a hand-written struct `__hash__`
+  composed from `self.<field>.__hash__()` + `hash_combine` agrees with the
+  derived version within a run (`a == b ⟹ hash(a) == hash(b)`). Because the
+  `str`/`bytes` hash is now **seeded per process** (see _Changed_), a str hash is
+  **not stable across processes** — persist a named digest, not a `__hash__()`.
+  `bigint`/`complex` are not hashable (not dict keys) and have no `__hash__()`.
 - **`math` — everyday scalar functions** (#973, D-0234, epic #966). Fills the
   gaps in the elementary libm set with ~40 functions that show up in ordinary
   code and tests. **Integer math → `int`:** `gcd`/`lcm`/`factorial`/`comb`/`perm`/
@@ -1510,6 +1520,21 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Changed
 
+- **Dict/set string-key hash is now wyhash, seeded per process** (#1064).
+  The string-key hash (and the `@derive(Hash)` / value-struct string-field hash)
+  moved from byte-at-a-time FNV-1a to **wyhash** (vendored public-domain scalar
+  final v3; portable x86_64/aarch64, no SIMD/CPU-dispatch, so standalone and not
+  under #139/#947). Collision quality is unchanged (statistically identical on a
+  1M-key study); throughput is far higher on the 4-32B identifier / JSON-field
+  keys dicts see most (FNV's serial multiply/xor chain was ~3-5x slower at 16B
+  and up to ~31x at 1KB). The in-table cached-hash design (#837) and the byte
+  compare are unchanged — only the hash function. The hash is now **seeded** from
+  OS entropy, captured once at process startup and inherited across `fork`,
+  closing the former unseeded hash-flooding exposure and making str hashes differ
+  across independent processes (Python-like). `ZAPHASHSEED=<uint>` pins a fixed
+  seed for reproducible runs (à la `PYTHONHASHSEED`); unset keeps a random seed.
+  `@derive(Hash)` field mixing (`hash_combine`) also moved to wyhash-style mixing.
+  The fork/exec/multiprocessing seed-domain semantics are recorded in `DECISIONS.md`.
 - **`DECISIONS.md` consistency pass: stale/amended decisions marked in place**
   (docs-only). Every decision whose stated ruling was later reversed or superseded
   now carries a `⚠️`/`⛔` status banner pointing at the governing decision, and a new

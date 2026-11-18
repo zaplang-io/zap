@@ -485,6 +485,9 @@ const BUILTINS: &[&str] = &[
     "input",
     "range",
     "len",
+    // Fold one field hash into an accumulator for a hand-written `__hash__`
+    // (#1064); the same mixing `@derive(Hash)` uses, so the two agree in-run.
+    "hash_combine",
     "sum",
     "dot",
     "concatenate",
@@ -6797,6 +6800,33 @@ impl Checker {
                     }
                     return Ty::Int64;
                 }
+                // hash_combine(acc, h): fold one `int` field hash into an
+                // accumulator for a hand-written `__hash__` (#1064). Both args
+                // are `int`; the result is `int64`. Lowers to the same
+                // `zap_hash_combine` the derived/tuple hashes use.
+                "hash_combine" => {
+                    if args.len() != 2 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "hash_combine() takes exactly two arguments".to_string(),
+                            span,
+                        );
+                    }
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        if !at.is_int() && !matches!(at, Ty::Unknown) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "hash_combine() expects int arguments, found {}",
+                                    at.display()
+                                ),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::Int64;
+                }
                 // String / char builtins (ticket #284, D-0025).
                 "ord" => {
                     // ord(c): the codepoint number of a `char`.
@@ -7453,6 +7483,50 @@ impl Checker {
             // leaf-only is enforced at this site (ZAP5130).
             if matches!(&bt, Ty::Named(n) if n == "arena") {
                 return self.check_arena_method(name, args, *span);
+            }
+            // A capability dunder `__hash__()` on an intrinsic (scalar / str /
+            // bytes) receiver (#1064): typed precisely as `int64`, mirroring the
+            // IR `lower_intrinsic_capability_dunder` path (I#820) and the
+            // dict/`@derive(Hash)` machinery it lowers to (so `"abc".__hash__()`
+            // equals the dict's hash for `"abc"` in the same run). Exposed so a
+            // hand-written struct `__hash__` can hash its str/scalar fields
+            // (`self.name.__hash__()`) and fold them with the `hash_combine`
+            // builtin, staying consistent with `@derive(Hash)`. Only the
+            // dict-hashable scalar kinds qualify — `bigint`/`complex` are not
+            // dict keys and fall through to their normal (rejecting) path, the
+            // same hashability rule the dict/set key machinery enforces. Checked
+            // before the `str` branch so a `str` receiver routes here too.
+            if name == "__hash__"
+                && matches!(
+                    bt,
+                    Ty::Int64
+                        | Ty::Int32
+                        | Ty::Uint8
+                        | Ty::Uint16
+                        | Ty::Uint32
+                        | Ty::Uint64
+                        | Ty::Usize
+                        | Ty::UntypedInt
+                        | Ty::Bool
+                        | Ty::Char
+                        | Ty::Str
+                        | Ty::Bytes
+                        | Ty::Float64
+                        | Ty::Float32
+                        | Ty::UntypedFloat
+                )
+            {
+                if !args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "__hash__() takes no arguments".to_string(),
+                        *span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                }
+                return Ty::Int64;
             }
             if matches!(bt, Ty::Str) {
                 return self.check_str_method(name, args, *span);

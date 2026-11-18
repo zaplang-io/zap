@@ -12785,6 +12785,26 @@ impl<'a> FnLower<'a> {
                 });
                 return Ok((d, Ty::I64));
             }
+            // hash_combine(acc, h) -> int (#1064): fold one field hash into an
+            // accumulator for a hand-written `__hash__`, via the same
+            // `zap_hash_combine` the derived/tuple structural hashes use — so a
+            // hand-written struct hash agrees with `@derive(Hash)` in-run.
+            if fname == "hash_combine" {
+                if args.len() != 2 {
+                    return Err(err("hash_combine() takes exactly two arguments"));
+                }
+                let (a, at) = self.expr(&args[0].value)?;
+                let a = self.coerce(a, at, Ty::I64);
+                let (b, bt) = self.expr(&args[1].value)?;
+                let b = self.coerce(b, bt, Ty::I64);
+                let d = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_hash_combine".to_string(),
+                    args: vec![a, b],
+                });
+                return Ok((d, Ty::I64));
+            }
             // String/char builtins (ticket #284, D-0025).
             if fname == "ord" {
                 // ord(c): the codepoint number of a `char`, as an `int`.
