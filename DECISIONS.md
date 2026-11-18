@@ -11385,3 +11385,62 @@ offline (not in CI, which has no network/tzdata guarantee).
 Relates to [[D-0056]] / #99 (the datetime seam), [[D-0221]] (#974 slice 1 — the
 arithmetic this builds on), #338 (strftime/strptime), [[D-0213]] (seam rows),
 epic #966, and Discussion #965 (gap #7).
+
+## D-0226 — stdlib datetime: `replace()` + separate `Date` / `Time` types (#1046 / #974 / epic #966)
+
+**Context.** The last `datetime` gap from #974 (#965 gap #7): no `replace()` (a
+copy of a `DateTime` with some fields changed — the everyday "same day at
+midnight", "first of the month" operation), and no standalone date / time-of-day
+values distinct from a full `DateTime`. Builds on [[D-0221]] (arithmetic) and
+[[D-0225]] (the now-aware `DateTime`).
+
+**Decision — `replace(dt, year=, month=, day=, hour=, minute=, second=)`.** A
+copy of `dt` with the supplied civil fields overridden; the DateTime is the sole
+positional argument and every field is an **optional keyword** (any subset, any
+order). The **zone is preserved** — `offset` and `is_aware` ride through
+untouched (Python's `replace` keeps `tzinfo`), so replacing the wall-clock fields
+of an aware value keeps it aware at the same offset. It is a pure civil-field
+substitution with **no range validation** (matching the lenient `parse` family —
+`to_timestamp` normalises later via `timegm`), and lowers with no runtime call.
+
+**Bespoke keyword binding — not the seam binder.** `replace`'s all-optional,
+any-subset surface produces **interior holes** (`replace(dt, day=1)` omits
+`year`/`month`), which the trailing-only seam binder ([[D-0204]]) rejects by
+design. So `replace` is deliberately **absent from `seam_sigs`** and binds its
+own keywords in the per-method `check`/`lower` (positional DateTime, the rest
+keyword fields from a fixed set, rejecting unknown/duplicate/positional-field).
+This is the concrete instance of the "interior optional needs a per-parameter
+model" follow-up D-0204 flagged; rather than generalise the binder, one bespoke
+method is simpler and contained.
+
+**Decision — separate `Date` / `Time` value structs.** The prelude gains `Date {
+year, month, day }` and `Time { hour, minute, second }` (naive civil values, no
+zone), with:
+- `datetime.date(year, month, day) -> Date` / `datetime.time(hour, minute,
+  second) -> Time` — constructors (no range validation).
+- `datetime.to_date(dt) -> Date` / `datetime.to_time(dt) -> Time` — the civil
+  date / time-of-day of a `DateTime` (Python `dt.date()` / `dt.time()`).
+- `datetime.combine(date, time) -> DateTime` — a naive `DateTime` (Python
+  `datetime.combine`).
+- `datetime.date_today() -> Date` — the current **local** calendar date.
+- `datetime.isoformat(x)` is **overloaded** on the argument type: a `DateTime`
+  renders RFC-3339 (offset suffix when aware, [[D-0225]]), a `Date` renders
+  `YYYY-MM-DD` (`zap_date_isoformat`), a `Time` renders `HH:MM:SS`
+  (`zap_time_isoformat`); lowering dispatches by the lowered struct id.
+  `rfc3339` stays `DateTime`-only.
+
+**Deferred.** Arithmetic / comparison / `weekday` directly on `Date`/`Time` (reuse
+`DateTime` via `combine` for now), and `Time`-carried offsets. Field access
+(`d.year`, `t.minute`) is free from the structs.
+
+**Tests.** Golden `datetime_dates` (deterministic: `replace` overriding fields on
+a naive and an aware value with the zone preserved; `Date`/`Time` construction +
+overloaded `isoformat`; `to_date`/`to_time`; `combine` → `to_timestamp`); sema
+type/arity tests incl. the interior-hole `replace(dt, day=1)` the seam binder
+would reject; seam-kwargs binding for the rowed constructors (`date`/`time`/
+`to_date`/`to_time`/`combine`). `date_today()` is host-local, so it is sema-only.
+
+Relates to [[D-0056]] / #99 (the datetime seam), [[D-0221]] (#974 arithmetic),
+[[D-0225]] (the aware `DateTime`), [[D-0204]] (the seam binder's trailing-only
+limit this method works around), [[D-0213]] (seam rows), epic #966, and
+Discussion #965 (gap #7).

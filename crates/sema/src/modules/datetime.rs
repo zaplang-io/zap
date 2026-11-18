@@ -30,6 +30,14 @@ const DATETIME: &str = "DateTime";
 /// `zone`/`fixed_offset` and consumed by `astimezone` (#1045, D-0225).
 const TIMEZONE: &str = "TimeZone";
 
+/// The prelude type names for the separate date / time-of-day values (#1046,
+/// D-0226): `Date { year, month, day }` and `Time { hour, minute, second }`.
+const DATE: &str = "Date";
+const TIME: &str = "Time";
+
+/// The `DateTime` civil fields that `replace` may override, in field order.
+const REPLACE_FIELDS: [&str; 6] = ["year", "month", "day", "hour", "minute", "second"];
+
 /// Require exactly one argument of the named kind, inferring it so it is still
 /// type-checked. `want` is a human description for the diagnostic; `ok` decides
 /// whether the inferred type is acceptable.
@@ -68,6 +76,46 @@ fn is_datetime(t: &Ty) -> bool {
 
 fn is_timezone(t: &Ty) -> bool {
     matches!(t, Ty::Named(n) if n == TIMEZONE)
+}
+
+fn is_date(t: &Ty) -> bool {
+    matches!(t, Ty::Named(n) if n == DATE)
+}
+
+fn is_time(t: &Ty) -> bool {
+    matches!(t, Ty::Named(n) if n == TIME)
+}
+
+/// Require exactly `n` integer arguments (the `date`/`time` constructors), each
+/// inferred so it is type-checked (#1046).
+fn expect_ints(checker: &mut Checker, method: &str, args: &[Arg], span: Span, n: usize) {
+    if args.len() != n {
+        checker.error(
+            ErrorCode::ZAP4025,
+            format!(
+                "datetime.{method}() takes {n} arguments, found {}",
+                args.len()
+            ),
+            span,
+        );
+        for a in args {
+            checker.infer(&a.value);
+        }
+        return;
+    }
+    for a in args {
+        let t = checker.infer(&a.value);
+        if !t.is_int() && !matches!(t, Ty::Unknown) {
+            checker.error(
+                ErrorCode::ZAP4024,
+                format!(
+                    "datetime.{method}() expects int fields, found {}",
+                    t.display()
+                ),
+                expr_span(&a.value),
+            );
+        }
+    }
 }
 
 /// Check a `(DateTime, str)` custom-format call (`strftime` / 2-arg `format`),
@@ -329,11 +377,160 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             }
             Some(Ty::Named(DATETIME.to_string()))
         }
-        // (DateTime) -> str: RFC-3339 with an offset suffix when aware
-        // (`isoformat` is the Python name; `rfc3339` the same renderer).
-        "isoformat" | "rfc3339" => {
+        // isoformat(x) -> str. Overloaded on the argument type (#1046): a
+        // DateTime renders RFC-3339 (offset suffix when aware), a Date renders
+        // `YYYY-MM-DD`, a Time renders `HH:MM:SS`.
+        "isoformat" => {
+            expect1(
+                checker,
+                method,
+                args,
+                span,
+                "a DateTime, Date or Time",
+                |t| is_datetime(t) || is_date(t) || is_time(t),
+            );
+            Some(Ty::Str)
+        }
+        // rfc3339(dt) -> str: the offset-aware DateTime renderer (DateTime only).
+        "rfc3339" => {
             expect1(checker, method, args, span, "a DateTime", is_datetime);
             Some(Ty::Str)
+        }
+        // replace(dt, year=, month=, day=, hour=, minute=, second=) -> DateTime
+        // (#1046, D-0226): a copy with some civil fields changed, the zone
+        // (offset / is_aware) preserved. The DateTime is positional; every field
+        // is an optional keyword (any subset, in any order). Bespoke binding —
+        // not the trailing-only seam binder (D-0204), which rejects the interior
+        // holes an all-optional surface needs.
+        "replace" => {
+            if args.is_empty() {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    "datetime.replace() takes the DateTime as its first argument".to_string(),
+                    span,
+                );
+            } else {
+                if args[0].name.is_some() {
+                    checker.error(
+                        ErrorCode::ZAP4023,
+                        "datetime.replace() takes the DateTime as a positional first argument"
+                            .to_string(),
+                        args[0].span,
+                    );
+                }
+                let dt = checker.infer(&args[0].value);
+                if !is_datetime(&dt) && !matches!(dt, Ty::Unknown) {
+                    checker.error(
+                        ErrorCode::ZAP4024,
+                        format!(
+                            "datetime.replace() expects a DateTime, found {}",
+                            dt.display()
+                        ),
+                        expr_span(&args[0].value),
+                    );
+                }
+                let mut seen: Vec<&str> = Vec::new();
+                for a in &args[1..] {
+                    let v = checker.infer(&a.value);
+                    match &a.name {
+                        None => checker.error(
+                            ErrorCode::ZAP4023,
+                            "datetime.replace() fields must be keyword arguments \
+                             (year=, month=, day=, hour=, minute=, second=)"
+                                .to_string(),
+                            a.span,
+                        ),
+                        Some(name) => {
+                            if !REPLACE_FIELDS.contains(&name.as_str()) {
+                                checker.error(
+                                    ErrorCode::ZAP4023,
+                                    format!("datetime.replace() has no field named '{name}'"),
+                                    a.span,
+                                );
+                            } else if seen.contains(&name.as_str()) {
+                                checker.error(
+                                    ErrorCode::ZAP4023,
+                                    format!(
+                                        "datetime.replace() got multiple values for field '{name}'"
+                                    ),
+                                    a.span,
+                                );
+                            } else {
+                                seen.push(name.as_str());
+                            }
+                            if !v.is_int() && !matches!(v, Ty::Unknown) {
+                                checker.error(
+                                    ErrorCode::ZAP4024,
+                                    format!(
+                                        "datetime.replace() field '{name}' must be an int, found {}",
+                                        v.display()
+                                    ),
+                                    expr_span(&a.value),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Some(Ty::Named(DATETIME.to_string()))
+        }
+        // date(year, month, day) -> Date / time(hour, minute, second) -> Time
+        // (#1046): plain civil-field constructors (no range validation, matching
+        // the lenient `parse` family).
+        "date" => {
+            expect_ints(checker, method, args, span, 3);
+            Some(Ty::Named(DATE.to_string()))
+        }
+        "time" => {
+            expect_ints(checker, method, args, span, 3);
+            Some(Ty::Named(TIME.to_string()))
+        }
+        // to_date(dt) -> Date / to_time(dt) -> Time: the civil date / time-of-day
+        // of a DateTime (Python `dt.date()` / `dt.time()`).
+        "to_date" => {
+            expect1(checker, method, args, span, "a DateTime", is_datetime);
+            Some(Ty::Named(DATE.to_string()))
+        }
+        "to_time" => {
+            expect1(checker, method, args, span, "a DateTime", is_datetime);
+            Some(Ty::Named(TIME.to_string()))
+        }
+        // combine(date, time) -> DateTime: a naive DateTime from a Date + Time
+        // (Python `datetime.combine`).
+        "combine" => {
+            if args.len() != 2 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!("datetime.combine() takes 2 arguments, found {}", args.len()),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                let d = checker.infer(&args[0].value);
+                if !is_date(&d) && !matches!(d, Ty::Unknown) {
+                    checker.error(
+                        ErrorCode::ZAP4024,
+                        format!("datetime.combine() expects a Date, found {}", d.display()),
+                        expr_span(&args[0].value),
+                    );
+                }
+                let t = checker.infer(&args[1].value);
+                if !is_time(&t) && !matches!(t, Ty::Unknown) {
+                    checker.error(
+                        ErrorCode::ZAP4024,
+                        format!("datetime.combine() expects a Time, found {}", t.display()),
+                        expr_span(&args[1].value),
+                    );
+                }
+            }
+            Some(Ty::Named(DATETIME.to_string()))
+        }
+        // date_today() -> Date: the current local calendar date.
+        "date_today" => {
+            expect_argc(checker, "datetime", method, args, 0, span);
+            Some(Ty::Named(DATE.to_string()))
         }
         // rfc3339_parse(s) -> DateTime: parse `...(Z|±HH:MM)` to an aware value.
         "rfc3339_parse" => {

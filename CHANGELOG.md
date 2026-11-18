@@ -25,6 +25,16 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`datetime.replace()` + separate `Date` / `Time` types** (#1046, D-0226).
+  `datetime.replace(dt, year=…, month=…, day=…, hour=…, minute=…, second=…)`
+  returns a copy of a `DateTime` with the supplied civil fields changed and the
+  zone (offset / `is_aware`) preserved — all fields optional keywords, any
+  subset. New prelude `Date { year, month, day }` and `Time { hour, minute,
+  second }` value structs with `datetime.date(…)` / `time(…)` constructors,
+  `datetime.to_date(dt)` / `to_time(dt)`, `datetime.combine(date, time)`, and
+  `datetime.date_today()`; `datetime.isoformat(x)` is overloaded to render a
+  `DateTime` (RFC-3339), a `Date` (`YYYY-MM-DD`) or a `Time` (`HH:MM:SS`).
+
 - **`datetime` timezone database — bundled IANA, aware `DateTime`** (#1045,
   D-0225). The IANA tz database is now **bundled into the toolchain** (vendored,
   generated transition tables), so zones resolve identically on every target

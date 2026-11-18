@@ -802,3 +802,25 @@ void *zap_tz_zone_require(void *name) {
     }
     return name;
 }
+
+/* Separate date / time-of-day renderers (#1046, D-0226). `Date` -> "YYYY-MM-DD",
+ * `Time` -> "HH:MM:SS" (zero-padded, no zone — these types carry none). */
+void *zap_date_isoformat(int64_t y, int64_t mo, int64_t d) {
+    char buf[24];
+    int n = snprintf(buf, sizeof buf, "%04lld-%02lld-%02lld", (long long)y,
+                     (long long)mo, (long long)d);
+    if (n < 0) {
+        n = 0;
+    }
+    return zap_str_new(buf, (int64_t)n);
+}
+
+void *zap_time_isoformat(int64_t h, int64_t mi, int64_t s) {
+    char buf[16];
+    int n = snprintf(buf, sizeof buf, "%02lld:%02lld:%02lld", (long long)h,
+                     (long long)mi, (long long)s);
+    if (n < 0) {
+        n = 0;
+    }
+    return zap_str_new(buf, (int64_t)n);
+}

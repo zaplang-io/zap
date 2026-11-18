@@ -74,6 +74,20 @@ fn timezone_sid(lowerer: &FnLower) -> Result<u32, LowerError> {
         .ok_or_else(|| err("TimeZone struct unavailable (built-in prelude missing)"))
 }
 
+/// Resolve a prelude struct id by name (`Date` / `Time`, #1046).
+fn struct_sid(lowerer: &FnLower, name: &str) -> Result<u32, LowerError> {
+    lowerer
+        .ctx
+        .ids
+        .get(name)
+        .copied()
+        .ok_or_else(|| err("prelude struct unavailable (built-in prelude missing)"))
+}
+
+/// The `DateTime`/`Date`/`Time` civil fields `replace` may override, in field
+/// order (#1046). Shared with the sema facet's `REPLACE_FIELDS`.
+const REPLACE_FIELDS: [&str; 6] = ["year", "month", "day", "hour", "minute", "second"];
+
 /// Build a `DateTime` value struct. The six civil fields come from the
 /// `zap_datetime_<field>(getter_ts, is_local)` getters (so `getter_ts` is the
 /// wall-clock-as-epoch when `is_local == 0`, or a UTC timestamp decomposed into
@@ -191,25 +205,66 @@ fn strftime(lowerer: &mut FnLower, args: &[ast::Arg]) -> Result<(Value, Ty), Low
     Ok((d, Ty::Ptr))
 }
 
-/// Lower `isoformat(dt)` / `rfc3339(dt)`: the six civil fields plus
-/// `offset`/`is_aware` to `zap_datetime_isoformat` (RFC-3339 with the offset
-/// suffix when aware, bare civil ISO when naive), #1045.
+/// Lower `isoformat(x)` / `rfc3339(dt)`, overloaded on the argument type
+/// (#1045/#1046): a `DateTime` renders RFC-3339 (`zap_datetime_isoformat`, with
+/// the offset suffix when aware); a `Date` renders `YYYY-MM-DD`
+/// (`zap_date_isoformat`); a `Time` renders `HH:MM:SS` (`zap_time_isoformat`).
+/// Dispatch is by the lowered struct id (sema guarantees one of the three).
 fn isoformat(lowerer: &mut FnLower, arg: &ast::Arg) -> Result<(Value, Ty), LowerError> {
-    let sid = datetime_sid(lowerer)?;
-    let (base, _) = lowerer.expr(&arg.value)?;
-    let mut call_args = civil_fields(lowerer, base, sid);
-    let off = lowerer.field_get(base, sid, F_OFFSET, Ty::I64);
-    let aware_i1 = lowerer.field_get(base, sid, F_AWARE, Ty::I1);
-    let aware_i64 = lowerer.coerce(aware_i1, Ty::I1, Ty::I64);
-    call_args.push(off);
-    call_args.push(aware_i64);
+    let (base, ty) = lowerer.expr(&arg.value)?;
+    let date_sid = struct_sid(lowerer, "Date")?;
+    let time_sid = struct_sid(lowerer, "Time")?;
     let d = lowerer.new_value(Ty::Ptr);
+    let (func, args): (&str, Vec<Value>) = match ty {
+        Ty::Struct(s) if s == date_sid => (
+            "zap_date_isoformat",
+            (0..3)
+                .map(|i| lowerer.field_get(base, date_sid, i, Ty::I64))
+                .collect(),
+        ),
+        Ty::Struct(s) if s == time_sid => (
+            "zap_time_isoformat",
+            (0..3)
+                .map(|i| lowerer.field_get(base, time_sid, i, Ty::I64))
+                .collect(),
+        ),
+        _ => {
+            // DateTime: six civil fields + offset + is_aware.
+            let sid = datetime_sid(lowerer)?;
+            let mut call_args = civil_fields(lowerer, base, sid);
+            let off = lowerer.field_get(base, sid, F_OFFSET, Ty::I64);
+            let aware_i1 = lowerer.field_get(base, sid, F_AWARE, Ty::I1);
+            let aware_i64 = lowerer.coerce(aware_i1, Ty::I1, Ty::I64);
+            call_args.push(off);
+            call_args.push(aware_i64);
+            ("zap_datetime_isoformat", call_args)
+        }
+    };
     lowerer.emit(Inst::Call {
         dest: Some(d),
-        func: "zap_datetime_isoformat".to_string(),
-        args: call_args,
+        func: func.to_string(),
+        args,
     });
     Ok((d, Ty::Ptr))
+}
+
+/// Build a 3-field `Date`/`Time` value struct from three `i64` values.
+fn build_triple(
+    lowerer: &mut FnLower,
+    sid: u32,
+    vals: [Value; 3],
+) -> Result<(Value, Ty), LowerError> {
+    let dest = lowerer.new_value(Ty::Struct(sid));
+    lowerer.emit(Inst::StructNew { dest, sid });
+    for (idx, v) in vals.into_iter().enumerate() {
+        lowerer.emit(Inst::FieldSet {
+            base: dest,
+            sid,
+            idx: idx as u32,
+            val: v,
+        });
+    }
+    Ok((dest, Ty::Struct(sid)))
 }
 
 /// Lower `fixed_offset(minutes)` / `zone(name)` into a `TimeZone` value struct.
@@ -495,6 +550,162 @@ fn lower(
             });
             let aware = lowerer.bconst(true);
             build_datetime(lowerer, local_ts, 0, off, aware)?
+        }
+        // replace(dt, field=val, ...) -> DateTime (#1046, D-0226): copy the
+        // civil fields, override the supplied ones, keep the zone (offset /
+        // is_aware). A pure civil-field substitution — no instant round-trip and
+        // no range validation (matching the lenient `parse` family).
+        "replace" => {
+            let sid = datetime_sid(lowerer)?;
+            let (base, _) = lowerer.expr(&args[0].value)?;
+            let mut civil = civil_fields(lowerer, base, sid);
+            let off = lowerer.field_get(base, sid, F_OFFSET, Ty::I64);
+            let aware = lowerer.field_get(base, sid, F_AWARE, Ty::I1);
+            for a in &args[1..] {
+                let name = a
+                    .name
+                    .as_deref()
+                    .ok_or_else(|| err("datetime.replace() field must be a keyword argument"))?;
+                let idx = REPLACE_FIELDS
+                    .iter()
+                    .position(|f| *f == name)
+                    .ok_or_else(|| err("datetime.replace() unknown field"))?;
+                let (v, vt) = lowerer.expr(&a.value)?;
+                civil[idx] = lowerer.coerce(v, vt, Ty::I64);
+            }
+            let dest = lowerer.new_value(Ty::Struct(sid));
+            lowerer.emit(Inst::StructNew { dest, sid });
+            for (idx, v) in civil.into_iter().enumerate() {
+                lowerer.emit(Inst::FieldSet {
+                    base: dest,
+                    sid,
+                    idx: idx as u32,
+                    val: v,
+                });
+            }
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: F_OFFSET,
+                val: off,
+            });
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: F_AWARE,
+                val: aware,
+            });
+            (dest, Ty::Struct(sid))
+        }
+        // date(y, mo, d) -> Date / time(h, mi, s) -> Time (#1046): civil-field
+        // constructors.
+        "date" | "time" => {
+            let sid = struct_sid(lowerer, if method == "date" { "Date" } else { "Time" })?;
+            let mut vals: Vec<Value> = Vec::with_capacity(3);
+            for a in args.iter().take(3) {
+                let (v, vt) = lowerer.expr(&a.value)?;
+                vals.push(lowerer.coerce(v, vt, Ty::I64));
+            }
+            build_triple(lowerer, sid, [vals[0], vals[1], vals[2]])?
+        }
+        // to_date(dt) -> Date (fields 0..=2) / to_time(dt) -> Time (fields 3..=5).
+        "to_date" | "to_time" => {
+            let dtsid = datetime_sid(lowerer)?;
+            let (base, _) = lowerer.expr(&args[0].value)?;
+            let (dst_name, start) = if method == "to_date" {
+                ("Date", 0u32)
+            } else {
+                ("Time", 3u32)
+            };
+            let sid = struct_sid(lowerer, dst_name)?;
+            let vals = [
+                lowerer.field_get(base, dtsid, start, Ty::I64),
+                lowerer.field_get(base, dtsid, start + 1, Ty::I64),
+                lowerer.field_get(base, dtsid, start + 2, Ty::I64),
+            ];
+            build_triple(lowerer, sid, vals)?
+        }
+        // combine(date, time) -> naive DateTime (#1046).
+        "combine" => {
+            let dtsid = datetime_sid(lowerer)?;
+            let date_sid = struct_sid(lowerer, "Date")?;
+            let time_sid = struct_sid(lowerer, "Time")?;
+            let (dbase, _) = lowerer.expr(&args[0].value)?;
+            let (tbase, _) = lowerer.expr(&args[1].value)?;
+            let civil = [
+                lowerer.field_get(dbase, date_sid, 0, Ty::I64),
+                lowerer.field_get(dbase, date_sid, 1, Ty::I64),
+                lowerer.field_get(dbase, date_sid, 2, Ty::I64),
+                lowerer.field_get(tbase, time_sid, 0, Ty::I64),
+                lowerer.field_get(tbase, time_sid, 1, Ty::I64),
+                lowerer.field_get(tbase, time_sid, 2, Ty::I64),
+            ];
+            let dest = lowerer.new_value(Ty::Struct(dtsid));
+            lowerer.emit(Inst::StructNew { dest, sid: dtsid });
+            for (idx, v) in civil.into_iter().enumerate() {
+                lowerer.emit(Inst::FieldSet {
+                    base: dest,
+                    sid: dtsid,
+                    idx: idx as u32,
+                    val: v,
+                });
+            }
+            let zero = lowerer.iconst(Ty::I64, 0);
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid: dtsid,
+                idx: F_OFFSET,
+                val: zero,
+            });
+            let naive = lowerer.bconst(false);
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid: dtsid,
+                idx: F_AWARE,
+                val: naive,
+            });
+            (dest, Ty::Struct(dtsid))
+        }
+        // date_today() -> Date: the current LOCAL calendar date.
+        "date_today" => {
+            let sid = struct_sid(lowerer, "Date")?;
+            let ts = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(ts),
+                func: "zap_datetime_now_unix".to_string(),
+                args: vec![],
+            });
+            let local = lowerer.iconst(Ty::I64, 1);
+            let vals = [
+                {
+                    let v = lowerer.new_value(Ty::I64);
+                    lowerer.emit(Inst::Call {
+                        dest: Some(v),
+                        func: "zap_datetime_year".to_string(),
+                        args: vec![ts, local],
+                    });
+                    v
+                },
+                {
+                    let v = lowerer.new_value(Ty::I64);
+                    lowerer.emit(Inst::Call {
+                        dest: Some(v),
+                        func: "zap_datetime_month".to_string(),
+                        args: vec![ts, local],
+                    });
+                    v
+                },
+                {
+                    let v = lowerer.new_value(Ty::I64);
+                    lowerer.emit(Inst::Call {
+                        dest: Some(v),
+                        func: "zap_datetime_day".to_string(),
+                        args: vec![ts, local],
+                    });
+                    v
+                },
+            ];
+            build_triple(lowerer, sid, vals)?
         }
         _ => return Ok(None),
     };

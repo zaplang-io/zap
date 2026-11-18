@@ -167,6 +167,16 @@ value struct TimeZone:
     int64 offset
     bool fixed
 
+value struct Date:
+    int64 year
+    int64 month
+    int64 day
+
+value struct Time:
+    int64 hour
+    int64 minute
+    int64 second
+
 value struct KeyInfo:
     str kind
     int64 bits
@@ -1306,6 +1316,11 @@ fn references_prelude(module: &Module) -> bool {
         // struct ships in the prelude (named/fixed zones for `astimezone`),
         // injected for any program that names the module or the struct.
         "\"TimeZone\"",
+        // The `datetime` separate date/time-of-day types (#1046, D-0226): the
+        // `Date` / `Time` value structs ship in the prelude, injected for any
+        // program that names the module or either struct.
+        "\"Date\"",
+        "\"Time\"",
         "\"time\"",
         "\"datetime\"",
         // The validated asymmetric-key metadata `crypto.key_info()` returns

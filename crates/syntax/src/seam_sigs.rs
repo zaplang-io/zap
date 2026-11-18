@@ -107,6 +107,15 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("datetime", "isoformat", &["dt"]),
     ("datetime", "rfc3339", &["dt"]),
     ("datetime", "rfc3339_parse", &["s"]),
+    // ---- datetime date/time types (#1046, D-0226) ----
+    // NOTE: `replace` is intentionally NOT listed — its fields are all-optional,
+    // any-subset keywords (interior holes), which the trailing-only seam binder
+    // (D-0204) rejects, so `replace` binds its keywords itself.
+    ("datetime", "date", &["year", "month", "day"]),
+    ("datetime", "time", &["hour", "minute", "second"]),
+    ("datetime", "to_date", &["dt"]),
+    ("datetime", "to_time", &["dt"]),
+    ("datetime", "combine", &["date", "time"]),
     // ---- random (ticket #98): only the non-numpy-overloaded verbs ----
     // `random`/`uniform`/`choice`/`shuffle` are overloaded with the NumPy
     // `Generator` surface (a distinct second signature keyed on an arg-0
