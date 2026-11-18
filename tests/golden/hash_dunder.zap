@@ -49,7 +49,9 @@ def main():
     auto five = 5
     print(five.__hash__())  # 7134611160154358618
     auto flag = True
-    print(flag.__hash__())  # -7995527694508729151
+    # `bool` is an i1; coercing to i64 for hashing sign-extends `True` to -1
+    # (the same path dict bool-keys take), so this is zap_hash_i64(-1).
+    print(flag.__hash__())  # -1956407806741107680
     auto ch = chr(97)  # the char 'a' (codepoint 97)
     print(ch.__hash__())  # 5718913436695043505
     # float __hash__: value-equal floats hash equal; distinct differ (#803 word).
