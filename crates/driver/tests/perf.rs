@@ -181,6 +181,48 @@ fn benches() -> Vec<Bench> {
             unit: "ops",
             floor_per_sec: 1_000.0,
         },
+        // LONGER string keys (#1064): the same 100k insert + lookup workload but
+        // with ~40-byte keys (`f"long_key_prefix_padding_{i}"`), where the key
+        // HASH dominates the per-op cost. The former byte-at-a-time FNV-1a was
+        // ~6-11x slower than wyhash at 32-64B, so the wyhash swap shows its real
+        // end-to-end win HERE — unlike the tiny-key `dict_string` above, whose
+        // 2-6B keys sit where FNV was only ~1.5-2x behind (and where alloc /
+        // safepoint / call cost dominates, washing the hash win out per #840).
+        // sum of lookups = 0+1+...+99999 = 4999950000.
+        Bench {
+            name: "dict_string_long",
+            src: "def main():\n    dict[str, int64] d = {}\n    int64 i = 0\n    \
+                  while i < 100000:\n        \
+                  d[f\"long_key_prefix_padding_{i}\"] = i\n        i = i + 1\n    \
+                  int64 s = 0\n    i = 0\n    \
+                  while i < 100000:\n        \
+                  s = s + d[f\"long_key_prefix_padding_{i}\"]\n        i = i + 1\n    \
+                  print(s)\n",
+            expect: "4999950000",
+            work: 200_000, // 100k inserts + 100k lookups
+            unit: "ops",
+            floor_per_sec: 1_000.0,
+        },
+        // Str-hash MICROBENCH (#1064): isolate the hash itself via the now
+        // user-callable `str.__hash__()`. Each iteration hashes a fresh ~40-byte
+        // f-string and folds the result into a seed-FREE accumulator with
+        // `hash_combine`, so the work is dominated by wyhash yet the loop cannot
+        // be elided (the accumulator depends on the per-process seed, so the
+        // optimizer cannot constant-fold it). It prints `acc != 0` — seed-
+        // INDEPENDENT — so the bench is deterministic while still measuring the
+        // hash; the correctness/value guards live in the goldens, not here.
+        Bench {
+            name: "str_hash_only",
+            src: "def main():\n    int64 acc = 0\n    int64 i = 0\n    \
+                  while i < 1000000:\n        \
+                  acc = hash_combine(acc, f\"long_key_prefix_padding_{i}\".__hash__())\n        \
+                  i = i + 1\n    \
+                  print(acc != 0)\n",
+            expect: "True",
+            work: 1_000_000,
+            unit: "hashes",
+            floor_per_sec: 10_000.0,
+        },
         // The string-CONSTRUCTION cost in isolation (#837 split): build 100k
         // `f"k{i}"` and sum their codepoint lengths, no dict. Exercises literal
         // interning (lever 3: the `"k"` prefix is now a shared constant, not a

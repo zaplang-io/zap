@@ -382,3 +382,19 @@ fn clean_program_has_no_diagnostics() {
     let r = check_source("def main():\n    print(1)\n");
     assert!(r.ok, "unexpected diagnostics: {:?}", r.diagnostics);
 }
+
+#[test]
+fn hash_dunder_and_hash_combine_misuse_is_rejected() {
+    // `str.__hash__()` (and every intrinsic `__hash__()`) takes no arguments
+    // (#1064) — a stray argument is the arity error ZAP4025.
+    assert_code("def main():\n    x = \"abc\".__hash__(5)\n", "ZAP4025");
+    // `hash_combine(acc, h)` takes exactly two arguments ...
+    assert_code("def main():\n    x = hash_combine(1)\n", "ZAP4025");
+    // ... and both must be int: a str argument is the arg-type error ZAP4024.
+    assert_code("def main():\n    x = hash_combine(1, \"b\")\n", "ZAP4024");
+    // A zero-arg `str.__hash__()` and `hash_combine(int, int)` are clean.
+    let ok = check_source(
+        "def main():\n    auto h = \"abc\".__hash__()\n    auto c = hash_combine(h, 5)\n",
+    );
+    assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
+}

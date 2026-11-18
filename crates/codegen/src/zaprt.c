@@ -131,6 +131,9 @@ static void *GC_get_my_stackbottom(struct GC_stack_base *sb) {
 #include <unistd.h> /* sysconf(_SC_NPROCESSORS_ONLN) for the M count (#47) */
 #include <signal.h> /* SIGURG / sigaction / pthread_kill: async preemption (#172) */
 #include <setjmp.h> /* zap_repl_call: catch an uncaught exception at a REPL entry (I#159) */
+#if defined(__linux__)
+#include <sys/random.h> /* getentropy for the per-process hash seed (#1064) */
+#endif
 
 #if defined(ZAP_PLATFORM_WINDOWS)
 /* Windows system headers (platform epic #158 / Area A4, I#198). The POSIX
@@ -2122,6 +2125,173 @@ void *zap_dict_new(void) {
     return d;
 }
 
+/* ---------------------------------------------------------------------------
+ * wyhash (final v3) — the dict/set string-key hash and the @derive(Hash) /
+ * value-struct string-field hash (#1064). Public domain (Wang Yi,
+ * https://github.com/wangyi-fudan/wyhash). Vendored as the portable SCALAR
+ * implementation only: the 64x64->128 multiply uses `__uint128_t` (supported on
+ * x86_64 + aarch64), reads are unaligned-safe via `memcpy`, and there is NO SIMD
+ * and NO CPU-feature dispatch — so this is a standalone runtime primitive, NOT
+ * under the #139/#947 ISA-accel facility. It replaces the former byte-at-a-time
+ * FNV-1a: wyhash keeps FNV's collision quality but drops its serial
+ * multiply/xor dependency chain, which measured ~3-5x slower at 16B and up to
+ * ~31x at 1KB on the perf box (see #1064).
+ * ------------------------------------------------------------------------- */
+#if defined(__GNUC__) || defined(__clang__)
+#define ZAP_WY_LIKELY(x) __builtin_expect(x, 1)
+#define ZAP_WY_UNLIKELY(x) __builtin_expect(x, 0)
+#else
+#define ZAP_WY_LIKELY(x) (x)
+#define ZAP_WY_UNLIKELY(x) (x)
+#endif
+
+/* 64x64 -> 128 multiply, folded back into *A (low word) and *B (high word). */
+static inline void zap_wymum(uint64_t *A, uint64_t *B) {
+#if defined(__SIZEOF_INT128__)
+    __uint128_t r = *A;
+    r *= *B;
+    *A = (uint64_t)r;
+    *B = (uint64_t)(r >> 64);
+#else
+    /* Portable 32x32 fallback (not expected on the supported targets). */
+    uint64_t ha = *A >> 32, hb = *B >> 32, la = (uint32_t)*A, lb = (uint32_t)*B;
+    uint64_t rh = ha * hb, rm0 = ha * lb, rm1 = hb * la, rl = la * lb;
+    uint64_t t = rl + (rm0 << 32), c = t < rl;
+    uint64_t lo = t + (rm1 << 32);
+    c += lo < t;
+    uint64_t hi = rh + (rm0 >> 32) + (rm1 >> 32) + c;
+    *A = lo;
+    *B = hi;
+#endif
+}
+
+/* MUM mix: multiply then xor-fold the two halves. */
+static inline uint64_t zap_wymix(uint64_t A, uint64_t B) {
+    zap_wymum(&A, &B);
+    return A ^ B;
+}
+
+/* Little-endian reads. The supported targets are little-endian; a big-endian
+ * build byte-swaps so a value still hashes identically within its own process,
+ * which is all the seed-domain contract requires. */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+static inline uint64_t zap_wyr8(const uint8_t *p) {
+    uint64_t v;
+    memcpy(&v, p, 8);
+    return __builtin_bswap64(v);
+}
+static inline uint64_t zap_wyr4(const uint8_t *p) {
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return __builtin_bswap32(v);
+}
+#else
+static inline uint64_t zap_wyr8(const uint8_t *p) {
+    uint64_t v;
+    memcpy(&v, p, 8);
+    return v;
+}
+static inline uint64_t zap_wyr4(const uint8_t *p) {
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+#endif
+static inline uint64_t zap_wyr3(const uint8_t *p, size_t k) {
+    return (((uint64_t)p[0]) << 16) | (((uint64_t)p[k >> 1]) << 8) | p[k - 1];
+}
+
+/* The default wyhash secret (final v3 constants). */
+static const uint64_t zap_wy_secret[4] = {
+    0x2d358dccaa6c78a5ull, 0x8bb84b93962eacc9ull, 0x4b33a62ed433d4a3ull,
+    0x4d5a2da51de1aa47ull};
+
+static inline uint64_t zap_wyhash(const void *key, size_t len, uint64_t seed) {
+    const uint8_t *p = (const uint8_t *)key;
+    const uint64_t *secret = zap_wy_secret;
+    seed ^= zap_wymix(seed ^ secret[0], secret[1]);
+    uint64_t a, b;
+    if (ZAP_WY_LIKELY(len <= 16)) {
+        if (ZAP_WY_LIKELY(len >= 4)) {
+            a = (zap_wyr4(p) << 32) | zap_wyr4(p + ((len >> 3) << 2));
+            b = (zap_wyr4(p + len - 4) << 32) |
+                zap_wyr4(p + len - 4 - ((len >> 3) << 2));
+        } else if (ZAP_WY_LIKELY(len > 0)) {
+            a = zap_wyr3(p, len);
+            b = 0;
+        } else {
+            a = b = 0;
+        }
+    } else {
+        size_t i = len;
+        if (ZAP_WY_UNLIKELY(i > 48)) {
+            uint64_t see1 = seed, see2 = seed;
+            do {
+                seed =
+                    zap_wymix(zap_wyr8(p) ^ secret[1], zap_wyr8(p + 8) ^ seed);
+                see1 = zap_wymix(zap_wyr8(p + 16) ^ secret[2],
+                                 zap_wyr8(p + 24) ^ see1);
+                see2 = zap_wymix(zap_wyr8(p + 32) ^ secret[3],
+                                 zap_wyr8(p + 40) ^ see2);
+                p += 48;
+                i -= 48;
+            } while (ZAP_WY_LIKELY(i > 48));
+            seed ^= see1 ^ see2;
+        }
+        while (ZAP_WY_UNLIKELY(i > 16)) {
+            seed = zap_wymix(zap_wyr8(p) ^ secret[1], zap_wyr8(p + 8) ^ seed);
+            i -= 16;
+            p += 16;
+        }
+        a = zap_wyr8(p + i - 16);
+        b = zap_wyr8(p + i - 8);
+    }
+    a ^= secret[1];
+    b ^= seed;
+    zap_wymum(&a, &b);
+    return zap_wymix(a ^ secret[0] ^ len, b ^ secret[1]);
+}
+
+/* Per-process hash seed (#1064): captured once at startup and inherited across
+ * `fork` (a C constructor runs per process image, not per fork). Seeding closes
+ * the unseeded hash-flooding exposure of the former FNV str hash and makes str
+ * hashes differ across independent processes (Python-like) — a persisted str
+ * hash is therefore invalid; use a named digest instead. `ZAPHASHSEED=<uint>`
+ * pins a fixed seed (0 allowed) for reproducible runs / goldens, à la
+ * PYTHONHASHSEED; unset (or empty / "random") keeps a random per-process seed.
+ * The fork / exec / multiprocessing seed-domain semantics, and the DECISIONS.md
+ * entry, are owned by the maintainer (see #1064). */
+static uint64_t zap_hash_seed = 0;
+
+static uint64_t zap_hash_os_seed(void) {
+    uint64_t s = 0;
+#if defined(__APPLE__)
+    arc4random_buf(&s, sizeof s);
+#elif defined(__linux__)
+    if (getentropy(&s, sizeof s) != 0) {
+        s = (uint64_t)time(NULL) ^ ((uint64_t)clock() << 21);
+    }
+#elif defined(ZAP_PLATFORM_WINDOWS)
+    if (BCryptGenRandom(NULL, (PUCHAR)&s, (ULONG)sizeof s,
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+        s = (uint64_t)time(NULL) ^ ((uint64_t)clock() << 21);
+    }
+#else
+    s = (uint64_t)time(NULL) ^ ((uint64_t)clock() << 21);
+#endif
+    return s;
+}
+
+__attribute__((constructor)) static void zap_hash_seed_init(void) {
+    const char *env = getenv("ZAPHASHSEED");
+    if (env != NULL && env[0] != '\0' && strcmp(env, "random") != 0) {
+        /* A fixed seed for reproducible runs (PYTHONHASHSEED-style, #1064). */
+        zap_hash_seed = (uint64_t)strtoull(env, NULL, 10);
+    } else {
+        zap_hash_seed = zap_hash_os_seed();
+    }
+}
+
 static uint64_t zap_hash_i64(int64_t k) {
     /* splitmix64 finalizer — cheap, good dispersion. */
     uint64_t x = (uint64_t)k + 0x9e3779b97f4a7c15ULL;
@@ -2131,12 +2301,11 @@ static uint64_t zap_hash_i64(int64_t k) {
 }
 
 static uint64_t zap_hash_str(const ZapStr *s) {
-    uint64_t h = 1469598103934665603ULL; /* FNV-1a */
-    for (int64_t i = 0; i < s->len; i++) {
-        h ^= (uint8_t)s->data[i];
-        h *= 1099511628211ULL;
-    }
-    return h;
+    /* wyhash, seeded per process (#1064). Collision quality matches the former
+     * byte-at-a-time FNV-1a; throughput is far higher on the 4-32B identifier /
+     * JSON-field keys dicts see most. The in-table cached-hash design (#837) and
+     * the KEY_STR compare path are unchanged — only the hash function changed. */
+    return zap_wyhash(s->data, (size_t)s->len, zap_hash_seed);
 }
 
 /* `noinline` (#841, D-0149): keeping the key hash out of line keeps the dict
@@ -2175,13 +2344,15 @@ static int zap_key_eq(int64_t a, int64_t b, int keykind, void *eqfn) {
 int64_t zap_i64_hash(int64_t k) { return (int64_t)zap_hash_i64(k); }
 int64_t zap_str_hash(void *s) { return (int64_t)zap_hash_str((const ZapStr *)s); }
 int64_t zap_hash_combine(int64_t acc, int64_t h) {
-    /* Mix in one field hash: FNV-style multiply/xor, then a splitmix64 finalizer
-     * for good dispersion so field order matters and small values spread out. */
-    uint64_t x = (uint64_t)acc * 1099511628211ULL;
-    x ^= (uint64_t)h;
-    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-    return (int64_t)(x ^ (x >> 31));
+    /* Mix one field hash into the accumulator with wyhash's MUM primitive
+     * (#1064), for consistency with the str/key hash and stronger avalanche than
+     * the former FNV-multiply + splitmix64. Field order matters (non-commutative)
+     * and small values spread out. Seedless and deterministic: the per-process
+     * seed enters a derived/hand-written struct hash only through its str fields'
+     * hashes, so two structs equal within a run hash equal (a == b ⟹
+     * hash(a) == hash(b), D-0047). The xor constant keeps combine(0, 0) off 0. */
+    return (int64_t)zap_wymix((uint64_t)acc ^ 0x9e3779b97f4a7c15ULL,
+                              (uint64_t)h);
 }
 /* Lexicographic byte comparison of two strings, returning -1 / 0 / +1. */
 int64_t zap_str_cmp(void *ap, void *bp) {

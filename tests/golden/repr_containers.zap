@@ -14,8 +14,15 @@ def main():
     print(ss)  # ['a', 'b']  string elements quoted
     list[int64] empty = []
     print(empty)  # []
-    dict[str, int64] d = {"k": 1, "m": 2}
-    print(d)  # {'k': 1, 'm': 2}
+    # A single-entry str dict: a str-keyed dict's iteration (hence repr) order is
+    # unspecified and, since #1064 seeded the str hash, varies across processes —
+    # so a multi-entry str dict is not order-stable to print. One entry pins the
+    # order while still covering the non-empty `{'key': val}` repr shape (the
+    # inter-entry comma is covered by the list reprs above). An int-keyed dict
+    # would be deterministic (int hashing is unseeded), but this line's point is
+    # the quoted str key.
+    dict[str, int64] d = {"k": 1}
+    print(d)  # {'k': 1}
     dict[str, int64] ed = {}
     print(ed)  # {}  empty dict
     set[int64] s = {7}
