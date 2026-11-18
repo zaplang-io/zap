@@ -30,7 +30,7 @@ def main():
     # 2) walk: top-down, sorted. The dirpath holds the temp path, so print only
     # the deterministic counts and the sorted entry names.
     print("walk:")
-    for (dirpath, dirs, files) in fs.walk(root):
+    for dirpath, dirs, files in fs.walk(root):
         print("dirs=" + str(len(dirs)) + " files=" + str(len(files)))
         for d in dirs:
             print("  d:" + d)
