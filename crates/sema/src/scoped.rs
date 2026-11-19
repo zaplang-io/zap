@@ -115,10 +115,11 @@ impl Checker {
         }
     }
 
-    /// Does this resolved type contain a `strview` anywhere in its structure?
+    /// Does this resolved type contain a borrowed view (`strview` or `bytesview`,
+    /// #1082) anywhere in its structure? Both are affine under the same rule.
     pub(crate) fn ty_mentions_strview(ty: &Ty) -> bool {
         match ty {
-            Ty::StrView => true,
+            Ty::StrView | Ty::BytesView => true,
             Ty::List(e)
             | Ty::Set(e)
             | Ty::Heap(e)
