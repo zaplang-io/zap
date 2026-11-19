@@ -26,6 +26,7 @@ mod crypto;
 mod datetime;
 mod decimal;
 mod fft;
+mod fractions;
 mod fs;
 mod gc;
 mod gzip;
@@ -91,6 +92,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     math::MODULE,
     statistics::MODULE,
     decimal::MODULE,
+    fractions::MODULE,
     fft::MODULE,
     linalg::MODULE,
     random::MODULE,

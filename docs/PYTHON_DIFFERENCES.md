@@ -337,6 +337,37 @@ deliberately differs in a few places:
 - **No decimal literal.** There is no `1.50d` syntax; construct via
   `decimal.Decimal("1.50")`. (A literal is a possible later grammar addition.)
 
+### `fractions.Fraction` (#982)
+
+Zap's exact rational `Fraction` matches CPython's `fractions.Fraction` for
+reduction to lowest terms, sign normalization (denominator always `> 0`, zero as
+`0/1`), exact `+ - * /`, comparisons, `limit_denominator`, and `str()` rendering
+(verified against CPython across a battery of construction, arithmetic,
+comparison and `limit_denominator` cases). It deliberately differs in a few
+places:
+
+- **No implicit `int → Fraction` promotion for operators.** CPython evaluates
+  `Fraction(1, 2) + 1` (the `int` is promoted). Zap's operator dispatch is
+  type-first — it dispatches on the left operand and does not coerce the right —
+  so mix an `int` in by constructing a `Fraction`: `Fraction(1, 2) +
+  Fraction(1)`. (The same model as `Decimal`.)
+- **Construction from a `float` is a compile error.** CPython's `Fraction(0.1)`
+  adopts the exact binary expansion (`3602879701896397/36028797018963968`). Zap
+  rejects a float argument (`ZAP4024`) and steers to the `str` form, so
+  `Fraction("0.1")` is exactly `1/10` — the value the author meant. There is no
+  `from_float` classmethod; a decimal `str` is the exact path.
+- **A signed denominator in a ratio literal is rejected.** Like CPython's own
+  grammar (the numerator may carry a sign, the denominator is digits only),
+  `Fraction("1/-2")` raises `ValueError`; write `Fraction("-1/2")`.
+- **`numerator` / `denominator` are methods, not properties**, and return
+  `bigint` (arbitrary precision), not Python `int` — Zap has no properties.
+- **Flat exception model.** CPython's `ZeroDivisionError` (a zero denominator, or
+  dividing by a zero `Fraction`) and the `ValueError` of a malformed string both
+  surface as Zap's `ValueError` (Zap has no exception subclassing — the
+  `statistics` / `decimal` precedent).
+- **No `Fraction` literal.** There is no rational literal syntax; construct via
+  `fractions.Fraction(...)`.
+
 ---
 
 ## Parity backlog

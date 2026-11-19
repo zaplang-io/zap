@@ -61,6 +61,7 @@ mod crypto;
 mod datetime;
 mod decimal;
 mod fft;
+mod fractions;
 mod fs;
 mod gc;
 mod gzip;
@@ -121,6 +122,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     math::MODULE,
     statistics::MODULE,
     decimal::MODULE,
+    fractions::MODULE,
     fft::MODULE,
     linalg::MODULE,
     random::MODULE,
