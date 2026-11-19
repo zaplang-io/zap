@@ -60,15 +60,10 @@ use crate::json::{self, Json};
 /// helper so the mistake cannot reappear piecemeal.)
 #[cfg(test)]
 pub(crate) fn unique_temp_dir(prefix: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let base = std::env::temp_dir().join(format!(
-        "{prefix}-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed),
-    ));
-    std::fs::create_dir_all(&base).unwrap();
-    base
+    // Delegates to the one crate-wide helper (#917) so every test module shares
+    // a single pid+counter implementation and the clock-based collision class
+    // cannot reappear in just one of them.
+    crate::testutil::unique_temp_dir(prefix)
 }
 
 /// The MCP protocol revision this server implements. Broadly supported by
