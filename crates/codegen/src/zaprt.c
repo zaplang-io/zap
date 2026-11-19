@@ -1097,35 +1097,129 @@ static void zap_big_raw_add(uint32_t *a, uint32_t *an,
     *an = n;
     if (carry && n < cap) a[(*an)++] = (uint32_t)carry;
 }
+/* Unsigned raw divmod on base-2^32 little-endian limb buffers. Computes
+ * q = a / b and r = a % b (both non-negative). The inputs are trimmed
+ * magnitudes (top limb non-zero, or length 0 for zero); the outputs are
+ * trimmed and malloc-allocated so callers can free()/realloc() them.
+ *
+ * Historically this walked the dividend bit-by-bit, shifting every active
+ * remainder limb on each of `an*32` steps (cost ~ numerator_bits *
+ * remainder_limbs). A near-equal-length division with a one-limb quotient
+ * therefore paid a full bit-length scan — the pidigits hot path (#1084).
+ *
+ * This is a word-wise long division: a single-limb fast path (schoolbook
+ * division by a scalar) and, for multi-limb divisors, Knuth Algorithm D
+ * (TAOCP vol. 2, 4.3.1): normalize so the divisor's top limb has its high
+ * bit set, estimate each quotient limb from the top two numerator limbs
+ * over the top divisor limb (with the two-limb correction), multiply-and-
+ * subtract, add back on the rare over-estimate, then de-normalize the
+ * remainder. A small quotient now costs ~O(n) limb operations. Sign and
+ * floor/modulo semantics are applied by the signed wrapper and are
+ * unchanged. */
 static void zap_big_raw_divmod(const uint32_t *a, uint32_t an,
                                const uint32_t *b, uint32_t bn,
                                ZapBigRaw *q, ZapBigRaw *r) {
-    q->n = an;
-    q->limb = (uint32_t *)calloc(an ? an : 1, sizeof(uint32_t));
-    r->n = bn + 1;
-    r->limb = (uint32_t *)calloc(r->n, sizeof(uint32_t));
-    if (!q->limb || !r->limb) abort();
+    /* Divide-by-zero: defensive — the signed wrapper already raises before
+     * reaching here. Return 0/0 with freeable buffers. */
     if (!bn) {
-        free(q->limb); free(r->limb); q->limb = r->limb = NULL;
-        q->n = r->n = 0;
+        q->n = 0; q->limb = (uint32_t *)calloc(1, sizeof(uint32_t));
+        r->n = 0; r->limb = (uint32_t *)calloc(1, sizeof(uint32_t));
+        if (!q->limb || !r->limb) abort();
         return;
     }
-    for (uint64_t bit = (uint64_t)an * 32; bit; bit--) {
-        uint64_t k = bit - 1;
-        uint64_t carry = (a[k / 32] >> (k % 32)) & 1u;
-        for (uint32_t i = 0; i < bn + 1; i++) {
-            uint64_t x = ((uint64_t)r->limb[i] << 1) | carry;
-            r->limb[i] = (uint32_t)x;
-            carry = x >> 32;
+    /* a < b (also covers a == 0): quotient 0, remainder = a. */
+    if (zap_big_raw_cmp(a, an, b, bn) < 0) {
+        q->n = 0; q->limb = (uint32_t *)calloc(1, sizeof(uint32_t));
+        r->limb = (uint32_t *)calloc(an ? an : 1, sizeof(uint32_t));
+        if (!q->limb || !r->limb) abort();
+        if (an) memcpy(r->limb, a, an * sizeof(uint32_t));
+        r->n = an; zap_big_trim(r);
+        return;
+    }
+    /* Single-limb divisor: schoolbook long division by a scalar. */
+    if (bn == 1) {
+        uint32_t d = b[0];
+        q->limb = (uint32_t *)calloc(an, sizeof(uint32_t));
+        if (!q->limb) abort();
+        q->n = an;
+        uint64_t rem = 0;
+        for (uint32_t i = an; i; i--) {
+            uint64_t cur = (rem << 32) | a[i - 1];
+            q->limb[i - 1] = (uint32_t)(cur / d);
+            rem = cur % d;
         }
-        r->n = bn + 1;
-        zap_big_trim(r);
-        if (zap_big_raw_cmp(r->limb, r->n, b, bn) >= 0) {
-            zap_big_raw_sub(r->limb, &r->n, b, bn);
-            q->limb[k / 32] |= (uint32_t)1u << (k % 32);
+        zap_big_trim(q);
+        r->limb = (uint32_t *)calloc(1, sizeof(uint32_t));
+        if (!r->limb) abort();
+        r->limb[0] = (uint32_t)rem;
+        r->n = rem ? 1 : 0;
+        return;
+    }
+    /* Knuth Algorithm D. Here an >= bn >= 2. */
+    uint32_t m = an, n = bn;
+    int s = 0;
+    for (uint32_t top = b[n - 1]; !(top & 0x80000000u); top <<= 1) s++;
+    uint32_t *vn = (uint32_t *)calloc(n, sizeof(uint32_t));
+    uint32_t *un = (uint32_t *)calloc((size_t)m + 1, sizeof(uint32_t));
+    if (!vn || !un) abort();
+    /* Normalize the divisor so vn[n-1] has its high bit set. */
+    for (uint32_t i = n - 1; i; i--)
+        vn[i] = (b[i] << s) | (s ? (uint32_t)((uint64_t)b[i - 1] >> (32 - s)) : 0u);
+    vn[0] = b[0] << s;
+    /* Normalize the dividend by the same shift (gains one high limb). */
+    un[m] = s ? (uint32_t)((uint64_t)a[m - 1] >> (32 - s)) : 0u;
+    for (uint32_t i = m - 1; i; i--)
+        un[i] = (a[i] << s) | (s ? (uint32_t)((uint64_t)a[i - 1] >> (32 - s)) : 0u);
+    un[0] = a[0] << s;
+
+    q->limb = (uint32_t *)calloc((size_t)(m - n) + 1, sizeof(uint32_t));
+    if (!q->limb) abort();
+    q->n = m - n + 1;
+
+    const uint64_t BASE = 0x100000000ull;
+    for (uint32_t j = m - n + 1; j--;) {
+        /* Estimate quotient limb from the top two numerator limbs. */
+        uint64_t num = (uint64_t)un[j + n] * BASE + un[j + n - 1];
+        uint64_t qhat = num / vn[n - 1];
+        uint64_t rhat = num % vn[n - 1];
+        while (qhat >= BASE ||
+               qhat * vn[n - 2] > rhat * BASE + un[j + n - 2]) {
+            qhat--;
+            rhat += vn[n - 1];
+            if (rhat >= BASE) break;
         }
+        /* Multiply divisor by qhat and subtract from the numerator window. */
+        int64_t k = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            uint64_t p = qhat * vn[i];
+            int64_t t = (int64_t)un[j + i] - k - (int64_t)(uint32_t)p;
+            un[j + i] = (uint32_t)t;
+            k = (int64_t)(p >> 32) - (t >> 32);
+        }
+        int64_t t = (int64_t)un[j + n] - k;
+        un[j + n] = (uint32_t)t;
+        /* Over-estimate (by at most one): add the divisor back. */
+        if (t < 0) {
+            qhat--;
+            uint64_t carry = 0;
+            for (uint32_t i = 0; i < n; i++) {
+                uint64_t sum = (uint64_t)un[j + i] + vn[i] + carry;
+                un[j + i] = (uint32_t)sum;
+                carry = sum >> 32;
+            }
+            un[j + n] = (uint32_t)(un[j + n] + carry);
+        }
+        q->limb[j] = (uint32_t)qhat;
     }
     zap_big_trim(q);
+    /* De-normalize the remainder: r = (normalized remainder) >> s. */
+    r->limb = (uint32_t *)calloc(n, sizeof(uint32_t));
+    if (!r->limb) abort();
+    for (uint32_t i = 0; i < n; i++)
+        r->limb[i] = s ? (uint32_t)((un[i] >> s) | ((uint64_t)un[i + 1] << (32 - s)))
+                       : un[i];
+    r->n = n; zap_big_trim(r);
+    free(un); free(vn);
 }
 static ZapBigInt *zap_big_parse_chars(const char *s, int64_t len) {
     int sign = 1;
