@@ -233,17 +233,20 @@ changes are gated in review.
 | [`docs/STABILITY.md`](STABILITY.md) | Versioning & stability policy; the D-0076 Stable/Experimental/Internal tiering and the 1.0 contract (D-0070) |
 | [`docs/RELEASING.md`](RELEASING.md) | Release process: `vX.Y.Z` tag convention, how the version bumps, how the changelog rolls (I#207) |
 | [`CHANGELOG.md`](../CHANGELOG.md) | Notable changes, Keep a Changelog format (pre-1.0 / editorial 0.x) |
+| [`changelog.d/`](../changelog.d/) | Changelog fragments (`<number>.<kind>.md`, one per PR) assembled into `CHANGELOG.md` at release |
 | [`design/IR.md`](../design/IR.md) | ZIR — the typed SSA IR (front-end ↔ backend contract) |
 | [`design/RUNTIME-ABI.md`](../design/RUNTIME-ABI.md) | Compiled-code ↔ runtime contract |
 | [`docs/FORMAT.md`](FORMAT.md) | The canonical `zap fmt` style |
 | [`design/NNNN-*.md`](../design/) | Per-feature design docs, from [`design/TEMPLATE.md`](../design/TEMPLATE.md) |
-| [`DECISIONS.md`](../DECISIONS.md) | Decision log (ADR): numbered `D-NNNN` entries, never deleted, only superseded |
+| [`decisions/`](../decisions/) | Going-forward decision log: one ADR file per decision, keyed to its issue/PR number, sharded by domain; CI-generated [`decisions/INDEX.md`](../decisions/INDEX.md) |
+| [`DECISIONS.md`](../DECISIONS.md) | **Frozen** historical decision log — `D-0001…D-0243`; never deleted, only superseded. New decisions live in [`decisions/`](../decisions/) |
 | [`OPEN-QUESTIONS.md`](../OPEN-QUESTIONS.md) | Tracked backlog of unresolved questions |
 | [`ROADMAP.md`](../ROADMAP.md) | Phased build plan |
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | Build, CI gates, tests, and the design-change doc workflow |
 
-**Conventions.** Decisions are recorded as `D-NNNN` in `DECISIONS.md` (mark a
-superseded entry *Superseded* and point at its replacement; never delete). A new
-feature or semantics change goes through `design/` (from `TEMPLATE.md`) →
-`DECISIONS.md` → `SPEC.md` → `GRAMMAR.ebnf`, per the workflow in
-`CONTRIBUTING.md`.
+**Conventions.** New decisions are recorded as per-file ADRs under `decisions/`,
+one file per decision keyed to its issue/PR number (`DECISIONS.md` is frozen as
+the historical `D-0001…D-0243` log; mark a superseded entry *Superseded* and
+point at its replacement; never delete). A new feature or semantics change goes
+through `design/` (from `TEMPLATE.md`) → a `decisions/` ADR → `SPEC.md` →
+`GRAMMAR.ebnf`, per the workflow in `CONTRIBUTING.md`.

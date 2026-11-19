@@ -5,6 +5,19 @@ decisions get a new numbered entry; superseded ones are marked, never deleted.
 This file exists so settled questions are not re-litigated — the single biggest
 time sink in language projects.
 
+> **Frozen / cutover.** This file is the historical decision log,
+> **`D-0001…D-0243`**. Going forward, **new decisions are per-file ADRs under
+> [`decisions/`](decisions/)** — one file per decision, keyed to the governing
+> issue/PR number (see [`decisions/README.md`](decisions/README.md) and
+> [`decisions/tooling/1089-decisions-as-per-file-adrs.md`](decisions/tooling/1089-decisions-as-per-file-adrs.md)).
+> That removes the tail-append conflicts and the hand-allocated-`D-####`
+> collisions that made this single file a bottleneck as contributor count grew.
+> In-flight PRs that already added a `D-####` here are **grandfathered**; the
+> exact moment new entries stop landing in this file is the maintainer's call,
+> made once the open-PR wave drains. Existing entries are **never** moved or
+> deleted — this stays the authority for `D-0001…D-0243` and the supersession
+> relationships recorded before the cutover.
+
 Status legend: **Locked** · **Proposed** (baked into docs, pending confirmation)
 · **Open** · **Superseded**
 

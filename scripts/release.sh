@@ -47,6 +47,18 @@ DATE="$(date +%Y-%m-%d)"
 [ -f "$CHANGELOG" ] || { echo "error: $CHANGELOG not found" >&2; exit 1; }
 [ -f "$CARGO" ]     || { echo "error: $CARGO not found" >&2; exit 1; }
 
+# Remind (do not block) if changelog fragments have not been assembled yet.
+# Fragments live in changelog.d/<number>.<kind>.md (docs/RELEASING.md §2.1); they
+# must be folded into [Unreleased] and removed before rolling the changelog.
+if [ -d changelog.d ]; then
+  frags=$(find changelog.d -maxdepth 1 -name '*.md' ! -name 'README.md' 2>/dev/null | wc -l | tr -d ' ')
+  if [ "${frags:-0}" -gt 0 ]; then
+    echo "warning: $frags unassembled changelog fragment(s) in changelog.d/." >&2
+    echo "         Run 'scripts/build-changelog.sh', fold the output into [Unreleased]," >&2
+    echo "         and 'git rm' the fragments before cutting the release (RELEASING.md §2.1)." >&2
+  fi
+fi
+
 if ! grep -q '^## \[Unreleased\]' "$CHANGELOG"; then
   echo "error: no '## [Unreleased]' section in $CHANGELOG" >&2
   exit 1
