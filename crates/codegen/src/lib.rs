@@ -2277,6 +2277,69 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             self.declare_rt("zap_str_startswith", &[p.into(), p.into()], Some(i.into()));
             self.declare_rt("zap_str_endswith", &[p.into(), p.into()], Some(i.into()));
             self.declare_rt("zap_str_contains", &[p.into(), p.into()], Some(i.into()));
+            // Borrowed-bytes view ABI (#1082): a view is `(backing:ptr, off:i64,
+            // len:i64)`; these entry points read `backing->data` fresh and never
+            // allocate or root (except `zap_strview_to_str`, the materializer).
+            self.declare_rt(
+                "zap_strview_off",
+                &[p.into(), i.into(), i.into()],
+                Some(i.into()),
+            );
+            self.declare_rt(
+                "zap_strview_len",
+                &[p.into(), i.into(), i.into(), i.into()],
+                Some(i.into()),
+            );
+            self.declare_rt(
+                "zap_strview_sub_off",
+                &[p.into(), i.into(), i.into(), i.into(), i.into()],
+                Some(i.into()),
+            );
+            self.declare_rt(
+                "zap_strview_sub_len",
+                &[p.into(), i.into(), i.into(), i.into(), i.into(), i.into()],
+                Some(i.into()),
+            );
+            self.declare_rt(
+                "zap_strview_startswith",
+                &[p.into(), i.into(), i.into(), p.into(), i.into(), i.into()],
+                Some(i.into()),
+            );
+            self.declare_rt(
+                "zap_strview_endswith",
+                &[p.into(), i.into(), i.into(), p.into(), i.into(), i.into()],
+                Some(i.into()),
+            );
+            self.declare_rt(
+                "zap_strview_contains",
+                &[p.into(), i.into(), i.into(), p.into(), i.into(), i.into()],
+                Some(i.into()),
+            );
+            self.declare_rt(
+                "zap_strview_cp_count",
+                &[p.into(), i.into(), i.into()],
+                Some(i.into()),
+            );
+            self.declare_rt(
+                "zap_strview_to_str",
+                &[p.into(), i.into(), i.into()],
+                Some(p.into()),
+            );
+            self.declare_rt(
+                "zap_strview_hash",
+                &[p.into(), i.into(), i.into()],
+                Some(i.into()),
+            );
+            self.declare_rt(
+                "zap_strview_eq_str",
+                &[p.into(), i.into(), i.into(), p.into()],
+                Some(i.into()),
+            );
+            self.declare_rt(
+                "zap_strview_eq",
+                &[p.into(), i.into(), i.into(), p.into(), i.into(), i.into()],
+                Some(i.into()),
+            );
             self.declare_rt("zap_str_find", &[p.into(), p.into()], Some(i.into()));
             self.declare_rt("zap_str_index_of", &[p.into(), p.into()], Some(i.into()));
             self.declare_rt(

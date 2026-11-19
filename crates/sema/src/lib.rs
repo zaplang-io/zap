@@ -2638,6 +2638,8 @@ impl Checker {
                 "bool" => Ty::Bool,
                 "str" => Ty::Str,
                 "bytes" => Ty::Bytes,
+                // A borrowed, non-owning view of a `str`'s bytes (#1082).
+                "strview" => Ty::StrView,
                 "char" => Ty::Char,
                 "bigint" => Ty::Bigint,
                 "complex" => Ty::Complex,
@@ -2756,6 +2758,7 @@ impl Checker {
                 "bool" => Ty::Bool,
                 "str" => Ty::Str,
                 "bytes" => Ty::Bytes,
+                "strview" => Ty::StrView,
                 "char" => Ty::Char,
                 "bigint" => Ty::Bigint,
                 "complex" => Ty::Complex,
@@ -7540,6 +7543,7 @@ impl Checker {
                         | Ty::Char
                         | Ty::Str
                         | Ty::Bytes
+                        | Ty::StrView
                         | Ty::Float64
                         | Ty::Float32
                         | Ty::UntypedFloat
@@ -7559,6 +7563,10 @@ impl Checker {
             }
             if matches!(bt, Ty::Str) {
                 return self.check_str_method(name, args, *span);
+            }
+            // Borrowed `strview` (#1082): the read-only consumer subset only.
+            if matches!(bt, Ty::StrView) {
+                return self.check_strview_method(name, args, *span);
             }
             // Built-in `dict` methods (ticket #299), typed precisely so that
             // `for k in d.keys()`, `for k, v in d.items()`, and a `copy()` that
@@ -7834,6 +7842,32 @@ impl Checker {
     }
 
     fn check_str_method(&mut self, name: &str, args: &[Arg], span: Span) -> Ty {
+        // `s.view()` / `s.view(lo)` / `s.view(lo, hi)` → a borrowed, non-owning
+        // `strview` of this string's bytes (#1082, discussion #1097). The bounds
+        // are codepoint indices (D-0025), like slicing; `str[a:b]`'s copy
+        // semantics are unchanged (views are opt-in). No alloc, no copy — the
+        // view borrows the backing's bytes and is affine (see check_strview_method
+        // + scoped.rs). The optional `lo`/`hi` must be ints.
+        if name == "view" {
+            if args.len() > 2 {
+                self.error(
+                    ErrorCode::ZAP4025,
+                    "str.view() takes 0, 1, or 2 arguments".to_string(),
+                    span,
+                );
+            }
+            for a in args {
+                let at = self.infer(&a.value);
+                if !assignable(&at, &Ty::Int64) && !matches!(at, Ty::Unknown) {
+                    self.error(
+                        ErrorCode::ZAP4024,
+                        format!("str.view() bounds must be int, found {}", at.display()),
+                        expr_span(&a.value),
+                    );
+                }
+            }
+            return Ty::StrView;
+        }
         // Methods taking no arguments → `str`.
         let no_arg_str = matches!(
             name,
@@ -8105,6 +8139,110 @@ impl Checker {
                 self.error(
                     ErrorCode::ZAP4080,
                     format!("str has no method '{name}'"),
+                    span,
+                );
+                for a in args {
+                    self.infer(&a.value);
+                }
+                Ty::Unknown
+            }
+        }
+    }
+
+    /// Type-check a method on a borrowed `strview` (#1082, discussion #1097).
+    ///
+    /// A `strview` exposes only the **read-only consumer** subset — the methods
+    /// that inspect bytes without retaining, copying, or growing them. Anything
+    /// that would need to *own* bytes (`upper`, `replace`, `strip`, `split`,
+    /// `join`, …) is deliberately absent: materialize with `.str()` first. A
+    /// string-taking argument may itself be a `str` or a `strview`.
+    fn check_strview_method(&mut self, name: &str, args: &[Arg], span: Span) -> Ty {
+        // A one-string-argument read-only probe → `bool` (the issue's borrowable
+        // prefix/suffix/membership consumers). Its argument may be `str` or
+        // `strview`. `find`/`index`/`count`/`is*` are deliberately NOT on the v1
+        // strview surface — materialize with `.str()` for those.
+        if matches!(name, "startswith" | "endswith" | "contains") {
+            if args.len() != 1 {
+                self.error(
+                    ErrorCode::ZAP4025,
+                    format!("strview.{name}() takes exactly one argument"),
+                    span,
+                );
+            }
+            for a in args {
+                let at = self.infer(&a.value);
+                if !matches!(at, Ty::Str | Ty::StrView | Ty::Unknown) {
+                    self.error(
+                        ErrorCode::ZAP4024,
+                        format!(
+                            "strview.{name}() expects a str or strview argument, found {}",
+                            at.display()
+                        ),
+                        expr_span(&a.value),
+                    );
+                }
+            }
+            return Ty::Bool;
+        }
+        match name {
+            // `v.len()` — byte/codepoint length, read from the header, no alloc.
+            "len" => {
+                if !args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "strview.len() takes no arguments".to_string(),
+                        span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                }
+                Ty::Int64
+            }
+            // Re-slice a view into a narrower view (#1082): `v.view(lo, hi)`.
+            "view" => {
+                if args.len() > 2 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "strview.view() takes 0, 1, or 2 arguments".to_string(),
+                        span,
+                    );
+                }
+                for a in args {
+                    let at = self.infer(&a.value);
+                    if !assignable(&at, &Ty::Int64) && !matches!(at, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!("strview.view() bounds must be int, found {}", at.display()),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+                Ty::StrView
+            }
+            // Materialize an owned copy — the escape hatch out of the borrow
+            // (the only method that allocates). `v.to_str()` → `str` (`str` is a
+            // reserved type name, so the method cannot be spelled `.str()`).
+            "to_str" => {
+                if !args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "strview.to_str() takes no arguments".to_string(),
+                        span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                }
+                Ty::Str
+            }
+            _ => {
+                self.error(
+                    ErrorCode::ZAP4080,
+                    format!(
+                        "strview has no method '{name}' (strview is a borrowed, read-only \
+                         view; materialize with .str() for owning methods)"
+                    ),
                     span,
                 );
                 for a in args {

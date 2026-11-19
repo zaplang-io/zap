@@ -38,6 +38,98 @@ impl Checker {
         self.check_scoped_well_formed(module);
         self.check_scoped_usage(module);
         self.check_arena_escape(module);
+        self.check_strview_affine(module);
+    }
+
+    /// Borrowed-`strview` affine check (#1082, discussion #1097; `ZAP5135`).
+    ///
+    /// A `strview` is a non-owning view of another string's bytes, sound only
+    /// while its backing is live. It keeps its OWN backing alive within a frame
+    /// (the view embeds the backing as a traced pointer that a moving-GC
+    /// evacuation rewrites — the "2b" base+offset representation), so an
+    /// intra-frame local or a `strview` parameter is always sound. The one hazard
+    /// is a view escaping to somewhere that outlives the backing's frame. Because
+    /// a `strview` is a distinct type and is NOT assignable to/from `str`
+    /// (`assignable` rejects the cross), the only way to escape is for a slot to
+    /// be *declared* `strview`. So the sound, closed enforcement is a
+    /// **type-position** rule: `strview` may not appear as a struct field type, a
+    /// module-global type, a collection element / dict key-or-value type, or a
+    /// function return type. This mirrors the `@scoped` no-escape rule (`ZAP5129`)
+    /// but is type-directed rather than a dataflow walk, which suffices precisely
+    /// because of non-assignability.
+    fn check_strview_affine(&mut self, module: &Module) {
+        for item in &module.items {
+            match item {
+                Item::Function(f) => self.check_strview_fn_sig(f),
+                Item::Struct(s) => {
+                    for field in &s.fields {
+                        self.reject_strview_type(
+                            &field.ty,
+                            field.span,
+                            "a struct field may not be a strview (it would outlive the \
+                             view's backing); store an owned str, or materialize with .str()",
+                        );
+                    }
+                    for m in &s.methods {
+                        self.check_strview_fn_sig(m);
+                    }
+                }
+                Item::Enum(e) => {
+                    for m in &e.methods {
+                        self.check_strview_fn_sig(m);
+                    }
+                }
+                // A module-level `TYPE name = ...` global: its annotation may not be
+                // a strview (a global outlives every frame).
+                Item::Stmt(Stmt::Let {
+                    ty: Some(t), span, ..
+                }) => self.reject_strview_type(
+                    t,
+                    *span,
+                    "a module global may not be a strview (it outlives the view's backing)",
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    /// Reject a `strview` return type on a function/method signature (`ZAP5135`).
+    /// Parameters MAY be `strview` — a borrowing read-only API is the point.
+    fn check_strview_fn_sig(&mut self, f: &zapc_syntax::ast::Function) {
+        if let Some(ret) = &f.ret {
+            self.reject_strview_type(
+                ret,
+                f.span,
+                "a function may not return a strview in v1 (the view would outlive its \
+                 backing's frame); return an owned str via .str(), or keep the view local",
+            );
+        }
+    }
+
+    /// Emit `ZAP5135` if the annotated type `t` resolves to a type that mentions
+    /// `strview` (directly, or nested inside a list/dict/set/tuple/etc.).
+    fn reject_strview_type(&mut self, t: &zapc_syntax::ast::Type, span: Span, why: &str) {
+        let resolved = self.resolve_type(t);
+        if Self::ty_mentions_strview(&resolved) {
+            self.error(ErrorCode::ZAP5135, format!("{why} (#1082)"), span);
+        }
+    }
+
+    /// Does this resolved type contain a `strview` anywhere in its structure?
+    fn ty_mentions_strview(ty: &Ty) -> bool {
+        match ty {
+            Ty::StrView => true,
+            Ty::List(e)
+            | Ty::Set(e)
+            | Ty::Heap(e)
+            | Ty::Deque(e)
+            | Ty::OSet(e)
+            | Ty::Chan(e)
+            | Ty::AtomicArray(e) => Self::ty_mentions_strview(e),
+            Ty::Dict(k, v) => Self::ty_mentions_strview(k) || Self::ty_mentions_strview(v),
+            Ty::Tuple(ts) => ts.iter().any(Self::ty_mentions_strview),
+            _ => false,
+        }
     }
 
     /// Arena-value escape check (#553, D-0158 §3; `ZAP5131`). The `@scoped` usage

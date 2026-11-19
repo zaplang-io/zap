@@ -2053,6 +2053,20 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
             "char" => Ok(Ty::Char),
             "str" => Ok(Ty::Ptr),
             "bytes" => Ok(Ty::Bytes),
+            // A borrowed `strview` (#1082) lowers to a by-value tuple
+            // `(backing: str, byte_off: int64, byte_len: int64)`. Reusing the
+            // tuple/value-aggregate machinery means the `backing` pointer is
+            // traced and rewritten on a moving-GC evacuation via the existing
+            // aggregate-root `(base, desc)` pairs (#586) — the "2b" base+offset
+            // representation — with no new GC-root instruction. Sema (`Ty::StrView`)
+            // keeps it a distinct, affine type; only its physical layout coincides
+            // with a `(str, int64, int64)` tuple, which has no methods, so the
+            // method dispatch never confuses the two.
+            "strview" => Ok(Ty::Struct(
+                env.tuples
+                    .borrow_mut()
+                    .intern(vec![Ty::Ptr, Ty::I64, Ty::I64]),
+            )),
             "bigint" => Ok(Ty::Bigint),
             "complex" => Ok(Ty::Complex),
             "pyobject" => Ok(Ty::Py),
@@ -13318,6 +13332,14 @@ impl<'a> FnLower<'a> {
             let Ty::Struct(sid) = bty else {
                 return Err(err("method call on a non-struct value"));
             };
+            // Borrowed `strview` (#1082): its physical layout is the tuple
+            // `(str, int64, int64)`, so route its read-only methods to the
+            // view-ABI lowering before the generic struct path. Checked by the
+            // interned tuple id; a plain `(str, int64, int64)` tuple has no
+            // methods (sema rejects them), so only a real `strview` lands here.
+            if self.is_strview_sid(sid) {
+                return self.lower_strview_method(recv, name, args);
+            }
             // Arena (#553, D-0158): `a.alloc(bytes, n)` / `a.new(T, ...)` on an
             // arena handle lower to the runtime region allocator, not a struct
             // method call. Sema has already enforced leaf-only and the escape rule.
@@ -19914,6 +19936,26 @@ impl<'a> FnLower<'a> {
             let (v, _t) = s.expr(&args[0].value)?;
             Ok(v)
         };
+        // `s.view()` / `s.view(lo)` / `s.view(lo, hi)` → a borrowed `strview`
+        // (#1082): a by-value tuple `(backing, byte_off, byte_len)`. The byte
+        // bounds are computed once, in the runtime, from the codepoint indices
+        // (D-0025, Python clamping incl. negatives); `has_lo`/`has_hi` make the
+        // zero-arg full view fall out of the same two calls. No owned alloc, no
+        // copy — the tuple aliases `s`'s bytes.
+        if name == "view" {
+            if args.len() > 2 {
+                return Err(err("str.view() takes 0, 1, or 2 arguments"));
+            }
+            let (lo, has_lo) = match args.first() {
+                Some(a) => (self.expr(&a.value)?.0, self.iconst(Ty::I64, 1)),
+                None => (self.iconst(Ty::I64, 0), self.iconst(Ty::I64, 0)),
+            };
+            let (hi, has_hi) = match args.get(1) {
+                Some(a) => (self.expr(&a.value)?.0, self.iconst(Ty::I64, 1)),
+                None => (self.iconst(Ty::I64, 0), self.iconst(Ty::I64, 0)),
+            };
+            return Ok((self.build_strview(recv, lo, has_lo, hi, has_hi), self.strview_ty()));
+        }
         match name {
             "upper" | "lower" => {
                 if !args.is_empty() {
@@ -20300,6 +20342,216 @@ impl<'a> FnLower<'a> {
                 Ok((d, Ty::List(Elem::I64)))
             }
             _ => Err(err(format!("str has no method '{name}'"))),
+        }
+    }
+
+    /// The interned tuple id for a borrowed `strview` — `(backing: str,
+    /// byte_off: int64, byte_len: int64)` (#1082). Always interns the same three
+    /// field types, so the id is stable across the module.
+    fn strview_sid(&self) -> u32 {
+        self.ctx
+            .tuples
+            .borrow_mut()
+            .intern(vec![Ty::Ptr, Ty::I64, Ty::I64])
+    }
+
+    /// The ZIR type of a `strview` value: the tuple struct above.
+    fn strview_ty(&self) -> Ty {
+        Ty::Struct(self.strview_sid())
+    }
+
+    /// Is `sid` the `strview` tuple layout? Used by the method dispatch; safe
+    /// because a plain `(str, int64, int64)` tuple has no methods (sema rejects
+    /// them), so only a real `strview` ever reaches a method call with this id.
+    fn is_strview_sid(&self, sid: u32) -> bool {
+        sid == self.strview_sid()
+    }
+
+    /// Build a `strview` value `(backing, byte_off, byte_len)` (#1082). The byte
+    /// bounds are computed in the runtime from the codepoint indices `lo`/`hi`
+    /// (present per `has_lo`/`has_hi`), so a full view (`has_* == 0`) yields
+    /// `off = 0`, `len = backing->len`. No owned allocation and no byte copy.
+    fn build_strview(
+        &mut self,
+        backing: Value,
+        lo: Value,
+        has_lo: Value,
+        hi: Value,
+        has_hi: Value,
+    ) -> Value {
+        let off = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(off),
+            func: "zap_strview_off".to_string(),
+            args: vec![backing, lo, has_lo],
+        });
+        let len = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(len),
+            func: "zap_strview_len".to_string(),
+            args: vec![backing, off, hi, has_hi],
+        });
+        let sid = self.strview_sid();
+        let dest = self.new_value(Ty::Struct(sid));
+        self.emit(Inst::StructNew { dest, sid });
+        for (idx, v) in [backing, off, len].into_iter().enumerate() {
+            self.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: idx as u32,
+                val: v,
+            });
+        }
+        dest
+    }
+
+    /// Extract the `(backing, byte_off, byte_len)` fields of a `strview` value,
+    /// for passing to a `(base, off, len)` view-ABI runtime entry point (#1082).
+    fn strview_fields(&mut self, recv: Value) -> (Value, Value, Value) {
+        let sid = self.strview_sid();
+        let base = self.new_value(Ty::Ptr);
+        self.emit(Inst::FieldGet {
+            dest: base,
+            base: recv,
+            sid,
+            idx: 0,
+        });
+        let off = self.new_value(Ty::I64);
+        self.emit(Inst::FieldGet {
+            dest: off,
+            base: recv,
+            sid,
+            idx: 1,
+        });
+        let len = self.new_value(Ty::I64);
+        self.emit(Inst::FieldGet {
+            dest: len,
+            base: recv,
+            sid,
+            idx: 2,
+        });
+        (base, off, len)
+    }
+
+    /// Lower a method call on a borrowed `strview` receiver (#1082). Sema has
+    /// already restricted the name/arity to the read-only consumer subset. Each
+    /// method extracts the `(base, off, len)` triple and calls a `_view` runtime
+    /// entry point that operates on the borrowed bytes with **no owned allocation
+    /// and no root** — the whole point of the borrow.
+    fn lower_strview_method(
+        &mut self,
+        recv: Value,
+        name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let (base, off, len) = self.strview_fields(recv);
+        // A single `str`/`strview` argument, materialized to a `(base, off, len)`
+        // triple so the view probes compare borrowed bytes against borrowed bytes.
+        let one_arg_triple = |s: &mut Self| -> Result<(Value, Value, Value), LowerError> {
+            if args.len() != 1 {
+                return Err(err(format!("strview.{name}() takes exactly one argument")));
+            }
+            let (v, t) = s.expr(&args[0].value)?;
+            Ok(match t {
+                // A `strview` argument: already a triple.
+                Ty::Struct(sid) if s.is_strview_sid(sid) => s.strview_fields(v),
+                // A `str` argument: a full view over it (off 0, len = ->len).
+                _ => {
+                    let z = s.iconst(Ty::I64, 0);
+                    let full = s.build_strview(v, z, z, z, z);
+                    s.strview_fields(full)
+                }
+            })
+        };
+        match name {
+            "startswith" | "endswith" | "contains" => {
+                let (abase, aoff, alen) = one_arg_triple(self)?;
+                let func = match name {
+                    "startswith" => "zap_strview_startswith",
+                    "endswith" => "zap_strview_endswith",
+                    _ => "zap_strview_contains",
+                };
+                let raw = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(raw),
+                    func: func.to_string(),
+                    args: vec![base, off, len, abase, aoff, alen],
+                });
+                let zero = self.iconst(Ty::I64, 0);
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred: CmpPred::Ne,
+                    lhs: raw,
+                    rhs: zero,
+                });
+                Ok((d, Ty::I1))
+            }
+            // Codepoint length of the borrowed range (Python `len`, D-0025).
+            "len" => {
+                let d = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_strview_cp_count".to_string(),
+                    args: vec![base, off, len],
+                });
+                Ok((d, Ty::I64))
+            }
+            // Re-slice into a narrower view: `v.view(lo, hi)` (#1082). A view of a
+            // view resolves to a view of the original backing with composed byte
+            // bounds, handled by the runtime `zap_strview_sub`.
+            "view" => {
+                if args.len() > 2 {
+                    return Err(err("strview.view() takes 0, 1, or 2 arguments"));
+                }
+                let (lo, has_lo) = match args.first() {
+                    Some(a) => (self.expr(&a.value)?.0, self.iconst(Ty::I64, 1)),
+                    None => (self.iconst(Ty::I64, 0), self.iconst(Ty::I64, 0)),
+                };
+                let (hi, has_hi) = match args.get(1) {
+                    Some(a) => (self.expr(&a.value)?.0, self.iconst(Ty::I64, 1)),
+                    None => (self.iconst(Ty::I64, 0), self.iconst(Ty::I64, 0)),
+                };
+                // Sub-view byte offset within the backing, then a length, both
+                // relative to the original backing — reuse the creation helpers
+                // with the view's own byte window as the base window.
+                let noff = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(noff),
+                    func: "zap_strview_sub_off".to_string(),
+                    args: vec![base, off, len, lo, has_lo],
+                });
+                let nlen = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(nlen),
+                    func: "zap_strview_sub_len".to_string(),
+                    args: vec![base, off, len, noff, hi, has_hi],
+                });
+                let sid = self.strview_sid();
+                let dest = self.new_value(Ty::Struct(sid));
+                self.emit(Inst::StructNew { dest, sid });
+                for (idx, v) in [base, noff, nlen].into_iter().enumerate() {
+                    self.emit(Inst::FieldSet {
+                        base: dest,
+                        sid,
+                        idx: idx as u32,
+                        val: v,
+                    });
+                }
+                Ok((dest, Ty::Struct(sid)))
+            }
+            // Materialize an owned `str` copy — the one allocating method, the
+            // escape hatch out of the borrow.
+            "to_str" => {
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_strview_to_str".to_string(),
+                    args: vec![base, off, len],
+                });
+                Ok((d, Ty::Ptr))
+            }
+            _ => Err(err(format!("strview has no method '{name}'"))),
         }
     }
 
