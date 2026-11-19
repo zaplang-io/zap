@@ -12863,6 +12863,20 @@ impl<'a> FnLower<'a> {
                 });
                 return Ok((d, Ty::I64));
             }
+            // `__ht_resize_count()` (#1083): cumulative dict/set table regrow
+            // count. Internal test hook behind the capacity / reserve goldens.
+            if fname == "__ht_resize_count" {
+                if !args.is_empty() {
+                    return Err(err("__ht_resize_count() takes no arguments"));
+                }
+                let d = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_ht_resize_count".to_string(),
+                    args: vec![],
+                });
+                return Ok((d, Ty::I64));
+            }
             // `__raise_signal(n)` (ticket #77): internal test hook; send signal n
             // to this process so a golden can trigger delivery deterministically.
             if fname == "__raise_signal" {
@@ -16910,21 +16924,27 @@ impl<'a> FnLower<'a> {
                 "a {ty} is unhashable and cannot be a set element (collections have no stable hash)"
             )));
         }
-        match args.len() {
-            0 => {
-                let set = self.new_value(Ty::Set(elem));
-                self.emit(Inst::Call {
-                    dest: Some(set),
-                    func: "zap_set_new".to_string(),
-                    args: vec![],
-                });
-                Ok((set, Ty::Set(elem)))
-            }
-            1 if args[0].name.is_none() => self.lower_set_from_iterable(&args[0].value, Some(elem)),
-            _ => Err(err(
-                "set[T](...) takes at most one positional iterable argument",
-            )),
+        // A single positional argument is an iterable (`set[T](xs)`); a single
+        // `capacity=` keyword (#1083) pre-sizes an empty set. No argument builds
+        // an empty set.
+        if args.len() == 1 && args[0].name.is_none() {
+            return self.lower_set_from_iterable(&args[0].value, Some(elem));
         }
+        let cap_arg = self.dict_set_capacity_arg(args, "set")?;
+        let set = self.new_value(Ty::Set(elem));
+        self.emit(Inst::Call {
+            dest: Some(set),
+            func: "zap_set_new".to_string(),
+            args: vec![],
+        });
+        if let Some(n) = cap_arg {
+            self.emit(Inst::Call {
+                dest: None,
+                func: "zap_set_reserve".to_string(),
+                args: vec![set, n],
+            });
+        }
+        Ok((set, Ty::Set(elem)))
     }
 
     /// Empty `list[T]()` construction (#1004): the generic-context synonym for
@@ -16972,18 +16992,59 @@ impl<'a> FnLower<'a> {
         let vt = resolve_ty(&expr_to_type(v_expr)?, &self.ctx.tyenv())?;
         let kk = elem_kind(kt, &self.ctx.nested)?;
         let vk = value_elem_kind(vt, &self.ctx.nested)?;
-        if !args.is_empty() {
-            return Err(err(
-                "dict[K, V]() takes no arguments; build a populated dict with a `{...}` literal",
-            ));
-        }
+        // Optional `capacity=` initial-capacity hint (#1083): pre-sizes the SoA
+        // table so a known-large build does not regrow. Sema has validated the
+        // keyword name, int type, and non-negative literal; lowering emits the
+        // fresh dict then a `reserve` for the hint.
+        let cap_arg = self.dict_set_capacity_arg(args, "dict")?;
         let dict = self.new_value(Ty::Dict(kk, vk));
         self.emit(Inst::Call {
             dest: Some(dict),
             func: "zap_dict_new".to_string(),
             args: vec![],
         });
+        if let Some(n) = cap_arg {
+            self.emit(Inst::Call {
+                dest: None,
+                func: "zap_dict_reserve".to_string(),
+                args: vec![dict, n],
+            });
+        }
         Ok((dict, Ty::Dict(kk, vk)))
+    }
+
+    /// Extract and lower an optional `capacity=` constructor keyword into an
+    /// `i64` capacity value (#1083), shared by `dict[K,V](...)` and
+    /// `set[T](capacity=...)`. Returns `None` for no argument. The single
+    /// argument must be the `capacity` keyword; a positional or misnamed
+    /// argument, or a negative literal, is rejected (sema reports the same with
+    /// a precise code, but lowering guards independently — set construction is
+    /// loosely typed in sema). `container` names the surface for messages.
+    fn dict_set_capacity_arg(
+        &mut self,
+        args: &[ast::Arg],
+        container: &str,
+    ) -> Result<Option<Value>, LowerError> {
+        match args.len() {
+            0 => Ok(None),
+            1 => {
+                let a = &args[0];
+                if a.name.as_deref() != Some("capacity") {
+                    return Err(err(format!(
+                        "{container}[...](...) accepts only the keyword `capacity` \
+                         (an initial-capacity hint)"
+                    )));
+                }
+                if is_negative_int_literal(&a.value) {
+                    return Err(err(format!("{container} capacity cannot be negative")));
+                }
+                let (v, vt) = self.expr(&a.value)?;
+                Ok(Some(self.coerce(v, vt, Ty::I64)))
+            }
+            _ => Err(err(format!(
+                "{container}[...](...) takes at most one `capacity=` keyword"
+            ))),
+        }
     }
 
     /// Build a set from an iterable (D17 #609): `set(iterable)` and the
@@ -17067,7 +17128,28 @@ impl<'a> FnLower<'a> {
                 );
                 Ok((self.iconst(Ty::I32, 0), Ty::I32))
             }
-            other => Err(err(format!("set has no method '{other}' (supported: add)"))),
+            // `reserve(n)` (#1083): pre-size the SoA table for ~n more adds. One
+            // positional integer arg; sema (loose for sets) is backed by this
+            // arity/type check, and a negative literal is rejected here too.
+            "reserve" => {
+                if args.len() != 1 || args.iter().any(|a| a.name.is_some()) {
+                    return Err(err("set.reserve(n) takes exactly one positional argument"));
+                }
+                if is_negative_int_literal(&args[0].value) {
+                    return Err(err("set.reserve(n) capacity cannot be negative"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                let n = self.coerce(v, vt, Ty::I64);
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_set_reserve".to_string(),
+                    args: vec![recv, n],
+                });
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
+            other => Err(err(format!(
+                "set has no method '{other}' (supported: add, reserve)"
+            ))),
         }
     }
 
@@ -17093,6 +17175,21 @@ impl<'a> FnLower<'a> {
         // the one-arg `Optional[V]` form) no `Optional$V` instance name is needed.
         if name == "get_default" {
             return self.lower_dict_get_default(recv, kk, vk, args);
+        }
+        // `reserve(n)` (#1083): pre-size the SoA table for ~n more inserts. One
+        // positional integer arg; sema has already rejected a negative literal.
+        if name == "reserve" {
+            if args.len() != 1 {
+                return Err(err("dict.reserve(n) takes exactly one argument"));
+            }
+            let (v, vt) = self.expr(&args[0].value)?;
+            let n = self.coerce(v, vt, Ty::I64);
+            self.emit(Inst::Call {
+                dest: None,
+                func: "zap_dict_reserve".to_string(),
+                args: vec![recv, n],
+            });
+            return Ok((self.iconst(Ty::I32, 0), Ty::I32));
         }
         if !args.is_empty() {
             return Err(err(format!("dict.{name}() takes no arguments")));
@@ -17132,7 +17229,7 @@ impl<'a> FnLower<'a> {
                  (ticket #281)",
             )),
             other => Err(err(format!(
-                "dict has no method '{other}' (supported: keys, values, items, copy, get)"
+                "dict has no method '{other}' (supported: keys, values, items, copy, get, reserve)"
             ))),
         }
     }
@@ -25304,6 +25401,17 @@ impl<'a> FnLower<'a> {
 
 fn is_name(e: &Expr, name: &str) -> bool {
     matches!(e, Expr::Name(n, _) if n == name)
+}
+
+/// True for a statically-negative integer literal — `Unary { Neg, Int }`, e.g.
+/// `-5` (#1083). The lexer never folds the sign into the literal, so a bare
+/// `Expr::Int` is always non-negative. Used to reject a negative `set.reserve`
+/// hint at lowering (set methods are loosely typed in sema).
+fn is_negative_int_literal(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Unary { op: AstUn::Neg, expr, .. } if matches!(expr.as_ref(), Expr::Int(_, _))
+    )
 }
 
 /// Stable runtime ids for the built-in exception hierarchy (I#471). Keep these

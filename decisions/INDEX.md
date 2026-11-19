@@ -22,6 +22,7 @@ listed here (see [`README.md`](README.md)).
 | [972](stdlib/972-collections-conveniences.md) | stdlib collections — Counter / defaultdict / OrderedDict as prelude generics | Locked | 2026-11-19 |
 | [981](stdlib/981-decimal-exact-base10.md) | stdlib decimal — exact base-10 Decimal, software over bigint | Locked | 2026-11-19 |
 | [982](stdlib/982-fractions-exact-rational.md) | stdlib fractions — exact rational Fraction, software over bigint | Locked | 2026-11-19 |
+| [1083](stdlib/1083-dict-set-capacity.md) | dict / set initial-capacity hint on construction + reserve() | Locked | 2026-11-19 |
 | [1095](stdlib/1095-list-pop-and-methods.md) | list.pop plus index / reverse / copy — the remaining Python list methods | Locked | 2026-11-19 |
 
 ## runtime
@@ -29,6 +30,7 @@ listed here (see [`README.md`](README.md)).
 | # | Title | Status | Date |
 |---|-------|--------|------|
 | [1081](runtime/1081-stack-promote-transients.md) | Stack-promote non-escaping transient heap values — pointer-bearing structs and length-bounded strings | Locked | 2026-11-19 |
+| [1084](runtime/1084-bigint-division-algorithm.md) | Native bigint division uses word-wise long division (Knuth Algorithm D) | Locked | 2026-11-19 |
 | [1100](runtime/1100-channel-element-type.md) | A typed channel's element keeps its precise type on receive | Locked | 2026-11-19 |
 
 ## tooling
