@@ -78,6 +78,21 @@ pub enum Elem {
     /// a clean follow-up, so [`elem_kind`] still rejects it there. Introduced so
     /// `linalg.eigvals` can return a `list[complex]`.
     Complex,
+    /// A `bytes` element (#1074, D-0241). Physically a pointer word to a GC
+    /// `ZapStr` — exactly like [`Elem::Ptr`] (a `str` is the same `ZapStr`), so
+    /// it pushes/reads through the `_ptr` runtime entry points, GC-traces as a
+    /// pointer, and — as a dict/set *key* — hashes/compares byte-wise through the
+    /// `str` key path (byte-identical to a `str` key). The distinction from
+    /// [`Elem::Ptr`] exists purely so *lowering* recovers the element's `bytes`
+    /// identity on read-back (`rows[i]`, `for row in rows`): a flat `Ptr` reads
+    /// back as [`Ty::Ptr`] (`str`), so `len(rows[i])` wrongly took the `str`
+    /// **codepoint** count (`zap_str_len_cp`) instead of the `bytes` **byte**
+    /// count (`zap_str_len`), and indexing/slicing/Display defaulted to `str`
+    /// semantics. [`Elem::ty`] returns [`Ty::Bytes`] so every read-back position
+    /// recovers the scalar `bytes`. Admitted in every collection position a
+    /// `str` is (value element, dict key/value, set member), since `bytes` is a
+    /// `ZapStr` with the same word, suffix, and hashing.
+    Bytes,
 }
 
 impl Elem {
@@ -98,6 +113,10 @@ impl Elem {
             // A complex element reads back as the scalar `complex` (#928): its
             // physical pointer word is reinterpreted as a `ZapComplex *`.
             Elem::Complex => Ty::Complex,
+            // A bytes element reads back as the scalar `bytes` (#1074): its
+            // physical `ZapStr` pointer word retains `bytes` identity, so
+            // `len`/indexing/slicing/Display use byte (not codepoint) semantics.
+            Elem::Bytes => Ty::Bytes,
         }
     }
     /// The runtime-entry-point suffix for an element/value of this kind. Struct
@@ -107,8 +126,9 @@ impl Elem {
         match self {
             Elem::I64 | Elem::Bool | Elem::Char | Elem::Enum(_) => "i64",
             Elem::F64 => "f64",
-            // `complex` is a heap pointer word, stored/read through the `_ptr` path.
-            Elem::Ptr | Elem::Struct(_) | Elem::Nested(_) | Elem::Complex => "ptr",
+            // `complex` and `bytes` are heap pointer words (`ZapComplex` /
+            // `ZapStr`), stored/read through the `_ptr` path like `str`.
+            Elem::Ptr | Elem::Struct(_) | Elem::Nested(_) | Elem::Complex | Elem::Bytes => "ptr",
         }
     }
     /// The runtime-entry-point suffix for a *key* of this kind. Pointer keys are
@@ -117,7 +137,9 @@ impl Elem {
     pub fn key_suffix(self) -> &'static str {
         match self {
             Elem::I64 | Elem::Bool | Elem::Char | Elem::Enum(_) => "i64",
-            Elem::Ptr => "str",
+            // `bytes` is a `ZapStr`, hashed/compared byte-wise exactly like a
+            // `str` key (#1074), so it shares the `str` key path.
+            Elem::Ptr | Elem::Bytes => "str",
             Elem::Struct(_) => "fn",
             // A float dict KEY / set MEMBER (#803) routes to the `_f64` key entry
             // points (`zap_dict_set_f64_*`, `zap_set_add_f64`, …), which take the
