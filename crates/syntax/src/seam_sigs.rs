@@ -481,6 +481,13 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
         "linear_regression",
         &["xs", "ys", "proportional"],
     ),
+    // ---- decimal (#981, #981): exact base-10 Decimal constructors ----
+    // Both take a single positional value, named for the keyword form
+    // (`decimal.Decimal(value="1.50")`). The `Decimal` arithmetic/`quantize`/
+    // `div` surface is prelude-struct methods (kwargs via method_param_info,
+    // I#481), not seam functions, so they carry no rows here.
+    ("decimal", "Decimal", &["value"]),
+    ("decimal", "from_float", &["f"]),
     // ---- net (ticket #104): plaintext TCP over opaque socket handles ----
     // (connect_ip_deadline is left on the legacy path pending a settled name
     // for its deadline parameter.)

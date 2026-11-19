@@ -1929,3 +1929,32 @@ fn statistics_too_many_args_rejected() {
         "ZAP4025",
     );
 }
+
+// ---------------------------------------------------------------------------
+// decimal (#981, #981) — the two seam constructors bind their single value by
+// keyword. (The Decimal arithmetic / quantize / div surface is prelude-struct
+// methods, so their keyword arguments ride method_param_info, not the seam.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn decimal_constructor_keyword_binds() {
+    assert_ok("import decimal\ndef f():\n    auto a = decimal.Decimal(value=\"1.50\")\n");
+    assert_ok("import decimal\ndef f():\n    auto a = decimal.Decimal(value=42)\n");
+    assert_ok("import decimal\ndef f():\n    auto a = decimal.from_float(f=1.25)\n");
+}
+
+#[test]
+fn decimal_constructor_unknown_keyword_rejected() {
+    assert_code(
+        "import decimal\ndef f():\n    auto a = decimal.Decimal(val=\"1.50\")\n",
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn decimal_too_many_args_rejected() {
+    assert_code(
+        "import decimal\ndef f():\n    auto a = decimal.Decimal(\"1\", \"2\")\n",
+        "ZAP4025",
+    );
+}

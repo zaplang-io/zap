@@ -299,6 +299,44 @@ decode (odd length or non-hex → `ValueError`); `crypto.token_hex` and
 of these live under the Zap-only `crypto` namespace (Python has no `crypto`
 module), so they are additive surface, not behavioral changes.
 
+### `decimal.Decimal` (#981, #981)
+
+Zap's exact base-10 `Decimal` matches CPython's `decimal` for parsing,
+`str()` formatting (the General Decimal Arithmetic *to-scientific-string* rules),
+exact `+ - *`, division rounded to a precision, `quantize`, comparisons and the
+eight rounding modes (verified against CPython across a large battery). It
+deliberately differs in a few places:
+
+- **No global/thread-local context.** CPython keeps a mutable `getcontext()`
+  precision + rounding that `+ - *` *and* `/` consult. Zap has none: `+ - *` are
+  **always exact** (so `Decimal("1e30") + Decimal("1")` keeps every digit, where
+  CPython rounds to the context's 28), and the only operations that round —
+  `/` / `div` and `quantize` — take the precision/rounding **per call**
+  (`a.div(b, prec=28, rounding="ROUND_HALF_EVEN")`; the `/` operator uses those
+  same defaults). This removes hidden, concurrency-unsafe state.
+- **Rounding modes are string tags**, e.g. `rounding="ROUND_HALF_EVEN"`. The tag
+  *values* equal CPython's `decimal.ROUND_*` constant values, so the call reads
+  almost identically; Zap does not (yet) export named `ROUND_*` constants.
+- **No special values.** `Infinity` / `NaN` (and `sNaN`) are not modelled —
+  parsing one raises `ValueError`. Zap `Decimal` is finite-only.
+- **No signed zero.** A zero result is always unsigned: `Decimal("0") *
+  Decimal("-1")` is `0`, where CPython yields `-0`.
+- **Flat exception model.** CPython's `decimal.InvalidOperation` (malformed
+  literal, unknown rounding tag) and `decimal.DivisionByZero` both surface as
+  Zap's `ValueError` (Zap has no exception subclassing — the `statistics` /
+  `StatisticsError` precedent).
+- **`quantize` never raises on precision.** CPython raises `InvalidOperation` if
+  the quantized result would exceed the context precision; with no context, Zap's
+  `quantize` always succeeds.
+- **`from_float` is shortest-round-trip, not exact-binary.** CPython's
+  `Decimal.from_float(0.1)` expands the full binary value
+  (`0.1000000000000000055…`); Zap's `decimal.from_float(0.1)` is `Decimal("0.1")`
+  (the float's shortest decimal string, matching Go's shopspring `NewFromFloat`).
+  Constructing a `Decimal` *directly* from a float is a compile error either way
+  — `from_float` is the explicit opt-in.
+- **No decimal literal.** There is no `1.50d` syntax; construct via
+  `decimal.Decimal("1.50")`. (A literal is a possible later grammar addition.)
+
 ---
 
 ## Parity backlog

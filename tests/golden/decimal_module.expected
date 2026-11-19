@@ -1,0 +1,49 @@
+exact_sum 0.3 True
+parse_fixed 1.50 -0.001
+parse_int 42 -7
+parse_leadzero 123 0.5
+parse_dot 1 42
+parse_ws 3.14
+parse_sci 1.5E+3 0.01
+parse_bigexp 9.99E+5 1E+10
+zero_scale 0.00 0
+big_sum 123456789012345678901234567890.12350
+big_mul 9999999999999999999800000000000000000001
+add_scale 3.75
+sub 3.90
+sub_neg -2
+mul_scale 2.2500
+mul_zero 0.00
+div_exact 0.5 0.25
+div_ten 0.1
+div_third_28 0.3333333333333333333333333333
+div_third_5 0.33333
+div_seventh_10 0.1428571429
+div_neg -1.666666666666666666666666667
+div_rounding 0.7
+round_half_even 2 4
+round_half_up 3
+round_half_down 2
+round_down 2
+round_up 3
+round_floor -3 2
+round_ceiling -2 3
+round_05up 1 2
+cents_even 1.00
+cents_default 20.00
+cents_neg -1.01
+scale_up 1.5000
+to_integral 3
+eq_scale True
+cmp True True
+ne True
+cmp_neg True True
+to_int_trunc 1 -1
+to_int_big 999
+exponent -3 0
+is_zero True False
+from_float 1.25 0.5
+cart_total 15.00
+caught_parse
+caught_divzero
+caught_badmode
