@@ -166,10 +166,13 @@ the language surface, the IR schema, or the runtime ABI goes through docs
    (with concrete `.zap` examples), Rationale (alternatives rejected),
    Compatibility, Implementation, Open issues. Wrap text near 80 columns and
    start each sentence on a new line so review comments and diffs stay precise.
-4. **Record the decision** in [`DECISIONS.md`](DECISIONS.md) as a new numbered
-   `D-NNNN` entry with **Status**, the decision, and the **Rationale**. Never
-   delete an entry; mark a superseded one *Superseded* and point at its
-   replacement.
+4. **Record the decision** as a new per-file ADR under
+   [`decisions/`](decisions/) — one file per decision, keyed to the governing
+   issue/PR number (see [`decisions/README.md`](decisions/README.md)), with a
+   **Status**, the decision, and the **Rationale**. New decisions no longer go in
+   [`DECISIONS.md`](DECISIONS.md), which is frozen as the historical
+   `D-0001…D-0243` log; never delete an entry, and mark a superseded one
+   *Superseded* pointing at its replacement.
 5. **Update the spec** ([`SPEC.md`](SPEC.md)) — it is the source of truth, so it
    must match what the compiler does. Walk the [Python-divergence
    checklist](docs/DIVERGENCE_CHECKLIST.md) and pin the new/changed semantics
@@ -185,10 +188,14 @@ need extra care: they are what lets front-end, middle-end, and runtime work
 proceed in parallel.
 
 **Changelog.** Any change to a public surface (language, stdlib, CLI, package
-format) also adds an entry under `[Unreleased]` in
-[`CHANGELOG.md`](CHANGELOG.md), and the PR states its change class
-(PATCH/MINOR/MAJOR) per [`docs/STABILITY.md`](docs/STABILITY.md). How a release
-is cut and how the version bumps is [`docs/RELEASING.md`](docs/RELEASING.md).
+format) also adds a **changelog fragment** under
+[`changelog.d/`](changelog.d/) — `changelog.d/<number>.<kind>.md`, see
+[`changelog.d/README.md`](changelog.d/README.md) — instead of editing the
+`[Unreleased]` tail of [`CHANGELOG.md`](CHANGELOG.md) directly (distinct fragment
+files never conflict). The PR states its change class (PATCH/MINOR/MAJOR) per
+[`docs/STABILITY.md`](docs/STABILITY.md). How a release is cut, and how the
+fragments are assembled and the version bumps, is
+[`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## Where documentation lives
 
@@ -197,9 +204,10 @@ is *normative and lasting* or *point-in-time*.
 
 **Stays in the repo (changed via pull requests).** Normative, spec-level,
 tooling-read, and version-coupled docs live in git and evolve with the code:
-[`SPEC.md`](SPEC.md), [`DECISIONS.md`](DECISIONS.md),
-[`docs/GRAMMAR.ebnf`](docs/GRAMMAR.ebnf), [`docs/STABILITY.md`](docs/STABILITY.md),
-`tests/conformance/CLAIMS.md`, [`CHANGELOG.md`](CHANGELOG.md),
+[`SPEC.md`](SPEC.md), [`DECISIONS.md`](DECISIONS.md) and the per-file ADRs under
+[`decisions/`](decisions/), [`docs/GRAMMAR.ebnf`](docs/GRAMMAR.ebnf),
+[`docs/STABILITY.md`](docs/STABILITY.md), `tests/conformance/CLAIMS.md`,
+[`CHANGELOG.md`](CHANGELOG.md) and its [`changelog.d/`](changelog.d/) fragments,
 [`README.md`](README.md), [`ROADMAP.md`](ROADMAP.md),
 [`docs/REPO_ARCHITECTURE.md`](docs/REPO_ARCHITECTURE.md), and the contributor
 guides. As a rule of thumb, anything CI or the tests read stays here — for
@@ -217,9 +225,10 @@ triage write-ups. Pick a category:
 - **Announcements** — releases.
 - **Show and tell** — demos.
 
-**When a Discussion settles a decision**, record the outcome in
-[`DECISIONS.md`](DECISIONS.md) as a `D-NNNN` entry and link back to the
-Discussion so the rationale and debate stay discoverable.
+**When a Discussion settles a decision**, record the outcome as a per-file ADR
+under [`decisions/`](decisions/) (keyed to the issue/PR number — see
+[`decisions/README.md`](decisions/README.md)) and link back to the Discussion so
+the rationale and debate stay discoverable.
 
 This policy applies to *new* documentation going forward; existing in-repo docs
 are not being migrated.
@@ -254,17 +263,32 @@ are not being migrated.
 
 ## Workflow: branches and pull requests
 
-1. Branch from `main`. Descriptive branch names with the issue number work well:
-   `feature/with-statement-185`, `fix/gc-immix-spawn-188`. If you work with
-   several checkouts, use `git worktree add` — the Makefile gives each worktree
-   its own cargo target volume so concurrent builds don't contaminate each other.
-2. Keep a PR to **one issue**. Put `Closes #n` in the PR description (GitHub's
-   keyword syntax; elsewhere still write `I#n`).
-3. Run the [CI gates](#the-ci-gates) locally, then push.
-4. Open the PR; the template is a checklist of what reviewers look for. Confirm
-   that **both** CI triggers (`pull_request` and `push`) are green.
-5. Don't force-push over review history without saying so; do rebase or merge
-   `main` if you've fallen behind.
+1. Branch from a **fresh `origin/main`**. Descriptive branch names with the issue
+   number work well: `feature/with-statement-185`, `fix/gc-immix-spawn-188`. If
+   you work with several checkouts, use `git worktree add` — the Makefile gives
+   each worktree its own cargo target volume so concurrent builds don't
+   contaminate each other.
+2. **Keep PRs small; one issue per PR.** A focused PR reviews faster, and because
+   every commit that lands on `main` is one CI-passed change, `git bisect` always
+   lands on a buildable commit. Split a large feature into a **stack of dependent
+   PRs** rather than one mega-PR. Put `Closes #n` in the PR description (GitHub's
+   keyword syntax; elsewhere still write `I#n`). A non-blocking advisory may label
+   an oversized PR (`size:L` / `size:XL`) and suggest splitting it — it never
+   blocks merge.
+3. **Squash-merge, linear history.** PRs are **squash-merged** and `main` keeps a
+   **linear history** (no merge commits): one CI-passed commit per PR. The **PR
+   title becomes the squash commit subject**, so write it as the Conventional-
+   Commits line from [Conventions](#conventions) — `type(scope): I#n summary`
+   (e.g. `feat(with): I#185 context-manager protocol`). The PR description body
+   becomes the commit body.
+4. Run the [CI gates](#the-ci-gates) locally, then push. The **fast PR gate**
+   (format, clippy, host tests, `zap fmt`, and the Node extension) runs on your
+   pull request for quick feedback. The **full matrix** (LLVM × both collectors ×
+   x86/arm64 + Windows) runs on the **merge-queue candidate** and after merge, not
+   on every PR push. Once the merge queue is enabled you no longer hand-rebase to
+   re-run it — the queue tests your PR rebased on `main` plus the PRs ahead of it.
+   Keep your branch reasonably current, but don't rebase just to re-trigger CI.
+5. Don't force-push over review history without saying so.
 
 Using a coding agent is welcome — Zap is built for it. Hold agent output to the
 same bar: it must pass the same gates, follow these conventions, and you are

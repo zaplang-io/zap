@@ -1,0 +1,85 @@
+name: PR size advisory
+
+# Non-blocking nudge toward the small-PR norm (Epic #1088 / Discussion #1087,
+# Workstream 1; see CONTRIBUTING.md "Workflow"). It measures the changed lines in
+# a PR (excluding lockfiles, vendored code and generated files), labels the PR
+# size:S/M/L/XL, and leaves a one-time friendly comment on a large PR suggesting a
+# split into stacked PRs.
+#
+# It NEVER blocks merge: the job is continue-on-error and is not part of the
+# `CI gate` aggregate. On a fork PR the GITHUB_TOKEN is read-only, so labeling is
+# skipped silently — that is fine, the advisory is best-effort.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-size-${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  size:
+    name: label PR size
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Measure, label, and advise
+        run: |
+          set -uo pipefail
+
+          # Sum additions + deletions over the PR's files, excluding paths that do
+          # not reflect authored effort: vendored code, lockfiles, packaged
+          # artifacts, and the generated decisions index.
+          exclude='^third_party/|(^|/)Cargo\.lock$|(^|/)package-lock\.json$|\.lock$|\.vsix$|^decisions/INDEX\.md$'
+          total=$(gh api --paginate "repos/$REPO/pulls/$PR/files" \
+            | jq -s "add
+                | map(select(.filename | test(\"$exclude\") | not))
+                | map(.additions + .deletions) | add // 0") || total=0
+          echo "Counted changed lines (excluding vendored/generated): $total"
+
+          # Buckets. L/XL are the ones worth a nudge.
+          if   [ "$total" -lt 100 ];  then label="size:S"; color="0E8A16"; desc="under 100 changed lines";
+          elif [ "$total" -lt 400 ];  then label="size:M"; color="FBCA04"; desc="100-399 changed lines";
+          elif [ "$total" -lt 1000 ]; then label="size:L"; color="D93F0B"; desc="400-999 changed lines";
+          else                             label="size:XL"; color="B60205"; desc="1000+ changed lines"; fi
+          echo "Bucket: $label"
+
+          # Ensure the label exists (idempotent), drop any other size:* label, add this one.
+          gh label create "$label" --repo "$REPO" --color "$color" --description "PR size: $desc" --force >/dev/null 2>&1 || true
+          for l in size:S size:M size:L size:XL; do
+            [ "$l" = "$label" ] && continue
+            gh pr edit "$PR" --repo "$REPO" --remove-label "$l" >/dev/null 2>&1 || true
+          done
+          gh pr edit "$PR" --repo "$REPO" --add-label "$label" >/dev/null 2>&1 || true
+
+          # One-time advisory comment on a large PR (keyed on a hidden marker).
+          case "$label" in
+            size:L|size:XL)
+              marker="<!-- pr-size-advisory -->"
+              exists=$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+                | jq -s "add | any(.[]; .body | contains(\"$marker\"))" 2>/dev/null || echo false)
+              if [ "$exists" != "true" ]; then
+                body="$(printf '%s\n' \
+                  "$marker" \
+                  "**Heads up — this is a large PR (\`$label\`, ~$total changed lines).**" \
+                  "" \
+                  "Smaller PRs review faster and keep \`main\`'s history easy to bisect. If" \
+                  "this change is separable, consider splitting it into a **stack of" \
+                  "dependent PRs** (see [CONTRIBUTING → Workflow](https://github.com/$REPO/blob/main/CONTRIBUTING.md#workflow-branches-and-pull-requests))." \
+                  "" \
+                  "This is only advice — it does not block merge." \
+                  "" \
+                  "_PR size advisory._")"
+                gh pr comment "$PR" --repo "$REPO" --body "$body" >/dev/null 2>&1 || true
+              fi
+              ;;
+          esac
