@@ -1,20 +1,33 @@
 name: CI
 
-# Build and test on every pull request and on every push to `main`, both on a
-# plain host (front-end crates, no LLVM) and in a full environment that mirrors
-# the LLVM 18 dev container (.devcontainer/Dockerfile) so codegen and the golden
-# end-to-end tests run too.
+# Two gates (Epic #1088 / Discussion #1087, Workstream 2):
 #
-# The `push` trigger is restricted to `main` on purpose: PR-branch commits are
-# already built by the `pull_request` event, and because that event and the
-# `push` event land in different `concurrency` groups (github.ref is
-# refs/pull/<n>/merge vs refs/heads/<branch>) an unrestricted `push` trigger ran
-# the whole matrix twice for every PR commit. Limiting `push` to `main` keeps the
-# merge-to-main run while leaving PR commits to the single pull_request run.
+#   * FAST PR gate — runs on `pull_request`: the host build (front-end crates, no
+#     LLVM: fmt/clippy/test/zap-fmt) and the Node extension. Quick contributor
+#     feedback, cheap to run on every push.
+#   * FULL gate — the LLVM 18 matrix (both collectors) + aarch64 + the Windows
+#     jobs. These NO LONGER run on `pull_request`. They run on the `merge_group`
+#     candidate (so the merge queue tests each PR rebased on main + the PRs ahead
+#     of it) and on `push` to `main` (post-merge). This ends the matrix-on-every-
+#     push CI waste while keeping "main always builds, tested-as-rebased".
+#
+# The single `CI gate` aggregate (bottom) is the required status check on both
+# events: green on a PR when the fast jobs pass, green in the queue when the full
+# matrix passes. Its name is unchanged, so no branch-protection edit is needed.
+#
+# CUTOVER: once the full matrix runs on `merge_group` instead of `pull_request`, a
+# PR is only fully validated inside the queue, so this must land together with the
+# maintainer enabling the Merge Queue (RFC checklist).
+#
+# `push` stays restricted to `main`: PR-branch commits are covered by the
+# `pull_request` (fast) and `merge_group` (full) events, and an unrestricted
+# `push` trigger would double-run on PR branches (different `concurrency` groups,
+# github.ref refs/pull/<n>/merge vs refs/heads/<branch>).
 on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
@@ -25,11 +38,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Change detection (ticket: CI path filtering for doc-only PRs). Cheap,
-  # always-run, no LLVM. Decides whether this change touches *code* (=> run the
-  # full matrix) or is *docs-only* (=> skip the heavy jobs). Everything downstream
-  # gates on `outputs.code`. FAIL SAFE: any ambiguity, missing ref, or error
-  # defaults to code=true, so we never skip real CI by mistake.
+  # Change detection + affected-target selection. Cheap, always-run, no LLVM.
+  # Emits two outputs so a PR only runs the jobs it affects:
+  #   * `rust`   — a non-doc path that is NOT solely the Node extension changed
+  #                (=> run the Rust/LLVM jobs: host + the full/arm64/windows gate).
+  #   * `vscode` — editors/vscode/** changed (=> run the Node extension job).
+  # A docs-only change leaves both false (all heavy jobs skip). The two axes are
+  # independent: the extension lives outside the Cargo workspace, so a Node-only
+  # PR skips the Rust matrix and a Rust-only PR skips the Node job.
+  # FAIL SAFE: any ambiguity, missing ref, or error sets BOTH true, so we never
+  # skip real CI by mistake. (No crate-level skipping: the merge gate must fully
+  # validate main.)
   #
   # Self-contained git-diff script (no external action) so the push/PR ref logic
   # and the zero-before-SHA edge case are explicit and auditable:
@@ -42,7 +61,8 @@ jobs:
     name: changes
     runs-on: ubuntu-latest
     outputs:
-      code: ${{ steps.detect.outputs.code }}
+      rust: ${{ steps.detect.outputs.rust }}
+      vscode: ${{ steps.detect.outputs.vscode }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -54,12 +74,15 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           PUSH_BEFORE: ${{ github.event.before }}
         run: |
-          # No `set -e`: we handle every failure explicitly and fail safe to code=true.
+          # No `set -e`: we handle every failure explicitly and fail safe to
+          # running every affected target (rust=true, vscode=true).
           set -uo pipefail
 
-          emit() { echo "code=$1" >> "$GITHUB_OUTPUT"; echo "Decision: code=$1"; }
+          emit() { echo "$1=$2" >> "$GITHUB_OUTPUT"; echo "Decision: $1=$2"; }
+          failsafe() { echo "Fail safe: running all targets."; emit rust true; emit vscode true; exit 0; }
 
           files=""
           if [ "$EVENT_NAME" = "pull_request" ]; then
@@ -67,59 +90,76 @@ jobs:
             if [ -n "$base" ] && git cat-file -e "${base}^{commit}" 2>/dev/null; then
               files="$(git diff --name-only "$base" HEAD)"
             else
-              echo "PR base SHA unavailable ($base); fail safe."; emit true; exit 0
+              echo "PR base SHA unavailable ($base); fail safe."; failsafe
+            fi
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            # The merge-queue candidate: diff the whole batch against the main
+            # commit it is based on. Same affected-selection as a PR, so a
+            # docs-only change stays cheap even inside the queue.
+            base="$MERGE_BASE_SHA"
+            if [ -n "$base" ] && git cat-file -e "${base}^{commit}" 2>/dev/null; then
+              files="$(git diff --name-only "$base" HEAD)"
+            else
+              echo "merge_group base SHA unavailable ($base); fail safe."; failsafe
             fi
           elif [ "$EVENT_NAME" = "push" ]; then
             before="$PUSH_BEFORE"
             zero="0000000000000000000000000000000000000000"
             if [ -z "$before" ] || [ "$before" = "$zero" ]; then
-              echo "Initial push / zero before-SHA; fail safe."; emit true; exit 0
+              echo "Initial push / zero before-SHA; fail safe."; failsafe
             elif git cat-file -e "${before}^{commit}" 2>/dev/null; then
               files="$(git diff --name-only "$before" HEAD)"
             elif git rev-parse HEAD~1 >/dev/null 2>&1; then
               echo "before-SHA $before not fetched; falling back to HEAD~1."
               files="$(git diff --name-only HEAD~1 HEAD)"
             else
-              echo "No usable before-SHA or HEAD~1; fail safe."; emit true; exit 0
+              echo "No usable before-SHA or HEAD~1; fail safe."; failsafe
             fi
           else
-            echo "Unknown event $EVENT_NAME; fail safe."; emit true; exit 0
+            echo "Unknown event $EVENT_NAME; fail safe."; failsafe
           fi
 
           echo "Changed files:"; printf '%s\n' "$files"
 
           if [ -z "$files" ]; then
-            echo "No changed files detected; treating as docs-only."; emit false; exit 0
+            echo "No changed files detected; treating as docs-only."
+            emit rust false; emit vscode false; exit 0
           fi
 
-          # Docs paths (safe to skip heavy CI). `case` patterns match '/' with '*',
-          # so `*.md` covers **/*.md (incl. editors/**/*.md) and `docs/*` covers
-          # docs/**. ANY path that is not a doc path flips the whole change to code.
-          code=false
+          # Classify each changed path. `case` patterns match '/' with '*', so
+          # `*.md` covers **/*.md (incl. editors/**/*.md) and `docs/*` covers
+          # docs/**. A path under editors/vscode/ only needs the Node extension
+          # job; any OTHER non-doc path needs the Rust/LLVM jobs. A PR touching
+          # both sets both. A pure docs change sets neither.
+          rust=false
+          vscode=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             case "$f" in
               *.md) ;;
               # docs/GRAMMAR.ebnf is load-bearing (I#396): a grammar test lints
               # it and runs a conformance corpus against the real parser, so an
-              # edit to it must trigger the host job even though it lives in docs/.
-              docs/GRAMMAR.ebnf) echo "code path (load-bearing grammar): $f"; code=true ;;
+              # edit to it must trigger the Rust jobs even though it lives in docs/.
+              docs/GRAMMAR.ebnf) echo "rust path (load-bearing grammar): $f"; rust=true ;;
               docs/*) ;;
               design/*) ;;
               LICENSE*) ;;
               .github/ISSUE_TEMPLATE/*) ;;
-              *) echo "code path: $f"; code=true ;;
+              editors/vscode/*) echo "vscode path: $f"; vscode=true ;;
+              *) echo "rust path: $f"; rust=true ;;
             esac
           done <<< "$files"
 
-          emit "$code"
+          emit rust "$rust"
+          emit vscode "$vscode"
 
   # Fast path: the default members only (no LLVM). Mirrors what `cargo test`
   # does on a host without LLVM (e.g. Intel macOS); keeps that path green.
   host:
     name: host (no LLVM)
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # Fast PR gate: runs on pull_request, merge_group and push when Rust changed.
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -168,7 +208,8 @@ jobs:
   vscode-extension:
     name: vscode extension (Node/TS)
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # Fast PR gate: only when the Node extension itself changed.
+    if: needs.changes.outputs.vscode == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -233,7 +274,8 @@ jobs:
   full:
     name: full (LLVM 18 + codegen)
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # FULL gate: the merge-queue candidate and post-merge main, NOT every PR push.
+    if: needs.changes.outputs.rust == 'true' && (github.event_name == 'merge_group' || github.event_name == 'push')
     runs-on: ubuntu-latest
     # Authenticate the image pull with the repo GITHUB_TOKEN so the leg works
     # even while the GHCR package is private (it is owned by this repo's org, so
@@ -330,7 +372,8 @@ jobs:
   arm64:
     name: arm64 (aarch64 Linux + codegen)
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # FULL gate: the merge-queue candidate and post-merge main, NOT every PR push.
+    if: needs.changes.outputs.rust == 'true' && (github.event_name == 'merge_group' || github.event_name == 'push')
     runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
@@ -411,7 +454,8 @@ jobs:
   windows-ctxswitch:
     name: "Windows coroutine context switch (I#195 / A1)"
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # FULL gate: the merge-queue candidate and post-merge main, NOT every PR push.
+    if: needs.changes.outputs.rust == 'true' && (github.event_name == 'merge_group' || github.event_name == 'push')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -484,7 +528,8 @@ jobs:
   windows-a3:
     name: "Windows signals / preemption / faults (I#197 / A3)"
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # FULL gate: the merge-queue candidate and post-merge main, NOT every PR push.
+    if: needs.changes.outputs.rust == 'true' && (github.event_name == 'merge_group' || github.event_name == 'push')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -542,7 +587,8 @@ jobs:
   windows-netpoller:
     name: "Windows IOCP netpoller (I#196 / A2)"
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # FULL gate: the merge-queue candidate and post-merge main, NOT every PR push.
+    if: needs.changes.outputs.rust == 'true' && (github.event_name == 'merge_group' || github.event_name == 'push')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -607,7 +653,8 @@ jobs:
   windows-runtime:
     name: "Windows full-program runtime (I#198 / A4)"
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # FULL gate: the merge-queue candidate and post-merge main, NOT every PR push.
+    if: needs.changes.outputs.rust == 'true' && (github.event_name == 'merge_group' || github.event_name == 'push')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -700,7 +747,8 @@ jobs:
   windows-crates:
     name: "Windows front-end crates (I#199 / A5)"
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # FULL gate (best-effort): the merge-queue candidate and post-merge main.
+    if: needs.changes.outputs.rust == 'true' && (github.event_name == 'merge_group' || github.event_name == 'push')
     runs-on: windows-latest
     continue-on-error: true
     steps:
@@ -724,16 +772,20 @@ jobs:
         run: cargo test
 
   # Aggregate status gate. THIS is the single required status check for `main`
-  # (branch-protection ruleset), replacing the per-matrix contexts. It runs on
-  # BOTH triggers, is never path-gated (always reports a status), and depends on
-  # every heavy job plus `changes`. `if: always()` makes it run even when a
-  # dependency was skipped (docs-only) or failed.
+  # (branch-protection ruleset), replacing the per-matrix contexts. It runs on all
+  # three events (pull_request, merge_group, push), is never path-gated (always
+  # reports a status), and depends on every heavy job plus `changes`.
+  # `if: always()` makes it run even when a dependency was skipped or failed.
   #
   # Pass/fail rule: GREEN when every needed job is `success` OR `skipped`; RED if
-  # any is `failure` or `cancelled`. So a docs-only change (heavy jobs skipped) is
-  # green, and a code change is green only when the whole matrix passed. This is
-  # the standard pattern that avoids the GitHub footgun where a *skipped* required
-  # matrix check would block merge forever.
+  # any is `failure` or `cancelled`. This is the standard pattern that avoids the
+  # GitHub footgun where a *skipped* required matrix check would block merge
+  # forever. Concretely:
+  #   * on `pull_request` the heavy jobs are skipped by design, so the gate is
+  #     green once the fast jobs (host / vscode) pass — the fast PR gate;
+  #   * on `merge_group` and `push` the full matrix runs, so the gate is green
+  #     only when every leg passes — the full gate;
+  #   * a docs-only change skips everything and is green on any event.
   #
   # `windows-crates` is intentionally NOT a dependency: it is best-effort
   # (`continue-on-error: true`) and must stay non-blocking, so it is excluded from
