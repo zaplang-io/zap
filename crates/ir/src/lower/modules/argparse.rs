@@ -8,10 +8,10 @@
 
 use zapc_syntax::ast;
 
-use super::support::{call_ret, call_void, lower_args};
+use super::support::{call_ret, call_void, empty_str, lower_args};
 use super::ModuleLower;
 use crate::ir::*;
-use crate::lower::{FnLower, LowerError};
+use crate::lower::{err, FnLower, LowerError};
 
 pub(super) const MODULE: ModuleLower = ModuleLower {
     name: "argparse",
@@ -23,6 +23,38 @@ fn lower(
     method: &str,
     args: &[ast::Arg],
 ) -> Result<Option<(Value, Ty)>, LowerError> {
+    // `argparse.ArgumentParser(prog="", description="")` — the object-model
+    // constructor (#997, D-0238). Like `concurrent.Counter`, it builds the
+    // prelude `struct ArgumentParser` by delegating to the prelude free function
+    // `__argparse_new` (crates/syntax/src/parser.rs); omitted trailing string
+    // arguments are padded with an empty `str` so the fixed-arity call always
+    // gets both words. Everything else about a parser (methods, parsing) is pure
+    // prelude Zap, so there is no runtime symbol to declare.
+    if method == "ArgumentParser" {
+        let sid = lowerer
+            .ctx
+            .ids
+            .get("ArgumentParser")
+            .copied()
+            .ok_or_else(|| err("ArgumentParser unavailable (built-in prelude missing)"))?;
+        let prog = match args.first() {
+            Some(a) => {
+                let (v, vt) = lowerer.expr(&a.value)?;
+                lowerer.coerce(v, vt, Ty::Ptr)
+            }
+            None => empty_str(lowerer),
+        };
+        let desc = match args.get(1) {
+            Some(a) => {
+                let (v, vt) = lowerer.expr(&a.value)?;
+                lowerer.coerce(v, vt, Ty::Ptr)
+            }
+            None => empty_str(lowerer),
+        };
+        let dest = lowerer.new_value(Ty::Struct(sid));
+        lowerer.throwing_call(Some(dest), "__argparse_new", vec![prog, desc]);
+        return Ok(Some((dest, Ty::Struct(sid))));
+    }
     // `get_flag` returns a C int64 0/1, normalized to an `i1`; it is fallible
     // (unknown argument), so it is a throwing call rather than `call_bool`.
     if method == "get_flag" {

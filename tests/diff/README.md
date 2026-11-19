@@ -66,8 +66,13 @@ Intentional (locked decisions):
 |---|---|
 | `default_arg_once` | D-0038 — defaults evaluated per call, not once at def (fixes Python's mutable-default footgun) |
 | `and_or_value` | D-0022 — `and`/`or` yield a strict `bool`, not the surviving operand |
-| `dict_order` | D-0056 — built-in `dict` is hash-ordered; insertion order is the opt-in `collections` ordered map |
 | `int_overflow` | D-0005 / D-0019 — default `int` is a wrapping int64; `bigint` is the arbitrary-precision opt-in |
+
+`dict`/`set` iteration order is also an intentional divergence (D-0056/D-0235 —
+hash order, not insertion order), but it is **unspecified and seed-dependent**
+(#1064), so it is not pinned as a fixture: a case that printed a multi-entry
+str-keyed dict's order would flake under the per-process hash seed. The
+order-independent behaviour is covered by `dict_lookup`.
 
 Bugs found on `main` (for triage; NOT fixed in this PR):
 

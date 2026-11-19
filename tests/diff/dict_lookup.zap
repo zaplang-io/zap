@@ -1,9 +1,9 @@
 # diff: match
 # Dict lookup and membership that are order-independent: `len`, indexed reads,
 # and `k in d` (dict membership is supported; LIST membership is not — see
-# list_membership.zap). Dict *iteration order* is a separate deliberate
-# divergence (dict_order.zap); nothing here depends on it. String `in` (substring
-# membership) is also exercised.
+# list_membership.zap). Dict *iteration order* is unspecified and seed-dependent
+# (D-0235), so it is never asserted here — nothing in this case depends on it.
+# String `in` (substring membership) is also exercised.
 def mark(bool b) -> int64:
     if b:
         return 1

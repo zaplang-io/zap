@@ -1,0 +1,22 @@
+usage: tool [-h] [--verbose] [--name name] src
+
+A demo tool.
+
+positional arguments:
+  src  source file
+
+options:
+  -h, --help  show this help message and exit
+  --verbose  be loud
+  --name name  your name
+---
+usage: git [-h] [--config config] command ...
+
+positional arguments:
+  command  {build,test}
+
+options:
+  -h, --help  show this help message and exit
+
+global options:
+  --config config  config path

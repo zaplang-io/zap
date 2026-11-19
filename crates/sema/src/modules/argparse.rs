@@ -8,11 +8,12 @@
 //! then read typed results back (`get`/`get_int`/`get_flag`). `-h`/`--help`
 //! auto-prints the generated usage; `format_help()` exposes it directly.
 
+use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
 
 use super::{expect_argc, ModuleCheck};
-use crate::{Checker, Ty};
+use crate::{expr_span, Checker, Ty};
 
 pub(super) const MODULE: ModuleCheck = ModuleCheck {
     name: "argparse",
@@ -21,6 +22,36 @@ pub(super) const MODULE: ModuleCheck = ModuleCheck {
 
 fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Option<Ty> {
     Some(match method {
+        // The object-model constructor (#997, D-0238): `argparse.ArgumentParser(
+        // prog="", description="")` builds the prelude `struct ArgumentParser` (a
+        // real value, not the global singleton). Both arguments are optional
+        // `str`s (bound by name / defaulted through the seam, D-0204).
+        "ArgumentParser" => {
+            if args.len() > 2 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "argparse.ArgumentParser() takes 0 to 2 arguments, found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+            }
+            for a in args {
+                let at = checker.infer(&a.value);
+                if !matches!(at, Ty::Str | Ty::Unknown) {
+                    checker.error(
+                        ErrorCode::ZAP4024,
+                        format!(
+                            "argparse.ArgumentParser() expects str arguments, found {}",
+                            at.display()
+                        ),
+                        expr_span(&a.value),
+                    );
+                }
+            }
+            Ty::Named("ArgumentParser".to_string())
+        }
         // Parser metadata (shown in --help).
         "set_prog" | "set_description" => {
             expect_argc(checker, "argparse", method, args, 1, span);
