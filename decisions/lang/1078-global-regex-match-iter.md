@@ -2,7 +2,7 @@
 title: Global regex match `=~ m/.../g` yields an iterable `list[Match]` (eager)
 status: Locked
 issue: 1078
-pr:
+pr: 1109
 date: 2026-11-19
 domain: lang
 supersedes:
