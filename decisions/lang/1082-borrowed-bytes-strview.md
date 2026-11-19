@@ -2,7 +2,7 @@
 title: Borrowed-bytes `strview` — explicit non-owning string view for read-only consumers
 status: Locked
 issue: 1082
-pr:
+pr: 1101
 date: 2026-11-19
 domain: lang
 supersedes:
