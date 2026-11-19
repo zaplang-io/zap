@@ -10,7 +10,7 @@
 
 use zapc_syntax::ast;
 
-use super::support::{call_bool, call_ret, call_void, line_reader_wrap, lower_args};
+use super::support::{call_bool, call_ret, call_void, empty_str, line_reader_wrap, lower_args};
 use super::ModuleLower;
 use crate::ir::*;
 use crate::lower::{err, FnLower, LowerError};
@@ -101,6 +101,68 @@ fn lower_open_reader(lowerer: &mut FnLower, arg: &ast::Arg) -> Result<(Value, Ty
     line_reader_wrap(lowerer, handle)
 }
 
+/// `fs.mkstemp([prefix, suffix, dir])` -> `(fd, path)` (#979, D-0239). The three
+/// optional str arguments are padded to a fixed 3-word runtime call — an omitted
+/// `prefix` defaults to `"tmp"` (Python `tempfile`'s prefix), `suffix`/`dir` to
+/// `""` (empty `dir` => the platform temp dir, resolved in the runtime). The
+/// create is the throwing/validating call (a bad `dir`, no permission, etc.
+/// raises a catchable error); the two getters then read the handle's fd and path
+/// back into an `(int64, str)` tuple (the scandir/walk handle pattern, #1032).
+fn lower_mkstemp(lowerer: &mut FnLower, a: Vec<Value>) -> (Value, Ty) {
+    let prefix = match a.first().copied() {
+        Some(v) => v,
+        None => {
+            let d = lowerer.new_value(Ty::Ptr);
+            lowerer.emit(Inst::StrConst {
+                dest: d,
+                bytes: b"tmp".to_vec(),
+            });
+            d
+        }
+    };
+    let suffix = a.get(1).copied().unwrap_or_else(|| empty_str(lowerer));
+    let dir = a.get(2).copied().unwrap_or_else(|| empty_str(lowerer));
+    let handle = lowerer.new_value(Ty::Ptr);
+    lowerer.throwing_call(Some(handle), "zap_fs_mkstemp", vec![prefix, suffix, dir]);
+    let fd = lowerer.new_value(Ty::I64);
+    lowerer.emit(Inst::Call {
+        dest: Some(fd),
+        func: "zap_fs_mkstemp_fd".to_string(),
+        args: vec![handle],
+    });
+    let path = lowerer.new_value(Ty::Ptr);
+    lowerer.emit(Inst::Call {
+        dest: Some(path),
+        func: "zap_fs_mkstemp_path".to_string(),
+        args: vec![handle],
+    });
+    // Intern the (int64, str) tuple with the real field types — str stays a
+    // pointer word (`Ty::Ptr`), matching how `fs.walk` interns its tuple (#1032).
+    let tuple_sid = lowerer
+        .ctx
+        .tuples
+        .borrow_mut()
+        .intern(vec![Ty::I64, Ty::Ptr]);
+    let tup = lowerer.new_value(Ty::Struct(tuple_sid));
+    lowerer.emit(Inst::StructNew {
+        dest: tup,
+        sid: tuple_sid,
+    });
+    lowerer.emit(Inst::FieldSet {
+        base: tup,
+        sid: tuple_sid,
+        idx: 0,
+        val: fd,
+    });
+    lowerer.emit(Inst::FieldSet {
+        base: tup,
+        sid: tuple_sid,
+        idx: 1,
+        val: path,
+    });
+    (tup, Ty::Struct(tuple_sid))
+}
+
 fn lower(
     lowerer: &mut FnLower,
     method: &str,
@@ -129,6 +191,12 @@ fn lower(
         "size" => call_ret(lowerer, "zap_fs_size", a, Ty::I64, true),
         "listdir" => call_ret(lowerer, "zap_os_listdir", a, Ty::List(Elem::Ptr), true),
         "mkdtemp" => call_ret(lowerer, "zap_fs_mkdtemp", a, Ty::Ptr, true),
+        // Tempfile (#979, D-0239). mkstemp pads/builds its (fd, path) tuple;
+        // gettempdir never raises; write_atomic is a throwing void call (an I/O
+        // error must reach try/except, so throwing_call/invoke, not plain Call).
+        "mkstemp" => lower_mkstemp(lowerer, a),
+        "gettempdir" => call_ret(lowerer, "zap_fs_gettempdir", a, Ty::Ptr, false),
+        "write_atomic" => call_void(lowerer, "zap_fs_write_atomic", a, true),
         // Filesystem gaps (#968, D-0211).
         "mtime" => call_ret(lowerer, "zap_fs_mtime", a, Ty::I64, true),
         "rename" => call_void(lowerer, "zap_fs_rename", a, true),

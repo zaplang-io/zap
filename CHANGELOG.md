@@ -25,8 +25,28 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`fs` tempfile — `mkstemp`, `gettempdir`, atomic write** (#979, D-0239, epic
+  #966). Fills the temp-*file* hole next to the existing `fs.mkdtemp` (temp
+  *directory*), matching Python `tempfile` / Go `os.CreateTemp` + `os.TempDir`.
+  **`fs.mkstemp([prefix, suffix, dir]) -> (fd, path)`** creates a uniquely-named
+  temp file with an `O_EXCL` no-clobber create and returns a **raw read+write
+  fd** (drive it with `io.write` / `io.close_fd`) plus its path; `prefix`
+  defaults `"tmp"`, `suffix` `""`, and an empty `dir` resolves to the temp dir
+  (all three are optional, recommended as kwargs). **`fs.gettempdir() -> str`**
+  returns the platform temp directory (`$TMPDIR` else `/tmp`; Windows `$TMP` /
+  `$TEMP` else the system default). **`fs.write_atomic(path, data)`** writes to a
+  temp file in the *same directory* and `rename`s it into place, so a reader
+  never sees a half-written file and a crash leaves the complete old or new file
+  — never a truncated one (same-dir temp ⇒ the rename is atomic, not a
+  cross-device copy; POSIX `fsync` + replacing `rename`, Windows
+  `MoveFileEx(REPLACE_EXISTING)`). Name generation is a portable `O_EXCL` retry
+  loop (pid + atomic counter, no coarse-time dependence), so `prefix`/`suffix`
+  behave identically on POSIX and Windows. The higher-level **`fs.temp_file`**
+  (Python `NamedTemporaryFile`) is **deferred** to a follow-up pending the `io`
+  writer / file-object shape (#969); `mkstemp` already exposes the raw fd+path
+  and `write_atomic` covers safe writes, so nothing is blocked.
 - **`io` gains a buffered writer / file object — `io.writer(fd)`** (#1071,
-  D-0239, epic #966). The write twin of the #969 reader. `io.writer(fd)` wraps an
+  D-0240, epic #966). The write twin of the #969 reader. `io.writer(fd)` wraps an
   open, writable fd in the prelude **`Writer`** object: `w.write(data) -> int64`
   (bytes written, 8 KiB-buffered), `w.flush()` drains the buffer, and `w.close_()`
   flushes then closes the underlying fd (idempotent; `close` is a reserved word,

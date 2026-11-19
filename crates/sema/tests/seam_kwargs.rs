@@ -1228,7 +1228,7 @@ fn io_lines_and_fs_open_reader_unknown_keyword_rejected() {
     );
 }
 
-// Buffered writer / file object (#1071, D-0239): io.writer(fd) + the prelude
+// Buffered writer / file object (#1071, D-0240): io.writer(fd) + the prelude
 // `Writer` methods. `io.writer` is the only public seam fn (one row); the
 // `_writer_*` delegates are internal and positional (no rows).
 #[test]
@@ -1567,4 +1567,125 @@ fn process_popen_ctor_and_methods_typecheck() {
     assert_ok(&prog(
         "    auto p = process.Popen([\"/bin/cat\"], merge_stderr=True, stderr=False)\n    auto d = p.done()\n    auto code = p.poll()\n    p.terminate()\n    p.kill()\n    auto pid = p.pid()\n",
     ));
+}
+
+// ---------------------------------------------------------------------------
+// fs tempfile (#979, D-0239): mkstemp / gettempdir / write_atomic keyword binding
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fs_mkstemp_no_args() {
+    // All three parameters optional — the bare call returns the (fd, path) tuple.
+    assert_ok(&prog("    auto fd, p = fs.mkstemp()\n"));
+}
+
+#[test]
+fn fs_mkstemp_positional_prefix() {
+    assert_ok(&prog("    auto fd, p = fs.mkstemp(\"build-\")\n"));
+}
+
+#[test]
+fn fs_mkstemp_positional_prefix_suffix() {
+    assert_ok(&prog("    auto fd, p = fs.mkstemp(\"build-\", \".tmp\")\n"));
+}
+
+#[test]
+fn fs_mkstemp_positional_all_three() {
+    assert_ok(&prog(
+        "    auto fd, p = fs.mkstemp(\"build-\", \".tmp\", \"/tmp\")\n",
+    ));
+}
+
+#[test]
+fn fs_mkstemp_keyword_prefix_only() {
+    assert_ok(&prog("    auto fd, p = fs.mkstemp(prefix=\"build-\")\n"));
+}
+
+#[test]
+fn fs_mkstemp_keyword_suffix_only_fills_prefix_hole() {
+    // `prefix` sits before `suffix`; the binder must default it (no hole error)
+    // when only `suffix` is supplied by keyword.
+    assert_ok(&prog("    auto fd, p = fs.mkstemp(suffix=\".log\")\n"));
+}
+
+#[test]
+fn fs_mkstemp_keyword_dir_only_fills_prefix_and_suffix_holes() {
+    // `prefix` and `suffix` both precede `dir`; both must default when only `dir`
+    // is supplied.
+    assert_ok(&prog("    auto fd, p = fs.mkstemp(dir=\"/var/tmp\")\n"));
+}
+
+#[test]
+fn fs_mkstemp_all_keywords_reordered() {
+    // Reordered keywords must still land in the right slots.
+    assert_ok(&prog(
+        "    auto fd, p = fs.mkstemp(dir=\"/tmp\", suffix=\".tmp\", prefix=\"build-\")\n",
+    ));
+}
+
+#[test]
+fn fs_mkstemp_positional_and_keyword_mix() {
+    assert_ok(&prog(
+        "    auto fd, p = fs.mkstemp(\"build-\", dir=\"/tmp\")\n",
+    ));
+}
+
+#[test]
+fn fs_mkstemp_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto fd, p = fs.mkstemp(prefx=\"typo\")\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn fs_mkstemp_duplicate_value_rejected() {
+    // `prefix` supplied both positionally and by keyword.
+    assert_code(
+        &prog("    auto fd, p = fs.mkstemp(\"a\", prefix=\"b\")\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn fs_mkstemp_too_many_args_rejected() {
+    assert_code(
+        &prog("    auto fd, p = fs.mkstemp(\"a\", \"b\", \"c\", \"d\")\n"),
+        "ZAP4025",
+    );
+}
+
+#[test]
+fn fs_gettempdir_ok() {
+    assert_ok(&prog("    auto d = fs.gettempdir()\n"));
+}
+
+#[test]
+fn fs_gettempdir_rejects_args() {
+    assert_code(&prog("    auto d = fs.gettempdir(\"x\")\n"), "ZAP4025");
+}
+
+#[test]
+fn fs_write_atomic_positional() {
+    assert_ok(&prog("    fs.write_atomic(\"out.txt\", \"hello\")\n"));
+}
+
+#[test]
+fn fs_write_atomic_keywords_reordered() {
+    assert_ok(&prog(
+        "    fs.write_atomic(data=\"hello\", path=\"out.txt\")\n",
+    ));
+}
+
+#[test]
+fn fs_write_atomic_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    fs.write_atomic(\"out.txt\", contents=\"hello\")\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn fs_write_atomic_wrong_arity_rejected() {
+    assert_code(&prog("    fs.write_atomic(\"out.txt\")\n"), "ZAP4025");
 }

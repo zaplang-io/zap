@@ -504,7 +504,7 @@ struct LineReader:
         return (line, True)
 
 # Writer — a buffered writable file object over an io.writer handle (#1071,
-# D-0239). The write twin of LineReader: a thin reference struct over the opaque
+# D-0240). The write twin of LineReader: a thin reference struct over the opaque
 # buffered-writer handle (like Lock / LineReader wrap their handles) giving the
 # method and context-manager surface the raw handle cannot. `write` returns the
 # number of bytes written, `flush` drains the buffer, and `close_` flushes then
@@ -1995,7 +1995,7 @@ fn references_prelude(module: &Module) -> bool {
         "\"open_reader\"",
         "\"LineReader\"",
         // The `io.writer(fd)` buffered file object returns the prelude `Writer`
-        // struct (#1071, D-0239): injected for any program that names the `io`
+        // struct (#1071, D-0240): injected for any program that names the `io`
         // module or the struct directly. Over-injection for an `io.read`-only
         // program is harmless — the unused struct emits no code.
         "\"Writer\"",

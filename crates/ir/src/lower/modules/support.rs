@@ -50,7 +50,7 @@ fn prelude_sid(lowerer: &FnLower, name: &str) -> Result<u32, LowerError> {
     })
 }
 
-/// Lower `io.writer(fd)` (#1071, D-0239): allocate a fresh buffered-writer handle
+/// Lower `io.writer(fd)` (#1071, D-0240): allocate a fresh buffered-writer handle
 /// via `zap_io_writer_new(fd)` and wrap it in a freshly-constructed prelude
 /// `Writer` (field 0 = `_h`). The constructor only allocates — it does no I/O —
 /// so it is a plain (non-throwing) call; the object's `write`/`flush`/`close`

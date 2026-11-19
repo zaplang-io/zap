@@ -63,7 +63,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "io", method, args, 1, span);
             Ty::Named("LineReader".to_string())
         }
-        // Buffered writer / file-object (#1071, D-0239) — the write twin of the
+        // Buffered writer / file-object (#1071, D-0240) — the write twin of the
         // #969 reader. `writer(fd)` wraps an open, writable fd in the prelude
         // `Writer` struct (field 0 = the opaque `bytes` handle). The object's
         // methods (`write`/`flush`/`close`/`__enter__`/`__exit__`) delegate to

@@ -1,4 +1,4 @@
-# Golden fixture: io buffered writer / file object (#1071, D-0239) — the write
+# Golden fixture: io buffered writer / file object (#1071, D-0240) — the write
 # twin of the #969 buffered reader. Exercises write/flush/close_ over a fresh
 # mkdtemp sandbox, a round-trip read-back (fs.read_file and the #969
 # io.reader/io.readall), a large write that bypasses the 8 KiB buffer, ordered

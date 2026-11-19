@@ -12210,7 +12210,77 @@ prelude-struct value pattern), [[D-0204]] (the seam keyword-binding convention)
 and [[D-0202]] (seam ctor sugar). No grammar change — a prelude struct, its
 methods, and one seam constructor.
 
-## D-0239 — stdlib io: buffered writer / file object — `io.writer(fd)` + a `Writer` struct (#1071 / epic #966)
+## D-0239 — stdlib `fs` tempfile: `mkstemp` (fd + path), `gettempdir`, `write_atomic`; `temp_file` deferred (#979 / epic #966)
+
+**Context.** `fs.mkdtemp` ([[D-0056]]) creates a temp *directory*, but there was
+no temp *file* primitive. Tools that need a safe scratch file (unique name, no
+races) or an atomic file write (no half-written file ever visible) had to
+hand-roll it. #979 (Discussion #965 gap #13, epic #966) fills the hole, matching
+Python `tempfile` / Go `os.CreateTemp` + `os.TempDir`.
+
+1. **`fs.mkstemp([prefix, suffix, dir]) -> (fd, path)`.** Create a uniquely-named
+   temp file and return a **raw int64 fd** (open for read+write) plus its path —
+   the fd stays consistent with the existing raw-fd `io` model ([[D-0056]]), so
+   `io.write(fd, …)` / `io.close_fd(fd)` drive it. Creation uses `O_EXCL`, so it
+   never clobbers an existing name (and a name race loses cleanly, retrying).
+   Name generation is the runtime's own portable `O_EXCL` retry loop (pid + an
+   atomic per-call counter, **no coarse-time dependence** — the collision class
+   behind the #917 nanosecond-name flake), so `prefix`/`suffix` behave
+   identically on POSIX and Windows rather than depending on `mkstemps`
+   (a BSD/glibc extension not available under the runtime's feature macros).
+   Defaults: `prefix="tmp"` (Python's), `suffix=""`, `dir=""` ⇒ `gettempdir()`.
+   The runtime returns an opaque handle whose two fields the lowering reads back
+   into the `(int64, str)` tuple (the scandir/walk handle pattern, #1032). The
+   **caller owns both** the fd (close it) and the file (remove it) — like Python
+   `mkstemp` and Go `os.CreateTemp`.
+
+2. **`fs.gettempdir() -> str`.** The platform temp directory: POSIX `$TMPDIR`
+   else `/tmp`; Windows `$TMP` / `$TEMP` else the system default. Reuses the
+   existing `zap_tempdir()` search order (already powering `mkdtemp`), matching
+   Python `tempfile.gettempdir` / Go `os.TempDir`.
+
+3. **`fs.write_atomic(path, data) -> unit`.** Write `data` (a `str`) to a
+   freshly-created temp file in the **same directory** as `path`, then `rename`
+   it onto `path`. A reader therefore never observes a half-written file, and a
+   crash leaves either the complete old file or the complete new one — never a
+   truncated one. Siting the temp beside the target keeps the `rename`
+   same-filesystem (atomic), not a cross-device copy. On POSIX the bytes are
+   `fsync`'d before the rename (durability; atomicity itself is the rename) and
+   `rename` atomically replaces an existing target; on Windows `rename` cannot
+   replace, so `MoveFileEx(…, MOVEFILE_REPLACE_EXISTING)` does the atomic swap.
+   The write-temp-then-rename idiom (Go; Python `os.replace`-based helpers). A
+   **`write_bytes_atomic`** (bytes payload) and a Windows durability `fsync`
+   equivalent are documented follow-ups; `str` payload matches `fs.write_file`.
+
+4. **`fs.temp_file` (Python `NamedTemporaryFile`) — DEFERRED.** The issue itself
+   gates it on the `io` reader/writer shape (#969). #969 shipped only the
+   buffered *reader* ([[D-0212]]) and explicitly deferred the *writer /
+   file-object* shape; a proper `NamedTemporaryFile` wants a file-like handle
+   (`.write`/`.read`/`.name`, `with`-auto-remove via the [[D-0069]]
+   context-manager protocol), which belongs with that writer work. `mkstemp`
+   already exposes the raw fd + path and `write_atomic` covers safe writes, so
+   nothing is blocked. `temp_file` is a follow-up on the io writer/file-object
+   PR; building a throwaway thin handle now would diverge from Python and be
+   reworked. (The writer-shape work is tracked separately under epic #966.)
+
+**Seam (positional-vs-kwarg).** `mkstemp`'s `prefix`/`suffix`/`dir` are **all
+optional trailing str kwargs** and far clearer named (`fs.mkstemp(suffix=".log")`,
+`fs.mkstemp(dir="/var/tmp")`) — **recommended kwargs**, not positional. A row is
+added to `crates/syntax/src/seam_sigs.rs`, with `prefix`→`SeamDefault::Str("tmp")`
+and `suffix`→`SeamDefault::Str("")` in `SEAM_METHOD_DEFAULTS` so a keyword call
+that skips an interior parameter (e.g. supplying only `dir=`) fills the hole by
+name; `dir` is the trailing optional (resolved to the temp dir at runtime).
+`write_atomic(path, data)` — both required — also gets a row ([[D-0213]]: every
+≥1-arg seam fn is keyword-capable). `gettempdir` takes no arguments (no row).
+Cases in `crates/sema/tests/seam_kwargs.rs`.
+
+Relates to [[D-0056]] (the raw-fd `io`/`fs` model + `mkdtemp`/`zap_tempdir` this
+builds on), [[D-0211]] (the #968 `fs` mutation surface, incl. `rename` used by
+`write_atomic`), [[D-0212]] (the #969 reader whose writer twin `temp_file`
+awaits), [[D-0204]] (the seam keyword-binding convention) and [[D-0213]] (the
+keyword-capable-surface rule). No grammar change — stdlib methods only.
+
+## D-0240 — stdlib io: buffered writer / file object — `io.writer(fd)` + a `Writer` struct (#1071 / epic #966)
 
 **Context.** [[D-0212]] (#969) shipped the *read* side of line-oriented I/O — an
 opaque buffered `io.reader(fd)` handle with `io.readline`/`readall`/`readn` — and
@@ -12289,5 +12359,7 @@ on this `Writer` later (tracked under #979). This slice is `io.writer` + the
 
 Relates to [[D-0212]] (the #969 reader this twins), [[D-0069]] (the `with`
 protocol reused), [[D-0133]] (the opaque pointer-free handle precedent),
+[[D-0217]] (the distinct unbuffered `sys.stdout`/`sys.write` streams), [[D-0239]]
+(the #979 `fs` tempfile that `fs.temp_file` will join to this writer),
 [[D-0056]] / #97 (the `io` seam), [[D-0213]] (the single-argument seam row),
 [[D-0204]] (seam kwargs), epic #966, and Discussion #965 (gap #3).

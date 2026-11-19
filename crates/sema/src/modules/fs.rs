@@ -3,7 +3,7 @@
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
 
-use super::{expect_argc, ModuleCheck};
+use super::{expect_argc, expect_argc_range, ModuleCheck};
 use crate::{Checker, Ty};
 
 pub(super) const MODULE: ModuleCheck = ModuleCheck { name: "fs", check };
@@ -83,6 +83,28 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "mkdtemp" => {
             expect_argc(checker, "fs", method, args, 0, span);
             Ty::Str
+        }
+        // Tempfile (#979, D-0239).
+        // fs.mkstemp([prefix, suffix, dir]) -> (fd, path): create a uniquely-named
+        // temp file (O_EXCL, no clobber) and return its raw fd and path. All three
+        // are optional trailing str kwargs (prefix defaults "tmp", suffix "", dir
+        // => the platform temp dir). Python `tempfile.mkstemp` / Go `os.CreateTemp`.
+        "mkstemp" => {
+            expect_argc_range(checker, "fs", method, args, 0, 3, span);
+            Ty::Tuple(vec![Ty::Int64, Ty::Str])
+        }
+        // fs.gettempdir() -> str: the platform temp directory (Python
+        // `tempfile.gettempdir` / Go `os.TempDir`).
+        "gettempdir" => {
+            expect_argc(checker, "fs", method, args, 0, span);
+            Ty::Str
+        }
+        // fs.write_atomic(path, data) -> unit: write `data` to a sibling temp file
+        // then rename it onto `path`, so a half-written file is never visible
+        // (write-temp-then-rename). Raises on an I/O error.
+        "write_atomic" => {
+            expect_argc(checker, "fs", method, args, 2, span);
+            Ty::Unit
         }
         // Filesystem gaps (#968, D-0211).
         // Metadata: `stat` returns the prelude `Stat` value struct; `mtime` an int.

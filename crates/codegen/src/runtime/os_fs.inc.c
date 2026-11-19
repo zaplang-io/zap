@@ -656,6 +656,170 @@ void *zap_fs_mkdtemp(void) {
 }
 
 /* ===========================================================================
+ * stdlib: fs tempfile (ticket #979, D-0239)
+ * ---------------------------------------------------------------------------
+ * `fs.mkstemp` (a uniquely-named temp FILE: raw fd + path, O_EXCL no-clobber),
+ * `fs.gettempdir` (the platform temp dir), and `fs.write_atomic` (the
+ * write-temp-then-rename safe-write idiom). The higher-level `fs.temp_file`
+ * (Python `NamedTemporaryFile`) is deferred to a follow-up: it wants the io
+ * writer / file-object handle shape (the writer twin of #969's reader), which
+ * is tracked separately. Mirrors Python `tempfile` / Go `os.CreateTemp` +
+ * `os.TempDir`. All name generation is portable (its own O_EXCL retry loop),
+ * so prefix/suffix behave identically on POSIX and Windows.
+ * =========================================================================== */
+
+/* Fill the 6 bytes at `slot` with pseudo-random [a-z0-9]. The O_EXCL/EEXIST
+ * retry in every caller is what makes a name collision harmless, so this need
+ * only spread well, not be cryptographic. Entropy is the process id plus a
+ * per-call atomic counter — monotonic within a process, so two temp names from
+ * the same process never collide (no coarse-time dependence, unlike the #917
+ * nanosecond-name flake), and cross-process names differ by pid. */
+static void zap_temp_fill6(char *slot) {
+    static const char cs[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+#if defined(ZAP_PLATFORM_WINDOWS)
+    static volatile LONG zap_temp_seq = 0;
+    unsigned long long r = (unsigned long long)GetCurrentProcessId();
+    r ^= (unsigned long long)InterlockedIncrement(&zap_temp_seq) * 2654435761ULL;
+#else
+    static unsigned long long zap_temp_seq = 0;
+    unsigned long long n = __atomic_add_fetch(&zap_temp_seq, 1ULL, __ATOMIC_RELAXED);
+    unsigned long long r = (unsigned long long)getpid();
+    r ^= n * 2654435761ULL;
+#endif
+    for (int i = 0; i < 6; i++) {
+        slot[i] = cs[r % 36];
+        r = r / 36 + 0x9e3779b97f4a7c15ULL;
+    }
+}
+
+/* Create a unique file `<dir>/<prefix>XXXXXX<suffix>` with O_EXCL (never
+ * clobbers an existing name), returning its fd (open read+write) or -1 with
+ * errno set. `tmpl` must already hold the full template; `xoff` is the offset
+ * of the 6-char random run. 0600 perms (owner-only), binary mode on Windows. */
+static int zap_temp_create(char *tmpl, size_t xoff, const char *op) {
+    for (int attempt = 0; attempt < 256; attempt++) {
+        zap_temp_fill6(tmpl + xoff);
+        int fd = open(tmpl, O_RDWR | O_CREAT | O_EXCL | ZAP_O_BINARY, 0600);
+        if (fd >= 0) {
+            return fd;
+        }
+        if (errno != EEXIST) {
+            zap_sys_fail(op, strerror(errno));
+        }
+    }
+    errno = EEXIST;
+    return -1;
+}
+
+/* fs.mkstemp(prefix, suffix, dir) -> handle {fd, path}: create a uniquely-named
+ * temp file and return a raw fd (open for read+write) plus its path. With
+ * O_EXCL the create never races another name into existence. `dir` empty =>
+ * the platform temp dir (`fs.gettempdir`). The caller owns both the fd (close
+ * it) and the file (unlink it). Mirrors Python `tempfile.mkstemp` / Go
+ * `os.CreateTemp`. The lowering reads the two fields back into an
+ * `(int64, str)` tuple (the scandir/walk handle pattern, #1032). */
+typedef struct {
+    void *path; /* ZapStr (the sole GC pointer field) */
+    int64_t fd;
+} ZapMkstemp;
+static const int32_t zap_off_mkstemp[] = {(int32_t)offsetof(ZapMkstemp, path)};
+static const ZapTypeDesc zap_desc_mkstemp = {(int64_t)sizeof(ZapMkstemp), ZAP_TD_PRECISE, 1,
+                                             zap_off_mkstemp};
+
+void *zap_fs_mkstemp(void *prefix_, void *suffix_, void *dir_) {
+    char *prefix = zap_sys_cstr((ZapStr *)prefix_);
+    char *suffix = zap_sys_cstr((ZapStr *)suffix_);
+    char *dir = zap_sys_cstr((ZapStr *)dir_);
+    const char *d = (dir[0] != '\0') ? dir : zap_tempdir();
+    char tmpl[4096];
+    int base = snprintf(tmpl, sizeof tmpl, "%s/%sXXXXXX%s", d, prefix, suffix);
+    if (base < 0 || base >= (int)sizeof tmpl) {
+        zap_sys_fail("fs.mkstemp", "temp path too long");
+    }
+    /* The 6 X's sit right after "<d>/<prefix>". */
+    size_t xoff = strlen(d) + 1 + strlen(prefix);
+    int fd = zap_temp_create(tmpl, xoff, "fs.mkstemp");
+    if (fd < 0) {
+        zap_sys_fail("fs.mkstemp", "could not create a unique temp file");
+    }
+    /* Build the path string before the handle so the handle's pointer field is
+     * never momentarily uninitialised (a runtime call takes no safepoint, so
+     * this is belt-and-braces over the scandir/walk ordering). */
+    void *pathstr = zap_str_new(tmpl, (int64_t)strlen(tmpl));
+    ZapMkstemp *h = (ZapMkstemp *)zap_obj(&zap_desc_mkstemp);
+    h->fd = (int64_t)fd;
+    h->path = pathstr;
+    return h;
+}
+int64_t zap_fs_mkstemp_fd(void *h) { return ((ZapMkstemp *)h)->fd; }
+void *zap_fs_mkstemp_path(void *h) { return ((ZapMkstemp *)h)->path; }
+
+/* fs.gettempdir() -> str: the platform temp directory (Python
+ * `tempfile.gettempdir` / Go `os.TempDir`). POSIX: $TMPDIR else /tmp; Windows:
+ * $TMP / $TEMP else the system default — see `zap_tempdir`. */
+void *zap_fs_gettempdir(void) {
+    const char *t = zap_tempdir();
+    return zap_str_new(t, (int64_t)strlen(t));
+}
+
+/* fs.write_atomic(path, data): write `data` to a freshly-created temp file in
+ * the SAME directory as `path`, then rename it onto `path`. A reader therefore
+ * never observes a half-written file, and a crash leaves either the complete
+ * old file or the complete new one — never a truncated one. Siting the temp
+ * beside the target keeps the rename same-filesystem (atomic), not a
+ * cross-device copy. On POSIX the data is fsync'd before the rename for
+ * crash-durability; the rename atomically replaces an existing target. On
+ * Windows `rename()` cannot replace, so `MoveFileEx(..., REPLACE_EXISTING)`
+ * does the atomic swap. The write-temp-then-rename idiom (Go, Python). */
+void zap_fs_write_atomic(void *path_, void *data_) {
+    char *path = zap_sys_cstr((ZapStr *)path_);
+    ZapStr *data = (ZapStr *)data_;
+    char tmpl[4096];
+    int base = snprintf(tmpl, sizeof tmpl, "%s.zaptmpXXXXXX", path);
+    if (base < 0 || base >= (int)sizeof tmpl) {
+        zap_sys_fail("fs.write_atomic", "path too long");
+    }
+    size_t xoff = strlen(path) + strlen(".zaptmp");
+    int fd = zap_temp_create(tmpl, xoff, "fs.write_atomic");
+    if (fd < 0) {
+        zap_sys_fail("fs.write_atomic", "could not create a temp file");
+    }
+    const char *p = (const char *)data->data;
+    int64_t left = data->len;
+    while (left > 0) {
+        ssize_t w = write(fd, p, (size_t)left);
+        if (w < 0) {
+            int e = errno;
+            close(fd);
+            unlink(tmpl);
+            errno = e;
+            zap_sys_fail("fs.write_atomic", strerror(errno));
+        }
+        p += w;
+        left -= w;
+    }
+#if !defined(ZAP_PLATFORM_WINDOWS)
+    /* Flush the bytes to disk before the rename makes them visible (durability;
+     * atomicity itself is the rename, independent of this). */
+    fsync(fd);
+#endif
+    close(fd);
+#if defined(ZAP_PLATFORM_WINDOWS)
+    if (!MoveFileExA(tmpl, path, MOVEFILE_REPLACE_EXISTING)) {
+        unlink(tmpl);
+        zap_sys_fail("fs.write_atomic", "rename onto target failed");
+    }
+#else
+    if (rename(tmpl, path) != 0) {
+        int e = errno;
+        unlink(tmpl);
+        errno = e;
+        zap_sys_fail("fs.write_atomic", strerror(errno));
+    }
+#endif
+}
+
+/* ===========================================================================
  * stdlib: os/fs filesystem gaps (ticket #968, D-0211)
  * ---------------------------------------------------------------------------
  * Metadata (the prelude `Stat` value struct + `mtime`), mutation (rename/move/

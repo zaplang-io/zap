@@ -262,6 +262,12 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     // Path matching (#1033, D-0216).
     ("fs", "fnmatch", &["name", "pattern"]),
     ("fs", "glob", &["root", "pattern"]),
+    // Tempfile (#979, D-0239). `mkstemp`'s three args are all optional str
+    // kwargs; `prefix`/`suffix` carry a `SeamDefault::Str` below so an interior
+    // hole (e.g. `fs.mkstemp(dir=…)`) fills by name. `gettempdir` takes no args
+    // (no row). `write_atomic`'s two args are required.
+    ("fs", "mkstemp", &["prefix", "suffix", "dir"]),
+    ("fs", "write_atomic", &["path", "data"]),
     // ---- time (ticket #99): sleeps + Duration constructors/accessors ----
     // (monotonic/monotonic_ns/time/time_ns take no args, so no row.)
     ("time", "sleep", &["seconds"]),
@@ -368,7 +374,7 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("io", "readall", &["reader"]),
     ("io", "readn", &["reader", "n"]),
     ("io", "lines", &["reader"]),
-    // #1071, D-0239: io.writer(fd) -> Writer. The flat `_writer_*` delegates are
+    // #1071, D-0240: io.writer(fd) -> Writer. The flat `_writer_*` delegates are
     // internal (called only by the prelude `Writer`), so — like the threading
     // `_*` delegates — they get no row and stay positional.
     ("io", "writer", &["fd"]),
@@ -553,6 +559,12 @@ pub const SEAM_METHOD_DEFAULTS: &[(&str, &str, &str, SeamDefault)] = &[
         "description",
         SeamDefault::Str(""),
     ),
+    // `fs.mkstemp(prefix="tmp", suffix="", dir="")` (#979, D-0239): `prefix` and
+    // `suffix` precede the trailing `dir`, so each must default when a caller
+    // supplies only a later one by keyword (`fs.mkstemp(dir="/var/tmp")`). `dir`
+    // is trailing — left absent when omitted, resolved to the temp dir at runtime.
+    ("fs", "mkstemp", "prefix", SeamDefault::Str("tmp")),
+    ("fs", "mkstemp", "suffix", SeamDefault::Str("")),
     // `http` client verbs: `headers` sits before the trailing `timeout` (#986),
     // so it must default when a caller supplies only `timeout`.
     ("http", "get", "headers", SeamDefault::EmptyDict),
