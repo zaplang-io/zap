@@ -30,6 +30,17 @@ fn seam_default_arg(def: SeamDefault, span: Span) -> Arg {
         SeamDefault::EmptyDict => Expr::Dict(Vec::new(), span),
         // A float literal (its raw lexeme), e.g. `math.isclose`'s `rel_tol=1e-9`.
         SeamDefault::Float(lexeme) => Expr::Float(lexeme.to_string(), span),
+        // A plain string literal, e.g. `process.run`'s `cwd=""` / `input=""`.
+        SeamDefault::Str(s) => Expr::Str {
+            value: s.to_string(),
+            raw: false,
+            bytes: false,
+            fstring: false,
+            span,
+            fstring_fields: Vec::new(),
+        },
+        // A bool literal, e.g. `process.run`'s `capture_output=True`.
+        SeamDefault::Bool(b) => Expr::Bool(b, span),
     };
     Arg {
         name: None,

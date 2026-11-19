@@ -1356,3 +1356,121 @@ fn uuid_parse_keyword_and_positional() {
     ));
     assert_code(&prog("    auto u = uuid.parse(value=\"x\")\n"), "ZAP4023");
 }
+
+// ---------------------------------------------------------------------------
+// `process.run` / `check_run` / `run_shell` option keywords (#976, D-0237).
+// `cmd` is positional; `env`/`cwd`/`timeout`/`input`/`capture_output`/
+// `merge_stderr` are keyword-bound, with interior holes filled from the
+// SEAM_METHOD_DEFAULTS rows. `run_shell` takes a `str` command.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn process_run_bare_positional_unchanged() {
+    assert_ok(&prog(
+        "    auto c, o, e = process.run([\"/bin/echo\", \"hi\"])\n",
+    ));
+}
+
+#[test]
+fn process_run_timeout_only_fills_interior_holes() {
+    // `env`/`cwd` sit before `timeout`; the binder must default them (no hole
+    // error) when only `timeout` is supplied.
+    assert_ok(&prog(
+        "    auto c, o, e = process.run([\"/bin/sleep\", \"1\"], timeout=0.5)\n",
+    ));
+}
+
+#[test]
+fn process_run_input_keyword() {
+    assert_ok(&prog(
+        "    auto c, o, e = process.run([\"/bin/cat\"], input=\"hello\")\n",
+    ));
+}
+
+#[test]
+fn process_run_env_keyword() {
+    assert_ok(&prog(
+        "    auto m = {\"K\": \"V\"}\n    auto c, o, e = process.run([\"/bin/env\"], env=m)\n",
+    ));
+}
+
+#[test]
+fn process_run_cwd_keyword() {
+    assert_ok(&prog(
+        "    auto c, o, e = process.run([\"/bin/pwd\"], cwd=\"/tmp\")\n",
+    ));
+}
+
+#[test]
+fn process_run_capture_and_merge_keywords() {
+    assert_ok(&prog(
+        "    auto c, o, e = process.run([\"/bin/echo\", \"x\"], capture_output=True, merge_stderr=True)\n",
+    ));
+}
+
+#[test]
+fn process_run_all_options_reordered() {
+    assert_ok(&prog(
+        "    auto m = {\"K\": \"V\"}\n    auto c, o, e = process.run(merge_stderr=False, cmd=[\"/bin/env\"], env=m, cwd=\"/tmp\", timeout=1.0, input=\"\", capture_output=True)\n",
+    ));
+}
+
+#[test]
+fn process_run_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto c, o, e = process.run([\"/bin/echo\"], bogus=1)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn process_run_duplicate_value_rejected() {
+    // `cmd` supplied both positionally and by keyword → multiple values.
+    assert_code(
+        &prog("    auto c, o, e = process.run([\"/bin/echo\"], cmd=[\"/bin/x\"])\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn process_check_run_keywords() {
+    assert_ok(&prog(
+        "    auto c, o, e = process.check_run([\"/bin/false\"], timeout=1.0)\n",
+    ));
+}
+
+#[test]
+fn process_check_run_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto c, o, e = process.check_run([\"/bin/echo\"], check=True)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn process_run_shell_str_command_and_options() {
+    assert_ok(&prog(
+        "    auto c, o, e = process.run_shell(\"echo hi\", merge_stderr=True)\n",
+    ));
+}
+
+#[test]
+fn process_run_shell_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto c, o, e = process.run_shell(\"echo\", shell=True)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn process_popen_ctor_and_methods_typecheck() {
+    // `process.Popen(...)` desugars to the prelude factory; its methods drive the
+    // internal `_popen_*` primitives. This exercises the whole streaming surface
+    // through sema (ctor sugar + struct methods + keyword options).
+    assert_ok(&prog(
+        "    auto p = process.Popen([\"/bin/cat\"])\n    auto n = p.write(\"hi\")\n    p.close_stdin()\n    auto out = p.read_stdout_all()\n    auto rc = p.wait()\n",
+    ));
+    assert_ok(&prog(
+        "    auto p = process.Popen([\"/bin/cat\"], merge_stderr=True, stderr=False)\n    auto d = p.done()\n    auto code = p.poll()\n    p.terminate()\n    p.kill()\n    auto pid = p.pid()\n",
+    ));
+}

@@ -47,6 +47,12 @@ pub const SEAM_GENERIC_CTORS: &[(&str, &str, &str)] = &[
     // via `auto client = http.Client(...)`, so the dotted type head is not spelled
     // as an annotation (the bare prelude type is `HttpClient`, not `Client`).
     ("http", "Client", "__http_client"),
+    // The streaming subprocess handle `process.Popen(...)` (#976, D-0237) — a
+    // non-generic prelude struct built by the prelude factory `__process_popen`,
+    // which spawns the child with pipes and returns this struct wrapping the
+    // opaque runtime handle. Same callee-rewrite sugar as `http.Client`:
+    // `process.Popen(...)` → `__process_popen(...)`, args carried through.
+    ("process", "Popen", "__process_popen"),
 ];
 
 /// If the dotted type head `dotted` (`"concurrent.Queue"`) names a seam generic,

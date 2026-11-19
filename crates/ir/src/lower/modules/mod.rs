@@ -264,6 +264,15 @@ fn seam_default_arg(def: zapc_syntax::seam_sigs::SeamDefault, args: &[ast::Arg])
         zapc_syntax::seam_sigs::SeamDefault::Float(lexeme) => {
             ast::Expr::Float(lexeme.to_string(), span)
         }
+        zapc_syntax::seam_sigs::SeamDefault::Str(s) => ast::Expr::Str {
+            value: s.to_string(),
+            raw: false,
+            bytes: false,
+            fstring: false,
+            span,
+            fstring_fields: Vec::new(),
+        },
+        zapc_syntax::seam_sigs::SeamDefault::Bool(b) => ast::Expr::Bool(b, span),
     };
     ast::Arg {
         name: None,

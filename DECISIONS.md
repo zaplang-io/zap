@@ -12009,3 +12009,109 @@ and `key` the trailing optional selector). Recorded in
 Relates to [[D-0057]] (the base `heap[T]`), [[D-0067]] (first-class function
 values, used for `key=`), #800 (`float64` heaps), and #983 (`bisect`, the sibling
 `Comparable`-list helper). No grammar change — these are functions and methods.
+
+## D-0237 — `process` subprocess ergonomics: `run` options, `check_run`, `run_shell`, and a streaming `Popen` handle (#976 / epic #966)
+
+**Status: Locked.**
+
+**Context.** `process.run(argv: list[str]) -> (int, str, str)` ([[D-0056]])
+spawns (posix_spawn / CreateProcess, no fork), captures stdout/stderr into temp
+files (so there is no pipe-buffer deadlock), and waits. It had no control over
+the environment, working directory, stdin, a timeout, or capture, and no way to
+stream a long-running child's output. #976 (basis: Discussion #965 gap #10) adds
+the Python-`subprocess` / Go-`os/exec` ergonomics around it. The issue itself
+splits the work into a cheaper options slice and a larger streaming slice; both
+land here (one PR, maintainer's call).
+
+**Decision — blocking capture gains keyword options, two sibling verbs, and a
+streaming handle, keeping the deadlock-free temp-file model for all capture.**
+
+1. **Options on `run`** (keyword-bound via the seam registry, [[D-0204]]):
+   `process.run(cmd, env={}, cwd="", timeout=0.0, input="",
+   capture_output=True, merge_stderr=False) -> (int, str, str)`.
+   - **`env`** *overrides/augments* the inherited environment (empty = inherit
+     unchanged); it does **not** fully replace it. This diverges from Python
+     (`env=` replaces) because Zap's stdlib has no `None` to distinguish "not
+     given" from "empty", and augment is the ergonomic common case the issue
+     explicitly names ("env override/augment"). PATH-based executable lookup
+     still uses the parent's `PATH` (posix_spawnp semantics), not `env`'s.
+   - **`cwd`** sets the child's working directory (empty = inherit) via
+     `posix_spawn_file_actions_addchdir_np` (glibc ≥ 2.29 / macOS ≥ 10.15 — both
+     CI targets) or `CreateProcess`'s `lpCurrentDirectory`; on a POSIX libc
+     without the extension a non-empty `cwd` is a clean runtime error.
+   - **`timeout`** is in **seconds** (float; `0` = none). On expiry the child is
+     SIGKILLed (POSIX) / `TerminateProcess`d (Windows), reaped, and a
+     **`TimeoutError`** is raised. Because capture is to temp files (never
+     pipes), a plain `waitpid(WNOHANG)` poll loop bounds the wait with no risk of
+     the child blocking on a full pipe.
+   - **`input`** (bytes/str) is fed to the child's stdin via a temp file (empty =
+     inherit the parent's stdin); the temp-file path keeps the no-deadlock
+     guarantee.
+   - **`capture_output`** defaults to **`True`** (unlike Python's `False`) to
+     preserve the existing `run` behaviour; `False` lets the child inherit the
+     parent's stdout/stderr and returns empty strings.
+   - **`merge_stderr`** folds the child's stderr into stdout (`2>&1`); the
+     returned stderr is then empty.
+2. **`process.check_run(cmd, …same options…) -> (int, str, str)`** — Python
+   `subprocess.run(check=True)`: identical to `run` but raises **`RuntimeError`**
+   (message = command + exit code + a short stderr/stdout tail) when the exit
+   code is non-zero. Zap has no dedicated `CalledProcessError`, so `RuntimeError`
+   is the chosen type (a typed subprocess-error hierarchy is a possible future
+   refinement); it is lowered with `throwing_call` so a `try/except` catches it.
+3. **`process.run_shell(cmd: str, …same options…)`** — runs `cmd` through the
+   system shell (`/bin/sh -c` / `cmd.exe /C`). A deliberate, explicit opt-in
+   (its own verb, not a `shell=True` flag on `run`) so shell-injection surface is
+   never reached by accident.
+4. **Streaming `process.Popen(argv, env={}, cwd="", merge_stderr=False,
+   stdin=True, stdout=True, stderr=True) -> Popen`** (Python `Popen` / Go
+   `exec.Cmd`). `process.Popen(...)` is seam ctor sugar ([[D-0202]]) for the
+   prelude factory `__process_popen`, which returns a prelude **`Popen` struct**
+   (the `http.Client` shape, D-0230). Methods: `write(data) -> int` (writes every
+   byte, parking while the pipe is full) / `close_stdin()`,
+   `read_stdout([n])` / `read_stderr([n])` / `read_stdout_all()` /
+   `read_stderr_all()` (b"" at EOF), `poll() -> int` (the exit status, or the
+   **`-256`** still-running sentinel) / `done() -> bool`, `wait() -> int`,
+   `returncode() -> int` (raises `RuntimeError` if still running), `pid() -> int`,
+   `terminate()` (SIGTERM) / `kill()` (SIGKILL).
+   - **Non-blocking pipe I/O on the netpoller.** The child's pipe ends are set
+     non-blocking and registered with the netpoller (epoll); a read/write that
+     would block **parks the calling coroutine** (`zap_netpoll_wait`) and frees
+     the worker thread, exactly like the `net` sockets. Interleaved stdout/stderr
+     streaming of output larger than one pipe buffer therefore never deadlocks.
+   - **Handle representation.** The `Popen` wraps a **non-GC malloc control
+     block** addressed by an `int64` handle (the keep-alive-pool pattern, D-0230),
+     *not* a GC object. The block's address is stable, so the C code may hold it —
+     and mutate its state (`reaped`/`returncode`, closing a stream on EOF) —
+     across a park; a GC object would move under precise-Immix evacuation and
+     invalidate the pointer held across the park. Read/write scratch buffers are
+     likewise malloc, copied into a GC `bytes` only after the last park. Stream
+     fds/netpoller descriptors are released on EOF, `close_stdin`, and `wait`; the
+     small control block itself is leaked on drop (like the keep-alive pool
+     without `shutdown`) — join each child with `wait`.
+   - **`wait` is terminal for the streams:** it reaps and then closes any
+     remaining stdin/stdout/stderr fds, so read all output *before* `wait` (the
+     `communicate` idiom). `returncode()` after `wait()` stays valid.
+
+**Cross-platform.** `run` / `check_run` / `run_shell` with all options are fully
+cross-platform (POSIX posix_spawn + temp files; Windows `CreateProcess` with
+`lpEnvironment` / `lpCurrentDirectory` / inherited redirected handles +
+`WaitForSingleObject(timeout)` + `TerminateProcess`). The streaming `Popen` is
+**POSIX-only in v1**: anonymous-pipe streaming on Windows needs named-pipe +
+overlapped-IOCP integration (I#196 basis) — a substantial, separately-landable
+piece that CI (Linux-only) cannot exercise — so `process.Popen` raises a clear
+"not yet supported on Windows" error there, tracked as a follow-up. The POSIX
+streaming path is exercised end-to-end by CI (gc-immix + gc-boehm, x86 + aarch64).
+
+**Seam (positional-vs-kwarg).** `cmd` is the one positional argument (argv list,
+or the shell `str`); `env`/`cwd`/`timeout`/`input`/`capture_output`/`merge_stderr`
+are all keyword-bound — heterogeneous, mostly omitted, and far clearer by name —
+with interior holes filled from `SEAM_METHOD_DEFAULTS` (this added the `Str` and
+`Bool` `SeamDefault` shapes). Recorded in `crates/syntax/src/seam_sigs.rs` with
+`crates/sema/tests/seam_kwargs.rs` cases. The internal `process._popen_*`
+primitives the `Popen` prelude struct drives stay **positional-only** (like
+`http._pool_*`), so they carry no seam-signature row.
+
+Relates to [[D-0056]] (`process.run` and the sys/io/fs core), [[D-0204]] (the
+seam keyword-binding convention), [[D-0202]] (seam ctor sugar) and D-0230 (the
+`http.Client` prelude-struct + stable-handle pattern this reuses). No grammar
+change — these are module functions, a prelude struct, and its methods.
