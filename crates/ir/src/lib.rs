@@ -1085,6 +1085,39 @@ mod tests {
     }
 
     #[test]
+    fn strview_distinct_from_same_shape_tuple() {
+        // Regression (#1082): a borrowed `strview` lowers to a reserved
+        // `(ptr, i64, i64)` aggregate. A genuine `(str, int64, int64)` tuple has
+        // the SAME physical shape but must NEVER be treated as a strview — its
+        // `==` / `print` must route to the tuple/struct path, not the view ABI,
+        // and probing struct method dispatch must not materialize a stray strview.
+        let m = lower_ok(
+            "def main():\n    (str, int64, int64) t = (\"a\", 1, 2)\n    \
+             print(t == t)\n    print(t)\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            !text.contains("zap_strview"),
+            "a (str, int64, int64) tuple was misrouted to the strview view ABI:\n{text}"
+        );
+    }
+
+    #[test]
+    fn strview_view_uses_borrow_abi() {
+        // A `strview` consumer lowers to the zero-alloc view ABI, never an owned
+        // `zap_str_new` / `zap_str_slice` for the view itself (#1082).
+        let m = lower_ok(
+            "def main():\n    str s = \"hello\"\n    strview v = s.view(0, 2)\n    \
+             print(v.startswith(\"he\"))\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("zap_strview_startswith"),
+            "strview method did not use the view ABI:\n{text}"
+        );
+    }
+
+    #[test]
     fn lower_structs() {
         let m = lower_ok(include_str!("../../../tests/golden/point.zap"));
         assert_eq!(m.structs.len(), 1);

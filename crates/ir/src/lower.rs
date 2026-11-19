@@ -46,6 +46,12 @@ struct TupleInterner {
     base: u32,
     layouts: Vec<Vec<Ty>>,
     map: HashMap<Vec<Ty>, u32>,
+    /// The reserved id for the borrowed `strview` aggregate `(backing: str,
+    /// byte_off: int64, byte_len: int64)` (#1082), allocated once on first use.
+    /// It is a `push_layout` id — NOT deduplicated — so it can never equal the
+    /// id a genuine `(str, int64, int64)` tuple interns to, which keeps a
+    /// `strview` distinct from such a tuple for `==` / `print` / method dispatch.
+    strview_sid: Option<u32>,
 }
 
 impl TupleInterner {
@@ -54,7 +60,29 @@ impl TupleInterner {
             base,
             layouts: Vec::new(),
             map: HashMap::new(),
+            strview_sid: None,
         }
+    }
+
+    /// The reserved `strview` layout id (#1082), allocated on first use. Uses
+    /// [`Self::push_layout`] (no dedup) so it is distinct from any natural
+    /// `(str, int64, int64)` tuple; appended to [`Module::structs`] like any
+    /// tuple, so the backing pointer is traced via the aggregate-root pairs.
+    fn strview_sid(&mut self) -> u32 {
+        if let Some(sid) = self.strview_sid {
+            return sid;
+        }
+        let sid = self.push_layout(vec![Ty::Ptr, Ty::I64, Ty::I64]);
+        self.strview_sid = Some(sid);
+        sid
+    }
+
+    /// Whether `sid` is the reserved `strview` layout. A pure read — it never
+    /// allocates the layout, so probing an arbitrary struct id (e.g. during
+    /// method dispatch) does not materialize a stray `strview` in a module that
+    /// has none.
+    fn is_strview(&self, sid: u32) -> bool {
+        self.strview_sid == Some(sid)
     }
 
     /// The struct id for a tuple with these element types (deduplicated).
@@ -2062,11 +2090,7 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
             // keeps it a distinct, affine type; only its physical layout coincides
             // with a `(str, int64, int64)` tuple, which has no methods, so the
             // method dispatch never confuses the two.
-            "strview" => Ok(Ty::Struct(env.tuples.borrow_mut().intern(vec![
-                Ty::Ptr,
-                Ty::I64,
-                Ty::I64,
-            ]))),
+            "strview" => Ok(Ty::Struct(env.tuples.borrow_mut().strview_sid())),
             "bigint" => Ok(Ty::Bigint),
             "complex" => Ok(Ty::Complex),
             "pyobject" => Ok(Ty::Py),
@@ -20401,22 +20425,20 @@ impl<'a> FnLower<'a> {
     /// byte_off: int64, byte_len: int64)` (#1082). Always interns the same three
     /// field types, so the id is stable across the module.
     fn strview_sid(&self) -> u32 {
-        self.ctx
-            .tuples
-            .borrow_mut()
-            .intern(vec![Ty::Ptr, Ty::I64, Ty::I64])
+        self.ctx.tuples.borrow_mut().strview_sid()
     }
 
-    /// The ZIR type of a `strview` value: the tuple struct above.
+    /// The ZIR type of a `strview` value: the reserved aggregate layout.
     fn strview_ty(&self) -> Ty {
         Ty::Struct(self.strview_sid())
     }
 
-    /// Is `sid` the `strview` tuple layout? Used by the method dispatch; safe
-    /// because a plain `(str, int64, int64)` tuple has no methods (sema rejects
-    /// them), so only a real `strview` ever reaches a method call with this id.
+    /// Is `sid` the reserved `strview` layout? A pure read that does **not**
+    /// allocate the layout, so probing an arbitrary struct id during dispatch
+    /// never materializes a stray `strview`. The reserved id is a `push_layout`
+    /// id, so it is distinct from any natural `(str, int64, int64)` tuple.
     fn is_strview_sid(&self, sid: u32) -> bool {
-        sid == self.strview_sid()
+        self.ctx.tuples.borrow().is_strview(sid)
     }
 
     /// Build a `strview` value `(backing, byte_off, byte_len)` (#1082). The byte
