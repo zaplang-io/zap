@@ -1689,3 +1689,114 @@ fn fs_write_atomic_unknown_keyword_rejected() {
 fn fs_write_atomic_wrong_arity_rejected() {
     assert_code(&prog("    fs.write_atomic(\"out.txt\")\n"), "ZAP4025");
 }
+
+// temp_file (#1077): four optional args (prefix, suffix, dir, delete) — three
+// optional str kwargs plus a bool `delete`. Mirrors the mkstemp binding matrix,
+// and adds the bool `delete` slot (interior-hole fill when a later keyword is
+// supplied alone) and the prelude `TempFile` method / `with` surface.
+
+#[test]
+fn fs_temp_file_no_args() {
+    // All four parameters optional — the bare call returns a `TempFile`.
+    assert_ok(&prog("    auto t = fs.temp_file()\n"));
+}
+
+#[test]
+fn fs_temp_file_positional_prefix() {
+    assert_ok(&prog("    auto t = fs.temp_file(\"build-\")\n"));
+}
+
+#[test]
+fn fs_temp_file_positional_prefix_suffix() {
+    assert_ok(&prog("    auto t = fs.temp_file(\"build-\", \".tmp\")\n"));
+}
+
+#[test]
+fn fs_temp_file_positional_three_strings() {
+    assert_ok(&prog(
+        "    auto t = fs.temp_file(\"build-\", \".tmp\", \"/tmp\")\n",
+    ));
+}
+
+#[test]
+fn fs_temp_file_positional_all_four() {
+    // The fourth positional is the bool `delete`.
+    assert_ok(&prog(
+        "    auto t = fs.temp_file(\"build-\", \".tmp\", \"/tmp\", False)\n",
+    ));
+}
+
+#[test]
+fn fs_temp_file_keyword_prefix_only() {
+    assert_ok(&prog("    auto t = fs.temp_file(prefix=\"build-\")\n"));
+}
+
+#[test]
+fn fs_temp_file_keyword_delete_only_fills_holes() {
+    // `delete` is the last parameter; supplying it alone by keyword must default
+    // prefix/suffix/dir (fill all three interior holes) with no hole error.
+    assert_ok(&prog("    auto t = fs.temp_file(delete=False)\n"));
+}
+
+#[test]
+fn fs_temp_file_keyword_dir_only_fills_prefix_and_suffix_holes() {
+    assert_ok(&prog("    auto t = fs.temp_file(dir=\"/var/tmp\")\n"));
+}
+
+#[test]
+fn fs_temp_file_all_keywords_reordered() {
+    // Reordered keywords (including the trailing bool) must land in the right slots.
+    assert_ok(&prog(
+        "    auto t = fs.temp_file(delete=False, dir=\"/tmp\", suffix=\".tmp\", prefix=\"build-\")\n",
+    ));
+}
+
+#[test]
+fn fs_temp_file_positional_and_keyword_mix() {
+    assert_ok(&prog(
+        "    auto t = fs.temp_file(\"build-\", delete=False)\n",
+    ));
+}
+
+#[test]
+fn fs_temp_file_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto t = fs.temp_file(prefx=\"typo\")\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn fs_temp_file_duplicate_value_rejected() {
+    // `prefix` supplied both positionally and by keyword.
+    assert_code(
+        &prog("    auto t = fs.temp_file(\"a\", prefix=\"b\")\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn fs_temp_file_too_many_args_rejected() {
+    assert_code(
+        &prog("    auto t = fs.temp_file(\"a\", \"b\", \"c\", True, \"e\")\n"),
+        "ZAP4025",
+    );
+}
+
+#[test]
+fn fs_temp_file_methods_and_with_typecheck() {
+    // The prelude `TempFile` surface: `write` returns int64, `name` is a public
+    // str field, `flush`/`close_` return unit, and the `with` form drives
+    // __enter__/__exit__. Exercising all of it keeps the prelude struct's types
+    // pinned (sema only; the golden covers runtime behaviour).
+    assert_ok(
+        "def f():\n\
+         \x20   with fs.temp_file(prefix=\"log-\", suffix=\".txt\") as t:\n\
+         \x20       auto wrote = t.write(\"hello\")\n\
+         \x20       t.flush()\n\
+         \x20       auto name = t.name\n\
+         \x20   auto t2 = fs.temp_file(delete=False)\n\
+         \x20   t2.write(\"x\")\n\
+         \x20   t2.close_()\n",
+    );
+}

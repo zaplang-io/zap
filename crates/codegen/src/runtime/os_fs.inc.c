@@ -819,6 +819,19 @@ void zap_fs_write_atomic(void *path_, void *data_) {
 #endif
 }
 
+/* fs.temp_file delete-on-close helper (#1077): unlink `path`, treating an
+ * already-gone file (ENOENT) as success so a second close_/`with`-exit after an
+ * explicit close is a harmless no-op (Python's NamedTemporaryFile swallows the
+ * missing-file case). Any other failure (e.g. a permission error) raises a
+ * catchable RuntimeError. The fd is already closed by the writer before this
+ * runs, so the Windows "cannot unlink an open file" case does not arise. */
+void zap_fs_unlink_quiet(void *path_) {
+    const char *p = zap_sys_cstr((ZapStr *)path_);
+    if (unlink(p) != 0 && errno != ENOENT) {
+        zap_sys_fail("fs.temp_file", strerror(errno));
+    }
+}
+
 /* ===========================================================================
  * stdlib: os/fs filesystem gaps (ticket #968, D-0211)
  * ---------------------------------------------------------------------------

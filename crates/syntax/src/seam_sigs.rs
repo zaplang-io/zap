@@ -268,6 +268,11 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     // (no row). `write_atomic`'s two args are required.
     ("fs", "mkstemp", &["prefix", "suffix", "dir"]),
     ("fs", "write_atomic", &["path", "data"]),
+    // temp_file (#1077): four optional args (all recommended keyword). Each of
+    // prefix/suffix/dir/delete carries a `SeamDefault` below so an interior hole
+    // (e.g. `fs.temp_file(delete=False)`) fills by name. `_unlink_quiet` is the
+    // internal 1-arg close helper — positional, so no row.
+    ("fs", "temp_file", &["prefix", "suffix", "dir", "delete"]),
     // ---- time (ticket #99): sleeps + Duration constructors/accessors ----
     // (monotonic/monotonic_ns/time/time_ns take no args, so no row.)
     ("time", "sleep", &["seconds"]),
@@ -565,6 +570,14 @@ pub const SEAM_METHOD_DEFAULTS: &[(&str, &str, &str, SeamDefault)] = &[
     // is trailing — left absent when omitted, resolved to the temp dir at runtime.
     ("fs", "mkstemp", "prefix", SeamDefault::Str("tmp")),
     ("fs", "mkstemp", "suffix", SeamDefault::Str("")),
+    // temp_file (#1077): same prefix/suffix/dir defaults as mkstemp, plus
+    // `delete` defaulting to True (Python's `NamedTemporaryFile` default). All
+    // four carry a default so any later keyword (e.g. `delete=False`) fills the
+    // interior holes before it.
+    ("fs", "temp_file", "prefix", SeamDefault::Str("tmp")),
+    ("fs", "temp_file", "suffix", SeamDefault::Str("")),
+    ("fs", "temp_file", "dir", SeamDefault::Str("")),
+    ("fs", "temp_file", "delete", SeamDefault::Bool(true)),
     // `http` client verbs: `headers` sits before the trailing `timeout` (#986),
     // so it must default when a caller supplies only `timeout`.
     ("http", "get", "headers", SeamDefault::EmptyDict),

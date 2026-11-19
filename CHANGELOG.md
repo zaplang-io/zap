@@ -25,6 +25,17 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`fs.temp_file` — a named temporary file (`NamedTemporaryFile`)** (#1077,
+  D-0242, epic #966). The deferred follow-up from #979, now that #1071 shipped
+  the `io` buffered `Writer`. **`fs.temp_file([prefix, suffix, dir, delete]) ->
+  TempFile`** creates a uniquely-named temp file (reusing `mkstemp`'s `O_EXCL`
+  no-clobber create) under the temp dir and wraps its fd in a `Writer`, so the
+  returned prelude `TempFile` has `write` / `flush` / `close_` plus a public
+  on-disk `name` and the `with` auto-close form. `delete` defaults to `True`
+  (Python's default), so `close_` / the `with`-exit unlink the file — idempotently
+  (a repeated close is a harmless no-op). All four arguments are optional
+  (recommended as kwargs). Write-oriented in v1: to read the bytes back, keep the
+  file (`delete=False`) and reopen `name`, or stream via `fs.open_reader`.
 - **`fs` tempfile — `mkstemp`, `gettempdir`, atomic write** (#979, D-0239, epic
   #966). Fills the temp-*file* hole next to the existing `fs.mkdtemp` (temp
   *directory*), matching Python `tempfile` / Go `os.CreateTemp` + `os.TempDir`.

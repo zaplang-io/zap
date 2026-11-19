@@ -163,6 +163,93 @@ fn lower_mkstemp(lowerer: &mut FnLower, a: Vec<Value>) -> (Value, Ty) {
     (tup, Ty::Struct(tuple_sid))
 }
 
+/// `fs.temp_file([prefix, suffix, dir, delete])` -> `TempFile` (#1077). A named
+/// temporary file (Python `tempfile.NamedTemporaryFile`), composed from existing
+/// primitives: `zap_fs_mkstemp` (O_EXCL create → fd + path, the throwing gate)
+/// then `zap_io_writer_new(fd)` (the #1071 buffered `Writer` handle, which owns
+/// the fd's lifetime). The three str arguments are padded exactly like
+/// `mkstemp`; `delete` is a bool padded to `True` (Python's default) and is kept
+/// an `i1` — it feeds the struct's `bool` field directly, so it must NOT go
+/// through `lower_args` (which coerces integer/bool words to `i64`). The prelude
+/// `TempFile` (field 0 = the writer handle `_h`, 1 = the on-disk `name`, 2 = the
+/// `_delete` flag) carries the write/flush/close_ + `with` surface.
+fn lower_temp_file(lowerer: &mut FnLower, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
+    let sid = *lowerer
+        .ctx
+        .ids
+        .get("TempFile")
+        .ok_or_else(|| err("TempFile struct unavailable (built-in prelude missing)"))?;
+
+    // prefix: default "tmp"; suffix/dir: default "" (empty dir => temp dir).
+    let prefix = match args.first() {
+        Some(a) => lowerer.expr(&a.value)?.0,
+        None => {
+            let d = lowerer.new_value(Ty::Ptr);
+            lowerer.emit(Inst::StrConst {
+                dest: d,
+                bytes: b"tmp".to_vec(),
+            });
+            d
+        }
+    };
+    let suffix = match args.get(1) {
+        Some(a) => lowerer.expr(&a.value)?.0,
+        None => empty_str(lowerer),
+    };
+    let dir = match args.get(2) {
+        Some(a) => lowerer.expr(&a.value)?.0,
+        None => empty_str(lowerer),
+    };
+    // delete: a `bool` (kept `i1`); default `True`. Any interior hole before it
+    // is already materialised by the seam, so a present arg at index 3 means
+    // prefix/suffix/dir are present too.
+    let delete = match args.get(3) {
+        Some(a) => {
+            let (v, vt) = lowerer.expr(&a.value)?;
+            lowerer.coerce(v, vt, Ty::I1)
+        }
+        None => lowerer.iconst(Ty::I1, 1),
+    };
+
+    // Create the uniquely-named file (throwing: a bad dir / permission error
+    // must reach try/except), then wrap its fd in the buffered writer handle
+    // (allocation only — never does I/O, so a plain Call).
+    let handle = lowerer.new_value(Ty::Ptr);
+    lowerer.throwing_call(Some(handle), "zap_fs_mkstemp", vec![prefix, suffix, dir]);
+    let fd = lowerer.new_value(Ty::I64);
+    lowerer.emit(Inst::Call {
+        dest: Some(fd),
+        func: "zap_fs_mkstemp_fd".to_string(),
+        args: vec![handle],
+    });
+    let path = lowerer.new_value(Ty::Ptr);
+    lowerer.emit(Inst::Call {
+        dest: Some(path),
+        func: "zap_fs_mkstemp_path".to_string(),
+        args: vec![handle],
+    });
+    let writer = lowerer.new_value(Ty::Ptr);
+    lowerer.emit(Inst::Call {
+        dest: Some(writer),
+        func: "zap_io_writer_new".to_string(),
+        args: vec![fd],
+    });
+
+    // Build the prelude `TempFile`: _h(0) = writer handle, name(1) = path,
+    // _delete(2) = the flag. The struct roots the handle and the path.
+    let dest = lowerer.new_value(Ty::Struct(sid));
+    lowerer.emit(Inst::StructNew { dest, sid });
+    for (idx, val) in [(0u32, writer), (1, path), (2, delete)] {
+        lowerer.emit(Inst::FieldSet {
+            base: dest,
+            sid,
+            idx,
+            val,
+        });
+    }
+    Ok((dest, Ty::Struct(sid)))
+}
+
 fn lower(
     lowerer: &mut FnLower,
     method: &str,
@@ -181,6 +268,12 @@ fn lower(
             .ok_or_else(|| err("fs.open_reader expects 1 argument"))?;
         return Ok(Some(lower_open_reader(lowerer, arg)?));
     }
+    // temp_file builds the prelude `TempFile` from mkstemp + io.writer; its
+    // `delete` bool must stay an i1, so it bypasses the i64-coercing lower_args
+    // path (#1077).
+    if method == "temp_file" {
+        return Ok(Some(lower_temp_file(lowerer, args)?));
+    }
     let a = lower_args(lowerer, args)?;
     Ok(Some(match method {
         "read_file" => call_ret(lowerer, "zap_fs_read_file", a, Ty::Ptr, true),
@@ -197,6 +290,10 @@ fn lower(
         "mkstemp" => lower_mkstemp(lowerer, a),
         "gettempdir" => call_ret(lowerer, "zap_fs_gettempdir", a, Ty::Ptr, false),
         "write_atomic" => call_void(lowerer, "zap_fs_write_atomic", a, true),
+        // temp_file's delete-on-close helper (#1077): unlink, tolerating an
+        // already-gone file. A real error must reach try/except, so it is a
+        // throwing void call (not a plain Call).
+        "_unlink_quiet" => call_void(lowerer, "zap_fs_unlink_quiet", a, true),
         // Filesystem gaps (#968, D-0211).
         "mtime" => call_ret(lowerer, "zap_fs_mtime", a, Ty::I64, true),
         "rename" => call_void(lowerer, "zap_fs_rename", a, true),
