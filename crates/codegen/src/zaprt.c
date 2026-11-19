@@ -2705,6 +2705,53 @@ double zap_dict_get_i64_f64(void *d, int64_t k) {
 double zap_dict_get_str_f64(void *d, void *k) {
     return zap_f64_from_bits(zap_dict_get(d, (int64_t)(intptr_t)k, KEY_STR));
 }
+
+/* ---- Borrowed-bytes dict probes (#1082) ---------------------------------- */
+/* Probe a str-keyed dict with a non-owning view `(backing, byte_off, byte_len)`
+ * instead of an owned `ZapStr` key: NO transient key allocation and NO root.
+ * The hash (seeded wyhash, #1064) and the per-slot compare operate on the
+ * borrowed bytes directly, so the result is byte-for-byte identical to the
+ * `zap_dict_get_str_*` / `zap_dict_contains_str` path with the materialized key.
+ * Returns the matching slot index, or -1. */
+static int64_t zap_dict_sv_slot(ZapDict *d, const char *data, int64_t len) {
+    if (d->cap == 0) {
+        return -1;
+    }
+    uint64_t h = zap_wyhash(data, (size_t)len, zap_hash_seed);
+    uint8_t t = zap_tag(h);
+    int64_t j = (int64_t)(h & (uint64_t)(d->cap - 1));
+    uint8_t *tags = zap_d_tags(d);
+    while (tags[j] != ZAP_TAG_EMPTY) {
+        /* 1-byte tag reject, then gate the byte compare on the full cached hash
+         * (#837), exactly like the owned str-key slow path. */
+        if (tags[j] == t && zap_d_hashes(d)[j] == h) {
+            const ZapStr *k = (const ZapStr *)(intptr_t)zap_d_keys(d)[j];
+            if (k->len == len && memcmp(k->data, data, (size_t)len) == 0) {
+                return j;
+            }
+        }
+        j = (j + 1) & (d->cap - 1);
+    }
+    return -1;
+}
+static int64_t zap_dict_sv_word(void *dp, void *bp, int64_t off, int64_t len) {
+    ZapDict *d = (ZapDict *)dp;
+    int64_t j = zap_dict_sv_slot(d, ((const ZapStr *)bp)->data + off, len);
+    return j < 0 ? 0 : zap_d_vals(d)[j];
+}
+int64_t zap_dict_get_strview_i64(void *dp, void *bp, int64_t off, int64_t len) {
+    return zap_dict_sv_word(dp, bp, off, len);
+}
+void *zap_dict_get_strview_ptr(void *dp, void *bp, int64_t off, int64_t len) {
+    return (void *)(intptr_t)zap_dict_sv_word(dp, bp, off, len);
+}
+double zap_dict_get_strview_f64(void *dp, void *bp, int64_t off, int64_t len) {
+    return zap_f64_from_bits(zap_dict_sv_word(dp, bp, off, len));
+}
+int64_t zap_dict_contains_strview(void *dp, void *bp, int64_t off, int64_t len) {
+    ZapDict *d = (ZapDict *)dp;
+    return zap_dict_sv_slot(d, ((const ZapStr *)bp)->data + off, len) >= 0 ? 1 : 0;
+}
 double zap_dict_get_fn_f64(void *dp, void *k, void *hashfn, void *eqfn) {
     ZapDict *d = (ZapDict *)dp;
     d->hashfn = hashfn;

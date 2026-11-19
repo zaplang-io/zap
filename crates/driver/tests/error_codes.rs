@@ -226,6 +226,48 @@ fn arena_codes() {
     );
 }
 
+/// Borrowed-bytes `strview` affine soundness (#1082, discussion #1097; ZAP5135).
+/// A `strview` is a non-owning view valid only while its backing lives, so it may
+/// not be stored anywhere that could outlive the backing's frame. These are the
+/// walled-garden negative cases: each must be a compile error, and each
+/// corresponds to one bullet of the issue's "Cannot borrow (must own)" list.
+#[test]
+fn strview_affine_codes() {
+    // --- reject (ZAP5135) -----------------------------------------------------
+    // A strview as a STRUCT FIELD type — would outlive the view's backing.
+    assert_code(
+        "struct Box:\n    strview v\ndef main():\n    pass\n",
+        "ZAP5135",
+    );
+    // A strview as a FUNCTION RETURN type (v1 forbids cross-frame return).
+    assert_code(
+        "def first(str s) -> strview:\n    return s.view(0, 1)\ndef main():\n    pass\n",
+        "ZAP5135",
+    );
+    // A strview as a MODULE-GLOBAL type.
+    assert_code(
+        "strview g = \"x\".view()\ndef main():\n    pass\n",
+        "ZAP5135",
+    );
+    // A strview nested in a COLLECTION element type (list / dict value).
+    assert_code("def main():\n    list[strview] xs = []\n", "ZAP5135");
+    assert_code("def main():\n    dict[str, strview] d = {}\n", "ZAP5135");
+
+    // --- accept (no ZAP5135) --------------------------------------------------
+    // An intra-frame local: sound (the view roots its own backing), and a
+    // `strview` PARAMETER is the intended read-only borrowing API.
+    assert_no_code(
+        "def probe(strview v) -> bool:\n    return v.startswith(\"k\")\n\
+         def main():\n    str s = \"key\"\n    strview v = s.view()\n    bool b = probe(v)\n",
+        "ZAP5135",
+    );
+    // Materializing with .to_str() escapes the borrow legitimately (owned str).
+    assert_no_code(
+        "def main() -> str:\n    str s = \"abc\"\n    return s.view(0, 2).to_str()\n",
+        "ZAP5135",
+    );
+}
+
 #[test]
 fn eq_none_on_value_type_is_rejected() {
     // `== None` / `!= None` is consistent with `is None` (SPEC §5, #374/B3): a

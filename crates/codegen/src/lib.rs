@@ -2703,6 +2703,28 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), p.into()],
             Some(f64t.into()),
         );
+        // Borrowed-bytes probes (#1082): look up a str-keyed dict with a view
+        // `(backing, byte_off, byte_len)` — no transient key alloc, no root.
+        self.declare_rt(
+            "zap_dict_get_strview_i64",
+            &[p.into(), p.into(), i.into(), i.into()],
+            Some(i.into()),
+        );
+        self.declare_rt(
+            "zap_dict_get_strview_ptr",
+            &[p.into(), p.into(), i.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_dict_get_strview_f64",
+            &[p.into(), p.into(), i.into(), i.into()],
+            Some(f64t.into()),
+        );
+        self.declare_rt(
+            "zap_dict_contains_strview",
+            &[p.into(), p.into(), i.into(), i.into()],
+            Some(i.into()),
+        );
         self.declare_rt(
             "zap_dict_get_fn_f64",
             &[p.into(), p.into(), p.into(), p.into()],

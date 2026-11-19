@@ -116,7 +116,7 @@ impl Checker {
     }
 
     /// Does this resolved type contain a `strview` anywhere in its structure?
-    fn ty_mentions_strview(ty: &Ty) -> bool {
+    pub(crate) fn ty_mentions_strview(ty: &Ty) -> bool {
         match ty {
             Ty::StrView => true,
             Ty::List(e)

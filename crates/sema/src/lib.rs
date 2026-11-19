@@ -3538,6 +3538,23 @@ impl Checker {
                     Some(t) => {
                         self.check_numeric_container_type(t);
                         let dt = self.resolve_type(t);
+                        // A borrowed `strview` nested in a collection/aggregate
+                        // (e.g. `list[strview]`, `dict[str, strview]`) is an escape
+                        // even as a local, since storing a view into a container
+                        // outlives the backing (#1082, ZAP5135). A *bare* `strview`
+                        // local is fine — it is frame-scoped and roots its backing.
+                        if dt != Ty::StrView && Self::ty_mentions_strview(&dt) {
+                            self.error(
+                                ErrorCode::ZAP5135,
+                                format!(
+                                    "a strview may not be stored in a collection ({}); \
+                                     it would outlive the view's backing — materialize \
+                                     with .to_str() (#1082)",
+                                    dt.display()
+                                ),
+                                *span,
+                            );
+                        }
                         if !self.coercible(&vt, &dt) {
                             self.error(
                                 ErrorCode::ZAP4001,
@@ -3951,6 +3968,23 @@ impl Checker {
                     Some(t) => {
                         self.check_numeric_container_type(t);
                         let dt = self.resolve_type(t);
+                        // A borrowed `strview` nested in a collection/aggregate
+                        // (e.g. `list[strview]`, `dict[str, strview]`) is an escape
+                        // even as a local, since storing a view into a container
+                        // outlives the backing (#1082, ZAP5135). A *bare* `strview`
+                        // local is fine — it is frame-scoped and roots its backing.
+                        if dt != Ty::StrView && Self::ty_mentions_strview(&dt) {
+                            self.error(
+                                ErrorCode::ZAP5135,
+                                format!(
+                                    "a strview may not be stored in a collection ({}); \
+                                     it would outlive the view's backing — materialize \
+                                     with .to_str() (#1082)",
+                                    dt.display()
+                                ),
+                                *span,
+                            );
+                        }
                         if !self.coercible(&vt, &dt) {
                             self.error(
                                 ErrorCode::ZAP4001,
@@ -8671,7 +8705,14 @@ impl Checker {
             for (i, a) in args.iter().enumerate() {
                 let at = self.infer(&a.value);
                 // First argument is the key, checked against the dict's key type.
-                if i == 0 && (n == 1 || n == 2) && !assignable(&at, k) && !matches!(at, Ty::Unknown)
+                // A borrowed `strview` is accepted where the dict is keyed by
+                // `str` (#1082): `d.get(v)` probes with the borrowed bytes, with
+                // no transient owned key.
+                if i == 0
+                    && (n == 1 || n == 2)
+                    && !assignable(&at, k)
+                    && !matches!(at, Ty::Unknown)
+                    && !(matches!(at, Ty::StrView) && *k == Ty::Str)
                 {
                     self.error(
                         ErrorCode::ZAP4025,
