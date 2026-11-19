@@ -3488,6 +3488,14 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), p.into(), i.into()],
             Some(p.into()),
         );
+        // `m/.../g` (global match) → `zap_regex_match_all` (a `list[Match]` of
+        // all ordered non-overlapping matches, #1078). Same C signature as
+        // `zap_regex_match`.
+        self.declare_rt(
+            "zap_regex_match_all",
+            &[p.into(), p.into(), i.into()],
+            Some(p.into()),
+        );
         self.declare_rt(
             "zap_regex_subst",
             &[p.into(), p.into(), p.into(), i.into()],

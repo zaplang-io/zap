@@ -10,6 +10,7 @@ listed here (see [`README.md`](README.md)).
 
 | # | Title | Status | Date |
 |---|-------|--------|------|
+| [1078](lang/1078-global-regex-match-iter.md) | Global regex match `=~ m/.../g` yields an iterable `list[Match]` (eager) | Locked | 2026-11-19 |
 | [1082](lang/1082-borrowed-bytes-strview.md) | Borrowed-bytes `strview` — explicit non-owning string view for read-only consumers | Locked | 2026-11-19 |
 
 ## stdlib
