@@ -2476,7 +2476,14 @@ fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError
         | Ty::AtomicArray(_)
         | Ty::Deque(_)
         | Ty::OSet(_) => Ok(Elem::Nested(nested.borrow_mut().intern(t))),
-        Ty::Ptr | Ty::Bytes | Ty::Array(..) | Ty::Match | Ty::Func(_) | Ty::Py => Ok(Elem::Ptr),
+        // A `bytes` element is a `ZapStr` pointer word — the same storage, GC
+        // tracing, and byte-wise key hashing as a `str` (`Elem::Ptr`) — but it is
+        // a dedicated `Elem::Bytes` (#1074, D-0241) so read-back (`rows[i]`,
+        // `for row in rows`) recovers `Ty::Bytes` instead of defaulting the bare
+        // pointer to `str`; without it, `len(rows[i])` counted codepoints
+        // (`zap_str_len_cp`) rather than bytes (`zap_str_len`).
+        Ty::Bytes => Ok(Elem::Bytes),
+        Ty::Ptr | Ty::Array(..) | Ty::Match | Ty::Func(_) | Ty::Py => Ok(Elem::Ptr),
         Ty::Bigint | Ty::Complex => Err(err(
             "collections of bigint or complex values are not supported yet",
         )),
@@ -2541,9 +2548,10 @@ fn deque_elem_tag(elem: Elem) -> i64 {
 /// element has no runtime ordering — `heap.nlargest`/`nsmallest` must be given a
 /// `key=` that maps it to an orderable key, and `heap[T]` rejects it outright.
 fn heap_orderable(elem: Elem) -> bool {
+    // `str` and `bytes` are both byte-wise-orderable `ZapStr` words (#1074).
     matches!(
         elem,
-        Elem::I64 | Elem::Bool | Elem::Char | Elem::Enum(_) | Elem::F64 | Elem::Ptr
+        Elem::I64 | Elem::Bool | Elem::Char | Elem::Enum(_) | Elem::F64 | Elem::Ptr | Elem::Bytes
     )
 }
 
@@ -19533,7 +19541,8 @@ impl<'a> FnLower<'a> {
                 // `char` orders as its `i64` codepoint word, like an int (#709).
                 Elem::I64 | Elem::Bool | Elem::Char => Ok(0),
                 Elem::Enum(_) => Ok(0),
-                Elem::Ptr => Ok(1),
+                // `str` and `bytes` are `ZapStr` words, ordered byte-wise (#1074).
+                Elem::Ptr | Elem::Bytes => Ok(1),
                 // Ordering `f64` elements directly is a clean follow-up (the
                 // runtime sort compares elements as `i64`/str words today); a
                 // `list[float]` is still sortable via a `key=` projection.

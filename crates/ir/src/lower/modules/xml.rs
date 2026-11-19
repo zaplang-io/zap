@@ -59,7 +59,10 @@ fn lower(
         // xml.dumps(e) -> str: call the prelude serializer.
         "dumps" => call_ret(lowerer, "__xml_dumps", a, Ty::Ptr, false),
         // Tokenizer cursor primitives.
-        "_lex_new" => call_ret(lowerer, "zap_xml_lex_new", a, Ty::Ptr, false),
+        // The lexer cursor handle is an opaque GC pointer sema types as `bytes`;
+        // the IR agrees (`Ty::Bytes`) for sema/IR type consistency now that
+        // `bytes`/`str` are distinct `Elem` kinds (#1074, D-0241).
+        "_lex_new" => call_ret(lowerer, "zap_xml_lex_new", a, Ty::Bytes, false),
         "_lex_next" => call_ret(lowerer, "zap_xml_lex_next", a, Ty::I64, false),
         "_lex_name" => call_ret(lowerer, "zap_xml_lex_name", a, Ty::Ptr, false),
         "_lex_value" => call_ret(lowerer, "zap_xml_lex_value", a, Ty::Ptr, false),

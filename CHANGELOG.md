@@ -1851,6 +1851,23 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **`len()` on a `bytes` element read back from a collection** (#1074, D-0241).
+  A `bytes` value stored in a `list`/`dict`/`set` and read back — via indexing
+  (`rows[0]`), iteration (`for row in rows`), a dict value, or a set member — now
+  reports its **byte** length, matching a direct `bytes` binding; it previously
+  reported the UTF-8 **codepoint** count (`len(bytes([195, 169, 0, 255, 128]))`
+  from a list element gave `4`, not `5`). The IR lowering had collapsed a `bytes`
+  collection element into the `str` pointer kind, so read-back lost the `bytes`
+  identity and took the `str` codepoint-length path; a dedicated `Elem::Bytes`
+  element kind now carries `bytes` through to read-back (byte-identical storage,
+  GC, and key hashing to `str` — only the read-back type and `len`/index/slice/
+  Display semantics differ). Unblocks the Mandelbrot `list[bytes]` benchmark.
+  Distinguishing `bytes` from `str` also realigned several module handle types
+  the IR had lowered as a bare `str` pointer though sema types them `bytes` — the
+  `net`/`tls` socket handles, the `http` response/request handle, `io.reader`,
+  the `sync` primitives, the `sys` standard streams, and the `process` subprocess
+  reads — so a handle is now storable in a `bytes`-typed collection and a
+  subprocess read reports its byte length (same pointer word; no runtime change).
 - **Collection constructors with a type-parameter element** (#1013). `list[T]()`
   / `dict[K, V]()` / `set[T]()` (and `heap`/`channel`) inside a **generic body**
   now monomorphise to the concrete element type instead of reaching codegen as a

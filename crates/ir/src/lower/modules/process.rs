@@ -160,14 +160,17 @@ fn lower(
             call_void(lowerer, "zap_popen_close_stdin", a, false)
         }
         // _popen_read(h, which, maxn) -> bytes. May raise (read error / cancel).
+        // Subprocess output is binary `bytes` (sema agrees), so the IR must carry
+        // `Ty::Bytes`, not a bare `str` `Ty::Ptr` — otherwise `len()` on the read
+        // would count UTF-8 codepoints, not bytes (the #1074 class, D-0241).
         "_popen_read" => {
             let a = lower_args(lowerer, args)?;
-            call_ret(lowerer, "zap_popen_read", a, Ty::Ptr, true)
+            call_ret(lowerer, "zap_popen_read", a, Ty::Bytes, true)
         }
         // _popen_read_all(h, which) -> bytes. May raise.
         "_popen_read_all" => {
             let a = lower_args(lowerer, args)?;
-            call_ret(lowerer, "zap_popen_read_all", a, Ty::Ptr, true)
+            call_ret(lowerer, "zap_popen_read_all", a, Ty::Bytes, true)
         }
         // _popen_poll(h) -> int64 (exit status, or -256 sentinel). Infallible.
         "_popen_poll" => {

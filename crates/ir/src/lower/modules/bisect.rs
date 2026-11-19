@@ -45,7 +45,8 @@ fn lower(
     let suffix = match elem {
         Elem::I64 | Elem::Bool | Elem::Char | Elem::Enum(_) => "i64",
         Elem::F64 => "f64",
-        Elem::Ptr => "ptr",
+        // `str` and `bytes` are both byte-comparable `ZapStr` words (#1074).
+        Elem::Ptr | Elem::Bytes => "ptr",
         _ => {
             return Err(err(
                 "bisect over a list of this element type is not supported \

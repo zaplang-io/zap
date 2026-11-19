@@ -67,7 +67,10 @@ fn lower(
         // json.dumps(v) -> str: call the prelude serializer.
         "dumps" => call_ret(lowerer, "__json_dumps", a, Ty::Ptr, false),
         // Tokenizer cursor primitives.
-        "_lex_new" => call_ret(lowerer, "zap_json_lex_new", a, Ty::Ptr, true),
+        // The lexer cursor handle is an opaque GC pointer sema types as `bytes`;
+        // the IR agrees (`Ty::Bytes`) for sema/IR type consistency now that
+        // `bytes`/`str` are distinct `Elem` kinds (#1074, D-0241).
+        "_lex_new" => call_ret(lowerer, "zap_json_lex_new", a, Ty::Bytes, true),
         "_lex_next" => call_ret(lowerer, "zap_json_lex_next", a, Ty::I64, false),
         "_lex_int" => call_ret(lowerer, "zap_json_lex_int", a, Ty::I64, false),
         "_lex_float" => call_ret(lowerer, "zap_json_lex_float", a, Ty::F64, false),

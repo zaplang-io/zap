@@ -12363,3 +12363,79 @@ protocol reused), [[D-0133]] (the opaque pointer-free handle precedent),
 (the #979 `fs` tempfile that `fs.temp_file` will join to this writer),
 [[D-0056]] / #97 (the `io` seam), [[D-0213]] (the single-argument seam row),
 [[D-0204]] (seam kwargs), epic #966, and Discussion #965 (gap #3).
+
+## D-0241 — a `bytes` collection element is a distinct `Elem::Bytes` so read-back counts bytes, not codepoints (#1074)
+
+**Context.** `len()` on a `bytes` value read back from a collection — `rows[0]`
+on a `list[bytes]`, `for row in rows`, a `dict`/`set` position — returned the
+UTF-8 **codepoint** count instead of the **byte** count. A direct `bytes`
+binding was correct; only the collection-read element was wrong. The issue's
+payload `bytes([195, 169, 0, 255, 128])` is 5 bytes but 4 codepoints (`0xC3
+0xA9` = `é`, then `0x00`, `0xFF`, `0x80`), so a list element reported `4`. This
+blocked the Mandelbrot `list[bytes]` benchmark (zap-benchmarks#5): `len(row)`
+disagreed with the bytes `io.write` actually emitted.
+
+**Root cause.** The IR element-kind map (`elem_kind`, `crates/ir/src/lower.rs`)
+collapsed `Ty::Bytes` into the `Elem::Ptr` arm together with `str`. A `bytes`
+element was therefore physically **and** nominally a `str` pointer: on read-back,
+`Elem::ty(Elem::Ptr)` returned `Ty::Ptr`, so `len()` took the `str` **codepoint**
+arm (`zap_str_len_cp`) rather than the `bytes` **byte** arm (`zap_str_len`), and
+indexing/slicing/Display defaulted to `str` semantics. Sema was **not** at fault
+— it types the element as `bytes` correctly; this was purely IR lowering losing
+the `bytes` identity once the element entered a collection cell.
+
+**Decision.** Introduce a dedicated **`Elem::Bytes`** element kind — the
+`Elem::Complex` value-element pattern (#928: a pointer word that retains scalar
+identity for read-back). A `bytes` element is a GC `ZapStr` pointer — the **same**
+physical word, `_ptr` runtime entry points, GC tracing, and byte-wise key
+hashing as a `str` (`Elem::Ptr`) — so storage, pushing, reading, and `dict`/`set`
+key behaviour are byte-identical to `str`. The **only** difference is read-back:
+`Elem::Bytes::ty()` returns `Ty::Bytes`, so every read-back position (`rows[i]`,
+iteration, dict value, set member) recovers the scalar `bytes` and uses byte (not
+codepoint) semantics for `len`/indexing/slicing/Display. `Elem::Bytes` is
+admitted in **every** position a `str` is — value element, dict key and value,
+set member — since it is a `ZapStr` with the same word, suffix, and hashing;
+`str` and `bytes` are both byte-wise orderable (`sort`, `heap`, `bisect`) and
+byte-wise hashable (dict key / set member).
+
+**Why not route `bytes` through the nested-collection interner** (#625,
+`Elem::Nested`)? That interner recovers a nested type on read-back without a new
+variant, but `Elem::Nested` is treated as an *unhashable, unorderable aggregate*:
+it is rejected as a `dict`/`set` key, rejected by `deque`/`oset` as a
+non-primitive element, and rejected by `sort`/`bisect`/`heap` ordering. Routing
+`bytes` through it would newly reject `set[bytes]`, `dict[.., bytes]` keys,
+`deque[bytes]`, `oset[bytes]`, and `sort`/`bisect` over `list[bytes]` — all of
+which currently work, because `bytes` is a `ZapStr` and behaves exactly like a
+`str` key/element. The dedicated `Elem::Bytes` preserves every one of those
+str-like behaviours while fixing only the read-back type.
+
+**No ABI / codegen change.** Codegen treats every collection element uniformly
+as a traced pointer word and never matches on `Elem`, so `Elem::Bytes` shares the
+`_ptr` entry points with no new runtime symbol; the distinction is lowering-only.
+`Elem` is not serialized into the module. No grammar change.
+
+**Fallout: sema/IR handle types realigned.** Distinguishing `bytes` from `str`
+surfaced a latent inconsistency the old `bytes ≡ str ≡ Elem::Ptr` collapse had
+hidden: several module functions whose handle/payload sema types as `bytes` were
+lowered in the IR as a bare `str` pointer (`Ty::Ptr`). Harmless while the two were
+one `Elem`, each is now a real bug — a handle stored in the `list[bytes]` /
+`dict[.., bytes]` sema accepts is rejected as a wrong-element-type mismatch, and
+`len()` on a `bytes`-typed read counts codepoints. The IR lowering is corrected to
+return `Ty::Bytes` (the same pointer word; no runtime change) for every one, so
+sema and the IR agree: the `net` socket/listener handle (`listen`/`connect`/
+`connect_ip_deadline`/`accept` — the regression `net_connect_deadline_stall`
+caught), the `tls` handle (`connect`/`connect_resolved`/`connect_insecure`/
+`listen`/`accept`), the `http` response/request handle (`get`/`post`/`request`/
+`read_request`/`_pool_do`), the `io.reader` and `json`/`xml` `_lex_new` cursor
+handles, the `sync` primitive handles (`mutex`/`waitgroup`/`once`/`rlock`/`event`/
+`semaphore`/`condition`), the `sys` standard-stream objects (`stdin`/`stdout`/
+`stderr`), and the `process` subprocess reads (`_popen_read`/`_popen_read_all`,
+which read binary `bytes`). The data-codec modules (`base64`/`hex`/`crypto`) were
+already consistent.
+
+Relates to the `Elem::Complex` pointer-identity value-element precedent this
+mirrors (#928), the `Elem::Nested` interner deliberately **not** used (#625), and
+the `bytes` value type (#337). Regression goldens: `tests/golden/list_bytes_len`
+(indexed / iterated / dict-value / set-member read-back across ASCII, multibyte
+UTF-8, an embedded zero byte, and non-UTF-8 bytes) and `list_bytes_len_param`
+(the issue's exact function-parameter repro).
