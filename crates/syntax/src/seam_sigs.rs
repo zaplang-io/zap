@@ -476,6 +476,10 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("tls", "recv", &["conn", "n"]),
     ("tls", "send", &["conn", "data"]),
     // ---- argparse (ticket #101): global singleton parser; `default` trailing ----
+    // The object-model constructor (#997, D-0238): both arguments optional, so
+    // each carries a SeamDefault::Str("") below for keyword-with-a-hole calls
+    // (e.g. `ArgumentParser(description="x")` fills `prog`).
+    ("argparse", "ArgumentParser", &["prog", "description"]),
     ("argparse", "set_prog", &["prog"]),
     ("argparse", "set_description", &["description"]),
     ("argparse", "add_flag", &["name"]),
@@ -535,6 +539,16 @@ pub enum SeamDefault {
 /// interior hole the binder rejects the call as before. Only interior optionals
 /// need an entry — a trailing optional is simply left absent when omitted.
 pub const SEAM_METHOD_DEFAULTS: &[(&str, &str, &str, SeamDefault)] = &[
+    // `argparse.ArgumentParser(prog="", description="")` (#997, D-0238): both
+    // optional, so `prog` must default when a caller supplies only
+    // `description=` by keyword (`description` is trailing, filled in lowering).
+    ("argparse", "ArgumentParser", "prog", SeamDefault::Str("")),
+    (
+        "argparse",
+        "ArgumentParser",
+        "description",
+        SeamDefault::Str(""),
+    ),
     // `http` client verbs: `headers` sits before the trailing `timeout` (#986),
     // so it must default when a caller supplies only `timeout`.
     ("http", "get", "headers", SeamDefault::EmptyDict),

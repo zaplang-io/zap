@@ -1451,6 +1451,426 @@ def __process_popen(list[str] cmd, dict[str, str] env={}, str cwd=\"\", bool mer
     if stderr:
         flags = flags + 8
     return Popen(_h=process._popen_spawn(cmd, env, cwd, flags))
+
+# argparse ArgumentParser object (I#997, D-0238) — a real parser VALUE, replacing
+# the process-global singleton (#101, still present as the flat `argparse.*`
+# back-compat shim). Pure Zap over `list`/`dict`/`str`/`int()` — NO runtime C —
+# so parsers are reentrant: two independent parsers never clobber each other, a
+# parser can be built in a function and returned, and libraries parse their own
+# args without touching an app's parser.
+#
+# Construct with `argparse.ArgumentParser(prog=\"\", description=\"\")` (lowers to
+# `__argparse_new`, the `concurrent.Counter` pattern). Declare arguments with the
+# Python-shaped `add_argument(name, action=, type=, ...)`; `action`/`type` are
+# string tags (static-language adaptation of Python's callables): `action` is
+# \"store\" (default), \"store_true\" or \"store_false\"; `type` is \"str\" (default),
+# \"int\" or \"float\". A name starting with \"-\" is an optional, otherwise a
+# positional (Python's rule). Subcommands: `add_subparsers()` -> `SubParsers`,
+# then `add_parser(name)` -> a nested `ArgumentParser`. Grouping:
+# `add_argument_group(title)` (help sectioning) and
+# `add_mutually_exclusive_group(required=)` (at most one member; conflict raises).
+#
+# `parse_args(argv)` takes argv WITHOUT the program name (Python's
+# `parse_args(sys.argv[1:])`) and returns a `Namespace`; read values back with
+# the typed getters. Parse errors raise a catchable error (no process exit, so a
+# library parser never kills its host); `-h`/`--help` sets `help_requested()`
+# (no auto-print, no exit) — a deliberate divergence from Python's exit(0)/exit(2)
+# that keeps parsing composable and testable.
+
+# The parsed result: a frozen snapshot of values keyed by destination name (an
+# argument's name with leading dashes stripped and \"-\" turned into \"_\", e.g.
+# \"--max-count\" -> \"max_count\"). Every declared argument has an entry (its
+# default until seen), so a typed getter never faults on a declared name. Values
+# are stored as strings and converted by the typed getters; flags store
+# \"true\"/\"false\".
+struct Namespace:
+    dict[str, str] _vals = {}
+    dict[str, bool] _present = {}
+    bool _help = False
+
+    # The raw string value for `name` (an option/positional destination).
+    def get(self, str name) -> str:
+        return self._vals[name]
+
+    # Same as `get` — the explicit string accessor.
+    def get_str(self, str name) -> str:
+        return self._vals[name]
+
+    # The value parsed as an int (raises if it is not a valid integer).
+    def get_int(self, str name) -> int64:
+        return int(self._vals[name])
+
+    # The value parsed as a float (raises if it is not a valid float).
+    def get_float(self, str name) -> float64:
+        return float(self._vals[name])
+
+    # A boolean flag's value (True once the flag was seen, else its default).
+    def get_flag(self, str name) -> bool:
+        return self._vals[name] == \"true\"
+
+    # Whether `name` was explicitly supplied on the command line (vs defaulted).
+    def has(self, str name) -> bool:
+        if name in self._present:
+            return self._present[name]
+        return False
+
+    # Whether `-h`/`--help` appeared (parsing does not auto-print or exit).
+    def help_requested(self) -> bool:
+        return self._help
+
+# One declared argument (flag / option / positional). Built by `_add`; callers
+# use `add_argument`, never this struct directly.
+struct Argument:
+    str name
+    str dest
+    str metavar
+    bool optional
+    bool is_flag
+    bool store_val
+    str kind
+    str default_raw
+    bool required
+    bool has_choices
+    list[str] choices
+    str help
+    int64 mx_group
+    str group_title
+
+# The handle returned by `add_subparsers()`; `add_parser` registers a nested
+# parser on the owning parent and hands it back for independent configuration.
+struct SubParsers:
+    ArgumentParser _p
+
+    def add_parser(self, str name, str help=\"\") -> ArgumentParser:
+        ArgumentParser child = __argparse_new(name, help)
+        self._p._sub_names.append(name)
+        self._p._sub_parsers.append(child)
+        return child
+
+# A named help section. Its `add_argument` registers on the owning parent (so
+# parsing is identical to a top-level argument) but tags the argument with the
+# group title so `format_help` lists it under that heading.
+struct ArgumentGroup:
+    ArgumentParser _p
+    str _title
+
+    def add_argument(self, str name, str action=\"store\", str type=\"str\", str default=\"\", bool required=False, list[str] choices=[], str help=\"\", str metavar=\"\") -> Argument:
+        return self._p._add(name, action, type, default, required, choices, help, metavar, -1, self._title)
+
+# A set of arguments at most one of which may appear; supplying two raises. When
+# the group is `required`, exactly one must appear.
+struct MutuallyExclusiveGroup:
+    ArgumentParser _p
+    int64 _idx
+
+    def add_argument(self, str name, str action=\"store\", str type=\"str\", str default=\"\", bool required=False, list[str] choices=[], str help=\"\", str metavar=\"\") -> Argument:
+        return self._p._add(name, action, type, default, required, choices, help, metavar, self._idx, \"\")
+
+# A command-line argument parser. A real value — build as many as you like.
+struct ArgumentParser:
+    str prog
+    str description
+    list[Argument] _opts = []
+    list[Argument] _pos = []
+    bool _has_sub = False
+    str _sub_dest = \"command\"
+    list[str] _sub_names = []
+    list[ArgumentParser] _sub_parsers = []
+    list[bool] _mx_required = []
+
+    # Declare an argument. A `name` starting with \"-\" is an optional (`--name`
+    # VALUE, or a boolean flag under action \"store_true\"/\"store_false\"); anything
+    # else is a positional consumed in declaration order. `type` (\"str\"/\"int\"/
+    # \"float\") validates the value at parse time; `choices` restricts it;
+    # `required` forces an optional to appear; `default` (a string) seeds the
+    # value when the argument is absent.
+    def add_argument(self, str name, str action=\"store\", str type=\"str\", str default=\"\", bool required=False, list[str] choices=[], str help=\"\", str metavar=\"\") -> Argument:
+        return self._add(name, action, type, default, required, choices, help, metavar, -1, \"\")
+
+    # Shared registration for `add_argument` and the group variants (`mx` is the
+    # mutually-exclusive group index or -1; `group` is the help-section title).
+    def _add(self, str name, str action, str kind, str default, bool required, list[str] choices, str help, str metavar, int64 mx, str group) -> Argument:
+        auto optional = name.startswith(\"-\")
+        auto dest = __argparse_dest(name)
+        auto is_flag = action == \"store_true\" or action == \"store_false\"
+        auto storev = action == \"store_true\"
+        auto dflt = default
+        if is_flag:
+            if action == \"store_true\":
+                dflt = \"false\"
+            else:
+                dflt = \"true\"
+        auto mv = metavar
+        if mv == \"\":
+            mv = dest
+        Argument a = Argument(name=name, dest=dest, metavar=mv, optional=optional, is_flag=is_flag, store_val=storev, kind=kind, default_raw=dflt, required=required, has_choices=len(choices) > 0, choices=choices, help=help, mx_group=mx, group_title=group)
+        if optional:
+            self._opts.append(a)
+        else:
+            self._pos.append(a)
+        return a
+
+    # Enable git-style subcommands. The chosen command name is stored under
+    # `dest` in the Namespace; each child parser handles the remaining argv.
+    def add_subparsers(self, str dest=\"command\", str help=\"\") -> SubParsers:
+        self._has_sub = True
+        self._sub_dest = dest
+        return SubParsers(_p=self)
+
+    # A titled help section; arguments added to it parse as normal top-level
+    # arguments.
+    def add_argument_group(self, str title=\"\", str description=\"\") -> ArgumentGroup:
+        return ArgumentGroup(_p=self, _title=title)
+
+    # A mutually-exclusive set; supplying more than one member raises, and when
+    # `required` is set, omitting all of them raises.
+    def add_mutually_exclusive_group(self, bool required=False) -> MutuallyExclusiveGroup:
+        auto idx = len(self._mx_required)
+        self._mx_required.append(required)
+        return MutuallyExclusiveGroup(_p=self, _idx=idx)
+
+    # Parse `argv` (WITHOUT the program name) and return the populated Namespace.
+    def parse_args(self, list[str] argv) -> Namespace:
+        Namespace ns = Namespace()
+        self._fill_defaults(ns)
+        self._parse_into(ns, argv, 0)
+        return ns
+
+    # Seed every declared destination with its default (and mark it not-present),
+    # so a getter never faults and `has` is accurate.
+    def _fill_defaults(self, Namespace ns):
+        for a in self._opts:
+            ns._vals[a.dest] = a.default_raw
+            ns._present[a.dest] = False
+        for a in self._pos:
+            ns._vals[a.dest] = a.default_raw
+            ns._present[a.dest] = False
+
+    # Index of the optional declared as `name`, or -1.
+    def _find_opt(self, str name) -> int64:
+        auto i = 0
+        for a in self._opts:
+            if a.name == name:
+                return i
+            i = i + 1
+        return -1
+
+    # Index of the subcommand `name`, or -1.
+    def _find_sub(self, str name) -> int64:
+        auto i = 0
+        for nm in self._sub_names:
+            if nm == name:
+                return i
+            i = i + 1
+        return -1
+
+    # The core scan: walk argv from `start`, binding optionals, positionals and
+    # (when enabled) a subcommand that consumes the remaining argv into a child
+    # parser. Runs required/mutually-exclusive checks at the end unless help was
+    # requested.
+    def _parse_into(self, Namespace ns, list[str] argv, int64 start):
+        list[bool] mx_seen = []
+        for r in self._mx_required:
+            mx_seen.append(False)
+        auto pos_i = 0
+        auto i = start
+        auto n = len(argv)
+        while i < n:
+            auto tok = argv[i]
+            if tok == \"-h\" or tok == \"--help\":
+                ns._help = True
+                i = i + 1
+            elif tok.startswith(\"-\") and tok != \"-\" and not __argparse_is_negnum(tok):
+                auto name = tok
+                auto inlinev = \"\"
+                auto has_inline = False
+                auto eq = tok.find(\"=\")
+                if eq >= 0:
+                    name = tok[:eq]
+                    inlinev = tok[eq + 1:]
+                    has_inline = True
+                auto oi = self._find_opt(name)
+                if oi < 0:
+                    raise \"unrecognized arguments: \" + name
+                Argument a = self._opts[oi]
+                if a.mx_group >= 0:
+                    if mx_seen[a.mx_group]:
+                        raise \"argument \" + name + \": not allowed with another argument in the same group\"
+                    mx_seen[a.mx_group] = True
+                if a.is_flag:
+                    if a.store_val:
+                        ns._vals[a.dest] = \"true\"
+                    else:
+                        ns._vals[a.dest] = \"false\"
+                    ns._present[a.dest] = True
+                    i = i + 1
+                else:
+                    auto val = \"\"
+                    if has_inline:
+                        val = inlinev
+                        i = i + 1
+                    else:
+                        if i + 1 >= n:
+                            raise \"argument \" + name + \": expected one argument\"
+                        val = argv[i + 1]
+                        i = i + 2
+                    __argparse_check(a, val)
+                    ns._vals[a.dest] = val
+                    ns._present[a.dest] = True
+            else:
+                if self._has_sub and pos_i >= len(self._pos):
+                    auto si = self._find_sub(tok)
+                    if si < 0:
+                        raise \"argument \" + self._sub_dest + \": invalid choice: \" + tok
+                    ns._vals[self._sub_dest] = tok
+                    ns._present[self._sub_dest] = True
+                    ArgumentParser child = self._sub_parsers[si]
+                    child._fill_defaults(ns)
+                    child._parse_into(ns, argv, i + 1)
+                    i = n
+                else:
+                    if pos_i >= len(self._pos):
+                        raise \"unrecognized arguments: \" + tok
+                    Argument a = self._pos[pos_i]
+                    __argparse_check(a, tok)
+                    ns._vals[a.dest] = tok
+                    ns._present[a.dest] = True
+                    pos_i = pos_i + 1
+                    i = i + 1
+        if not ns._help:
+            self._check_required(ns, pos_i, mx_seen)
+
+    # Enforce unmet positionals, required optionals, and required
+    # mutually-exclusive groups (all as catchable raises).
+    def _check_required(self, Namespace ns, int64 pos_consumed, list[bool] mx_seen):
+        if pos_consumed < len(self._pos):
+            Argument miss = self._pos[pos_consumed]
+            raise \"the following arguments are required: \" + miss.name
+        for a in self._opts:
+            if a.required and not ns._present[a.dest]:
+                raise \"the following arguments are required: \" + a.name
+        auto gi = 0
+        for req in self._mx_required:
+            if req and not mx_seen[gi]:
+                raise \"one of the arguments in mutually exclusive group is required\"
+            gi = gi + 1
+
+    # Render the usage + argument help (deterministic, for goldens/tooling).
+    def format_help(self) -> str:
+        list[str] lines = []
+        auto u = \"usage:\"
+        if self.prog != \"\":
+            u = u + \" \" + self.prog
+        u = u + \" [-h]\"
+        for a in self._opts:
+            u = u + \" \" + __argparse_usage_opt(a)
+        for a in self._pos:
+            u = u + \" \" + a.metavar
+        if self._has_sub:
+            u = u + \" \" + self._sub_dest + \" ...\"
+        lines.append(u)
+        if self.description != \"\":
+            lines.append(\"\")
+            lines.append(self.description)
+        if len(self._pos) > 0 or self._has_sub:
+            lines.append(\"\")
+            lines.append(\"positional arguments:\")
+            for a in self._pos:
+                lines.append(__argparse_help_row(a.metavar, a.help))
+            if self._has_sub:
+                auto subnames = \"\"
+                auto f = True
+                for nm in self._sub_names:
+                    if f:
+                        subnames = nm
+                        f = False
+                    else:
+                        subnames = subnames + \",\" + nm
+                lines.append(__argparse_help_row(self._sub_dest, \"{\" + subnames + \"}\"))
+        lines.append(\"\")
+        lines.append(\"options:\")
+        lines.append(\"  -h, --help  show this help message and exit\")
+        for a in self._opts:
+            if a.group_title == \"\":
+                lines.append(__argparse_help_row(__argparse_opt_display(a), a.help))
+        for a in self._opts:
+            if a.group_title != \"\" and __argparse_first_in_group(self, a):
+                lines.append(\"\")
+                lines.append(a.group_title + \":\")
+                for b in self._opts:
+                    if b.group_title == a.group_title:
+                        lines.append(__argparse_help_row(__argparse_opt_display(b), b.help))
+        auto out = \"\"
+        auto first = True
+        for ln in lines:
+            if first:
+                out = ln
+                first = False
+            else:
+                out = out + \"\\n\" + ln
+        return out
+
+    # Print `format_help()` to stdout.
+    def print_help(self):
+        print(self.format_help())
+
+# The backing constructor for `argparse.ArgumentParser(prog, description)` (its
+# lowering emits a call to this; see crates/ir/src/lower/modules/argparse.rs).
+def __argparse_new(str prog, str description) -> ArgumentParser:
+    return ArgumentParser(prog=prog, description=description)
+
+# Compute a destination name: strip leading dashes, map \"-\" to \"_\".
+def __argparse_dest(str name) -> str:
+    auto s = name
+    while s.startswith(\"-\"):
+        s = s[1:]
+    return s.replace(\"-\", \"_\")
+
+# Is `tok` a negative number (so it is a value, not an option)? e.g. \"-5\".
+def __argparse_is_negnum(str tok) -> bool:
+    if len(tok) < 2:
+        return False
+    return tok[1:].isdigit()
+
+# Validate a value against an argument's choices and declared type (raises).
+def __argparse_check(Argument a, str val):
+    if a.has_choices:
+        auto ok = False
+        for c in a.choices:
+            if c == val:
+                ok = True
+        if not ok:
+            raise \"argument \" + a.name + \": invalid choice: \" + val
+    if a.kind == \"int\":
+        int(val)
+    elif a.kind == \"float\":
+        float(val)
+
+# One option's token in the usage line.
+def __argparse_usage_opt(Argument a) -> str:
+    if a.is_flag:
+        return \"[\" + a.name + \"]\"
+    return \"[\" + a.name + \" \" + a.metavar + \"]\"
+
+# One option's left column in the help body.
+def __argparse_opt_display(Argument a) -> str:
+    if a.is_flag:
+        return a.name
+    return a.name + \" \" + a.metavar
+
+# A two-column help row (\"  <head>  <help>\"), or just the head when no help.
+def __argparse_help_row(str head, str help) -> str:
+    if help == \"\":
+        return \"  \" + head
+    return \"  \" + head + \"  \" + help
+
+# Is `a` the first-declared member of its (non-empty) help group? Used to emit
+# each group heading exactly once, in declaration order.
+def __argparse_first_in_group(ArgumentParser p, Argument a) -> bool:
+    for b in p._opts:
+        if b.group_title == a.group_title:
+            return b.name == a.name
+    return False
 ";
 
 /// Parse the built-in [`PRELUDE_SRC`] into AST items. The prelude is authored to
@@ -1620,6 +2040,20 @@ fn references_prelude(module: &Module) -> bool {
         // the unused struct/factory emit no code.
         "\"process\"",
         "\"Popen\"",
+        // The `argparse.ArgumentParser(...)` object (#997, D-0238): the parser
+        // value types (`ArgumentParser`, `Namespace`, `SubParsers`,
+        // `ArgumentGroup`, `MutuallyExclusiveGroup`, the internal `Argument`) and
+        // their `__argparse_*` helpers ship in the prelude, injected for any
+        // program that names the `argparse` module (so `argparse.ArgumentParser`
+        // triggers it — the flat `argparse.*` shim does too, harmlessly) or one
+        // of the result/parser types directly. The flat singleton is unaffected
+        // (it is C-backed, not prelude Zap); an unused injection emits no code.
+        "\"argparse\"",
+        "\"ArgumentParser\"",
+        "\"Namespace\"",
+        "\"SubParsers\"",
+        "\"ArgumentGroup\"",
+        "\"MutuallyExclusiveGroup\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))

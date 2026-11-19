@@ -844,6 +844,61 @@ fn argparse_positional_unchanged() {
     assert_ok(&prog("    argparse.add_option(\"--out\", \"x\")\n"));
 }
 
+// The object-model constructor `argparse.ArgumentParser(prog="",
+// description="")` (#997, D-0238): both arguments optional, keyword-bindable,
+// reorderable, and defaultable through the seam.
+#[test]
+fn argparse_parser_ctor_keyword_and_reorder() {
+    // Zero args: both default.
+    assert_ok(&prog("    auto p = argparse.ArgumentParser()\n"));
+    // One positional.
+    assert_ok(&prog("    auto p = argparse.ArgumentParser(\"tool\")\n"));
+    // Both positional.
+    assert_ok(&prog(
+        "    auto p = argparse.ArgumentParser(\"tool\", \"desc\")\n",
+    ));
+    // Both by keyword.
+    assert_ok(&prog(
+        "    auto p = argparse.ArgumentParser(prog=\"tool\", description=\"desc\")\n",
+    ));
+    // Reordered keywords.
+    assert_ok(&prog(
+        "    auto p = argparse.ArgumentParser(description=\"desc\", prog=\"tool\")\n",
+    ));
+    // A keyword with a leading hole: `prog` must default (interior fill).
+    assert_ok(&prog(
+        "    auto p = argparse.ArgumentParser(description=\"desc\")\n",
+    ));
+    // Only the leading keyword: `description` stays absent (trailing default).
+    assert_ok(&prog(
+        "    auto p = argparse.ArgumentParser(prog=\"tool\")\n",
+    ));
+}
+
+#[test]
+fn argparse_parser_ctor_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto p = argparse.ArgumentParser(name=\"tool\")\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn argparse_parser_ctor_too_many_args_rejected() {
+    assert_code(
+        &prog("    auto p = argparse.ArgumentParser(\"a\", \"b\", \"c\")\n"),
+        "ZAP4025",
+    );
+}
+
+#[test]
+fn argparse_parser_ctor_bad_arg_type_rejected() {
+    assert_code(
+        &prog("    auto p = argparse.ArgumentParser(prog=5)\n"),
+        "ZAP4024",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // xml — DOM parse / serialize / construct.
 // ---------------------------------------------------------------------------

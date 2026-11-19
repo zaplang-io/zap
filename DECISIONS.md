@@ -12115,3 +12115,97 @@ Relates to [[D-0056]] (`process.run` and the sys/io/fs core), [[D-0204]] (the
 seam keyword-binding convention), [[D-0202]] (seam ctor sugar) and D-0230 (the
 `http.Client` prelude-struct + stable-handle pattern this reuses). No grammar
 change — these are module functions, a prelude struct, and its methods.
+
+## D-0238 — `argparse` `ArgumentParser` object: subparsers, groups, and a typed-getter result; the flat singleton kept as a back-compat shim (#997 / epic #966)
+
+**Status: Locked.**
+
+**Context.** The v1 `argparse` ([[D-0056]], #101) is a **process-global singleton**:
+one parser manipulated through flat module functions (`set_prog`/`add_flag`/
+`add_option`/`add_int`/`add_positional`/`parse`/`get*`/`format_help`/
+`help_requested`/`reset`). That shape blocks everything a non-trivial CLI needs —
+git-style subcommands, more than one parser, argument / mutually-exclusive
+groups, building a parser in a function and returning it, and reentrancy (tests
+had to `reset()` between cases; two argvs could not be parsed concurrently).
+#997 (basis: Discussion #965, the former L-4) replaces it with a real parser
+**value**. The language already supports this: the seam returns method-bearing
+structs ([[D-0230]] `http.Client`, `threading.Thread`, `concurrent.Counter`),
+and a self-referential `struct P { list[P] subs }` with a method that creates,
+stores and returns a fresh nested instance type-checks and lowers.
+
+**Decision — a pure-Zap `ArgumentParser` prelude struct, a `Namespace` result
+with typed getters, Python-shaped `add_argument`, and the flat singleton kept
+unchanged as a back-compat shim.**
+
+1. **Construction.** `argparse.ArgumentParser(prog="", description="")` is seam
+   ctor sugar: its lowering delegates to the prelude free function
+   `__argparse_new` (the `concurrent.Counter` pattern), which builds the prelude
+   **`struct ArgumentParser`**. A real value — build as many as you like; two
+   never clobber each other.
+2. **Pure Zap, no runtime C.** The parser, result, group and subparser types and
+   all parsing/formatting logic live in `PRELUDE_SRC`
+   (`crates/syntax/src/parser.rs`) as ordinary Zap over `list`/`dict`/`str`/
+   `int()` — **no `zaprt.c` / GC / runtime code**. Reclamation is the tracing
+   collector's job (the `concurrent` finding). Reentrancy is therefore structural,
+   not bolted on. The types are injected (via the `references_prelude` needles)
+   for any program that names the `argparse` module or one of the parser types.
+3. **Declaring arguments — Python-shaped `add_argument`.** The chosen surface is
+   the single `add_argument(name, action="store", type="str", default="",
+   required=False, choices=[], help="", metavar="")` method (not Zap-idiomatic
+   `add_flag`/`add_str`/… typed methods). It mirrors Python's spelling; because
+   Zap is statically typed, Python's *callables* become **string tags**: `action`
+   is `"store"` / `"store_true"` / `"store_false"`, and `type` is `"str"` /
+   `"int"` / `"float"` (validated — and `int`/`float` conversion-raising — at
+   parse time). A `name` starting with `-` is an optional, otherwise a positional
+   (Python's rule). **Divergence:** one `name` per argument — short/long aliasing
+   (`-v`/`--verbose` as one argument) is deferred.
+4. **Result representation — a `Namespace` with typed getters (not dynamic
+   attributes).** `parse_args(argv) -> Namespace`. A static language cannot grow
+   attributes named at runtime, so a Python `args.verbose` `Namespace` is
+   impossible; the result instead exposes `get`/`get_str`/`get_int`/`get_float`/
+   `get_flag`/`has`/`help_requested`, keyed by **destination name** (leading
+   dashes stripped, `-` → `_`, e.g. `--max-count` → `max_count`). Values are
+   stored as strings and converted by the typed getters; every declared argument
+   has an entry (its default until supplied), so a getter never faults.
+   `argv` is **without** the program name, matching Python's `parse_args(
+   sys.argv[1:])` (and unlike the flat `argparse.parse`, which skips `argv[0]`).
+5. **Subcommands.** `add_subparsers(dest="command") -> SubParsers`, then
+   `add_parser(name) -> ArgumentParser` registers a nested parser on the parent
+   and hands it back. At parse time the first positional after the parent's own
+   arguments selects the child (stored under `dest`); the child parses the
+   remaining argv and merges its results into the same `Namespace`.
+6. **Groups.** `add_argument_group(title) -> ArgumentGroup` (a help-sectioning
+   wrapper whose members parse as ordinary top-level arguments) and
+   `add_mutually_exclusive_group(required=False) -> MutuallyExclusiveGroup`
+   (supplying two members raises; `required` makes omitting all of them raise).
+7. **Migration — the flat singleton is kept, unchanged, as a shim.** The
+   C-backed `argparse.*` functions ([[D-0056]]) are **left exactly as they are**
+   (zero risk to existing callers, incl. tooling), documented as legacy /
+   superseded by `ArgumentParser`; the new object API is independent. (Reimplementing
+   the flat functions as a literal delegation to a hidden default parser would
+   depend on module-level mutable state, #661, which is only partially landed —
+   not worth the risk for an invisible internal change.)
+8. **Errors / help — catchable, no process exit.** A parse error (unknown
+   argument, missing required / positional, bad choice, bad typed value,
+   mutually-exclusive conflict) raises a **catchable** error; the object API
+   **never calls `exit()`**, so a library parser cannot kill its host.
+   `-h`/`--help` sets `help_requested()` — **no auto-print, no exit**. Both are
+   deliberate **divergences from Python** (which prints usage and `exit(0)`, or
+   errors and `exit(2)`), chosen for composability and testability; `print_help()`
+   / `format_help()` render the usage + arguments on demand.
+
+**Seam (positional-vs-kwarg).** Only the **constructor** is a seam function:
+`ArgumentParser(prog, description)` — both optional, so both are keyword-bound
+and carry a `SeamDefault::Str("")` in `SEAM_METHOD_DEFAULTS` (recorded in
+`crates/syntax/src/seam_sigs.rs`, with `crates/sema/tests/seam_kwargs.rs` cases).
+`prog`/`description` are **recommended kwargs** — each is an optional string and
+far clearer named. The object's **methods** (`add_argument`, `parse_args`, the
+group/subparser calls) are ordinary prelude-struct methods, so they get
+keyword/default binding natively (I#481) and need **no** seam row; `add_argument`'s
+many options (`action`/`type`/`default`/`required`/`choices`/`help`/`metavar`)
+are all keyword-with-defaults by that mechanism, which is the intended spelling.
+
+Relates to [[D-0056]] (the v1 singleton this supersedes), [[D-0230]] (the
+prelude-struct value pattern), [[D-0204]] (the seam keyword-binding convention)
+and [[D-0202]] (seam ctor sugar). No grammar change — a prelude struct, its
+methods, and one seam constructor.

@@ -25,6 +25,29 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`argparse` — a real `ArgumentParser` object: subcommands, groups, and
+  composable parsers** (#997, D-0238, epic #966). Replaces the v1 process-global
+  singleton (#101, D-0056) with a parser **value**: `argparse.ArgumentParser(
+  prog="", description="")`. Declare arguments with the Python-shaped
+  **`add_argument(name, action=, type=, default=, required=, choices=, help=,
+  metavar=)`** — `action` (`"store"`/`"store_true"`/`"store_false"`) and `type`
+  (`"str"`/`"int"`/`"float"`) are string tags (Zap is statically typed), and a
+  leading `-` marks an optional vs a positional. **Subcommands**:
+  `add_subparsers(dest=)` → `add_parser(name)` returns a nested `ArgumentParser`
+  (git-style dispatch). **Groups**: `add_argument_group(title)` and
+  `add_mutually_exclusive_group(required=)` (a conflict raises).
+  **`parse_args(argv) -> Namespace`** (argv **without** the program name, like
+  Python's `sys.argv[1:]`) returns a result read back through typed getters
+  **`get`/`get_str`/`get_int`/`get_float`/`get_flag`/`has`/`help_requested`**,
+  keyed by destination name (`--max-count` → `max_count`); a static language has
+  no dynamic-attribute `Namespace`. **`format_help()` / `print_help()`** render
+  usage + arguments. Parsers are pure Zap (no runtime C) and fully reentrant —
+  two parsers never clobber each other, and a parser can be built in a function
+  and returned. **Migration:** the flat `argparse.*` functions are kept unchanged
+  as a back-compat shim (legacy; superseded by the object). **Divergences from
+  Python (D-0238):** parse errors raise a *catchable* error and `-h`/`--help`
+  sets `help_requested()` — the object API never calls `exit()` (composable /
+  testable); one `name` per argument (short/long aliasing deferred).
 - **`process` — subprocess ergonomics: run options, `check_run`, `run_shell`,
   and a streaming `Popen` handle** (#976, D-0237, epic #966). The blocking
   `process.run(argv)` grows Python-`subprocess.run`-shaped keyword options:
