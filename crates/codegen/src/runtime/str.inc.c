@@ -857,8 +857,9 @@ void *zap_regex_match(void *subject_, void *pattern_, int64_t flags) {
  * match yields an empty list.
  *
  * Zero-length matches advance the search by one UTF-8 code point so the loop
- * always makes forward progress and terminates (e.g. `m/a*/g`); a non-empty
- * match continues from its end, which also keeps matches non-overlapping. */
+ * always makes forward progress and terminates (patterns that can match empty,
+ * such as a star-quantified group); a non-empty match continues from its end,
+ * which also keeps matches non-overlapping. */
 void *zap_regex_match_all(void *subject_, void *pattern_, int64_t flags) {
     ZapStr *subject = (ZapStr *)subject_;
     ZapStr *pattern = (ZapStr *)pattern_;
