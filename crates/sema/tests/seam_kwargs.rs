@@ -1800,3 +1800,132 @@ fn fs_temp_file_methods_and_with_typecheck() {
          \x20   t2.close_()\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// statistics (#980, D-0243): keyword binding, defaults, and arg-type checks.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn statistics_list_keyword_binds() {
+    // The single-list functions name their list `xs`.
+    assert_ok(&prog("    auto a = statistics.mean(xs=[1.0, 2.0, 3.0])\n"));
+    assert_ok(&prog(
+        "    auto b = statistics.median(xs=[1.0, 2.0, 3.0])\n",
+    ));
+    assert_ok(&prog("    auto c = statistics.mode(xs=[1.0, 1.0, 2.0])\n"));
+    assert_ok(&prog("    auto d = statistics.multimode(xs=[1.0, 2.0])\n"));
+}
+
+#[test]
+fn statistics_int_lists_accepted() {
+    // An int list is accepted alongside a float list (D-0243).
+    assert_ok(&prog("    auto a = statistics.mean(xs=[1, 2, 3])\n"));
+    assert_ok(&prog("    auto b = statistics.pstdev([1, 2, 3, 4])\n"));
+}
+
+#[test]
+fn statistics_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto a = statistics.mean(data=[1.0, 2.0])\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn statistics_non_numeric_list_rejected() {
+    // A list of str is not a numeric sequence.
+    assert_code(
+        &prog("    auto a = statistics.mean([\"a\", \"b\"])\n"),
+        "ZAP4024",
+    );
+}
+
+#[test]
+fn statistics_spread_optional_centre_keyword() {
+    // `variance`/`stdev` bind their optional `xbar`; `pvariance`/`pstdev` bind `mu`.
+    assert_ok(&prog("    auto a = statistics.variance([1.0, 2.0, 3.0])\n"));
+    assert_ok(&prog(
+        "    auto b = statistics.variance([1.0, 2.0, 3.0], xbar=2.0)\n",
+    ));
+    assert_ok(&prog(
+        "    auto c = statistics.stdev([1.0, 2.0, 3.0], xbar=2.0)\n",
+    ));
+    assert_ok(&prog(
+        "    auto d = statistics.pvariance([1.0, 2.0], mu=1.5)\n",
+    ));
+    assert_ok(&prog(
+        "    auto e = statistics.pstdev([1.0, 2.0], mu=1.5)\n",
+    ));
+}
+
+#[test]
+fn statistics_variance_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto a = statistics.variance([1.0, 2.0], centre=1.0)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn statistics_quantiles_keywords_and_defaults() {
+    // `quantiles(xs, n=4, method='exclusive')`: all three bindings, plus the
+    // interior `n` default when only `method` is given by keyword (D-0243).
+    assert_ok(&prog(
+        "    auto a = statistics.quantiles([1.0, 2.0, 3.0, 4.0])\n",
+    ));
+    assert_ok(&prog(
+        "    auto b = statistics.quantiles([1.0, 2.0, 3.0], n=3)\n",
+    ));
+    assert_ok(&prog(
+        "    auto c = statistics.quantiles([1.0, 2.0, 3.0], method=\"inclusive\")\n",
+    ));
+    assert_ok(&prog(
+        "    auto d = statistics.quantiles(xs=[1.0, 2.0, 3.0], n=4, method=\"exclusive\")\n",
+    ));
+    // Reordered keywords still land in the right slots.
+    assert_ok(&prog(
+        "    auto e = statistics.quantiles(method=\"inclusive\", xs=[1.0, 2.0, 3.0], n=5)\n",
+    ));
+}
+
+#[test]
+fn statistics_quantiles_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto a = statistics.quantiles([1.0, 2.0], buckets=4)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn statistics_relationship_keywords() {
+    // Two-list relationships name their lists `xs`/`ys`; `linear_regression`
+    // carries the optional `proportional` flag.
+    assert_ok(&prog(
+        "    auto a = statistics.covariance(xs=[1.0, 2.0, 3.0], ys=[1.0, 2.0, 3.0])\n",
+    ));
+    assert_ok(&prog(
+        "    auto b = statistics.correlation([1.0, 2.0, 3.0], [1.0, 2.0, 3.0])\n",
+    ));
+    assert_ok(&prog(
+        "    auto c = statistics.linear_regression([1.0, 2.0, 3.0], [2.0, 4.0, 6.0])\n",
+    ));
+    assert_ok(&prog(
+        "    auto d = statistics.linear_regression([1.0, 2.0], [2.0, 4.0], proportional=True)\n",
+    ));
+}
+
+#[test]
+fn statistics_linear_regression_unknown_keyword_rejected() {
+    assert_code(
+        &prog("    auto a = statistics.linear_regression([1.0], [2.0], prop=True)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn statistics_too_many_args_rejected() {
+    assert_code(
+        &prog("    auto a = statistics.mean([1.0, 2.0], [3.0, 4.0])\n"),
+        "ZAP4025",
+    );
+}

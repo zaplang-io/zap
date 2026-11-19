@@ -43,6 +43,7 @@ mod process;
 mod random;
 mod runtime;
 mod signal;
+mod statistics;
 mod support;
 mod sync;
 mod sys;
@@ -87,6 +88,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     hex::MODULE,
     hash::MODULE,
     math::MODULE,
+    statistics::MODULE,
     fft::MODULE,
     linalg::MODULE,
     random::MODULE,
@@ -263,6 +265,9 @@ fn seam_default_arg(def: zapc_syntax::seam_sigs::SeamDefault, args: &[ast::Arg])
         zapc_syntax::seam_sigs::SeamDefault::EmptyDict => ast::Expr::Dict(Vec::new(), span),
         zapc_syntax::seam_sigs::SeamDefault::Float(lexeme) => {
             ast::Expr::Float(lexeme.to_string(), span)
+        }
+        zapc_syntax::seam_sigs::SeamDefault::Int(lexeme) => {
+            ast::Expr::Int(lexeme.to_string(), span)
         }
         zapc_syntax::seam_sigs::SeamDefault::Str(s) => ast::Expr::Str {
             value: s.to_string(),

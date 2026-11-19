@@ -156,6 +156,11 @@ pub(crate) static RUNTIME_FRAGMENTS: &[RuntimeFile] = &[
         in_tu: true,
     },
     RuntimeFile {
+        path: "runtime/statistics.inc.c",
+        text: include_str!("runtime/statistics.inc.c"),
+        in_tu: true,
+    },
+    RuntimeFile {
         path: "runtime/json.inc.c",
         text: include_str!("runtime/json.inc.c"),
         in_tu: true,

@@ -1,0 +1,39 @@
+mean 2.5 3.0
+fmean 2.5 0.1
+hmean_exact 2.0
+median 2.0 2.5
+median_lohi 2.0 3.0 2.0 2.0
+mode 3.0 1.0 5.0 1.0
+multimode_ties [1.0, 2.0]
+multimode_all [1.0, 2.0, 3.0]
+multimode_empty []
+variance 2.5 2.0
+variance_xbar 1.0
+pvariance_mu 1.0
+q_default [1.25, 2.5, 3.75]
+q_excl [1.25, 2.5, 3.75]
+q_incl [1.75, 2.5, 3.25]
+q_incl_defn [1.75, 2.5, 3.25]
+cov 1.0
+corr 1.0 -1.0
+linreg 2.0 0.0
+linreg_prop 2.0 0.0
+geomean_ok
+geomean_exact_ok
+hmean_ok
+stdev_ok
+stdev_xbar_ok
+mean_empty
+mode_empty
+variance_one
+stdev_one
+geomean_nonpos
+geomean_zero
+hmean_nonpos
+quantiles_one
+quantiles_n0
+quantiles_method
+cov_one
+cov_mismatch
+corr_constant
+linreg_constant

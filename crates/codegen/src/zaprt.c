@@ -10230,6 +10230,10 @@ __attribute__((constructor)) static void zap_gc_register_statics(void) {
 #include "runtime/accel/blas.inc.c"
 
 #include "runtime/math_random.inc.c"
+/* statistics (#980, D-0243): descriptive stats over scalar lists. Included
+ * after math_random so it reuses the ZapList/ZapStr helpers and libm, and the
+ * Shewchuk-sum pattern from `zap_math_fsum`. */
+#include "runtime/statistics.inc.c"
 /* NumPy-compatible bit-exact PCG64 `Generator` surface (#930/#931, D-0189).
  * Included here, after the ZapArray helpers (array construction/access) and the
  * xoshiro block (`zap_os_entropy_u64`), so both are in scope. */

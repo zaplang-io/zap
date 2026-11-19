@@ -30,6 +30,8 @@ fn seam_default_arg(def: SeamDefault, span: Span) -> Arg {
         SeamDefault::EmptyDict => Expr::Dict(Vec::new(), span),
         // A float literal (its raw lexeme), e.g. `math.isclose`'s `rel_tol=1e-9`.
         SeamDefault::Float(lexeme) => Expr::Float(lexeme.to_string(), span),
+        // An int literal (its raw lexeme), e.g. `statistics.quantiles`'s `n=4`.
+        SeamDefault::Int(lexeme) => Expr::Int(lexeme.to_string(), span),
         // A plain string literal, e.g. `process.run`'s `cwd=""` / `input=""`.
         SeamDefault::Str(s) => Expr::Str {
             value: s.to_string(),
@@ -76,6 +78,7 @@ mod process;
 mod random;
 mod runtime;
 mod signal;
+mod statistics;
 mod sync;
 mod sys;
 mod threading;
@@ -115,6 +118,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     hex::MODULE,
     hash::MODULE,
     math::MODULE,
+    statistics::MODULE,
     fft::MODULE,
     linalg::MODULE,
     random::MODULE,

@@ -25,6 +25,27 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`statistics` — descriptive statistics over scalar lists** (#980, D-0243,
+  epic #966). The ergonomic scalar-`list` surface Python's `statistics` provides,
+  distinct from the #505 numeric-**array** reductions (it builds on plain `list`
+  iteration + libm, not on the array machinery). **Means:** `mean` (compensated
+  sum), `fmean` (Shewchuk-exact), `geometric_mean`, `harmonic_mean`. **Order
+  statistics:** `median`, `median_low`, `median_high`, `mode` (first value with
+  the maximal count), `multimode` (all tied values, first-appearance order).
+  **Spread:** `variance`/`stdev` (sample, ÷ n−1, optional `xbar`) and
+  `pvariance`/`pstdev` (population, ÷ n, optional `mu`). **`quantiles(xs, n=4,
+  method='exclusive')`** — both CPython methods (`'exclusive'`/`'inclusive'`),
+  returning the n−1 cut points. **Relationships:** `covariance`, `correlation`
+  (Pearson), `linear_regression(xs, ys, proportional=False) -> (slope,
+  intercept)`. Every function accepts a `list[float64]` **or** a `list[int64]`
+  and returns `float` (`multimode`/`quantiles` → `list[float64]`); an int list is
+  promoted to `float` at the boundary. Empty / invalid input raises a catchable
+  `ValueError` (the StatisticsError-equivalent — Python's `StatisticsError`
+  subclasses `ValueError`). Divergences from Python: results are always `float`
+  (not `int`/`Fraction`); `harmonic_mean` requires strictly positive data (a
+  non-positive value raises, matching `geometric_mean`). The `quantiles` `n=`/
+  `method=`, the `variance`/`stdev` `xbar=`, the `pvariance`/`pstdev` `mu=`, and
+  the `linear_regression` `proportional=` arguments are recommended keywords.
 - **`fs.temp_file` — a named temporary file (`NamedTemporaryFile`)** (#1077,
   D-0242, epic #966). The deferred follow-up from #979, now that #1071 shipped
   the `io` buffered `Writer`. **`fs.temp_file([prefix, suffix, dir, delete]) ->

@@ -12512,3 +12512,80 @@ pattern it mirrors), and [[D-0069]] (the `with` context-manager protocol).
 Golden: `tests/golden/fs_temp_file` (write/flush/close_, delete-on-close vs
 `delete=False` persistence, the `with` auto-delete form, idempotent close,
 prefix/suffix/dir, and the catchable create-error path).
+
+## D-0243 — stdlib `statistics`: descriptive statistics over scalar lists (#980 / epic #966)
+
+**Context.** Zap had NumPy-style reductions over numeric **arrays** (#505) but no
+ergonomic scalar-list `statistics` surface — a quick `mean`/`median`/`stdev` over
+a plain `list` meant reaching for the array machinery or hand-coding. #980 (epic
+#966, Discussion #965 gap #15) fills that gap, matching Python's `statistics`. A
+pre-implementation search confirmed no earlier issue/discussion to fold in.
+
+**Module shape.** `statistics` is the ergonomic **scalar-list** surface, built on
+plain `list` iteration + libm (`sqrt`/`exp`/`log` already in the runtime). It does
+**not** wrap or duplicate the numeric-array reductions (`math.fsum`/`prod`, the
+#505 array ops) — an `array` is not a valid argument. The whole module lives in a
+new runtime fragment `runtime/statistics.inc.c` with the usual three-facet front
+end (sema types/arity, ir lowering, codegen symbol decls).
+
+**Functions (Python parity).**
+- **means** — `mean` (Neumaier compensated sum ÷ n), `fmean` (Shewchuk-exact sum ÷
+  n), `geometric_mean` (`exp(mean(log x))`), `harmonic_mean` (`n / Σ(1/x)`).
+- **order statistics** — `median` (mean of the two middles for even n),
+  `median_low`, `median_high`, `mode` (first value with the maximal count, in
+  first-appearance order on a tie), `multimode` (every value tied for the mode, in
+  first-appearance order).
+- **spread** — `variance`/`stdev` (sample, ÷ n−1, need ≥ 2 points, optional
+  `xbar`), `pvariance`/`pstdev` (population, ÷ n, need ≥ 1 point, optional `mu`).
+  The sum of squared deviations uses CPython's `_ss` correction (`Σd² − (Σd)²/n`).
+- **quantiles** — `quantiles(xs, n=4, method='exclusive')`, both CPython methods
+  (`'exclusive'` / `'inclusive'`), returning the n−1 cut points; need ≥ 2 points
+  and n ≥ 1.
+- **relationships** — `covariance`, `correlation` (Pearson, clamped to `[-1, 1]`),
+  `linear_regression(xs, ys, proportional=False) -> (slope, intercept)`; each needs
+  ≥ 2 points and equal-length inputs.
+
+**Decision 1 — element-type surface.** Every function accepts a **`list[float64]`
+OR a `list[int64]`**; an integer list is read element-wise and promoted to
+`double` at the runtime boundary via a per-call `is_float` `i64` flag (0 = read the
+word as `int64`, 1 = read it as `f64` bits), so a single C kernel serves both (no
+`_i64`/`_f64` split as in `math.prod`, because the result is always float). **All
+results are `float`** (`multimode`/`quantiles` → `list[float64]`,
+`linear_regression` → `(float64, float64)`) — one static return type.
+
+**Decision 2 — exception.** Empty / invalid input raises **`ValueError`**, the
+StatisticsError-equivalent: Python's `StatisticsError` subclasses `ValueError`, so
+`except ValueError` catches every case, and Zap's exception model is a flat enum
+with no subclassing (no distinct `StatisticsError` type). Messages are prefixed
+`statistics.<fn>():`. Every raising kernel is lowered through `throwing_call`
+(`invoke`), so the error is catchable (the "raising runtime calls need
+throwing_call" rule); `multimode`, which never raises (empty → `[]`), uses a plain
+call.
+
+**Divergences from Python (intentional).**
+- **Results are always `float`.** Python's `mean`/`median`/`mode`/`median_low`/
+  `median_high` can return `int`/`Fraction`/`Decimal`; Zap returns the float value
+  (e.g. `mode([5, 5, 5, 1]) -> 5.0`). `mean` uses Neumaier compensated summation,
+  not Python's exact-rational arithmetic (`fmean` is Shewchuk-exact).
+- **`harmonic_mean` requires strictly positive data** — a non-positive element
+  raises (matching `geometric_mean`), where CPython maps a zero to a `0.0` result.
+- **No `StatisticsError` subclass** (flat exception model — see Decision 2).
+- `linear_regression` returns a `(slope, intercept)` tuple (no named result type);
+  `proportional=True` fits through the origin.
+
+**Seam (positional-vs-kwarg).** Rows are added to `crates/syntax/src/seam_sigs.rs`
+for every function (D-0213). The list arguments (`xs`/`ys`) are positional; the
+tuning parameters are **recommended kwargs**: `quantiles` `n`/`method`,
+`variance`/`stdev` `xbar`, `pvariance`/`pstdev` `mu`, `linear_regression`
+`proportional`. `quantiles`' `n` is an *interior* optional (it precedes the
+trailing `method`), so a new **`SeamDefault::Int("4")`** variant fills it when a
+caller supplies only `method=`; `method` defaults to `"exclusive"`. This is the
+first use of an integer seam default (the variant synthesizes an `Expr::Int`
+lexeme in both the sema binder and the lowering twin, exactly like `Float`).
+
+Relates to [[D-0234]] (the `math` scalar/reduction surface it reuses the ZapList +
+Shewchuk-sum patterns from) and [[D-0204]] (the seam calling convention it extends
+with `SeamDefault::Int`). seam kwargs: `crates/sema/tests/seam_kwargs.rs`. Golden:
+`tests/golden/statistics_module` (every function at known values, both quantile
+methods, int-vs-float inputs, mode/multimode ties, even/odd median, and the
+empty/single-point/non-positive/length-mismatch/constant-input raises).
