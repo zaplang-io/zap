@@ -22,6 +22,12 @@ listed here (see [`README.md`](README.md)).
 | [982](stdlib/982-fractions-exact-rational.md) | stdlib fractions — exact rational Fraction, software over bigint | Locked | 2026-11-19 |
 | [1095](stdlib/1095-list-pop-and-methods.md) | list.pop plus index / reverse / copy — the remaining Python list methods | Locked | 2026-11-19 |
 
+## runtime
+
+| # | Title | Status | Date |
+|---|-------|--------|------|
+| [1100](runtime/1100-channel-element-type.md) | A typed channel's element keeps its precise type on receive | Locked | 2026-11-19 |
+
 ## tooling
 
 | # | Title | Status | Date |
