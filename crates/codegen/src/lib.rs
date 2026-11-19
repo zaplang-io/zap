@@ -2609,6 +2609,25 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             None,
         );
         self.declare_rt("zap_list_clear", &[p.into()], None);
+        // list.pop([i]) (#1095): remove+return the element at `i` (last when
+        // `has_index == 0`), typed like `get_*`; may raise a catchable
+        // IndexError, so the caller `invoke`s it. reverse() flips in place.
+        self.declare_rt(
+            "zap_list_pop_i64",
+            &[p.into(), i.into(), i.into()],
+            Some(i.into()),
+        );
+        self.declare_rt(
+            "zap_list_pop_ptr",
+            &[p.into(), i.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_list_pop_f64",
+            &[p.into(), i.into(), i.into()],
+            Some(f64t.into()),
+        );
+        self.declare_rt("zap_list_reverse", &[p.into()], None);
         // dict
         self.declare_rt("zap_dict_new", &[], Some(p.into()));
         self.declare_rt("zap_dict_len", &[p.into()], Some(i.into()));

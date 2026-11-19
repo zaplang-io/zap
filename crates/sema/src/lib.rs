@@ -8604,6 +8604,97 @@ impl Checker {
                 }
                 Ty::Unit
             }
+            // pop([i]) -> elem (#1095): remove and return the last element, or
+            // the element at index `i`. The optional index is positional (as in
+            // CPython, which rejects `pop(index=…)`) and must be an int.
+            "pop" => {
+                if args.len() > 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!(
+                            "list.pop([i]) takes at most one argument, got {}",
+                            args.len()
+                        ),
+                        span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                } else if let Some(a) = args.first() {
+                    let it = self.infer(&a.value);
+                    if !it.is_int() && !matches!(it, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!("list.pop() index must be an int, found {}", it.display()),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+                elem.clone()
+            }
+            // index(value[, start[, stop]]) -> int64 (#1095): position of the
+            // first element equal to `value`; the optional start/stop bounds are
+            // positional ints. A not-found raises ValueError at runtime.
+            "index" => {
+                if args.is_empty() || args.len() > 3 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!(
+                            "list.index(value[, start[, stop]]) takes one to three arguments, got {}",
+                            args.len()
+                        ),
+                        span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                } else {
+                    check_val(self, &args[0]);
+                    for a in &args[1..] {
+                        let it = self.infer(&a.value);
+                        if !it.is_int() && !matches!(it, Ty::Unknown) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "list.index() start/stop must be an int, found {}",
+                                    it.display()
+                                ),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                }
+                Ty::Int64
+            }
+            // reverse() -> unit (#1095): reverse the elements in place.
+            "reverse" => {
+                if !args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "list.reverse() takes no arguments".to_string(),
+                        span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                }
+                Ty::Unit
+            }
+            // copy() -> list[elem] (#1095): a shallow copy (new list, same
+            // elements).
+            "copy" => {
+                if !args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "list.copy() takes no arguments".to_string(),
+                        span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                }
+                Ty::List(Box::new(elem.clone()))
+            }
             _ => return None,
         })
     }

@@ -1935,6 +1935,66 @@ void *zap_list_copy(void *lp) {
     return o;
 }
 
+/* list.pop([i]) (#1095): remove and RETURN the element at index `i`, shifting
+ * the tail down one slot (CPython `list.pop`). `has_index == 0` pops the LAST
+ * element in O(1) (the loop below runs zero times — no shift). A negative index
+ * counts from the end. An out-of-range index, or a pop from an empty list,
+ * raises a CATCHABLE `IndexError` (via `zap_list_norm` for the indexed form, or
+ * the explicit empty check below) — so the lowering MUST `invoke` these so a
+ * `try`/`except` can catch it. Element-type-agnostic: it moves uniform 8-byte
+ * words, and the vacated tail slot is zeroed so the precise collector does not
+ * pin the removed referent. The returned word is handed back through the typed
+ * wrappers below, mirroring `zap_list_get_*`, so every `list[T]` element kind
+ * (int, bytes/str, pointer/struct reference, float) round-trips with no bit
+ * change. This helper is a GC leaf (no alloc on the success path, no call into
+ * compiled Zap), so the element words stay rooted via the live list. */
+static int64_t zap_list_pop_word(ZapList *l, int64_t i, int64_t has_index) {
+    int64_t k;
+    if (has_index) {
+        k = zap_list_norm(l, i); /* normalize + bounds-check (IndexError) */
+    } else {
+        if (l->len == 0) {
+            zap_panic_typed(ZAP_EXC_INDEX_ERROR,
+                            zap_str_new("pop from empty list", 19));
+        }
+        k = l->len - 1;
+    }
+    int64_t w = l->data[k];
+    for (int64_t j = k; j + 1 < l->len; j++) {
+        l->data[j] = l->data[j + 1];
+    }
+    l->len--;
+    l->data[l->len] = 0; /* don't pin the removed referent for the collector */
+    return w;
+}
+int64_t zap_list_pop_i64(void *lp, int64_t i, int64_t has_index) {
+    return zap_list_pop_word((ZapList *)lp, i, has_index);
+}
+void *zap_list_pop_ptr(void *lp, int64_t i, int64_t has_index) {
+    return (void *)(intptr_t)zap_list_pop_word((ZapList *)lp, i, has_index);
+}
+double zap_list_pop_f64(void *lp, int64_t i, int64_t has_index) {
+    return zap_f64_from_bits(zap_list_pop_word((ZapList *)lp, i, has_index));
+}
+
+/* list.reverse() (#1095): reverse the elements in place (CPython
+ * `list.reverse`). An element-type-agnostic word swap over the whole list; a GC
+ * leaf (no alloc, no call into compiled Zap), so the element words stay rooted
+ * via the live list for its duration. `elem_ptr` is unchanged — the same
+ * referents, in the opposite order. */
+void zap_list_reverse(void *lp) {
+    ZapList *l = (ZapList *)lp;
+    int64_t a = 0;
+    int64_t b = l->len - 1;
+    while (a < b) {
+        int64_t t = l->data[a];
+        l->data[a] = l->data[b];
+        l->data[b] = t;
+        a++;
+        b--;
+    }
+}
+
 /* list[T] slice `xs[lo:hi:step]` -> a NEW list (a copy, D-0030; contrast array
  * slices, which are views). Python bounds: negatives count from the end, out-of-
  * range clamps (no fault — unlike indexing), and `step` may be negative. The
