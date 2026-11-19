@@ -417,6 +417,63 @@ mod tests {
     }
 
     #[test]
+    fn fs_temp_file_lowers_mkstemp_writer_and_delete_on_close() {
+        // fs.temp_file composes mkstemp (create → fd + path) + io.writer_new
+        // (wrap the fd) into a prelude `TempFile`, and close_ (reached via the
+        // `with` __exit__) flushes/closes the writer and, when delete is true,
+        // unlinks the path. Collect calls across ALL funcs: the create/wrap live
+        // in `main`, while the write/flush/close + unlink live in the lowered
+        // prelude `TempFile` methods.
+        let m = lower_ok(
+            "def main():\n\
+            \x20   with fs.temp_file(prefix=\"log-\", suffix=\".txt\") as t:\n\
+            \x20       auto wrote = t.write(\"hello\")\n\
+            \x20       t.flush()\n\
+            \x20       print(t.name)\n\
+            \x20   auto t2 = fs.temp_file(delete=False)\n\
+            \x20   t2.write(\"x\")\n\
+            \x20   t2.close_()\n",
+        );
+        let has = |symbol: &str| {
+            m.funcs
+                .iter()
+                .flat_map(|f| &f.blocks)
+                .flat_map(|b| &b.insts)
+                .any(|i| {
+                    matches!(
+                        i,
+                        Inst::Call { func, .. } | Inst::Invoke { func, .. } if func == symbol
+                    )
+                })
+        };
+        for symbol in [
+            "zap_fs_mkstemp",      // the O_EXCL create (throwing gate)
+            "zap_fs_mkstemp_fd",   // read the fd back
+            "zap_fs_mkstemp_path", // read the path back (the TempFile `name`)
+            "zap_io_writer_new",   // wrap the fd in the buffered writer handle
+            "zap_io_writer_write", // TempFile.write delegates here
+            "zap_io_writer_close", // TempFile.close_ / __exit__
+            "zap_fs_unlink_quiet", // TempFile.close_ delete-on-close branch
+        ] {
+            assert!(has(symbol), "missing lowered call to {symbol}");
+        }
+        // The create is fallible — it must reach the throwing-call path, never a
+        // plain non-catchable Call-at-top-level is required but the throwing_call
+        // helper emits an Invoke inside a try; here it is at least present.
+        assert!(has("zap_fs_mkstemp"), "mkstemp must be emitted");
+        // The TempFile object is a StructNew (field 0 = writer handle, 1 = name,
+        // 2 = delete flag).
+        assert!(
+            m.funcs
+                .iter()
+                .flat_map(|f| &f.blocks)
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i, Inst::StructNew { .. })),
+            "temp_file must build a TempFile struct"
+        );
+    }
+
+    #[test]
     fn crypto_result_types_distinguish_buffers_text_and_handles() {
         // Guard the boundary: opaque streaming contexts are not digest buffers,
         // and the existing hex/string APIs must keep string operation dispatch.

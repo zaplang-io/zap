@@ -106,6 +106,25 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "fs", method, args, 2, span);
             Ty::Unit
         }
+        // fs.temp_file([prefix, suffix, dir, delete]) -> TempFile (#1077): a
+        // named temporary file (Python `tempfile.NamedTemporaryFile`). Builds on
+        // `mkstemp` (O_EXCL create) + `io.writer` (the `Writer` buffered file
+        // object, #1071): the returned prelude `TempFile` has write/flush/close_
+        // + `with` auto-close and a public on-disk `name`, and `delete=True` (the
+        // default) unlinks the file on close. All four arguments are optional
+        // (recommended keyword): prefix defaults "tmp", suffix "", dir => the
+        // platform temp dir, delete True.
+        "temp_file" => {
+            expect_argc_range(checker, "fs", method, args, 0, 4, span);
+            Ty::Named("TempFile".to_string())
+        }
+        // fs._unlink_quiet(path) -> unit (#1077): internal delete-on-close helper
+        // for the prelude `TempFile.close_`; unlinks `path`, tolerating an
+        // already-gone file so a repeated close is a no-op. Not a public surface.
+        "_unlink_quiet" => {
+            expect_argc(checker, "fs", method, args, 1, span);
+            Ty::Unit
+        }
         // Filesystem gaps (#968, D-0211).
         // Metadata: `stat` returns the prelude `Stat` value struct; `mtime` an int.
         "stat" => {

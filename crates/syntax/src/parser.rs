@@ -531,6 +531,40 @@ struct Writer:
     def __exit__(self):
         io._writer_close(self._h)
 
+# TempFile — a named temporary file (#1077, D-0242), Zap's take on Python's
+# tempfile.NamedTemporaryFile. fs.temp_file(...) creates a uniquely-named file
+# (mkstemp's O_EXCL no-clobber create) under the temp dir and wraps its fd in an
+# io buffered writer handle, so the object has the same write / flush / close_
+# surface as Writer plus the on-disk path in `name`. A reference struct over the
+# opaque writer handle (like Writer / LineReader wrap theirs). `delete` (true by
+# default, matching Python) makes close_ unlink the file after closing the fd.
+# close_ is idempotent: io._writer_close early-returns once closed, and
+# _unlink_quiet tolerates an already-gone file, so a second close_ or the
+# with-exit after an explicit close_ is a harmless no-op. The
+# `with fs.temp_file() as t:` form auto-closes (and auto-deletes) on scope exit,
+# even on unwind, via the D-0069 protocol.
+struct TempFile:
+    bytes _h
+    str name
+    bool _delete
+
+    def write(self, str data) -> int64:
+        return io._writer_write(self._h, data)
+
+    def flush(self):
+        io._writer_flush(self._h)
+
+    def close_(self):
+        io._writer_close(self._h)
+        if self._delete:
+            fs._unlink_quiet(self.name)
+
+    def __enter__(self) -> TempFile:
+        return self
+
+    def __exit__(self):
+        self.close_()
+
 enum JsonValue:
     Null
     Bool(bool b)
@@ -1986,6 +2020,12 @@ fn references_prelude(module: &Module) -> bool {
         // struct ships in the prelude, injected for any program that names the
         // struct (`fs` already covers `fs.scandir`/`fs.walk`/`fs.copytree`).
         "\"DirEntry\"",
+        // The `fs.temp_file(...)` named temporary file returns the prelude
+        // `TempFile` struct (#1077, D-0242): injected for any program that names
+        // the struct directly (`fs` already covers `fs.temp_file`). Over-injection
+        // for an `fs.read_file`-only program is harmless — the unused struct emits
+        // no code.
+        "\"TempFile\"",
         // The `io.lines(reader)` / `fs.open_reader(path)` line iterator returns
         // the `LineReader` struct (#1031, D-0223): injected for any program that
         // names the `io` module, `open_reader`, or the struct (`fs` already

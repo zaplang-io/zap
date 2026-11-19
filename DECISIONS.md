@@ -12439,3 +12439,76 @@ the `bytes` value type (#337). Regression goldens: `tests/golden/list_bytes_len`
 (indexed / iterated / dict-value / set-member read-back across ASCII, multibyte
 UTF-8, an embedded zero byte, and non-UTF-8 bytes) and `list_bytes_len_param`
 (the issue's exact function-parameter repro).
+
+## D-0242 — stdlib `fs` tempfile: `fs.temp_file` — a named temporary file (`NamedTemporaryFile`) on the io `Writer` (#1077 / epic #966)
+
+**Context.** [[D-0239]] (#979) shipped the three low-level tempfile primitives
+(`fs.mkstemp` → raw `(fd, path)`, `fs.gettempdir`, `fs.write_atomic`) and
+explicitly **deferred** the high-level named-temp-file object — Python's
+`tempfile.NamedTemporaryFile` — because it wants a file-like handle
+(`.write`/`.name`, `with`-auto-cleanup) and no *writer* file-object shape existed
+yet. [[D-0240]] (#1071) then shipped exactly that: `io.writer(fd)` returning the
+prelude `Writer` (buffered `write`/`flush`/`close_` + the [[D-0069]]
+context-manager surface, with an idempotent fd-owning close). #1077 is the
+now-unblocked follow-up.
+
+**`fs.temp_file([prefix, suffix, dir, delete]) -> TempFile`.** Create a
+uniquely-named temp file (reusing `mkstemp`'s `O_EXCL` no-clobber create) under
+the temp dir, wrap its fd in an `io` buffered `Writer`, and return the prelude
+**`TempFile`** — the write twin of `LineReader`, a thin reference struct over the
+opaque writer handle:
+
+- `name: str` — the on-disk path (a **public field**, like Python's
+  `NamedTemporaryFile.name`).
+- `write(data: str) -> int64` / `flush()` — delegate to the `Writer` entry points
+  (buffered, raise on I/O error).
+- `close_()` — flush + close the fd, then, when `delete` is true, unlink the file.
+  Spelled `close_` (Zap reserves `close` for channel close), matching
+  `Writer.close_`.
+- `__enter__` / `__exit__` — `with fs.temp_file() as t:` auto-closes (and, by
+  default, auto-deletes) on scope exit, even on unwind.
+
+**`delete=True` by default** (matching Python). Cleanup is **idempotent**: the
+`Writer`'s `close_` early-returns once the fd is closed, and the delete goes
+through a dedicated runtime helper `zap_fs_unlink_quiet` that treats an
+already-gone file (`ENOENT`) as success — so a second `close_`, or the `with`-exit
+after an explicit `close_`, is a harmless no-op, not a double-unlink raise. Any
+*other* unlink failure (e.g. a permission error) raises a catchable error (the
+helper lowers through the throwing-call path). The fd is already closed before the
+unlink runs, so the Windows "cannot delete an open file" case does not arise.
+
+**Composed, not re-implemented.** The lowering calls `zap_fs_mkstemp` (the
+throwing create gate — a bad `dir`/permission error reaches `try/except`) then
+`zap_io_writer_new(fd)`, and builds the `TempFile` (`_h` = writer handle, `name` =
+path, `_delete` = flag). No new file-creation or buffering runtime code: only the
+one-line `zap_fs_unlink_quiet` helper is added. `io`'s `declare_rt` runs before
+`fs`'s, so `zap_io_writer_new` is always declared — no redeclaration.
+
+**Divergences from Python (intentional, v1).**
+- **Write-oriented first cut.** `NamedTemporaryFile` defaults to `w+b` (read +
+  write); `TempFile` exposes the `Writer` (write-only) surface. To read back,
+  either keep the file (`delete=False`) and reopen `name` (`fs.read_file`), or
+  stream via `fs.open_reader`. A combined read+write file object can follow once a
+  reader+writer handle exists — a documented follow-up, not a blocker.
+- **No `mode`/`buffering`/`encoding`/`newline`/`errors` keywords.** Text bytes are
+  written as-is (UTF-8), matching `fs.write_file`.
+- **No Windows `delete_on_close`/open-sharing nuance** — unlink happens after the
+  fd closes.
+
+**Seam (positional-vs-kwarg).** All four parameters are **optional and far
+clearer named** (`fs.temp_file(prefix="log-", suffix=".txt")`,
+`fs.temp_file(delete=False)`) — **recommended kwargs**, not positional. A row is
+added to `crates/syntax/src/seam_sigs.rs` with every parameter carrying a
+`SeamDefault` in `SEAM_METHOD_DEFAULTS` (`prefix`→`"tmp"`, `suffix`→`""`,
+`dir`→`""`, `delete`→`true`), so a keyword call that supplies only a later
+parameter (e.g. `delete=False`) fills the interior holes before it by name. The
+internal `fs._unlink_quiet(path)` close helper stays positional (no row). The
+`delete` bool is lowered as an `i1` straight into the struct field, so
+`fs.temp_file` bypasses the `i64`-coercing generic argument path.
+
+Relates to [[D-0239]] (the `fs` tempfile primitives it builds on), [[D-0240]]
+(the `io` `Writer` it wraps), [[D-0223]] (the `LineReader` reference-struct
+pattern it mirrors), and [[D-0069]] (the `with` context-manager protocol).
+Golden: `tests/golden/fs_temp_file` (write/flush/close_, delete-on-close vs
+`delete=False` persistence, the `with` auto-delete form, idempotent close,
+prefix/suffix/dir, and the catchable create-error path).

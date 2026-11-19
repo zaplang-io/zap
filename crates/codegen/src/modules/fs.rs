@@ -30,6 +30,12 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_fs_mkstemp_path", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_fs_gettempdir", &[], Some(p.into()));
     cg.declare_rt("zap_fs_write_atomic", &[p.into(), p.into()], None);
+    // temp_file (#1077): delete-on-close helper for the prelude `TempFile`.
+    // Unlinks `path`, tolerating an already-gone file so close_ is idempotent;
+    // may raise on a real error, so the prelude calls it via a throwing call.
+    // The fd is wrapped via `zap_io_writer_new` (declared by the `io` module,
+    // whose `declare_rt` always runs before this one) — no redeclaration here.
+    cg.declare_rt("zap_fs_unlink_quiet", &[p.into()], None);
     // Filesystem gaps (#968, D-0211). Stat getters (one per `Stat` field):
     // str -> int64 (size/mtime/ctime/mode) or int64 bool (is_dir/is_file/
     // is_symlink); `size`/`is_symlink` and friends raise on a bad path.
