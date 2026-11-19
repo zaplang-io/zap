@@ -10636,19 +10636,63 @@ impl<'a> FnLower<'a> {
         elem_e: &Expr,
         clauses: &[CompClause],
     ) -> Result<(Value, Ty), LowerError> {
+        self.lower_list_comp_expected(elem_e, clauses, None)
+    }
+
+    /// `[elem for CLAUSES]` with an optional expected element kind (#1080).
+    ///
+    /// When the comprehension lands in an annotated destination
+    /// (`list[Optional[T]] xs = [None for ...]`), `expected` carries that
+    /// element kind so the element expression lowers in a type-contextual
+    /// position — a bare `None` then materializes `Optional[T].None` via
+    /// `expr_collection_context` instead of hitting the generic bail. With no
+    /// expected kind the element kind is inferred from the first element, exactly
+    /// as before. The `coerce` + `box_elem_for_store` mirror the list-literal
+    /// element path so both build identical lists.
+    fn lower_list_comp_expected(
+        &mut self,
+        elem_e: &Expr,
+        clauses: &[CompClause],
+        expected: Option<Elem>,
+    ) -> Result<(Value, Ty), LowerError> {
         let list = self.new_value(Ty::List(Elem::I64));
         self.emit(Inst::Call {
             dest: Some(list),
             func: "zap_list_new".to_string(),
             args: vec![],
         });
-        let kind = std::cell::Cell::new(None);
+        let kind = std::cell::Cell::new(expected);
         let mut emit = |s: &mut FnLower<'a>| -> Result<(), LowerError> {
-            let (ev, et) = s.expr(elem_e)?;
-            let ek = list_elem_kind(et, &s.ctx.nested)?;
-            kind.set(Some(ek));
+            let (ev, et) = match kind.get() {
+                Some(k) => s.expr_collection_context(elem_e, s.elem_ty(k))?,
+                None => s.expr(elem_e)?,
+            };
+            let ek = match kind.get() {
+                Some(k) => {
+                    // A concrete value whose representation differs from the
+                    // declared element is accepted only when the element is an
+                    // interface and the value structurally conforms (#829);
+                    // `coerce` boxes it into the fat pointer below. Any other
+                    // mismatch is a representation error — same rule as a list
+                    // literal element.
+                    let actual = list_elem_kind(et, &s.ctx.nested)?;
+                    if actual != k && !s.conforms_to_iface_elem(et, k, actual) {
+                        return Err(err(format!(
+                            "list element expects `{}`, found `{}`",
+                            s.render_ty(&s.elem_ty(k)),
+                            s.render_ty(&et)
+                        )));
+                    }
+                    k
+                }
+                None => {
+                    let k = list_elem_kind(et, &s.ctx.nested)?;
+                    kind.set(Some(k));
+                    k
+                }
+            };
             let ev = s.coerce(ev, et, ek.ty());
-            let ev = s.box_if_value(ev, ek.ty());
+            let ev = s.box_elem_for_store(ev, ek.ty());
             s.emit(Inst::Call {
                 dest: None,
                 func: format!("zap_list_push_{}", ek.val_suffix()),
@@ -13831,9 +13875,20 @@ impl<'a> FnLower<'a> {
     /// nested literals, but leave named values alone: a real type mismatch must
     /// still be rejected, never erased by relabelling its pointer.
     fn expr_collection_context(&mut self, e: &Expr, target: Ty) -> Result<(Value, Ty), LowerError> {
+        // A bare `None` collection element / contextual value materializes the
+        // canonical value for `target` (#1075, #1080), the same way `expr_coerced`
+        // does for arguments and returns. Routing it through `lower_none_expr`
+        // here covers list/dict literal elements, list comprehensions, and
+        // index/key assignment, so `list[Optional[T]] = [None]` no longer bails.
+        if matches!(e, Expr::None(_)) {
+            return Ok((self.lower_none_expr(target)?, target));
+        }
         match (e, target) {
             (Expr::List(items, _), Ty::List(elem)) => {
                 self.lower_list_lit_expected(items, Some(elem))
+            }
+            (Expr::ListComp { elem, clauses, .. }, Ty::List(ek)) => {
+                self.lower_list_comp_expected(elem, clauses, Some(ek))
             }
             (Expr::Dict(items, _), Ty::Dict(key, value)) => {
                 self.lower_dict_lit_expected(items, Some((key, value)))
@@ -13887,6 +13942,56 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    /// Lower a bare `None` literal in a position whose expected ZIR type is
+    /// `target` — the single type-contextual `None` mechanism shared by call
+    /// arguments / returns (`expr_coerced`), struct-constructor fields
+    /// (`fill_struct_fields`), and collection elements
+    /// (`expr_collection_context`, list/dict literals + comprehensions).
+    ///
+    /// Mono rewrites `None` into `Optional[T].None` wherever it threads an
+    /// expected type (plain bindings, returns — Fork I/O), but *not* for call
+    /// arguments, defaulted parameters, struct-constructor fields, or collection
+    /// elements, so a bare `Expr::None` reaches lowering with only the
+    /// destination type to go on. The destination's `None` is NOT always a raw
+    /// null pointer: a scalar-payload `Optional` tags its discriminant, so a null
+    /// would make `is_some()`/`is_none()` dereference nil at native runtime
+    /// (#564). `gen_opt_none` yields the tagged `None` for a scalar payload and
+    /// the null pointer for a niche/pointer payload, so niche `Optional`s are
+    /// byte-identical to the old behaviour.
+    ///
+    /// Only call this when the expression is `Expr::None`.
+    fn lower_none_expr(&mut self, target: Ty) -> Result<Value, LowerError> {
+        if target.is_ptr() {
+            if let Some(opt) = optional_layout(self.ctx, target) {
+                return Ok(gen_opt_none(self, &opt));
+            }
+            // A plain reference type (a struct instance, `str`, or a collection):
+            // its null value IS the null pointer. Member access on it then throws
+            // (D-0007, EXC-4), enforced by the null-guard at the access site.
+            // Value structs are not nullable (D-0014), so `None` is rejected.
+            if let Ty::Struct(sid) = target {
+                if self.ctx.is_value_struct(sid) {
+                    return Err(err(
+                        "None cannot be assigned to a value struct (value types are \
+                         not nullable, D-0014)",
+                    ));
+                }
+            }
+            let d = self.new_value(target);
+            self.emit(Inst::NullConst { dest: d });
+            return Ok(d);
+        }
+        // A non-reference destination (a scalar `int`/`float`/`bool`/`char`/enum)
+        // cannot hold `None`: reject a bare `None` supplied for a non-optional
+        // field, element, or argument with a clear type error rather than
+        // deferring to the generic "unsupported expression" bail (#1075, #1080).
+        Err(err(format!(
+            "None is not a valid `{}` value (only optional and reference types \
+             are nullable)",
+            self.render_ty(&target)
+        )))
+    }
+
     /// Lower an expression in a position whose expected ZIR type is `target`
     /// (I#163): a `lambda` is lowered against the expected function type (the
     /// only way its parameter types are known). Collection literals also inherit
@@ -13905,36 +14010,10 @@ impl<'a> FnLower<'a> {
             let (v, _) = self.lower_lambda(params, body, idx)?;
             return Ok(v);
         }
-        // `None` coerced to a reference-typed slot. Mono rewrites `None` into
-        // `Optional[T].None` wherever it threads an expected type (bindings,
-        // returns — Fork I/O), but *not* for call arguments (`rewrite_call` lowers
-        // each argument with no expected type) nor for an omitted parameter's
-        // defaulted `None`. So a bare `Expr::None` can still reach here against an
-        // `Optional[T]` target, and that target's `None` is NOT a raw null pointer:
-        // a scalar-payload `Optional` tags its discriminant, so a null would make
-        // `is_some()`/`is_none()` dereference nil at native runtime (#564).
-        // Construct the canonical value instead — `gen_opt_none` yields the tagged
-        // `None` for a scalar payload and the null pointer for a niche/pointer
-        // payload, so niche `Optional`s are unchanged.
-        if matches!(e, Expr::None(_)) && target.is_ptr() {
-            if let Some(opt) = optional_layout(self.ctx, target) {
-                return Ok(gen_opt_none(self, &opt));
-            }
-            // A plain reference type (a struct instance, `str`, or a collection):
-            // its null value IS the null pointer. Member access on it then throws
-            // (D-0007, EXC-4), enforced by the null-guard at the access site. Value
-            // structs are not nullable (D-0014), so `None` is rejected for them.
-            if let Ty::Struct(sid) = target {
-                if self.ctx.is_value_struct(sid) {
-                    return Err(err(
-                        "None cannot be assigned to a value struct (value types are \
-                         not nullable, D-0014)",
-                    ));
-                }
-            }
-            let d = self.new_value(target);
-            self.emit(Inst::NullConst { dest: d });
-            return Ok(d);
+        // A bare `None` in a type-contextual position lowers to the canonical
+        // value for `target` (#564, #1075, #1080). See `lower_none_expr`.
+        if matches!(e, Expr::None(_)) {
+            return self.lower_none_expr(target);
         }
         let (v, vt) = self.expr_collection_context(e, target)?;
         // A function value coerced to a `fn(...)` slot (argument / assignment /
@@ -14232,8 +14311,12 @@ impl<'a> FnLower<'a> {
                     (i as u32, f.1)
                 }
             };
-            let (v, vt) = self.expr(&a.value)?;
-            let v = self.coerce(v, vt, fty);
+            // Lower against the field's declared type so a bare `None` for an
+            // `Optional[T]` field materializes the canonical empty option (#1075),
+            // a `fn(...)` field accepts a lambda (I#163), and a collection field
+            // inherits its element kinds — matching field assignment
+            // (`obj.field = value`), which already uses `expr_coerced`.
+            let v = self.expr_coerced(&a.value, fty, zapc_diag::ErrorCode::ZAP4001)?;
             // A value-struct field is copied in (D-0051): the new struct holds an
             // independent instance of the aggregate.
             let v = self.copy_if_value(v, fty, &a.value);
@@ -14268,8 +14351,10 @@ impl<'a> FnLower<'a> {
                 continue;
             };
             let fty = self.ctx.fields[sid as usize][idx].1;
-            let (v, vt) = self.expr(&default)?;
-            let v = self.coerce(v, vt, fty);
+            // Defaults lower against the field type too, so a `None` default for
+            // an `Optional[T]` field (#461 adjacent gap noted under #564) becomes
+            // the canonical empty option rather than a stray null.
+            let v = self.expr_coerced(&default, fty, zapc_diag::ErrorCode::ZAP4001)?;
             let v = self.copy_if_value(v, fty, &default);
             self.emit(Inst::FieldSet {
                 base: dest,
