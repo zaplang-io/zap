@@ -277,7 +277,51 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("time", "to_millis", &["d"]),
     ("time", "to_micros", &["d"]),
     // ---- process (ticket #97) ----
-    ("process", "run", &["cmd"]),
+    // `cmd` is the positional argv (list[str]); every other option is a keyword
+    // mirroring Python `subprocess.run(..., env=, cwd=, timeout=, input=,
+    // capture_output=)` (#976, D-0237). `check_run` (Python `check=True`) and the
+    // explicit shell form `run_shell` (whose `cmd` is a `str`) share the option
+    // set. Interior holes fill from SEAM_METHOD_DEFAULTS; `merge_stderr` is the
+    // only trailing-optional with no default row (left absent when omitted).
+    (
+        "process",
+        "run",
+        &[
+            "cmd",
+            "env",
+            "cwd",
+            "timeout",
+            "input",
+            "capture_output",
+            "merge_stderr",
+        ],
+    ),
+    (
+        "process",
+        "check_run",
+        &[
+            "cmd",
+            "env",
+            "cwd",
+            "timeout",
+            "input",
+            "capture_output",
+            "merge_stderr",
+        ],
+    ),
+    (
+        "process",
+        "run_shell",
+        &[
+            "cmd",
+            "env",
+            "cwd",
+            "timeout",
+            "input",
+            "capture_output",
+            "merge_stderr",
+        ],
+    ),
     // ---- sys (ticket #97): the single-argument verbs (argv/platform/*_fd/
     // cpu_source/cpu_sve_vl take no args, so no row) ----
     ("sys", "exit", &["code"]),
@@ -477,6 +521,13 @@ pub enum SeamDefault {
     /// types + lowers exactly like the literal a caller would have written. The
     /// default for `math.isclose`'s interior `rel_tol` (#973, D-0234).
     Float(&'static str),
+    /// A `str` literal, carried as its raw (un-escaped) UTF-8 contents. Lowers
+    /// exactly like a plain string literal a caller would have written. The
+    /// default for `process.run`'s interior `cwd` / `input` (#976, D-0237).
+    Str(&'static str),
+    /// A `bool` literal (`True` / `False`). The default for `process.run`'s
+    /// interior `capture_output` / `merge_stderr` (#976, D-0237).
+    Bool(bool),
 }
 
 /// Parameters that carry a [`SeamDefault`], keyed by `(module, method,
@@ -495,6 +546,35 @@ pub const SEAM_METHOD_DEFAULTS: &[(&str, &str, &str, SeamDefault)] = &[
     // filled in lowering, but is listed for symmetry (#973, D-0234).
     ("math", "isclose", "rel_tol", SeamDefault::Float("1e-9")),
     ("math", "isclose", "abs_tol", SeamDefault::Float("0.0")),
+    // `process.run(cmd, env={}, cwd="", timeout=0.0, input="",
+    // capture_output=True, merge_stderr=False)` and its `check_run` / `run_shell`
+    // siblings (#976, D-0237): each option before the last one supplied must
+    // default. `merge_stderr` is trailing (no row — left absent when omitted).
+    ("process", "run", "env", SeamDefault::EmptyDict),
+    ("process", "run", "cwd", SeamDefault::Str("")),
+    ("process", "run", "timeout", SeamDefault::Float("0.0")),
+    ("process", "run", "input", SeamDefault::Str("")),
+    ("process", "run", "capture_output", SeamDefault::Bool(true)),
+    ("process", "check_run", "env", SeamDefault::EmptyDict),
+    ("process", "check_run", "cwd", SeamDefault::Str("")),
+    ("process", "check_run", "timeout", SeamDefault::Float("0.0")),
+    ("process", "check_run", "input", SeamDefault::Str("")),
+    (
+        "process",
+        "check_run",
+        "capture_output",
+        SeamDefault::Bool(true),
+    ),
+    ("process", "run_shell", "env", SeamDefault::EmptyDict),
+    ("process", "run_shell", "cwd", SeamDefault::Str("")),
+    ("process", "run_shell", "timeout", SeamDefault::Float("0.0")),
+    ("process", "run_shell", "input", SeamDefault::Str("")),
+    (
+        "process",
+        "run_shell",
+        "capture_output",
+        SeamDefault::Bool(true),
+    ),
 ];
 
 /// The [`SeamDefault`] for `(module, method, param)`, or `None` when the

@@ -1368,6 +1368,89 @@ struct HttpClient:
 
 def __http_client(int64 max_redirects=10, bool follow=True, int64 timeout=0) -> HttpClient:
     return HttpClient(_pool=http._pool_new(8), _max_redirects=max_redirects, _follow=follow, _timeout=timeout)
+
+
+# The streaming subprocess handle (#976, D-0237). `process.Popen(...)` desugars
+# (D-0202 seam ctor sugar) to the `__process_popen` factory, which spawns the
+# child with pipes for the selected streams and returns this struct wrapping the
+# opaque runtime handle `_h` (a stable non-GC `int64` address, the `http.Client`
+# pool pattern). Methods drive the low-level `process._popen_*` primitives
+# (internal, positional-only seam calls, like `http._pool_*`). Non-blocking pipe
+# reads and writes park the calling coroutine on the netpoller (POSIX); streaming
+# is not yet available on Windows (the primitive raises there — see D-0237).
+# `poll()` returns the exit status or the `-256` still-running sentinel; `done()`
+# hides it.
+struct Popen:
+    int64 _h
+
+    # Write every byte of `data` to the child's stdin, parking while the pipe is
+    # full; returns the number of bytes written (== len(data)).
+    def write(self, str data) -> int64:
+        return process._popen_write(self._h, data)
+
+    # Close the child's stdin, signalling end-of-input (the child sees EOF).
+    def close_stdin(self):
+        process._popen_close_stdin(self._h)
+
+    # Read up to `n` bytes from the child's stdout, parking until data arrives;
+    # returns b\"\" at end-of-output.
+    def read_stdout(self, int64 n = 65536) -> bytes:
+        return process._popen_read(self._h, 1, n)
+
+    # Read up to `n` bytes from the child's stderr (b\"\" at EOF, or always b\"\"
+    # when stderr was merged into stdout).
+    def read_stderr(self, int64 n = 65536) -> bytes:
+        return process._popen_read(self._h, 2, n)
+
+    # Read the child's stdout to end-of-output and return it whole.
+    def read_stdout_all(self) -> bytes:
+        return process._popen_read_all(self._h, 1)
+
+    # Read the child's stderr to end-of-output and return it whole.
+    def read_stderr_all(self) -> bytes:
+        return process._popen_read_all(self._h, 2)
+
+    # Non-blocking status check: the exit status if the child has exited, else
+    # the `-256` sentinel (see `done`). Reaps the child without blocking.
+    def poll(self) -> int64:
+        return process._popen_poll(self._h)
+
+    # True once the child has exited (a non-blocking reap under the hood).
+    def done(self) -> bool:
+        return process._popen_poll(self._h) != -256
+
+    # Block until the child exits and return its exit status.
+    def wait(self) -> int64:
+        return process._popen_wait(self._h)
+
+    # The child's exit status. Raises RuntimeError if it has not exited yet.
+    def returncode(self) -> int64:
+        return process._popen_returncode(self._h)
+
+    # The child's process id.
+    def pid(self) -> int64:
+        return process._popen_pid(self._h)
+
+    # Request graceful termination (SIGTERM on POSIX; TerminateProcess on Windows).
+    def terminate(self):
+        process._popen_signal(self._h, 15)
+
+    # Force kill (SIGKILL on POSIX; TerminateProcess on Windows).
+    def kill(self):
+        process._popen_signal(self._h, 9)
+
+
+def __process_popen(list[str] cmd, dict[str, str] env={}, str cwd=\"\", bool merge_stderr=False, bool stdin=True, bool stdout=True, bool stderr=True) -> Popen:
+    auto flags = 0
+    if merge_stderr:
+        flags = flags + 1
+    if stdin:
+        flags = flags + 2
+    if stdout:
+        flags = flags + 4
+    if stderr:
+        flags = flags + 8
+    return Popen(_h=process._popen_spawn(cmd, env, cwd, flags))
 ";
 
 /// Parse the built-in [`PRELUDE_SRC`] into AST items. The prelude is authored to
@@ -1529,6 +1612,14 @@ fn references_prelude(module: &Module) -> bool {
         // `http.parse_set_cookie`; `http` already triggers it, this also covers a
         // direct `Cookie` reference.
         "\"Cookie\"",
+        // The streaming subprocess handle `process.Popen(...)` (#976, D-0237): the
+        // `Popen` struct + `__process_popen` factory ship in the prelude, injected
+        // for any program that names the `process` module (so `process.Popen(...)`
+        // and the blocking `process.run(...)` both trigger it) or the struct
+        // directly. Over-injection for a `process.run`-only program is harmless:
+        // the unused struct/factory emit no code.
+        "\"process\"",
+        "\"Popen\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))

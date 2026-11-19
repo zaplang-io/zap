@@ -25,6 +25,32 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`process` — subprocess ergonomics: run options, `check_run`, `run_shell`,
+  and a streaming `Popen` handle** (#976, D-0237, epic #966). The blocking
+  `process.run(argv)` grows Python-`subprocess.run`-shaped keyword options:
+  **`env=`** (override/augment the inherited environment; `{}` = inherit),
+  **`cwd=`**, **`timeout=`** seconds (on expiry the child is SIGKILLed and
+  `TimeoutError` is raised), **`input=`** (bytes/str fed to the child's stdin via
+  a temp file — no pipe-buffer deadlock), **`capture_output=`** (default `True`;
+  `False` lets the child inherit the parent's stdout/stderr), and
+  **`merge_stderr=`** (fold stderr into stdout, `2>&1`). **`process.check_run(…)`**
+  takes the same options and raises `RuntimeError` on a non-zero exit (Python
+  `check=True`); **`process.run_shell(cmd, …)`** runs a `str` command through the
+  system shell (`/bin/sh -c` / `cmd.exe /C`), an explicit opt-in. All capture
+  stays on the deadlock-free temp-file model, cross-platform (POSIX + Windows).
+  New **`process.Popen(argv, env=, cwd=, merge_stderr=, stdin=, stdout=,
+  stderr=)`** is a streaming handle (Python `Popen` / Go `exec.Cmd`): `write` to
+  stdin and `close_stdin`, `read_stdout`/`read_stderr` (and `…_all`), `poll` /
+  `done` / `wait` / `returncode`, `pid`, `terminate` / `kill`. Non-blocking pipe
+  reads/writes **park the calling coroutine on the netpoller** (the worker thread
+  is freed, not blocked), so interleaved output larger than a pipe buffer never
+  deadlocks. Streaming is **POSIX-only** for now — on Windows `Popen` raises a
+  clear "not yet supported" error (anonymous-pipe IOCP integration is a tracked
+  follow-up); the blocking `run`/`check_run`/`run_shell` forms are fully
+  cross-platform. Divergences from Python (D-0237): `env=` augments rather than
+  replaces, `capture_output` defaults to `True`, and a non-zero `check_run` /
+  timeout raises `RuntimeError` / `TimeoutError` (Zap has no dedicated
+  `CalledProcessError` / `TimeoutExpired`).
 - **`heap[T]` ergonomics — heapify, heapreplace/heappushpop, nlargest/nsmallest**
   (#978, D-0236, epic #966). Rounds out the built-in min-heap ([[D-0057]]) with
   the Python-`heapq` surface, keeping Zap's object model. **O(n) heapify** is a

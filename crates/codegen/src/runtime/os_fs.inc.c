@@ -37,8 +37,11 @@
 #include <stddef.h> /* offsetof */
 #include <sys/stat.h>
 #if defined(ZAP_PLATFORM_POSIX)
+#include <poll.h>     /* poll: process streaming no-netpoller fallback           */
+#include <signal.h>   /* kill / SIGTERM / SIGKILL: process.run timeout + Popen    */
 #include <spawn.h>    /* posix_spawn: process.run (POSIX)                        */
 #include <sys/wait.h> /* waitpid                                                 */
+#include <time.h>     /* nanosleep: process.run timeout poll                     */
 #endif
 #if defined(__APPLE__)
 #include <crt_externs.h> /* _NSGetArgc / _NSGetArgv */
@@ -1518,90 +1521,487 @@ static char *zap_win_build_cmdline(char **argv, int64_t n) {
 }
 #endif /* ZAP_PLATFORM_WINDOWS */
 
-/* process.run(argv: list[str]) -> ZapProc*: spawn argv[0] (PATH-searched) with
- * the given arguments, capturing stdout/stderr into temp files (so there is no
- * pipe-buffer deadlock), and wait. The exit code is the child's status, or
- * 128+signo if it was killed by a signal (POSIX). Raises on spawn failure. */
-void *zap_process_run(void *argv_list) {
-    int64_t n = zap_list_len(argv_list);
-    if (n < 1) {
-        zap_sys_fail("process.run", "empty argument list");
+/* `cwd=` support (#976): posix_spawn gains a working directory via the
+ * `posix_spawn_file_actions_addchdir_np` extension (glibc >= 2.29, macOS >=
+ * 10.15 — both CI targets). Where it is unavailable a non-empty `cwd` is a
+ * clean runtime error rather than a silent miss. Windows takes the directory
+ * through `CreateProcess`'s `lpCurrentDirectory` and needs no feature gate. */
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 29))
+#define ZAP_HAVE_SPAWN_CHDIR 1
+#elif defined(__APPLE__)
+#define ZAP_HAVE_SPAWN_CHDIR 1
+#endif
+
+#if defined(ZAP_PLATFORM_POSIX)
+/* Does the NUL-terminated `environ` entry `e` ("KEY=VALUE") have key == `k`?
+ * Keys compare up to the first '='; `k` is a (non-NUL-terminated) ZapStr. */
+static int zap_proc_env_key_eq(const char *e, const ZapStr *k) {
+    int64_t i = 0;
+    for (; i < k->len; i++) {
+        if (e[i] == '\0' || e[i] != k->data[i]) {
+            return 0;
+        }
     }
-    char **cargv = (char **)malloc(sizeof(char *) * (size_t)(n + 1));
-    if (cargv == NULL) {
-        zap_sys_fail("process.run", "out of memory");
+    return e[i] == '=';
+}
+
+/* malloc'd "KEY=VALUE\0" from two ZapStr (the caller frees), or NULL on OOM. */
+static char *zap_proc_env_kv(const ZapStr *k, const ZapStr *v) {
+    size_t n = (size_t)k->len + 1 + (size_t)v->len + 1;
+    char *s = (char *)malloc(n);
+    if (!s) {
+        return NULL;
     }
-    for (int64_t i = 0; i < n; i++) {
-        cargv[i] = zap_sys_cstr((ZapStr *)zap_list_get_ptr(argv_list, i));
+    if (k->len > 0) {
+        memcpy(s, k->data, (size_t)k->len);
     }
-    cargv[n] = NULL;
+    s[k->len] = '=';
+    if (v->len > 0) {
+        memcpy(s + k->len + 1, v->data, (size_t)v->len);
+    }
+    s[k->len + 1 + v->len] = '\0';
+    return s;
+}
+
+/* Build an augmented child environment (#976): the parent `environ` with the
+ * `env` dict's entries overriding same-named variables and adding new ones
+ * (Python `subprocess`'s semantics are full-replace; Zap's `env=` is
+ * documented as override/augment, D-0237). Returns a malloc'd NULL-terminated
+ * `char**` (each string malloc'd) that the caller frees with
+ * `zap_proc_free_envp`, or NULL when `env` is empty/NULL (then the caller uses
+ * `environ` directly). NULL is also returned on OOM — indistinguishable from
+ * "no overrides", which is safe: the child merely inherits the unmodified
+ * environment. */
+static char **zap_proc_build_envp(const ZapDict *env) {
+    if (!env || zap_dict_len((void *)env) == 0) {
+        return NULL;
+    }
+    int64_t pcount = 0;
+    while (environ[pcount]) {
+        pcount++;
+    }
+    int64_t cap = pcount + zap_dict_len((void *)env) + 1;
+    char **envp = (char **)malloc(sizeof(char *) * (size_t)cap);
+    if (!envp) {
+        return NULL;
+    }
+    int64_t o = 0;
+    /* Copy each parent entry unless an override shadows its key. */
+    for (int64_t i = 0; i < pcount; i++) {
+        int shadowed = 0;
+        for (int64_t e = 0; e < env->cap; e++) {
+            if (zap_d_tags(env)[e] < 2) {
+                continue; /* empty / tombstone slot (#840) */
+            }
+            const ZapStr *k = (const ZapStr *)(intptr_t)zap_d_keys(env)[e];
+            if (zap_proc_env_key_eq(environ[i], k)) {
+                shadowed = 1;
+                break;
+            }
+        }
+        if (!shadowed) {
+            char *dup = strdup(environ[i]);
+            if (!dup) {
+                goto oom;
+            }
+            envp[o++] = dup;
+        }
+    }
+    /* Append the overrides (KEY=VALUE). */
+    for (int64_t e = 0; e < env->cap; e++) {
+        if (zap_d_tags(env)[e] < 2) {
+            continue;
+        }
+        const ZapStr *k = (const ZapStr *)(intptr_t)zap_d_keys(env)[e];
+        const ZapStr *v = (const ZapStr *)(intptr_t)zap_d_vals(env)[e];
+        char *kv = zap_proc_env_kv(k, v);
+        if (!kv) {
+            goto oom;
+        }
+        envp[o++] = kv;
+    }
+    envp[o] = NULL;
+    return envp;
+oom:
+    for (int64_t i = 0; i < o; i++) {
+        free(envp[i]);
+    }
+    free(envp);
+    return NULL;
+}
+
+static void zap_proc_free_envp(char **envp) {
+    if (!envp) {
+        return;
+    }
+    for (int64_t i = 0; envp[i]; i++) {
+        free(envp[i]);
+    }
+    free(envp);
+}
+
+/* Wait for `pid`, decoding the exit status (128+signo for a signal death). With
+ * `timeout_s > 0` the wait is bounded by a monotonic deadline: on expiry the
+ * child is SIGKILLed and reaped, and `*timed_out` is set (the caller raises
+ * TimeoutError). Capture goes to temp files (never pipes), so the child can
+ * never block on a full pipe while we poll — a plain WNOHANG poll loop suffices
+ * and there is no deadlock. Bracketed in enter/leave_blocking so a concurrent
+ * stop-the-world GC need not wait on this thread. */
+static int64_t zap_proc_wait_timed(pid_t pid, double timeout_s, int *timed_out) {
+    *timed_out = 0;
+    int status = 0;
+    if (timeout_s <= 0.0) {
+        pid_t w;
+        zap_enter_blocking();
+        do {
+            w = waitpid(pid, &status, 0);
+        } while (w < 0 && errno == EINTR);
+        zap_leave_blocking();
+        if (w < 0) {
+            return -1;
+        }
+    } else {
+        int64_t deadline = np_now_ns() + (int64_t)(timeout_s * 1e9);
+        zap_enter_blocking();
+        for (;;) {
+            pid_t w = waitpid(pid, &status, WNOHANG);
+            if (w == pid) {
+                break;
+            }
+            if (w < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                zap_leave_blocking();
+                return -1;
+            }
+            /* w == 0: still running. */
+            int64_t remaining = deadline - np_now_ns();
+            if (remaining <= 0) {
+                kill(pid, SIGKILL);
+                do {
+                    w = waitpid(pid, &status, 0);
+                } while (w < 0 && errno == EINTR);
+                zap_leave_blocking();
+                *timed_out = 1;
+                return -1;
+            }
+            int64_t ms = remaining / 1000000LL;
+            if (ms > 20) {
+                ms = 20; /* cap the poll granularity at 20ms */
+            }
+            struct timespec ts;
+            ts.tv_sec = 0;
+            ts.tv_nsec = (ms > 0 ? ms : 1) * 1000000L;
+            nanosleep(&ts, NULL);
+        }
+        zap_leave_blocking();
+    }
+    if (WIFEXITED(status)) {
+        return (int64_t)WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status)) {
+        return 128 + (int64_t)WTERMSIG(status);
+    }
+    return -1;
+}
+#endif /* ZAP_PLATFORM_POSIX */
+
+#if defined(ZAP_PLATFORM_WINDOWS)
+/* Build a Windows environment block ("K=V\0K=V\0...\0") from the parent block
+ * augmented with the `env` dict's overrides/additions (#976). Returns a malloc'd
+ * block the caller frees, or NULL when `env` is empty (inherit the parent block)
+ * or on OOM (also inherit — safe). */
+static char *zap_win_build_env_block(const ZapDict *env) {
+    if (!env || zap_dict_len((void *)env) == 0) {
+        return NULL;
+    }
+    char *parent = GetEnvironmentStringsA();
+    size_t cap = 1;
+    for (const char *p = parent; p && *p;) {
+        size_t l = strlen(p);
+        cap += l + 1;
+        p += l + 1;
+    }
+    for (int64_t e = 0; e < env->cap; e++) {
+        if (zap_d_tags(env)[e] < 2) {
+            continue;
+        }
+        const ZapStr *k = (const ZapStr *)(intptr_t)zap_d_keys(env)[e];
+        const ZapStr *v = (const ZapStr *)(intptr_t)zap_d_vals(env)[e];
+        cap += (size_t)k->len + 1 + (size_t)v->len + 1;
+    }
+    cap += 1; /* final terminator */
+    char *block = (char *)malloc(cap);
+    if (!block) {
+        if (parent) {
+            FreeEnvironmentStringsA(parent);
+        }
+        return NULL;
+    }
+    size_t o = 0;
+    for (const char *p = parent; p && *p;) {
+        size_t l = strlen(p);
+        const char *eq = (const char *)memchr(p, '=', l);
+        int shadowed = 0;
+        if (eq) {
+            int64_t klen = (int64_t)(eq - p);
+            for (int64_t e = 0; e < env->cap; e++) {
+                if (zap_d_tags(env)[e] < 2) {
+                    continue;
+                }
+                const ZapStr *k = (const ZapStr *)(intptr_t)zap_d_keys(env)[e];
+                if (k->len == klen && memcmp(p, k->data, (size_t)klen) == 0) {
+                    shadowed = 1;
+                    break;
+                }
+            }
+        }
+        if (!shadowed) {
+            memcpy(block + o, p, l + 1);
+            o += l + 1;
+        }
+        p += l + 1;
+    }
+    if (parent) {
+        FreeEnvironmentStringsA(parent);
+    }
+    for (int64_t e = 0; e < env->cap; e++) {
+        if (zap_d_tags(env)[e] < 2) {
+            continue;
+        }
+        const ZapStr *k = (const ZapStr *)(intptr_t)zap_d_keys(env)[e];
+        const ZapStr *v = (const ZapStr *)(intptr_t)zap_d_vals(env)[e];
+        if (k->len > 0) {
+            memcpy(block + o, k->data, (size_t)k->len);
+            o += (size_t)k->len;
+        }
+        block[o++] = '=';
+        if (v->len > 0) {
+            memcpy(block + o, v->data, (size_t)v->len);
+            o += (size_t)v->len;
+        }
+        block[o++] = '\0';
+    }
+    block[o++] = '\0';
+    return block;
+}
+#endif /* ZAP_PLATFORM_WINDOWS */
+
+/* Write `data` entirely to fd `fd` (a temp file; no short-write parking needed
+ * beyond the EINTR retry). Returns 0, or -1 with errno set. */
+static int zap_proc_write_all_fd(int fd, const ZapStr *data) {
+    const char *p = data->data;
+    int64_t left = data->len;
+    while (left > 0) {
+        ssize_t w = write(fd, p, (size_t)left);
+        if (w < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        p += w;
+        left -= (int64_t)w;
+    }
+    return 0;
+}
+
+/* Shared blocking spawn + capture for run / check_run / run_shell (#976,
+ * D-0237). `cmd_arg` is a `list[str]` argv (is_shell == 0) or a `str` shell
+ * command (is_shell == 1, run through `/bin/sh -c` / `cmd.exe /C`). `env`
+ * overrides/augments the environment; `cwd` (non-empty) is the working
+ * directory; `timeout_s > 0` SIGKILLs on expiry (-> TimeoutError); `input`
+ * (non-empty) is fed to stdin via a temp file; `capture` toggles stdout/stderr
+ * capture; `merge` folds stderr into stdout. `do_check` raises RuntimeError on a
+ * non-zero exit. Returns a GC `ZapProc`. Raises on spawn failure. */
+static void *zap_proc_run_impl(const char *op, void *cmd_arg, const ZapDict *env,
+                               const ZapStr *cwd, double timeout_s,
+                               const ZapStr *input, int64_t capture, int64_t merge,
+                               int do_check, int is_shell) {
+    int want_in = (input && input->len > 0);
+    int want_cwd = (cwd && cwd->len > 0);
+
+    /* --- build argv --- */
+    char **cargv;
+    int64_t n;
+    const char *display; /* argv[0] / shell command, for messages */
+    if (is_shell) {
+        char *cmdz = zap_sys_cstr((ZapStr *)cmd_arg);
+        cargv = (char **)malloc(sizeof(char *) * 4);
+        if (!cargv) {
+            zap_sys_fail(op, "out of memory");
+        }
+#if defined(ZAP_PLATFORM_WINDOWS)
+        cargv[0] = "cmd.exe";
+        cargv[1] = "/C";
+#else
+        cargv[0] = "/bin/sh";
+        cargv[1] = "-c";
+#endif
+        cargv[2] = cmdz;
+        cargv[3] = NULL;
+        n = 3;
+        display = cmdz;
+    } else {
+        n = zap_list_len(cmd_arg);
+        if (n < 1) {
+            zap_sys_fail(op, "empty argument list");
+        }
+        cargv = (char **)malloc(sizeof(char *) * (size_t)(n + 1));
+        if (!cargv) {
+            zap_sys_fail(op, "out of memory");
+        }
+        for (int64_t i = 0; i < n; i++) {
+            cargv[i] = zap_sys_cstr((ZapStr *)zap_list_get_ptr(cmd_arg, i));
+        }
+        cargv[n] = NULL;
+        display = cargv[0];
+    }
 
     const char *tmp = zap_tempdir();
-    char otmpl[4096], etmpl[4096];
-    snprintf(otmpl, sizeof otmpl, "%s/zapout_XXXXXX", tmp);
-    snprintf(etmpl, sizeof etmpl, "%s/zaperr_XXXXXX", tmp);
+    char itmpl[4096], otmpl[4096], etmpl[4096];
+    int ifd = -1, ofd = -1, efd = -1;
+
+    /* --- stdin temp file (only when input is supplied) --- */
+    if (want_in) {
+        snprintf(itmpl, sizeof itmpl, "%s/zapin_XXXXXX", tmp);
 #if defined(ZAP_PLATFORM_WINDOWS)
-    int ofd = zap_win_mkstemp(otmpl);
+        ifd = zap_win_mkstemp(itmpl);
 #else
-    int ofd = mkstemp(otmpl);
+        ifd = mkstemp(itmpl);
 #endif
-    if (ofd < 0) {
-        free(cargv);
-        zap_sys_fail("process.run", strerror(errno));
+        if (ifd < 0) {
+            free(cargv);
+            zap_sys_fail(op, strerror(errno));
+        }
+        if (zap_proc_write_all_fd(ifd, input) != 0) {
+            int e = errno;
+            close(ifd);
+            unlink(itmpl);
+            free(cargv);
+            zap_sys_fail(op, strerror(e));
+        }
+        lseek(ifd, 0, SEEK_SET);
     }
+
+    /* --- capture temp files --- */
+    if (capture) {
+        snprintf(otmpl, sizeof otmpl, "%s/zapout_XXXXXX", tmp);
 #if defined(ZAP_PLATFORM_WINDOWS)
-    int efd = zap_win_mkstemp(etmpl);
+        ofd = zap_win_mkstemp(otmpl);
 #else
-    int efd = mkstemp(etmpl);
+        ofd = mkstemp(otmpl);
 #endif
-    if (efd < 0) {
-        int e = errno;
-        close(ofd);
-        unlink(otmpl);
-        free(cargv);
-        zap_sys_fail("process.run", strerror(e));
+        if (ofd < 0) {
+            int e = errno;
+            if (ifd >= 0) {
+                close(ifd);
+                unlink(itmpl);
+            }
+            free(cargv);
+            zap_sys_fail(op, strerror(e));
+        }
+        if (!merge) {
+            snprintf(etmpl, sizeof etmpl, "%s/zaperr_XXXXXX", tmp);
+#if defined(ZAP_PLATFORM_WINDOWS)
+            efd = zap_win_mkstemp(etmpl);
+#else
+            efd = mkstemp(etmpl);
+#endif
+            if (efd < 0) {
+                int e = errno;
+                close(ofd);
+                unlink(otmpl);
+                if (ifd >= 0) {
+                    close(ifd);
+                    unlink(itmpl);
+                }
+                free(cargv);
+                zap_sys_fail(op, strerror(e));
+            }
+        }
     }
 
     int64_t code;
+    int timed_out = 0;
 #if defined(ZAP_PLATFORM_WINDOWS)
-    /* CreateProcessW with stdout/stderr redirected to the temp files. The child
-     * inherits the two file handles (marked inheritable); the command line carries
-     * argv with MSVCRT quoting, and a NULL application name lets CreateProcess do
-     * the PATH search posix_spawnp would (Python-faithful). There is no signal
-     * exit status on Windows, so `code` is just the process exit code. */
     char *cmdline = zap_win_build_cmdline(cargv, n);
     free(cargv);
+    char *envblock = zap_win_build_env_block(env);
+    char *cwdz = want_cwd ? zap_sys_cstr((ZapStr *)cwd) : NULL;
     if (!cmdline) {
-        close(ofd);
-        close(efd);
-        unlink(otmpl);
-        unlink(etmpl);
-        zap_sys_fail("process.run", "out of memory");
+        if (envblock) {
+            free(envblock);
+        }
+        if (ifd >= 0) {
+            close(ifd);
+            unlink(itmpl);
+        }
+        if (ofd >= 0) {
+            close(ofd);
+            unlink(otmpl);
+        }
+        if (efd >= 0) {
+            close(efd);
+            unlink(etmpl);
+        }
+        zap_sys_fail(op, "out of memory");
     }
-    HANDLE oh = (HANDLE)_get_osfhandle(ofd);
-    HANDLE eh = (HANDLE)_get_osfhandle(efd);
-    SetHandleInformation(oh, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-    SetHandleInformation(eh, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
     STARTUPINFOA si;
     memset(&si, 0, sizeof si);
     si.cb = sizeof si;
     si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE ih = want_in ? (HANDLE)_get_osfhandle(ifd) : GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE oh = capture ? (HANDLE)_get_osfhandle(ofd) : GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE eh = capture ? (merge ? oh : (HANDLE)_get_osfhandle(efd))
+                        : GetStdHandle(STD_ERROR_HANDLE);
+    if (want_in) {
+        SetHandleInformation(ih, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    }
+    if (capture) {
+        SetHandleInformation(oh, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        if (!merge) {
+            SetHandleInformation(eh, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        }
+    }
+    si.hStdInput = ih;
     si.hStdOutput = oh;
     si.hStdError = eh;
     PROCESS_INFORMATION pi;
     memset(&pi, 0, sizeof pi);
-    BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, envblock, cwdz, &si, &pi);
     free(cmdline);
-    if (!ok) {
-        close(ofd);
-        close(efd);
-        unlink(otmpl);
-        unlink(etmpl);
-        zap_sys_fail("process.run", "CreateProcess failed");
+    if (envblock) {
+        free(envblock);
     }
-    zap_enter_blocking(); /* GC-safe: no un-flushed Zap temporaries across wait */
-    WaitForSingleObject(pi.hProcess, INFINITE);
+    if (!ok) {
+        if (ifd >= 0) {
+            close(ifd);
+            unlink(itmpl);
+        }
+        if (ofd >= 0) {
+            close(ofd);
+            unlink(otmpl);
+        }
+        if (efd >= 0) {
+            close(efd);
+            unlink(etmpl);
+        }
+        zap_sys_fail(op, "CreateProcess failed");
+    }
+    if (ifd >= 0) {
+        close(ifd); /* child holds its own inherited handle */
+        ifd = -1;
+    }
+    DWORD wait_ms = (timeout_s > 0.0) ? (DWORD)(timeout_s * 1000.0) : INFINITE;
+    zap_enter_blocking();
+    DWORD wr = WaitForSingleObject(pi.hProcess, wait_ms);
+    if (wr == WAIT_TIMEOUT) {
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        timed_out = 1;
+    }
     zap_leave_blocking();
     DWORD exit_code = 1;
     GetExitCodeProcess(pi.hProcess, &exit_code);
@@ -1611,56 +2011,663 @@ void *zap_process_run(void *argv_list) {
 #else
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_adddup2(&fa, ofd, 1);
-    posix_spawn_file_actions_adddup2(&fa, efd, 2);
-    pid_t pid = 0;
-    int rc = posix_spawnp(&pid, cargv[0], &fa, NULL, cargv, environ);
-    posix_spawn_file_actions_destroy(&fa);
-    free(cargv);
-    if (rc != 0) {
-        close(ofd);
-        close(efd);
-        unlink(otmpl);
-        unlink(etmpl);
-        zap_sys_fail("process.run", strerror(rc));
+    if (want_in) {
+        posix_spawn_file_actions_adddup2(&fa, ifd, 0);
     }
-
-    int status = 0;
-    pid_t w;
-    zap_enter_blocking(); /* GC-safe: no un-flushed Zap temporaries across wait */
-    do {
-        w = waitpid(pid, &status, 0);
-    } while (w < 0 && errno == EINTR);
-    zap_leave_blocking();
-
-    if (w < 0) {
-        code = -1;
-    } else if (WIFEXITED(status)) {
-        code = (int64_t)WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
-        code = 128 + (int64_t)WTERMSIG(status);
-    } else {
-        code = -1;
+    if (capture) {
+        posix_spawn_file_actions_adddup2(&fa, ofd, 1);
+        posix_spawn_file_actions_adddup2(&fa, merge ? ofd : efd, 2);
     }
+    if (want_cwd) {
+#if defined(ZAP_HAVE_SPAWN_CHDIR)
+        char *cwdz = zap_sys_cstr((ZapStr *)cwd);
+        posix_spawn_file_actions_addchdir_np(&fa, cwdz);
+#else
+        posix_spawn_file_actions_destroy(&fa);
+        if (ifd >= 0) {
+            close(ifd);
+            unlink(itmpl);
+        }
+        if (ofd >= 0) {
+            close(ofd);
+            unlink(otmpl);
+        }
+        if (efd >= 0) {
+            close(efd);
+            unlink(etmpl);
+        }
+        free(cargv);
+        zap_sys_fail(op, "cwd= is not supported on this platform");
 #endif
+    }
+    char **built = zap_proc_build_envp(env);
+    char **envp = built ? built : environ;
+    pid_t pid = 0;
+    int rc = posix_spawnp(&pid, cargv[0], &fa, NULL, cargv, envp);
+    posix_spawn_file_actions_destroy(&fa);
+    zap_proc_free_envp(built);
+    free(cargv);
+    if (want_in) {
+        close(ifd); /* the child has its own stdin from the temp file */
+        ifd = -1;
+    }
+    if (rc != 0) {
+        if (want_in) {
+            unlink(itmpl);
+        }
+        if (ofd >= 0) {
+            close(ofd);
+            unlink(otmpl);
+        }
+        if (efd >= 0) {
+            close(efd);
+            unlink(etmpl);
+        }
+        zap_sys_fail(op, strerror(rc));
+    }
+    code = zap_proc_wait_timed(pid, timeout_s, &timed_out);
+#endif
+
+    if (want_in && ifd < 0) {
+        unlink(itmpl);
+    }
+    if (timed_out) {
+        if (ofd >= 0) {
+            close(ofd);
+            unlink(otmpl);
+        }
+        if (efd >= 0) {
+            close(efd);
+            unlink(etmpl);
+        }
+        char msg[256];
+        int mn = snprintf(msg, sizeof msg, "%s: command timed out after %.3gs", op, timeout_s);
+        if (mn < 0) {
+            mn = 0;
+        }
+        if (mn >= (int)sizeof msg) {
+            mn = (int)sizeof msg - 1;
+        }
+        zap_panic_typed(ZAP_EXC_TIMEOUT_ERROR, zap_str_new(msg, (int64_t)mn));
+    }
 
     ZapProc *r = (ZapProc *)zap_obj(&zap_desc_proc);
     r->code = code;
     r->out = NULL;
     r->err = NULL;
-    r->out = (ZapStr *)zap_read_all_fd(ofd);
-    r->err = (ZapStr *)zap_read_all_fd(efd);
-    close(ofd);
-    close(efd);
-    unlink(otmpl);
-    unlink(etmpl);
+    if (capture) {
+        r->out = (ZapStr *)zap_read_all_fd(ofd);
+        close(ofd);
+        unlink(otmpl);
+        if (merge) {
+            r->err = (ZapStr *)zap_str_new("", 0);
+        } else {
+            r->err = (ZapStr *)zap_read_all_fd(efd);
+            close(efd);
+            unlink(etmpl);
+        }
+    } else {
+        r->out = (ZapStr *)zap_str_new("", 0);
+        r->err = (ZapStr *)zap_str_new("", 0);
+    }
+
+    if (do_check && code != 0) {
+        /* RuntimeError (Zap has no dedicated CalledProcessError, D-0237): the
+         * message carries argv[0]/command and the exit code, plus a short tail of
+         * captured stderr (or merged stdout) for context. */
+        const ZapStr *tail = (!merge && r->err && r->err->len > 0) ? r->err : r->out;
+        char msg[512];
+        int mn = snprintf(msg, sizeof msg, "%s: command '%s' exited with code %lld", op,
+                          display ? display : "?", (long long)code);
+        if (mn < 0) {
+            mn = 0;
+        }
+        if (tail && tail->len > 0 && mn < (int)sizeof msg - 2) {
+            int room = (int)sizeof msg - mn - 1;
+            int take = (int)(tail->len < room ? tail->len : room);
+            msg[mn++] = ':';
+            msg[mn++] = ' ';
+            room = (int)sizeof msg - mn;
+            if (take > room) {
+                take = room;
+            }
+            memcpy(msg + mn, tail->data, (size_t)take);
+            mn += take;
+        }
+        if (mn >= (int)sizeof msg) {
+            mn = (int)sizeof msg - 1;
+        }
+        zap_panic_typed(ZAP_EXC_RUNTIME_ERROR, zap_str_new(msg, (int64_t)mn));
+    }
     return r;
+}
+
+/* process.run(cmd, env, cwd, timeout_s, input, capture_output, merge_stderr)
+ * -> ZapProc* (#97, #976). The exit code is the child's status, or 128+signo if
+ * it was killed by a signal (POSIX). Raises on spawn failure / timeout. */
+void *zap_process_run(void *argv_list, void *env, void *cwd, double timeout_s,
+                      void *input, int64_t capture, int64_t merge) {
+    return zap_proc_run_impl("process.run", argv_list, (const ZapDict *)env,
+                             (const ZapStr *)cwd, timeout_s, (const ZapStr *)input,
+                             capture, merge, 0, 0);
+}
+
+/* process.check_run(...): like run, but raises RuntimeError on a non-zero exit
+ * (Python `subprocess.run(check=True)`). Returns the `(0, out, err)` tuple. */
+void *zap_process_check_run(void *argv_list, void *env, void *cwd, double timeout_s,
+                            void *input, int64_t capture, int64_t merge) {
+    return zap_proc_run_impl("process.check_run", argv_list, (const ZapDict *)env,
+                             (const ZapStr *)cwd, timeout_s, (const ZapStr *)input,
+                             capture, merge, 1, 0);
+}
+
+/* process.run_shell(cmd, ...): run `cmd` through the system shell (`/bin/sh -c`
+ * on POSIX, `cmd.exe /C` on Windows). Explicit opt-in shell form (#976). */
+void *zap_process_run_shell(void *cmd, void *env, void *cwd, double timeout_s,
+                            void *input, int64_t capture, int64_t merge) {
+    return zap_proc_run_impl("process.run_shell", cmd, (const ZapDict *)env,
+                             (const ZapStr *)cwd, timeout_s, (const ZapStr *)input,
+                             capture, merge, 0, 1);
 }
 
 /* Field getters the lowerer calls to unpack the result into a tuple. */
 int64_t zap_process_result_code(void *r) { return ((ZapProc *)r)->code; }
 void *zap_process_result_stdout(void *r) { return ((ZapProc *)r)->out; }
 void *zap_process_result_stderr(void *r) { return ((ZapProc *)r)->err; }
+
+/* --- process: streaming Popen-style handle (#976, D-0237) -------------------
+ *
+ * `process.Popen(...)` (the prelude struct) spawns a child with pipes for the
+ * selected streams and hands back an opaque `ZapPopen` handle. Non-blocking
+ * pipe reads/writes PARK the calling coroutine on the netpoller (epoll), freeing
+ * the worker thread rather than blocking it — so interleaved stdout/stderr
+ * streaming of output larger than a pipe buffer never deadlocks.
+ *
+ * The handle is a NON-GC malloc block addressed by an `int64` handle (the
+ * `http.Client` pool pattern, #990): a stable address the precise-Immix
+ * collector never moves, so the C code may hold it — and mutate its state
+ * (`reaped`/`returncode`, closing a stream's fd) — ACROSS a park safely. (A GC
+ * object would move under evacuation, invalidating the C pointer held across the
+ * park.) Scratch read buffers are likewise malloc, copied into a GC `bytes` only
+ * at the very end, after the last park. The block's fds/netpoller descriptors
+ * are released on stream EOF, `close_stdin`, and `wait`; the small control block
+ * itself is intentionally leaked on drop (like the keep-alive pool without
+ * `shutdown`) — spawn a bounded number of children and join each with `wait`.
+ *
+ * Windows: streaming over anonymous pipes needs named-pipe + overlapped IOCP
+ * integration (I#196 basis) — a substantial, separately-landable follow-up that
+ * CI (Linux-only) cannot exercise. `zap_popen_spawn` therefore raises a clear
+ * "not yet supported on Windows" error there; the blocking run/check_run/
+ * run_shell forms remain fully cross-platform. */
+
+#define ZAP_POPEN_RUNNING (-256) /* poll() sentinel: child has not exited yet */
+
+typedef struct {
+    int64_t pid;
+    int in_fd;  /* stdin write end, or -1 (not opened / closed) */
+    int out_fd; /* stdout read end, or -1 */
+    int err_fd; /* stderr read end, or -1 */
+    void *in_pd;
+    void *out_pd;
+    void *err_pd;
+    int64_t returncode;
+    int reaped; /* 0 = running, 1 = exited (returncode valid) */
+} ZapPopen;
+
+/* The int64 handle is the malloc'd block's address; cast back here. */
+static ZapPopen *zap_popen_of(int64_t h) { return (ZapPopen *)(intptr_t)h; }
+
+#if defined(ZAP_PLATFORM_POSIX)
+/* Make `fd` non-blocking and register it with the netpoller. `*pd_out` is the
+ * descriptor (NULL when the netpoller is unavailable -> blocking-poll fallback). */
+static void zap_popen_arm_fd(int fd, void **pd_out) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) {
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    }
+    *pd_out = zap_netpoll_open((int64_t)fd);
+}
+
+/* Park until `fd` is ready for `mode` (ZAP_POLL_READ / _WRITE). Returns 0 ready,
+ * -1 closed, -3 cancelled. With the netpoller this frees the worker thread; the
+ * pd==NULL fallback blocks on poll() bracketed by enter/leave_blocking. */
+static int zap_popen_park(int fd, void *pd, int mode) {
+    if (pd) {
+        int64_t r = zap_netpoll_wait(pd, mode, 0);
+        if (r == ZAP_POLL_CANCELLED) {
+            return -3;
+        }
+        if (r == ZAP_POLL_CLOSED) {
+            return -1;
+        }
+        return 0;
+    }
+    for (;;) {
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = (short)((mode == ZAP_POLL_READ) ? POLLIN : POLLOUT);
+        pfd.revents = 0;
+        zap_enter_blocking();
+        int n = poll(&pfd, 1, -1);
+        int saved = errno;
+        zap_leave_blocking();
+        if (n < 0 && saved == EINTR) {
+            continue;
+        }
+        return (n < 0) ? -1 : 0;
+    }
+}
+
+/* Close a stream fd and deregister its netpoller descriptor (idempotent). */
+static void zap_popen_close_stream(int *fd, void **pd) {
+    if (*pd) {
+        zap_netpoll_close(*pd);
+        *pd = NULL;
+    }
+    if (*fd >= 0) {
+        close(*fd);
+        *fd = -1;
+    }
+}
+#endif /* ZAP_PLATFORM_POSIX */
+
+/* process._popen_spawn(argv, env, cwd, flags) -> int64 handle. flags bits:
+ * 1 merge_stderr, 2 want_stdin, 4 want_stdout, 8 want_stderr. */
+int64_t zap_popen_spawn(void *argv_list, void *env, void *cwd, int64_t flags) {
+#if defined(ZAP_PLATFORM_WINDOWS)
+    (void)argv_list;
+    (void)env;
+    (void)cwd;
+    (void)flags;
+    zap_sys_fail("process.Popen",
+                 "streaming subprocess is not yet supported on Windows (#976)");
+    return 0;
+#else
+    int merge = (flags & 1) != 0;
+    int want_in = (flags & 2) != 0;
+    int want_out = (flags & 4) != 0;
+    int want_err = (flags & 8) != 0 && !merge;
+    const ZapStr *cwds = (const ZapStr *)cwd;
+    int want_cwd = (cwds && cwds->len > 0);
+
+    int64_t n = zap_list_len(argv_list);
+    if (n < 1) {
+        zap_sys_fail("process.Popen", "empty argument list");
+    }
+    char **cargv = (char **)malloc(sizeof(char *) * (size_t)(n + 1));
+    if (!cargv) {
+        zap_sys_fail("process.Popen", "out of memory");
+    }
+    for (int64_t i = 0; i < n; i++) {
+        cargv[i] = zap_sys_cstr((ZapStr *)zap_list_get_ptr(argv_list, i));
+    }
+    cargv[n] = NULL;
+
+    /* Pipes: [0] read end, [1] write end. Parent keeps the far end per stream. */
+    int ipipe[2] = {-1, -1}, opipe[2] = {-1, -1}, epipe[2] = {-1, -1};
+    if ((want_in && pipe(ipipe) != 0) || (want_out && pipe(opipe) != 0) ||
+        (want_err && pipe(epipe) != 0)) {
+        int e = errno;
+        for (int k = 0; k < 2; k++) {
+            if (ipipe[k] >= 0) close(ipipe[k]);
+            if (opipe[k] >= 0) close(opipe[k]);
+            if (epipe[k] >= 0) close(epipe[k]);
+        }
+        free(cargv);
+        zap_sys_fail("process.Popen", strerror(e));
+    }
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    if (want_in) {
+        posix_spawn_file_actions_adddup2(&fa, ipipe[0], 0);
+        posix_spawn_file_actions_addclose(&fa, ipipe[1]); /* child drops the write end */
+    }
+    if (want_out) {
+        posix_spawn_file_actions_adddup2(&fa, opipe[1], 1);
+        posix_spawn_file_actions_addclose(&fa, opipe[0]);
+    }
+    if (merge && want_out) {
+        posix_spawn_file_actions_adddup2(&fa, opipe[1], 2); /* 2>&1 */
+    } else if (want_err) {
+        posix_spawn_file_actions_adddup2(&fa, epipe[1], 2);
+        posix_spawn_file_actions_addclose(&fa, epipe[0]);
+    }
+    if (want_cwd) {
+#if defined(ZAP_HAVE_SPAWN_CHDIR)
+        posix_spawn_file_actions_addchdir_np(&fa, zap_sys_cstr((ZapStr *)cwd));
+#else
+        posix_spawn_file_actions_destroy(&fa);
+        for (int k = 0; k < 2; k++) {
+            if (ipipe[k] >= 0) close(ipipe[k]);
+            if (opipe[k] >= 0) close(opipe[k]);
+            if (epipe[k] >= 0) close(epipe[k]);
+        }
+        free(cargv);
+        zap_sys_fail("process.Popen", "cwd= is not supported on this platform");
+#endif
+    }
+
+    char **built = zap_proc_build_envp((const ZapDict *)env);
+    char **envp = built ? built : environ;
+    pid_t pid = 0;
+    int rc = posix_spawnp(&pid, cargv[0], &fa, NULL, cargv, envp);
+    posix_spawn_file_actions_destroy(&fa);
+    zap_proc_free_envp(built);
+    free(cargv);
+
+    /* Close the child's ends we kept open in the parent. */
+    if (want_in && ipipe[0] >= 0) close(ipipe[0]);
+    if (want_out && opipe[1] >= 0) close(opipe[1]);
+    if (want_err && epipe[1] >= 0) close(epipe[1]);
+
+    if (rc != 0) {
+        if (ipipe[1] >= 0) close(ipipe[1]);
+        if (opipe[0] >= 0) close(opipe[0]);
+        if (epipe[0] >= 0) close(epipe[0]);
+        zap_sys_fail("process.Popen", strerror(rc));
+    }
+
+    ZapPopen *h = (ZapPopen *)malloc(sizeof(ZapPopen));
+    if (!h) {
+        if (ipipe[1] >= 0) close(ipipe[1]);
+        if (opipe[0] >= 0) close(opipe[0]);
+        if (epipe[0] >= 0) close(epipe[0]);
+        if (rc == 0) {
+            kill(pid, SIGKILL);
+            int st;
+            waitpid(pid, &st, 0);
+        }
+        zap_sys_fail("process.Popen", "out of memory");
+    }
+    h->pid = (int64_t)pid;
+    h->in_fd = want_in ? ipipe[1] : -1;
+    h->out_fd = want_out ? opipe[0] : -1;
+    h->err_fd = want_err ? epipe[0] : -1;
+    h->in_pd = NULL;
+    h->out_pd = NULL;
+    h->err_pd = NULL;
+    h->returncode = 0;
+    h->reaped = 0;
+    if (h->in_fd >= 0) zap_popen_arm_fd(h->in_fd, &h->in_pd);
+    if (h->out_fd >= 0) zap_popen_arm_fd(h->out_fd, &h->out_pd);
+    if (h->err_fd >= 0) zap_popen_arm_fd(h->err_fd, &h->err_pd);
+    return (int64_t)(intptr_t)h;
+#endif
+}
+
+/* process._popen_write(h, data) -> bytes written (== len(data)). Parks while the
+ * pipe is full; raises on a broken pipe or a closed stdin. */
+int64_t zap_popen_write(int64_t h_, void *data_) {
+#if defined(ZAP_PLATFORM_WINDOWS)
+    (void)h_;
+    (void)data_;
+    zap_sys_fail("process.Popen.write", "not supported on Windows");
+    return 0;
+#else
+    ZapPopen *h = zap_popen_of(h_);
+    const ZapStr *data = (const ZapStr *)data_;
+    if (h->in_fd < 0) {
+        zap_sys_fail("process.Popen.write", "stdin is not open");
+    }
+    int64_t total = data->len;
+    if (total <= 0) {
+        return 0;
+    }
+    /* Copy into malloc scratch: the loop parks, and a moving GC could relocate
+     * the source ZapStr out from under a pointer held across the park. */
+    char *scratch = (char *)malloc((size_t)total);
+    if (!scratch) {
+        zap_sys_fail("process.Popen.write", "out of memory");
+    }
+    memcpy(scratch, data->data, (size_t)total);
+    int64_t left = total;
+    const char *p = scratch;
+    while (left > 0) {
+        ssize_t w = write(h->in_fd, p, (size_t)left);
+        if (w < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                int pr = zap_popen_park(h->in_fd, h->in_pd, ZAP_POLL_WRITE);
+                if (pr == -3) {
+                    free(scratch);
+                    zap_raise(cancelled_exc());
+                }
+                if (pr < 0) {
+                    free(scratch);
+                    zap_sys_fail("process.Popen.write", "stdin closed");
+                }
+                continue;
+            }
+            free(scratch);
+            zap_sys_fail("process.Popen.write", strerror(errno));
+        }
+        p += w;
+        left -= (int64_t)w;
+    }
+    free(scratch);
+    return total;
+#endif
+}
+
+/* process._popen_close_stdin(h): close the child's stdin (signals EOF). */
+void zap_popen_close_stdin(int64_t h_) {
+#if defined(ZAP_PLATFORM_POSIX)
+    ZapPopen *h = zap_popen_of(h_);
+    zap_popen_close_stream(&h->in_fd, &h->in_pd);
+#else
+    (void)h_;
+#endif
+}
+
+#if defined(ZAP_PLATFORM_POSIX)
+/* Read up to `maxn` bytes from stream `which` (1=stdout, 2=stderr) into `buf`,
+ * parking until data arrives. Returns the byte count (0 at EOF), closing the
+ * stream on EOF. Raises on error / cancellation. */
+static int64_t zap_popen_read_into(ZapPopen *h, int64_t which, char *buf, int64_t maxn) {
+    int *fd = (which == 2) ? &h->err_fd : &h->out_fd;
+    void **pd = (which == 2) ? &h->err_pd : &h->out_pd;
+    if (*fd < 0) {
+        return 0; /* stream not open / already at EOF */
+    }
+    for (;;) {
+        ssize_t r = read(*fd, buf, (size_t)maxn);
+        if (r > 0) {
+            return (int64_t)r;
+        }
+        if (r == 0) {
+            zap_popen_close_stream(fd, pd);
+            return 0;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            int pr = zap_popen_park(*fd, *pd, ZAP_POLL_READ);
+            if (pr == -3) {
+                zap_raise(cancelled_exc());
+            }
+            if (pr < 0) {
+                zap_popen_close_stream(fd, pd);
+                return 0;
+            }
+            continue;
+        }
+        zap_sys_fail("process.Popen.read", strerror(errno));
+    }
+}
+#endif /* ZAP_PLATFORM_POSIX */
+
+/* process._popen_read(h, which, maxn) -> bytes (b"" at EOF). The scratch buffer
+ * is malloc (it lives across the park, where a moving GC would relocate a GC
+ * buffer); the result is copied into a GC `bytes` at the end. */
+void *zap_popen_read(int64_t h_, int64_t which, int64_t maxn) {
+#if defined(ZAP_PLATFORM_WINDOWS)
+    (void)h_;
+    (void)which;
+    (void)maxn;
+    zap_sys_fail("process.Popen.read", "not supported on Windows");
+    return NULL;
+#else
+    ZapPopen *h = zap_popen_of(h_);
+    if (maxn <= 0) {
+        maxn = 65536;
+    }
+    char *buf = (char *)malloc((size_t)maxn);
+    if (!buf) {
+        zap_sys_fail("process.Popen.read", "out of memory");
+    }
+    int64_t got = zap_popen_read_into(h, which, buf, maxn);
+    void *out = zap_str_new(buf, got);
+    free(buf);
+    return out;
+#endif
+}
+
+/* process._popen_read_all(h, which) -> bytes read to end-of-output. */
+void *zap_popen_read_all(int64_t h_, int64_t which) {
+#if defined(ZAP_PLATFORM_WINDOWS)
+    (void)h_;
+    (void)which;
+    zap_sys_fail("process.Popen.read_all", "not supported on Windows");
+    return NULL;
+#else
+    ZapPopen *h = zap_popen_of(h_);
+    size_t cap = 4096, len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) {
+        zap_sys_fail("process.Popen.read_all", "out of memory");
+    }
+    for (;;) {
+        if (len == cap) {
+            size_t ncap = cap * 2;
+            char *nb = (char *)realloc(buf, ncap);
+            if (!nb) {
+                free(buf);
+                zap_sys_fail("process.Popen.read_all", "out of memory");
+            }
+            buf = nb;
+            cap = ncap;
+        }
+        int64_t r = zap_popen_read_into(h, which, buf + len, (int64_t)(cap - len));
+        if (r == 0) {
+            break;
+        }
+        len += (size_t)r;
+    }
+    void *out = zap_str_new(buf, (int64_t)len);
+    free(buf);
+    return out;
+#endif
+}
+
+#if defined(ZAP_PLATFORM_POSIX)
+/* Reap the child without blocking; on exit record the decoded returncode.
+ * Returns 1 if (now) reaped, 0 if still running. */
+static int zap_popen_try_reap(ZapPopen *h) {
+    if (h->reaped) {
+        return 1;
+    }
+    int status = 0;
+    pid_t w;
+    do {
+        w = waitpid((pid_t)h->pid, &status, WNOHANG);
+    } while (w < 0 && errno == EINTR);
+    if (w == (pid_t)h->pid) {
+        if (WIFEXITED(status)) {
+            h->returncode = (int64_t)WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            h->returncode = 128 + (int64_t)WTERMSIG(status);
+        } else {
+            h->returncode = -1;
+        }
+        h->reaped = 1;
+        return 1;
+    }
+    return 0;
+}
+#endif /* ZAP_PLATFORM_POSIX */
+
+/* process._popen_poll(h) -> returncode, or ZAP_POPEN_RUNNING while still alive. */
+int64_t zap_popen_poll(int64_t h_) {
+#if defined(ZAP_PLATFORM_POSIX)
+    ZapPopen *h = zap_popen_of(h_);
+    return zap_popen_try_reap(h) ? h->returncode : ZAP_POPEN_RUNNING;
+#else
+    (void)h_;
+    return ZAP_POPEN_RUNNING;
+#endif
+}
+
+/* process._popen_wait(h) -> returncode (blocks until exit). Releases the stream
+ * fds/netpoller descriptors on return (read all output BEFORE waiting). */
+int64_t zap_popen_wait(int64_t h_) {
+#if defined(ZAP_PLATFORM_POSIX)
+    ZapPopen *h = zap_popen_of(h_);
+    if (!h->reaped) {
+        int status = 0;
+        pid_t w;
+        zap_enter_blocking();
+        do {
+            w = waitpid((pid_t)h->pid, &status, 0);
+        } while (w < 0 && errno == EINTR);
+        zap_leave_blocking();
+        if (w < 0) {
+            h->returncode = -1;
+        } else if (WIFEXITED(status)) {
+            h->returncode = (int64_t)WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            h->returncode = 128 + (int64_t)WTERMSIG(status);
+        } else {
+            h->returncode = -1;
+        }
+        h->reaped = 1;
+    }
+    zap_popen_close_stream(&h->in_fd, &h->in_pd);
+    zap_popen_close_stream(&h->out_fd, &h->out_pd);
+    zap_popen_close_stream(&h->err_fd, &h->err_pd);
+    return h->returncode;
+#else
+    (void)h_;
+    zap_sys_fail("process.Popen.wait", "not supported on Windows");
+    return -1;
+#endif
+}
+
+/* process._popen_returncode(h) -> returncode; raises RuntimeError if running. */
+int64_t zap_popen_returncode(int64_t h_) {
+#if defined(ZAP_PLATFORM_POSIX)
+    ZapPopen *h = zap_popen_of(h_);
+    if (!zap_popen_try_reap(h)) {
+        zap_panic_typed(ZAP_EXC_RUNTIME_ERROR,
+                        zap_str_new("process.Popen.returncode: process still running", 48));
+    }
+    return h->returncode;
+#else
+    (void)h_;
+    zap_sys_fail("process.Popen.returncode", "not supported on Windows");
+    return -1;
+#endif
+}
+
+/* process._popen_pid(h) -> child process id. */
+int64_t zap_popen_pid(int64_t h_) { return zap_popen_of(h_)->pid; }
+
+/* process._popen_signal(h, sig): terminate(15) / kill(9). No-op once reaped. */
+void zap_popen_signal(int64_t h_, int64_t sig) {
+#if defined(ZAP_PLATFORM_POSIX)
+    ZapPopen *h = zap_popen_of(h_);
+    if (!h->reaped) {
+        kill((pid_t)h->pid, (int)sig);
+    }
+#else
+    (void)h_;
+    (void)sig;
+    zap_sys_fail("process.Popen.signal", "not supported on Windows");
+#endif
+}
 
 /* --- Line-oriented input (#969, D-0212) ------------------------------------
  *
