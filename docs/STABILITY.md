@@ -198,18 +198,20 @@ not supported — it may change in **any** release, including a PATCH:
   (they were previously ordinary identifiers; pre-1.0 this needs no deprecation
   window, §2). Expected to graduate to Stable with the numeric tower; the exact
   conversion/overflow surface may still change pre-1.0.
-- **Borrowed-bytes `strview`** (#1082, `decisions/lang/1082-borrowed-bytes-strview.md`)
-  — **Experimental**. A non-owning view over an existing string's bytes for
-  read-only consumers (`dict.get`/`in`, hash, `==`, `startswith`/`endswith`/
-  `contains`, `len`, `to_str`), created with `s.view()` / `s.view(lo, hi)` and
-  sub-viewed with `v.view(...)`. It allocates nothing and copies nothing, and is
-  affine: a `strview` may not be a struct field, module global, collection
-  element, or function return type (`ZAP5135`). **Adding the type reserves the
-  keyword `strview`** (previously an ordinary identifier; pre-1.0 this needs no
-  deprecation window, §2). The surface may still change pre-1.0: the planned
-  additions (a `bytesview`; `int()`/`float()`/`print()` taking a view directly;
-  `find`/`index`/`count`/`is*`; and the implicit borrow at the call boundary of
-  #1082's RFC) may reshape it. `str[a:b]` slice semantics are unchanged.
+- **Borrowed-bytes `strview` / `bytesview`** (#1082,
+  `decisions/lang/1082-borrowed-bytes-strview.md`) — **Experimental**. A non-owning
+  view over an existing `str`'s or `bytes`'s storage for read-only consumers
+  (`dict.get`/`in`, hash, `==`, `startswith`/`endswith`/`contains`, `len`,
+  `to_str`/`to_bytes`), created with `s.view()` / `s.view(lo, hi)` (codepoint
+  bounds) or `b.view()` / `b.view(lo, hi)` (byte bounds, I#337) and sub-viewed with
+  `v.view(...)`. It allocates nothing and copies nothing, and is affine: a view may
+  not be a struct field, module global, collection element, or function return type
+  (`ZAP5135`). **Adding the types reserves the keywords `strview` and `bytesview`**
+  (previously ordinary identifiers; pre-1.0 this needs no deprecation window, §2).
+  The surface may still change pre-1.0: the planned additions
+  (`int()`/`float()`/`print()` taking a view directly; `find`/`index`/`count`/`is*`;
+  and the implicit borrow at the call boundary of #1082's RFC) may reshape it.
+  `str[a:b]` / `bytes[a:b]` slice semantics are unchanged.
 - **Built-in decorator not in the v1 set** — `@inject` (I#472, D-0109).
   **`@inject` is declined for core**: dependency injection is a framework
   concern, provided by reflection-driven `Depends(...)` adapters (D-0089/D-0092),

@@ -1103,6 +1103,22 @@ mod tests {
     }
 
     #[test]
+    fn bytesview_distinct_from_strview_and_tuple() {
+        // Regression (#1082 follow-up): bytesview has its OWN reserved layout,
+        // distinct from strview and from any `(bytes, int64, int64)` tuple. A
+        // byte-indexed view creation routes to the `zap_bytesview_*` helpers.
+        let m = lower_ok(
+            "def main():\n    bytes b = bytes([1, 2, 3])\n    bytesview v = b.view(1, 3)\n    \
+             print(len(v))\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("zap_bytesview_off"),
+            "bytesview creation did not use the byte-indexed helpers:\n{text}"
+        );
+    }
+
+    #[test]
     fn strview_view_uses_borrow_abi() {
         // A `strview` consumer lowers to the zero-alloc view ABI, never an owned
         // `zap_str_new` / `zap_str_slice` for the view itself (#1082).

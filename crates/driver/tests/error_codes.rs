@@ -268,6 +268,29 @@ fn strview_affine_codes() {
     );
 }
 
+/// The borrowed `bytesview` (#1082 follow-up) is affine under the identical rule
+/// (`ZAP5135`) as `strview` — it may not escape its backing's frame.
+#[test]
+fn bytesview_affine_codes() {
+    // reject: a bytesview as a struct field / return / collection-element type.
+    assert_code(
+        "struct Box:\n    bytesview v\ndef main():\n    pass\n",
+        "ZAP5135",
+    );
+    assert_code(
+        "def first(bytes s) -> bytesview:\n    return s.view(0, 1)\ndef main():\n    pass\n",
+        "ZAP5135",
+    );
+    assert_code("def main():\n    list[bytesview] xs = []\n", "ZAP5135");
+    // accept: an intra-frame local and a bytesview parameter are sound.
+    assert_no_code(
+        "def probe(bytesview v) -> bool:\n    return v.startswith(bytes([1]))\n\
+         def main():\n    bytes b = bytes([1, 2])\n    bytesview v = b.view()\n    \
+         bool ok = probe(v)\n",
+        "ZAP5135",
+    );
+}
+
 #[test]
 fn eq_none_on_value_type_is_rejected() {
     // `== None` / `!= None` is consistent with `is None` (SPEC §5, #374/B3): a

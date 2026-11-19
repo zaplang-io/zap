@@ -2300,6 +2300,28 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 &[p.into(), i.into(), i.into(), i.into(), i.into(), i.into()],
                 Some(i.into()),
             );
+            // bytesview creation (#1082 follow-up): byte-indexed bounds; the
+            // probes / hash / eq / materializer are shared with strview.
+            self.declare_rt(
+                "zap_bytesview_off",
+                &[p.into(), i.into(), i.into()],
+                Some(i.into()),
+            );
+            self.declare_rt(
+                "zap_bytesview_len",
+                &[p.into(), i.into(), i.into(), i.into()],
+                Some(i.into()),
+            );
+            self.declare_rt(
+                "zap_bytesview_sub_off",
+                &[p.into(), i.into(), i.into(), i.into(), i.into()],
+                Some(i.into()),
+            );
+            self.declare_rt(
+                "zap_bytesview_sub_len",
+                &[p.into(), i.into(), i.into(), i.into(), i.into(), i.into()],
+                Some(i.into()),
+            );
             self.declare_rt(
                 "zap_strview_startswith",
                 &[p.into(), i.into(), i.into(), p.into(), i.into(), i.into()],
