@@ -503,6 +503,34 @@ struct LineReader:
             return (\"\", False)
         return (line, True)
 
+# Writer — a buffered writable file object over an io.writer handle (#1071,
+# D-0240). The write twin of LineReader: a thin reference struct over the opaque
+# buffered-writer handle (like Lock / LineReader wrap their handles) giving the
+# method and context-manager surface the raw handle cannot. `write` returns the
+# number of bytes written, `flush` drains the buffer, and `close_` flushes then
+# closes the underlying fd (idempotent). `close` is a reserved word in Zap
+# (channel close), so the method is spelled `close_` — the trailing-underscore
+# convention Event uses for Python's reserved `set` (`set_`). The
+# `with io.writer(fd) as w:` form auto-closes on scope exit via the D-0069
+# protocol, even on unwind. Built by io.writer(fd).
+struct Writer:
+    bytes _h
+
+    def write(self, str data) -> int64:
+        return io._writer_write(self._h, data)
+
+    def flush(self):
+        io._writer_flush(self._h)
+
+    def close_(self):
+        io._writer_close(self._h)
+
+    def __enter__(self) -> Writer:
+        return self
+
+    def __exit__(self):
+        io._writer_close(self._h)
+
 enum JsonValue:
     Null
     Bool(bool b)
@@ -1966,6 +1994,11 @@ fn references_prelude(module: &Module) -> bool {
         "\"io\"",
         "\"open_reader\"",
         "\"LineReader\"",
+        // The `io.writer(fd)` buffered file object returns the prelude `Writer`
+        // struct (#1071, D-0240): injected for any program that names the `io`
+        // module or the struct directly. Over-injection for an `io.read`-only
+        // program is harmless — the unused struct emits no code.
+        "\"Writer\"",
         "\"JsonValue\"",
         "\"json\"",
         "\"Json\"",

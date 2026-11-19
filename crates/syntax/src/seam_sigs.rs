@@ -374,6 +374,10 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("io", "readall", &["reader"]),
     ("io", "readn", &["reader", "n"]),
     ("io", "lines", &["reader"]),
+    // #1071, D-0240: io.writer(fd) -> Writer. The flat `_writer_*` delegates are
+    // internal (called only by the prelude `Writer`), so — like the threading
+    // `_*` delegates — they get no row and stay positional.
+    ("io", "writer", &["fd"]),
     // ---- signal (ticket #77): subscribe to a Signal ----
     ("signal", "notify", &["sig"]),
     // ---- math (ticket #98): scalar transcendentals + 2/3-arg forms ----

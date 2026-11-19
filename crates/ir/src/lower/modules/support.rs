@@ -40,6 +40,40 @@ pub(super) fn line_reader_wrap(lowerer: &mut FnLower, h: Value) -> Result<(Value
     Ok((dest, Ty::Struct(sid)))
 }
 
+/// Resolve a prelude struct id by name (the user may have shadowed it, but the
+/// prelude injects it whenever the triggering surface is referenced).
+fn prelude_sid(lowerer: &FnLower, name: &str) -> Result<u32, LowerError> {
+    lowerer.ctx.ids.get(name).copied().ok_or_else(|| {
+        err(format!(
+            "{name} struct unavailable (built-in prelude missing)"
+        ))
+    })
+}
+
+/// Lower `io.writer(fd)` (#1071, D-0240): allocate a fresh buffered-writer handle
+/// via `zap_io_writer_new(fd)` and wrap it in a freshly-constructed prelude
+/// `Writer` (field 0 = `_h`). The constructor only allocates — it does no I/O —
+/// so it is a plain (non-throwing) call; the object's `write`/`flush`/`close`
+/// methods carry the throwing runtime ops. The new struct roots the handle.
+pub(super) fn writer_new_wrap(lowerer: &mut FnLower, fd: Value) -> Result<(Value, Ty), LowerError> {
+    let handle = lowerer.new_value(Ty::Ptr);
+    lowerer.emit(Inst::Call {
+        dest: Some(handle),
+        func: "zap_io_writer_new".to_string(),
+        args: vec![fd],
+    });
+    let sid = prelude_sid(lowerer, "Writer")?;
+    let dest = lowerer.new_value(Ty::Struct(sid));
+    lowerer.emit(Inst::StructNew { dest, sid });
+    lowerer.emit(Inst::FieldSet {
+        base: dest,
+        sid,
+        idx: 0,
+        val: handle,
+    });
+    Ok((dest, Ty::Struct(sid)))
+}
+
 /// Lower each argument expression: integer arguments (fds, counts) are coerced
 /// to `i64`; reference arguments (`str`, `list`) pass through as their pointer
 /// value. The backing runtime symbols take `i64`/`ptr` words accordingly.

@@ -45,6 +45,20 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   (Python `NamedTemporaryFile`) is **deferred** to a follow-up pending the `io`
   writer / file-object shape (#969); `mkstemp` already exposes the raw fd+path
   and `write_atomic` covers safe writes, so nothing is blocked.
+- **`io` gains a buffered writer / file object — `io.writer(fd)`** (#1071,
+  D-0240, epic #966). The write twin of the #969 reader. `io.writer(fd)` wraps an
+  open, writable fd in the prelude **`Writer`** object: `w.write(data) -> int64`
+  (bytes written, 8 KiB-buffered), `w.flush()` drains the buffer, and `w.close_()`
+  flushes then closes the underlying fd (idempotent; `close` is a reserved word,
+  so the method is `close_`, like `Event.set_`). Supports the context-manager
+  form **`with io.writer(fd) as w:`**, which flushes and closes on scope exit —
+  including when the body raises. `write`/`flush`/`close_` after close raise a
+  catchable `ValueError`; a bad fd raises a catchable `RuntimeError`. The write
+  state is an opaque pointer-free `bytes` handle (the #969 / crypto streaming-hash
+  pattern); the `Writer` is a thin reference wrapper over it. Distinct from the
+  unbuffered `sys.stdout()`/`sys.write` streams (#1035) — compose them with
+  `io.writer(sys.stdout_fd())` for a buffered stdout. Unblocks `fs.temp_file`
+  (#979).
 - **`argparse` — a real `ArgumentParser` object: subcommands, groups, and
   composable parsers** (#997, D-0238, epic #966). Replaces the v1 process-global
   singleton (#101, D-0056) with a parser **value**: `argparse.ArgumentParser(
