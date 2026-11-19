@@ -8275,7 +8275,7 @@ impl Checker {
                     ErrorCode::ZAP4080,
                     format!(
                         "strview has no method '{name}' (strview is a borrowed, read-only \
-                         view; materialize with .str() for owning methods)"
+                         view; materialize with .to_str() for owning methods)"
                     ),
                     span,
                 );

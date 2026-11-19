@@ -12570,6 +12570,20 @@ impl<'a> FnLower<'a> {
                             args: vec![v],
                         });
                         vals.push(s);
+                    } else if matches!(vt, Ty::Struct(sid) if self.is_strview_sid(sid)) {
+                        // print(strview) (#1082): materialize the borrowed bytes to
+                        // an owned str so it writes the TEXT (unquoted, like any
+                        // string), not the view's internal `(base, off, len)` tuple.
+                        // A true zero-alloc write-to-output borrow is a deferred
+                        // optimization; correctness first.
+                        let (base, off, len) = self.strview_fields(v);
+                        let s = self.new_value(Ty::Ptr);
+                        self.emit(Inst::Call {
+                            dest: Some(s),
+                            func: "zap_strview_to_str".to_string(),
+                            args: vec![base, off, len],
+                        });
+                        vals.push(s);
                     } else if matches!(
                         vt,
                         Ty::Struct(_) | Ty::List(_) | Ty::Dict(_, _) | Ty::Set(_)

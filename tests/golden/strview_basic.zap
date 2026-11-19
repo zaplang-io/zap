@@ -25,3 +25,7 @@ def main():
     strview uv = u.view(0, 2)  # "hé"
     print(len(uv))  # 2
     print(uv == "hé")  # True
+
+    # print(view) writes the borrowed TEXT (unquoted), not the internal tuple.
+    print(v)  # hello
+    print(uv)  # hé
