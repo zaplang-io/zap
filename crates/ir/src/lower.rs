@@ -2459,24 +2459,6 @@ fn flatten_array_literal<'e>(
     }
 }
 
-/// The channel element kind named by a construction subscript like
-/// `channel[int64]`, where the element type appears as a bare name in
-/// expression position (ticket #25, D-0031). Integers/bools become an `i64`
-/// word; reference types (`str`, structs, collections) become a pointer word.
-fn chan_elem_from_name(name: &str) -> Result<Elem, LowerError> {
-    match name {
-        "int" | "int64" | "i64" | "int32" | "i32" | "bool" | "char" => Ok(Elem::I64),
-        // A `channel[float64]` carries its element as a reinterpreted `f64` word
-        // (#800); an `f32` channel element stays deferred (ticket #49).
-        "float" | "float64" | "f64" => Ok(Elem::F64),
-        "float32" | "f32" => Err(err(
-            "channels of 32-bit float elements are not supported yet (ticket #49)",
-        )),
-        // `str`, `bytes`, struct, and nested-collection elements are references.
-        _ => Ok(Elem::Ptr),
-    }
-}
-
 /// Classify a ZIR type into the element word kind collections store. Elements
 /// are uniform 8-byte words (RUNTIME-ABI §"Collection layout"): integers/bools
 /// go in as `i64`, reference types as pointers, and an `f64` as the reinterpreted
@@ -16297,26 +16279,33 @@ impl<'a> FnLower<'a> {
         elem_expr: &Expr,
         args: &[ast::Arg],
     ) -> Result<(Value, Ty), LowerError> {
-        // A channel stores its elements as uniform 8-byte words (D-0031), so a
-        // bare scalar/reference name classifies directly. A **tuple** element is
-        // a value aggregate: delivering one across the channel ABI needs
-        // boxing/unboxing this slice does not implement (unlike a set/dict key,
-        // which hashes a tuple through its key functions), so it is rejected
-        // cleanly here with a specific message rather than the generic
-        // "expects an element type name" (#703; tuple channels are a follow-up).
+        // A channel stores its elements as uniform 8-byte words (D-0031). The
+        // element type is resolved through the shared value-position classifier
+        // (`expr_to_type` + [`value_elem_of`]), exactly like a dict value, a list
+        // element, or an `AtomicArray` element, so every element kind keeps its
+        // *precise* [`Elem`] — a struct is `Elem::Struct(sid)`, a nested
+        // collection is `Elem::Nested`, `bytes`/`complex`/`enum`/`float` each
+        // their own — and therefore recovers its real type on receive (#1100).
+        //
+        // Classifying a bare *name* instead (the earlier `chan_elem_from_name`)
+        // collapsed *every* reference element to an opaque `Elem::Ptr`, so a
+        // `channel[Struct]` value read back as a bare pointer (`str`): field
+        // access on the received value then failed with "field access on a
+        // non-struct value" (ZAP6001). This mirrors the #625/#1074 read-back
+        // fixes (a collection element must stay recoverable, never flattened to
+        // `Ptr`). A **tuple** element is a value aggregate whose boxing/unboxing
+        // across the channel ABI this slice does not implement (unlike a set/dict
+        // key, which hashes a tuple through its key functions), so it is rejected
+        // cleanly here with a specific message (#703; tuple channels are a
+        // follow-up) before the generic classifier would intern it as a struct.
         let elem = match elem_expr {
-            Expr::Name(ename, _) => chan_elem_from_name(ename)?,
             Expr::Tuple(..) => {
                 return Err(err(
                     "channels of tuple elements are not supported yet (a tuple is a \
                      value aggregate; channel elements are uniform words)",
                 ))
             }
-            _ => {
-                return Err(err(
-                    "channel[...] expects an element type name, e.g. channel[int64]",
-                ))
-            }
+            _ => value_elem_of(&expr_to_type(elem_expr)?, &self.ctx.tyenv())?,
         };
         let cap = match args.len() {
             0 => self.iconst(Ty::I64, 0),
