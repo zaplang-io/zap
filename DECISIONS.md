@@ -12414,6 +12414,25 @@ as a traced pointer word and never matches on `Elem`, so `Elem::Bytes` shares th
 `_ptr` entry points with no new runtime symbol; the distinction is lowering-only.
 `Elem` is not serialized into the module. No grammar change.
 
+**Fallout: sema/IR handle types realigned.** Distinguishing `bytes` from `str`
+surfaced a latent inconsistency the old `bytes ≡ str ≡ Elem::Ptr` collapse had
+hidden: several module functions whose handle/payload sema types as `bytes` were
+lowered in the IR as a bare `str` pointer (`Ty::Ptr`). Harmless while the two were
+one `Elem`, each is now a real bug — a handle stored in the `list[bytes]` /
+`dict[.., bytes]` sema accepts is rejected as a wrong-element-type mismatch, and
+`len()` on a `bytes`-typed read counts codepoints. The IR lowering is corrected to
+return `Ty::Bytes` (the same pointer word; no runtime change) for every one, so
+sema and the IR agree: the `net` socket/listener handle (`listen`/`connect`/
+`connect_ip_deadline`/`accept` — the regression `net_connect_deadline_stall`
+caught), the `tls` handle (`connect`/`connect_resolved`/`connect_insecure`/
+`listen`/`accept`), the `http` response/request handle (`get`/`post`/`request`/
+`read_request`/`_pool_do`), the `io.reader` and `json`/`xml` `_lex_new` cursor
+handles, the `sync` primitive handles (`mutex`/`waitgroup`/`once`/`rlock`/`event`/
+`semaphore`/`condition`), the `sys` standard-stream objects (`stdin`/`stdout`/
+`stderr`), and the `process` subprocess reads (`_popen_read`/`_popen_read_all`,
+which read binary `bytes`). The data-codec modules (`base64`/`hex`/`crypto`) were
+already consistent.
+
 Relates to the `Elem::Complex` pointer-identity value-element precedent this
 mirrors (#928), the `Elem::Nested` interner deliberately **not** used (#625), and
 the `bytes` value type (#337). Regression goldens: `tests/golden/list_bytes_len`

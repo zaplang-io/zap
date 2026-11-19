@@ -37,9 +37,14 @@ fn lower(
         // Standard streams as objects (#1035, D-0217). stdin -> reader handle,
         // stdout/stderr -> writer handle; write -> bytes written (throwing: the
         // backing zap_io_write raises on an I/O error).
-        "stdin" => call_ret(lowerer, "zap_sys_stdin", a, Ty::Ptr, false),
-        "stdout" => call_ret(lowerer, "zap_sys_stdout", a, Ty::Ptr, false),
-        "stderr" => call_ret(lowerer, "zap_sys_stderr", a, Ty::Ptr, false),
+        // The standard-stream objects are opaque GC pointer handles sema types as
+        // `bytes` (D-0217); the IR agrees (`Ty::Bytes`, not a bare `str`
+        // `Ty::Ptr`) so a stream stored in a `bytes`-typed collection is not
+        // mis-rejected now that `bytes`/`str` are distinct `Elem` kinds (#1074,
+        // D-0241). `platform`/`cpu_source` return real `str`, so they stay `Ptr`.
+        "stdin" => call_ret(lowerer, "zap_sys_stdin", a, Ty::Bytes, false),
+        "stdout" => call_ret(lowerer, "zap_sys_stdout", a, Ty::Bytes, false),
+        "stderr" => call_ret(lowerer, "zap_sys_stderr", a, Ty::Bytes, false),
         "write" => call_ret(lowerer, "zap_sys_write", a, Ty::I64, true),
         _ => return Ok(None),
     }))

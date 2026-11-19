@@ -31,15 +31,20 @@ fn lower(
         // (headers always present — the seam binder fills it with `{}` when only
         // `timeout` is supplied). Sema fixes the arities, so the arg count alone
         // selects the entry point.
-        "get" if a.len() == 3 => call_ret(lowerer, "zap_http_get_ht", a, Ty::Ptr, true),
-        "get" if a.len() == 2 => call_ret(lowerer, "zap_http_get_h", a, Ty::Ptr, true),
-        "get" => call_ret(lowerer, "zap_http_get", a, Ty::Ptr, true),
-        "post" if a.len() == 4 => call_ret(lowerer, "zap_http_post_ht", a, Ty::Ptr, true),
-        "post" if a.len() == 3 => call_ret(lowerer, "zap_http_post_h", a, Ty::Ptr, true),
-        "post" => call_ret(lowerer, "zap_http_post", a, Ty::Ptr, true),
-        "request" if a.len() == 5 => call_ret(lowerer, "zap_http_request_ht", a, Ty::Ptr, true),
-        "request" if a.len() == 4 => call_ret(lowerer, "zap_http_request_h", a, Ty::Ptr, true),
-        "request" => call_ret(lowerer, "zap_http_request", a, Ty::Ptr, true),
+        // The response handle is an opaque GC pointer word sema types as `bytes`
+        // (`crates/sema/src/modules/http.rs`); the IR must agree (`Ty::Bytes`, not
+        // a bare `str` `Ty::Ptr`) so a response stored in a `list[bytes]` /
+        // `dict[.., bytes]` is not mis-rejected now that `bytes` and `str` are
+        // distinct `Elem` kinds (#1074, D-0241). Same pointer word at codegen.
+        "get" if a.len() == 3 => call_ret(lowerer, "zap_http_get_ht", a, Ty::Bytes, true),
+        "get" if a.len() == 2 => call_ret(lowerer, "zap_http_get_h", a, Ty::Bytes, true),
+        "get" => call_ret(lowerer, "zap_http_get", a, Ty::Bytes, true),
+        "post" if a.len() == 4 => call_ret(lowerer, "zap_http_post_ht", a, Ty::Bytes, true),
+        "post" if a.len() == 3 => call_ret(lowerer, "zap_http_post_h", a, Ty::Bytes, true),
+        "post" => call_ret(lowerer, "zap_http_post", a, Ty::Bytes, true),
+        "request" if a.len() == 5 => call_ret(lowerer, "zap_http_request_ht", a, Ty::Bytes, true),
+        "request" if a.len() == 4 => call_ret(lowerer, "zap_http_request_h", a, Ty::Bytes, true),
+        "request" => call_ret(lowerer, "zap_http_request", a, Ty::Bytes, true),
         "status" => call_ret(lowerer, "zap_http_status", a, Ty::I64, false),
         "body" => call_ret(lowerer, "zap_http_body", a, Ty::Ptr, false),
         "header" => call_ret(lowerer, "zap_http_header", a, Ty::Ptr, false),
@@ -48,7 +53,8 @@ fn lower(
         "redirects" => call_ret(lowerer, "zap_http_redirects", a, Ty::Ptr, false),
         "url" => call_ret(lowerer, "zap_http_url", a, Ty::Ptr, false),
         // server
-        "read_request" => call_ret(lowerer, "zap_http_read_request", a, Ty::Ptr, true),
+        // The request handle, like the response handle, is sema-typed `bytes`.
+        "read_request" => call_ret(lowerer, "zap_http_read_request", a, Ty::Bytes, true),
         "method" => call_ret(lowerer, "zap_http_req_method", a, Ty::Ptr, false),
         "path" => call_ret(lowerer, "zap_http_req_path", a, Ty::Ptr, false),
         "req_header" => call_ret(lowerer, "zap_http_req_header", a, Ty::Ptr, false),
@@ -73,7 +79,7 @@ fn lower(
         // prelude `http.Client`. `_pool_new`/`_pool_do` can raise (OOM / network
         // / too-many-redirects), so they use throwing calls; `_pool_close` cannot.
         "_pool_new" => call_ret(lowerer, "zap_http_pool_new", a, Ty::I64, true),
-        "_pool_do" => call_ret(lowerer, "zap_http_pool_do", a, Ty::Ptr, true),
+        "_pool_do" => call_ret(lowerer, "zap_http_pool_do", a, Ty::Bytes, true),
         "_pool_close" => call_void(lowerer, "zap_http_pool_close", a, false),
         _ => return Ok(None),
     }))

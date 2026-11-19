@@ -33,9 +33,14 @@ fn lower(
             Ty::Ptr,
             true,
         ),
-        "connect" => call_ret(lowerer, "zap_tls_connect", a, Ty::Ptr, true),
-        "connect_resolved" => call_ret(lowerer, "zap_tls_connect_resolved", a, Ty::Ptr, true),
-        "connect_insecure" => call_ret(lowerer, "zap_tls_connect_insecure", a, Ty::Ptr, true),
+        // A TLS connection/listener handle is an opaque GC pointer word sema
+        // types as `bytes` (like `net`); the IR agrees (`Ty::Bytes`, not a bare
+        // `str` `Ty::Ptr`) so a handle stored in a `list[bytes]` / `dict[.., bytes]`
+        // is not mis-rejected now that `bytes`/`str` are distinct `Elem` kinds
+        // (#1074, D-0241). `recv` returns the data read (`str`), so it stays `Ptr`.
+        "connect" => call_ret(lowerer, "zap_tls_connect", a, Ty::Bytes, true),
+        "connect_resolved" => call_ret(lowerer, "zap_tls_connect_resolved", a, Ty::Bytes, true),
+        "connect_insecure" => call_ret(lowerer, "zap_tls_connect_insecure", a, Ty::Bytes, true),
         // TLS client contexts (#560): constructors return an opaque handle; the
         // loaders mutate the context and return unit. The optional trailing string
         // argument (capath / keyfile) is padded with "" for the fixed-arity symbol.
@@ -59,8 +64,8 @@ fn lower(
             }
             call_void(lowerer, "zap_tls_load_cert_chain", args, true)
         }
-        "listen" => call_ret(lowerer, "zap_tls_listen", a, Ty::Ptr, true),
-        "accept" => call_ret(lowerer, "zap_tls_accept", a, Ty::Ptr, true),
+        "listen" => call_ret(lowerer, "zap_tls_listen", a, Ty::Bytes, true),
+        "accept" => call_ret(lowerer, "zap_tls_accept", a, Ty::Bytes, true),
         "port" => call_ret(lowerer, "zap_tls_port", a, Ty::I64, false),
         "recv" => call_ret(lowerer, "zap_tls_recv", a, Ty::Ptr, true),
         "send" => call_ret(lowerer, "zap_tls_send", a, Ty::I64, true),

@@ -45,7 +45,12 @@ fn lower(
         // pointer (a `bytes` value whose buffer is a pointer-free reader state,
         // the crypto-streaming pattern). `reader` only allocates; the reads do
         // I/O and raise on error, so they are throwing calls.
-        "reader" => call_ret(lowerer, "zap_io_reader_new", a, Ty::Ptr, false),
+        // The buffered-reader handle is an opaque GC pointer sema types as
+        // `bytes` (D-0212); the IR agrees (`Ty::Bytes`) so it is storable in a
+        // `bytes`-typed collection now that `bytes`/`str` are distinct `Elem`
+        // kinds (#1074, D-0241). `readline`/`readall`/`readn`/`read` return the
+        // data read (`str`), so they stay `Ty::Ptr`.
+        "reader" => call_ret(lowerer, "zap_io_reader_new", a, Ty::Bytes, false),
         "readline" => call_ret(lowerer, "zap_io_readline", a, Ty::Ptr, true),
         "readall" => call_ret(lowerer, "zap_io_readall", a, Ty::Ptr, true),
         "readn" => call_ret(lowerer, "zap_io_readn", a, Ty::Ptr, true),
