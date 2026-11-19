@@ -255,6 +255,27 @@ fn run_fn(f: &mut Func, promotable: &[bool], size: &[u64]) {
                     // fat pointer that outlives this frame, and reasoning about its
                     // escape precisely is out of v1 scope — conservatively heap.
                     Inst::IfaceMake { data, .. } => set(&mut escaped, &mut changed, *data),
+                    // Published into a shared `Atomic[T]` cell (I#176): the stored
+                    // pointer becomes reachable from a heap box that outlives this
+                    // frame and may be read by another coroutine, so it escapes —
+                    // exactly like a `FieldSet`. `AtomicStore`/`AtomicRmw` store
+                    // `val`; `AtomicCas` stores `desired` on success (and we treat
+                    // `expected` as escaping too: conservative — it is only
+                    // identity-compared, never stored, but a lock-free CAS loop
+                    // feeds it right back in). Marking these is REQUIRED for
+                    // soundness once pointer-bearing structs are promotable (#1081):
+                    // a `StructNew` consumed only by an atomic publish would
+                    // otherwise look non-escaping and be stack-allocated, dangling
+                    // the moment the frame returns (the lock-free-map `MNode` case).
+                    Inst::AtomicStore { val, .. } | Inst::AtomicRmw { val, .. } => {
+                        set(&mut escaped, &mut changed, *val)
+                    }
+                    Inst::AtomicCas {
+                        expected, desired, ..
+                    } => {
+                        set(&mut escaped, &mut changed, *expected);
+                        set(&mut escaped, &mut changed, *desired);
+                    }
                     _ => {}
                 }
             }

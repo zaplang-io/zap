@@ -3904,6 +3904,20 @@ def main():
     fn main_of(m: &Module) -> &Func {
         m.funcs.iter().find(|f| f.name == "main").unwrap()
     }
+    /// Does `f` stack-promote any struct whose layout name is `name`? Lets a test
+    /// assert on a specific payload type rather than "any StackStruct" (e.g. a
+    /// local `Atomic[T]` box may itself be legitimately promoted while we check
+    /// that its `T` payload is not).
+    fn promotes_named(m: &Module, f: &Func, name: &str) -> bool {
+        let sid = m
+            .structs
+            .iter()
+            .position(|s| s.name == name)
+            .map(|i| i as u32);
+        sid.is_some_and(|sid| {
+            insts_of(f).any(|i| matches!(i, Inst::StackStruct { sid: s, .. } if *s == sid))
+        })
+    }
 
     #[test]
     fn escape_promotes_transient_fstring_dict_lookup_key() {
@@ -4236,6 +4250,47 @@ def main():
         assert!(
             !has_stack_struct(main_of(&m)),
             "...and must not be stack-promoted"
+        );
+    }
+
+    #[test]
+    fn escape_keeps_struct_published_into_atomic_on_heap() {
+        // #1081 soundness: a pointer-bearing struct stored into a shared
+        // `Atomic[T]` cell is published to a heap box that outlives the frame (and
+        // may be read by another coroutine) — exactly how a lock-free map's node
+        // escapes. It MUST stay heap-allocated; stack-promoting it would dangle the
+        // moment the frame returns. This is the escape edge the pre-#1081 leaf-only
+        // pass never needed (a leaf struct could not be a reference cell's payload).
+        let m = lower_ok(&format!(
+            "{NODE}\ndef main():\n    Atomic[Node] a = Atomic(Node(name=\"init\", v=0))\n    \
+             a.store(Node(name=\"x\", v=1))\n    print(a.load().v)\n"
+        ));
+        assert!(
+            has_heap_struct(main_of(&m)),
+            "a Node published into an Atomic cell must stay heap-allocated"
+        );
+        // The Node PAYLOAD must never be stack-promoted (it escapes via the atomic
+        // store). The local `Atomic[Node]` box itself does not escape and may be
+        // promoted — that is sound (its interior Node pointer is traced via the
+        // #586 aggregate root), so assert on the Node specifically, not on "any
+        // StackStruct".
+        assert!(
+            !promotes_named(&m, main_of(&m), "Node"),
+            "the Node payload escapes via the atomic store and must stay heap"
+        );
+    }
+
+    #[test]
+    fn escape_keeps_struct_cas_into_atomic_on_heap() {
+        // The compare-and-swap variant of the above: the `desired` node of a CAS
+        // is published on success, so it escapes too (the lock-free `put` shape).
+        let m = lower_ok(&format!(
+            "{NODE}\ndef main():\n    Atomic[Node] a = Atomic(Node(name=\"init\", v=0))\n    \
+             auto cur = a.load()\n    auto ok = a.compare_and_swap(cur, Node(name=\"x\", v=1))\n    print(ok)\n"
+        ));
+        assert!(
+            !promotes_named(&m, main_of(&m), "Node"),
+            "a Node CAS-published (desired) into an Atomic must stay heap"
         );
     }
 

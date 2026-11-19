@@ -47,13 +47,25 @@ more classes of provably non-escaping value, with no surface-language change:
 
 Both reuse the single #850/#839 monotone escape fixpoint — there is no second
 escape pass. A value is promotable iff it is NOT: stored into a heap object
-(`FieldSet` value, a retaining dict/set/list insert, a non-clean/global store),
-returned, captured by a closure/first-class-fn (#163), boxed behind an interface
-(`IfaceMake`), or passed to a retaining callee (every user function and dynamic
-dispatch; only a tight allowlist of pure readers borrows). ZIR has no
-field-address / interior-pointer instruction (`FieldGet`/`FieldSet` go through the
-struct base), so an interior address cannot leak — escape condition (4) is
-structural. Any ambiguity fails safe to the heap.
+(`FieldSet` value, a retaining dict/set/list insert, a non-clean/global store,
+**or an atomic publish** — see below), returned, captured by a closure/first-class-fn
+(#163), boxed behind an interface (`IfaceMake`), or passed to a retaining callee
+(every user function and dynamic dispatch; only a tight allowlist of pure readers
+borrows). ZIR has no field-address / interior-pointer instruction
+(`FieldGet`/`FieldSet` go through the struct base), so an interior address cannot
+leak — escape condition (4) is structural. Any ambiguity fails safe to the heap.
+
+**Atomic publication is an escape (new in #1081).** A pointer published into a
+shared `Atomic[T]` cell (`AtomicStore`/`AtomicRmw` `val`, `AtomicCas`
+`desired`/`expected`, I#176) becomes reachable from a heap box that outlives the
+frame and may be read by another coroutine — exactly like a `FieldSet`. The #850
+leaf-only pass never needed this edge (a leaf struct cannot be a reference cell's
+payload), so the fixpoint's wildcard silently dropped it; once pointer-bearing
+structs are promotable, a `StructNew` consumed only by an atomic publish would
+otherwise look non-escaping and be stack-allocated — dangling the instant the
+frame returns (the lock-free-map `MNode` shape). The pass now marks those operands
+escaping. A non-escaping *local* `Atomic[T]` box is itself still promotable (it is
+not shared), with its interior payload pointer traced via the aggregate root.
 
 ### Struct byte threshold
 
