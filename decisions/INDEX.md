@@ -28,6 +28,7 @@ listed here (see [`README.md`](README.md)).
 
 | # | Title | Status | Date |
 |---|-------|--------|------|
+| [1084](runtime/1084-bigint-division-algorithm.md) | Native bigint division uses word-wise long division (Knuth Algorithm D) | Locked | 2026-11-19 |
 | [1100](runtime/1100-channel-element-type.md) | A typed channel's element keeps its precise type on receive | Locked | 2026-11-19 |
 
 ## tooling
