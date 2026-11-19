@@ -28,6 +28,7 @@ listed here (see [`README.md`](README.md)).
 
 | # | Title | Status | Date |
 |---|-------|--------|------|
+| [1081](runtime/1081-stack-promote-transients.md) | Stack-promote non-escaping transient heap values — pointer-bearing structs and length-bounded strings | Locked | 2026-11-19 |
 | [1100](runtime/1100-channel-element-type.md) | A typed channel's element keeps its precise type on receive | Locked | 2026-11-19 |
 
 ## tooling

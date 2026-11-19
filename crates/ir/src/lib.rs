@@ -4113,6 +4113,204 @@ def main():
         );
     }
 
+    // --- Escape analysis #1081: pointer-bearing structs + bounded strings ----
+    // The #850 v1 only promoted LEAF (pointer-free) structs and left every stack
+    // string with a GC root. #1081 (a) promotes pointer-bearing reference structs
+    // (traced via a codegen aggregate root, #586) and (b) drops the root of a
+    // stack string whose length is provably bounded. These tests pin both the
+    // promotion direction and the conservative heap/root-retention direction, and
+    // stand guard against a later change wrongly promoting an escaping or
+    // unbounded value. (The no-root / aggregate-root codegen itself is a GC
+    // move-safety golden verified in CI under `gc-immix`; here we assert the ZIR
+    // the pass produces, which needs no LLVM.)
+
+    /// A plain (reference) struct with a GC-pointer (`str`) field AND a scalar —
+    /// so it is non-leaf (`struct_has_ptr`) yet small, and under the size cap.
+    const NODE: &str = "struct Node:\n    str name\n    int64 v\n";
+
+    fn bounded_stack_strbuilds(f: &Func) -> usize {
+        insts_of(f)
+            .filter(|i| {
+                matches!(
+                    i,
+                    Inst::StrBuild {
+                        stack: true,
+                        bounded: true,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+    fn unbounded_stack_strbuilds(f: &Func) -> usize {
+        insts_of(f)
+            .filter(|i| {
+                matches!(
+                    i,
+                    Inst::StrBuild {
+                        stack: true,
+                        bounded: false,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn escape_promotes_pointer_bearing_reference_struct() {
+        // #1081(b): a non-escaping reference struct WITH a pointer field is now
+        // stack-promoted (the #850 v1 kept it on the heap). The interior `str`
+        // pointer is traced in place via a codegen aggregate root (#586); no heap
+        // StructNew remains.
+        let m = lower_ok(&format!(
+            "{NODE}\ndef main():\n    auto n = Node(name=\"a\", v=1)\n    print(n.v)\n"
+        ));
+        assert!(
+            has_stack_struct(main_of(&m)),
+            "a non-escaping pointer-bearing reference struct should be stack-allocated"
+        );
+        assert!(
+            !has_heap_struct(main_of(&m)),
+            "...and not also heap-allocated"
+        );
+    }
+
+    #[test]
+    fn escape_keeps_returned_pointer_bearing_struct_on_heap() {
+        // Returning the struct escapes it — must stay a heap StructNew so its
+        // storage outlives the frame.
+        let m = lower_ok(&format!(
+            "{NODE}\ndef make(str s) -> Node:\n    return Node(name=s, v=1)\n\
+             def main():\n    auto n = make(\"a\")\n    print(n.v)\n"
+        ));
+        let make = m.funcs.iter().find(|f| f.name == "make").unwrap();
+        assert!(
+            has_heap_struct(make),
+            "a returned pointer-bearing struct must stay heap-allocated"
+        );
+        assert!(!has_stack_struct(make));
+    }
+
+    #[test]
+    fn escape_keeps_pointer_bearing_struct_in_list_on_heap() {
+        // Appending the struct into a list retains it (it outlives the frame) —
+        // escapes — so it stays heap-allocated even though it is pointer-bearing.
+        let m = lower_ok(&format!(
+            "{NODE}\ndef main():\n    list[Node] xs = []\n    xs.append(Node(name=\"a\", v=1))\n    print(len(xs))\n"
+        ));
+        assert!(
+            has_heap_struct(main_of(&m)),
+            "a pointer-bearing struct stored into a collection must stay heap-allocated"
+        );
+    }
+
+    #[test]
+    fn escape_keeps_field_stored_pointer_bearing_struct_on_heap() {
+        // Storing the struct into ANOTHER heap object's field reaches it through
+        // that object — escape — so it stays on the heap.
+        let m = lower_ok(&format!(
+            "{NODE}\nstruct Box:\n    Node inner\n\
+             def main():\n    auto b = Box(inner=Node(name=\"a\", v=1))\n    print(b.inner.v)\n"
+        ));
+        // The inner `Node` is stored into `Box.inner` (FieldSet val -> escapes),
+        // so at least one heap StructNew remains for it.
+        assert!(
+            has_heap_struct(main_of(&m)),
+            "a struct stored into another struct's field must stay heap-allocated"
+        );
+    }
+
+    #[test]
+    fn escape_keeps_captured_pointer_bearing_struct_on_heap() {
+        // Captured by a closure (#163) — the closure record outlives the frame —
+        // so the struct escapes and stays on the heap.
+        let m = lower_ok(&format!(
+            "{NODE}\ndef main():\n    auto n = Node(name=\"a\", v=1)\n    \
+             fn() -> int64 f = lambda: n.v\n    print(f())\n"
+        ));
+        assert!(
+            has_heap_struct(main_of(&m)),
+            "a struct captured by a closure must stay heap-allocated"
+        );
+        assert!(
+            !has_stack_struct(main_of(&m)),
+            "...and must not be stack-promoted"
+        );
+    }
+
+    #[test]
+    fn escape_respects_cap_for_pointer_bearing_struct() {
+        // A pointer-bearing reference struct OVER the 256 B cap stays heap even
+        // when non-escaping (bounds per-frame stack growth). 40 `str` fields =
+        // 40 * 8 = 320 B > 256.
+        let n = 40usize;
+        let mut fields = String::new();
+        for i in 0..n {
+            fields.push_str(&format!("    str s{i} = \"\"\n"));
+        }
+        let m = lower_ok(&format!(
+            "struct BigPtr:\n{fields}def main():\n    auto b = BigPtr()\n    print(b.s0)\n"
+        ));
+        assert!(
+            has_heap_struct(main_of(&m)),
+            "an oversized pointer-bearing struct must stay heap-allocated"
+        );
+        assert!(!has_stack_struct(main_of(&m)));
+    }
+
+    #[test]
+    fn escape_bounded_fstring_dict_key_drops_root() {
+        // #1081(a): `f"k{i}"` (literal + an integer render) has a compile-time max
+        // length ("k" + <=24 for an i64) well under the 64 B buffer, so it is
+        // promoted to a BOUNDED stack build — it can never spill, so codegen will
+        // reserve no GC root for it.
+        let m = lower_ok(
+            "def main():\n    dict[str, int64] d = {}\n    d[\"k0\"] = 7\n    int64 i = 0\n    \
+             int64 s = 0\n    while i < 10:\n        s = s + d[f\"k{i}\"]\n        i = i + 1\n    print(s)\n",
+        );
+        assert_eq!(
+            bounded_stack_strbuilds(main_of(&m)),
+            1,
+            "a length-bounded transient key must be a bounded (root-free) stack build"
+        );
+        assert_eq!(unbounded_stack_strbuilds(main_of(&m)), 0);
+    }
+
+    #[test]
+    fn escape_unbounded_fstring_keeps_root() {
+        // A join interpolating a runtime STRING has no static length bound, so it
+        // is still stack-promoted (non-escaping) but NOT bounded — it may spill to
+        // the heap at run time and therefore keeps its GC root.
+        let m = lower_ok(
+            "def main():\n    dict[str, int64] d = {}\n    str name = \"abc\"\n    int64 i = 0\n    \
+             int64 s = 0\n    while i < 10:\n        s = s + d[f\"x{name}\"]\n        i = i + 1\n    print(s)\n",
+        );
+        assert_eq!(
+            unbounded_stack_strbuilds(main_of(&m)),
+            1,
+            "an unbounded-length stack build must keep its root (bounded=false)"
+        );
+        assert_eq!(bounded_stack_strbuilds(main_of(&m)), 0);
+    }
+
+    #[test]
+    fn escape_spec_fstring_is_not_bounded() {
+        // A format spec can pad to an arbitrary width, so a spec'd field defeats
+        // the static length bound even for an integer: the build stays unbounded
+        // (keeps its root) though still stack-promoted.
+        let m = lower_ok(
+            "def main():\n    dict[str, int64] d = {}\n    int64 i = 0\n    \
+             int64 s = 0\n    while i < 10:\n        s = s + d[f\"k{i:10}\"]\n        i = i + 1\n    print(s)\n",
+        );
+        assert_eq!(bounded_stack_strbuilds(main_of(&m)), 0);
+        assert_eq!(
+            unbounded_stack_strbuilds(main_of(&m)),
+            1,
+            "a spec'd field is not statically length-bounded"
+        );
+    }
+
     // ---- module-level `const` globals (D-0112, #658 Phase 1) --------------
 
     fn count_calls(f: &zapc_ir_core::Func, name: &str) -> usize {

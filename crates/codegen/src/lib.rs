@@ -1923,6 +1923,16 @@ struct Cg<'a, 'ctx> {
     /// an inline aggregate is passed/returned **by value** (register/sret) rather
     /// than as a heap pointer. Indexed by struct id, parallel to `structs`.
     struct_inline: Vec<bool>,
+    /// Per-struct "has at least one GC-pointer field" flag, indexed by struct id.
+    /// A stack-promoted ([`zir::Inst::StackStruct`]) *reference* struct with
+    /// pointer fields needs an aggregate-root `(base, desc)` pair so the collector
+    /// traces its interior fields in place (#1081/#586); a pointer-free one needs
+    /// no root at all (#839). Computed from the logical field types (a packed
+    /// `value struct`, I#173, is all-bitfield and so never pointer-bearing).
+    /// Read only by the precise-GC frame setup (aggregate roots), so it is dead
+    /// under the Boehm build.
+    #[cfg_attr(not(feature = "gc-immix"), allow(dead_code))]
+    struct_has_ptr: Vec<bool>,
     /// Per-struct C-style bitfield packing (I#173, mirrors
     /// [`zir::StructLayout::packed`]). `Some` for a packed `value struct` whose
     /// LLVM type is a single `{ iN }` backing integer and whose fields are read
@@ -2061,6 +2071,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             fns: std::collections::HashMap::new(),
             structs: Vec::new(),
             struct_inline: Vec::new(),
+            struct_has_ptr: Vec::new(),
             struct_packed: Vec::new(),
             struct_descs: Vec::new(),
             globals: Vec::new(),
@@ -3717,6 +3728,11 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             };
             self.structs.push(st);
             self.struct_inline.push(sl.inline);
+            // A packed value struct (I#173) is a single backing integer with no
+            // pointer fields; any other struct is pointer-bearing iff a logical
+            // field is a GC pointer (#1081).
+            self.struct_has_ptr
+                .push(sl.packed.is_none() && sl.fields.iter().any(|t| t.is_ptr()));
             self.struct_packed.push(sl.packed.clone());
             self.struct_names.push(sl.name.clone());
         }
@@ -4441,21 +4457,34 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // reading it from a root slot or straight from the register is the same
         // pointer.
         let mut is_alloca_dest = vec![false; f.value_types.len()];
-        // A stack-promoted `StackStruct` (#839) is a stack-slot address holding no
-        // outgoing heap pointers. Like an `Alloca` dest it is never a heap
-        // reference, so it needs no direct root slot; excluding it keeps the
-        // #568/D-0144 frame-skip (a function whose only "allocations" are
-        // stack-promoted structs stays frameless) and is sound — the collector
-        // ignores a stack pointer anyway. A stack `StrBuild` is NOT excluded: it
-        // may spill to a *heap* string at run time when the join exceeds the
-        // inline buffer, and that spill must be a precise GC root, so it keeps its
-        // ordinary direct-root slot (rooting the stack-buffer case is harmless —
-        // the collector validates each root against the heap-block registry).
+        // A stack-promoted `StackStruct` (#839) is a stack-slot address: it is
+        // never a heap reference the collector relocates, so it needs no DIRECT
+        // root slot. A leaf (pointer-free) one needs no root at all; a
+        // pointer-bearing one (#1081) is instead given an aggregate-root
+        // `(base, desc)` pair below, which traces its interior fields in place.
+        // Excluding every `StackStruct` here keeps the #568/D-0144 frame-skip (a
+        // function whose only "allocations" are leaf stack structs stays
+        // frameless) and is sound — the collector ignores a stack pointer anyway.
+        //
+        // A stack `StrBuild` is excluded ONLY when `bounded` (#1081): the join's
+        // compile-time max length provably fits the inline buffer, so the runtime
+        // spill path is unreachable and the result is always the stack buffer (no
+        // root needed), removing the per-iteration `gc_store_root`. A NON-bounded
+        // stack `StrBuild` may spill to a *heap* string at run time, and that
+        // spill must be a precise GC root, so it keeps its ordinary direct-root
+        // slot (rooting the stack-buffer case is harmless — the collector
+        // validates each root against the heap-block registry).
         let mut is_stack_dest = vec![false; f.value_types.len()];
         for inst in f.blocks.iter().flat_map(|block| &block.insts) {
             match inst {
                 Inst::Alloca { dest, .. } => is_alloca_dest[*dest as usize] = true,
                 Inst::StackStruct { dest, .. } => is_stack_dest[*dest as usize] = true,
+                Inst::StrBuild {
+                    dest,
+                    stack: true,
+                    bounded: true,
+                    ..
+                } => is_stack_dest[*dest as usize] = true,
                 _ => {}
             }
         }
@@ -4477,17 +4506,31 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             }
         }
         let n_direct = n;
-        // Aggregate roots (#586): every by-value `value struct` / tuple SSA value
-        // is physically a pointer to a stack spill whose interior reference fields
-        // the direct roots above never cover. Reserve a `(base, desc)` pair for
-        // each so the collector can trace that spill's pointer fields in place.
+        // Aggregate roots (#586 / #1081): a stack spill whose interior reference
+        // fields the direct roots above never cover (its own SSA pointer addresses
+        // the stack, which the marker ignores). Reserve a `(base, desc)` pair for
+        // each so the collector traces those fields IN PLACE through the struct's
+        // precise descriptor. Two sources:
+        //  - a by-value `value struct` / tuple SSA value (`struct_inline`), the
+        //    D-0051 param/return spill (#586); and
+        //  - a stack-promoted *pointer-bearing* reference struct (`is_stack_dest`
+        //    + `struct_has_ptr`), the #1081 extension. A `StackStruct` is never
+        //    `struct_inline` (the escape pass promotes only reference structs), so
+        //    the two cases are disjoint.
+        // A leaf (pointer-free) `StackStruct` has no interior reference fields and
+        // so is never an aggregate root; a heap reference struct is covered by its
+        // direct slot.
         let mut aggr_of = vec![-1i32; f.value_types.len()];
         let mut aggr_sids: Vec<u32> = Vec::new();
         for (vid, ty) in f.value_types.iter().enumerate() {
             if let Ty::Struct(sid) = ty {
-                // A stack-promoted struct (#839) is leaf / pointer-free, so it has
-                // no interior reference fields to trace — never an aggregate root.
-                if self.struct_inline[*sid as usize] && !is_stack_dest[vid] {
+                let s = *sid as usize;
+                let is_aggr = if is_stack_dest[vid] {
+                    self.struct_has_ptr[s]
+                } else {
+                    self.struct_inline[s]
+                };
+                if is_aggr {
                     aggr_of[vid] = aggr_sids.len() as i32;
                     aggr_sids.push(*sid);
                 }
@@ -5608,6 +5651,11 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 dest,
                 parts,
                 stack,
+                // `bounded` is consumed in `gc_setup_frame` (it decides whether
+                // this stack build needs a GC root); the emission below is
+                // identical either way — the runtime `zap_strbuild_into` simply
+                // never takes its spill branch for a bounded join (#1081).
+                bounded: _,
                 cap,
             } => {
                 // One-pass string join (#839 / #837 lever-3(b)). Spill the part

@@ -6,36 +6,45 @@
 //! the REPL JIT, and `zap ir`. It only ever turns a **heap** allocation into a
 //! **stack** one; it never changes control flow or observable semantics.
 //!
-//! ## What it promotes (v1 scope, maintainer-set)
+//! ## What it promotes
 //! A `StructNew` or f-string `StrBuild` whose produced value **provably does not
-//! escape its function** AND whose representation is **leaf / pointer-free**
-//! (holds no outgoing heap pointers) AND **finalizer-free**:
-//! - `StructNew{sid}` → [`Inst::StackStruct`] when every field of `sid` is a
-//!   scalar (`!Ty::is_ptr`) and the struct is within the size caps.
+//! escape its function**:
+//! - `StructNew{sid}` → [`Inst::StackStruct`] for a genuine **reference struct**
+//!   (`!is_value && !inline`, D-0023) within the size caps. A **leaf**
+//!   (pointer-free) one holds no outgoing heap pointers and needs no GC root
+//!   (#839). A **pointer-bearing** one (#1081) is placed on the stack too;
+//!   codegen traces its interior reference fields in place via an aggregate-root
+//!   `(base, desc)` pair (the #586 by-value-spill mechanism), so the heap
+//!   allocation is removed while move-safety is preserved. Reference structs
+//!   never carry a finalizer (`StructNew` always uses a `ZAP_TD_PRECISE`
+//!   descriptor), so #92 does not gate them.
 //! - `StrBuild` → `StrBuild{stack:true, cap:STR_STACK_CAP}` (strings are
 //!   pointer-free atomic objects; the runtime builds into an inline stack buffer
-//!   with a heap spill when the length exceeds the cap).
+//!   with a heap spill when the length exceeds the cap). When `lower_fstring`
+//!   additionally proved the join is length-`bounded` (≤ the cap), the spill is
+//!   unreachable and codegen drops the root entirely (#1081).
 //!
-//! Pointer-holding structs are deferred to a v2 (they would need the precise
-//! static-root scanner, #663/#672, extended to scan a stack object's interior
-//! heap fields). Anything with a finalizer (#92 — today only `Ty::Py`, itself a
-//! pointer) stays on the heap.
+//! `value struct` / tuple (`is_value` / `inline`) aggregates are by-value and out
+//! of scope here — they already live in stack spills traced via #586.
 //!
 //! ## Soundness
 //! The escape lattice is **monotone**: a value starts non-escaping and is only
 //! ever raised to *escaping*; any allocation site, callee, or alias the pass does
 //! not understand resolves to *escaping* (heap). A wrong "does not escape" is a
 //! use-after-free, so every ambiguity fails safe to the heap. A stack slot is
-//! never relocated by moving Immix and holds no outgoing heap pointers, so it
-//! needs no GC-root tracking and there is no missed root — see discussion #849 §3.
+//! never relocated by moving Immix; a leaf one holds no outgoing heap pointers
+//! (no root needed) and a pointer-bearing one has its interior fields traced in
+//! place through the struct's precise descriptor, so there is no missed root —
+//! see discussion #849 §3 and #586.
 
-use crate::ir::{Func, Inst, Module, Term, Ty, Value};
+use crate::ir::{Func, Inst, Module, Term, Ty, Value, STR_STACK_CAP};
 use std::collections::HashMap;
 
 /// Max byte size of a single stack-promoted struct (tunable; fails safe to heap
 /// above it). Deliberately well under Go's 64 KB implicit-allocation cap because
 /// Zap coroutines run on fixed OS-thread stacks rather than growable goroutine
-/// stacks (discussion #849 §7).
+/// stacks (discussion #849 §7). Applies uniformly to leaf and pointer-bearing
+/// promoted structs (#1081); a pointer field counts as its 8-byte pointer width.
 const MAX_STACK_ALLOC: u64 = 256;
 
 /// Max total stack bytes this pass may add to one function's frame, summed over
@@ -43,12 +52,6 @@ const MAX_STACK_ALLOC: u64 = 256;
 /// loop is one entry-hoisted `alloca`, reused each iteration, #91). Past the
 /// budget, further eligible sites stay on the heap.
 const MAX_FRAME_BUDGET: u64 = 4096;
-
-/// Inline stack-buffer capacity for a promoted f-string (bound `K`, discussion
-/// #849). Go uses 32 B (`tmpStringBufSize`) for the analogous small-string stack
-/// buffer; maintainer chose 64 B for more headroom on short keys/lines. A string
-/// longer than this spills to a heap `ZapStr` at run time.
-const STR_STACK_CAP: u32 = 64;
 
 /// On-frame footprint charged for a promoted f-string: the `{i64 len; char[cap]}`
 /// inline buffer (one-object `ZapStr` layout, #838).
@@ -58,20 +61,20 @@ pub fn run(m: &mut Module) {
     // `struct_is_leaf` / `struct_size` only read `m.structs`, which the pass never
     // mutates, so snapshot the bits we need to satisfy the borrow checker while we
     // mutate `m.funcs` in place.
-    // Promote only genuine **reference structs** (D-0023) whose fields are all
-    // scalars. A `value struct` / tuple (`is_value` / `inline`) is already a
+    // Promote only genuine **reference structs** (D-0023): `!is_value &&
+    // !inline`. A `value struct` / tuple (`is_value` / `inline`) is already a
     // by-value aggregate — not a heap `StructNew` the way a reference struct is —
-    // and an interface-box cell relies on its heap identity, so both are out of
-    // v1 scope (discussion #849). Excluding them also keeps value-semantics,
-    // tuple, and interface-boxing lowering byte-for-byte unchanged.
-    let leaf: Vec<bool> = m
-        .structs
-        .iter()
-        .map(|s| !s.is_value && !s.inline && s.fields.iter().all(|f| !f.is_ptr()))
-        .collect();
+    // so it is out of scope (keeps value-semantics, tuple, and interface-boxing
+    // lowering byte-for-byte unchanged). Unlike the #839 v1, a struct is NO LONGER
+    // required to be leaf / pointer-free: a pointer-bearing reference struct is
+    // promotable too (#1081), traced via a codegen aggregate root (#586). An
+    // interface-box cell that relies on heap identity is handled by the escape
+    // fixpoint (its `IfaceMake` marks the boxed struct escaping), not excluded
+    // here. Reference structs carry no finalizer, so #92 does not gate them.
+    let promotable: Vec<bool> = m.structs.iter().map(|s| !s.is_value && !s.inline).collect();
     let size: Vec<u64> = m.structs.iter().map(struct_size).collect();
     for f in &mut m.funcs {
-        run_fn(f, &leaf, &size);
+        run_fn(f, &promotable, &size);
     }
 }
 
@@ -123,7 +126,7 @@ fn call_is_non_retaining(func: &str) -> bool {
     NON_RETAINING.iter().any(|p| func.starts_with(p))
 }
 
-fn run_fn(f: &mut Func, leaf: &[bool], size: &[u64]) {
+fn run_fn(f: &mut Func, promotable: &[bool], size: &[u64]) {
     let n = f.value_types.len();
     if n == 0 {
         return;
@@ -287,7 +290,7 @@ fn run_fn(f: &mut Func, leaf: &[bool], size: &[u64]) {
                     let d = *dest;
                     let s = *sid;
                     if !escaped[d as usize]
-                        && leaf[s as usize]
+                        && promotable[s as usize]
                         && size[s as usize] <= MAX_STACK_ALLOC
                         && size[s as usize] <= budget
                     {

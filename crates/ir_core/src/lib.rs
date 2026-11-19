@@ -568,6 +568,15 @@ impl Ty {
     }
 }
 
+/// Inline stack-buffer capacity, in payload bytes, for a stack-promoted string
+/// build ([`Inst::StrBuild`] with `stack`). Shared by `lower_fstring` (to decide
+/// the `bounded` flag: a join whose compile-time max length is ≤ this provably
+/// never spills to the heap and so needs no GC root, #1081) and the escape pass
+/// (which stamps it onto the promoted `StrBuild`'s `cap`). Go uses 32 B
+/// (`tmpStringBufSize`) for the analogous small-string stack buffer; Zap chose 64
+/// for more headroom on short keys / lines (discussion #849).
+pub const STR_STACK_CAP: u32 = 64;
+
 /// An SSA value id (index into [`Func::value_types`]).
 pub type Value = u32;
 /// A basic-block id (index into [`Func::blocks`]).
@@ -786,15 +795,23 @@ pub enum Inst {
         sid: u32,
         arena: Value,
     },
-    /// A **stack-allocated** zeroed struct instance (escape analysis, #839): the
-    /// value is a `StructNew` that the escape pass (`crates/ir/src/escape.rs`)
-    /// proved does not escape its function AND whose layout is leaf / pointer-free
-    /// / finalizer-free. Codegen lowers it to an entry-block `alloca` + zero-init
-    /// instead of a GC heap allocation. `dest : Struct(sid)` (a pointer to the
-    /// stack slot), so `FieldGet`/`FieldSet` are byte-identical to the heap case.
-    /// The slot holds no outgoing heap pointers, so it needs no GC-root tracking
-    /// (keeps the D-0144/#568 frame-skip) and is never relocated by moving Immix.
-    /// Only the pass constructs this; `lower` always emits `StructNew`.
+    /// A **stack-allocated** zeroed struct instance (escape analysis, #839 /
+    /// #1081): the value is a `StructNew` that the escape pass
+    /// (`crates/ir/src/escape.rs`) proved does not escape its function. Codegen
+    /// lowers it to an entry-block `alloca` + zero-init instead of a GC heap
+    /// allocation. `dest : Struct(sid)` (a pointer to the stack slot), so
+    /// `FieldGet`/`FieldSet` are byte-identical to the heap case, and the slot is
+    /// never relocated by moving Immix.
+    ///
+    /// A **leaf** (pointer-free) promoted struct holds no outgoing heap pointers,
+    /// so it needs no GC-root tracking at all (keeps the D-0144/#568 frame-skip,
+    /// #839). A **pointer-bearing** promoted struct (the #1081 extension) still
+    /// needs its interior reference fields traced and rewritten in place on a
+    /// move: codegen registers it as an aggregate-root `(base, desc)` pair (the
+    /// #586 by-value-spill mechanism) rather than a direct root, because its own
+    /// pointer addresses the stack (which the collector ignores). Either way the
+    /// heap allocation is gone. Only the pass constructs this; `lower` always
+    /// emits `StructNew`.
     StackStruct {
         dest: Value,
         sid: u32,
@@ -806,10 +823,21 @@ pub enum Inst {
     /// non-escaping) codegen builds into an entry-block inline buffer of `cap`
     /// bytes with a runtime heap spill when the summed length exceeds `cap`;
     /// otherwise it is one heap allocation. `cap` is meaningful only when `stack`.
+    ///
+    /// `bounded` (set by `lower_fstring`) means the join's length has a
+    /// compile-time upper bound that provably fits the stack buffer (≤
+    /// [`STR_STACK_CAP`]), so the runtime spill path is unreachable (#1081). A
+    /// `stack && bounded` build therefore never escapes to the heap and — like a
+    /// leaf [`Inst::StackStruct`] — needs NO GC root, removing the per-iteration
+    /// `gc_store_root`. A `stack` build that is NOT `bounded` may still spill to a
+    /// heap `ZapStr`, so it keeps an ordinary direct root. `bounded` is advisory
+    /// metadata only (safe to ignore): false never causes incorrectness, only a
+    /// retained root.
     StrBuild {
         dest: Value,
         parts: Vec<Value>,
         stack: bool,
+        bounded: bool,
         cap: u32,
     },
     /// Load field `idx` of struct `sid` from `base`; `dest` gets the field type.
@@ -1490,11 +1518,13 @@ fn fmt_inst(i: &Inst) -> String {
             dest,
             parts,
             stack,
+            bounded,
             cap,
         } => {
             let a: Vec<String> = parts.iter().map(|v| format!("%{v}")).collect();
             if *stack {
-                format!("%{dest} = strbuild.stack[{cap}] {}", a.join(", "))
+                let b = if *bounded { ".bounded" } else { "" };
+                format!("%{dest} = strbuild.stack{b}[{cap}] {}", a.join(", "))
             } else {
                 format!("%{dest} = strbuild {}", a.join(", "))
             }
