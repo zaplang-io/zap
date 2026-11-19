@@ -1,0 +1,68 @@
+# Code owners — review routing by domain.
+#
+# Last matching pattern wins (GitHub semantics), so more specific paths are
+# listed AFTER the general ones. Enabling "require review from Code Owners" is a
+# maintainer setting (see the RFC checklist, Discussion #1087).
+#
+# SCALING NOTE. Today every domain resolves to the maintainer, so the file is
+# valid and works immediately. As the project grows, create per-domain reviewer
+# teams under the org and swap the owner on each domain's lines, e.g.:
+#     lang      -> @zaplang-io/lang-reviewers
+#     stdlib    -> @zaplang-io/stdlib-reviewers
+#     runtime   -> @zaplang-io/runtime-reviewers
+#     tooling   -> @zaplang-io/tooling-reviewers
+# The path grouping below is already sharded by domain, so that swap is a
+# one-owner-per-section edit. Do NOT reference a team that does not exist yet —
+# an unknown owner is inert and can leave a required-review rule unsatisfiable.
+
+# ---------------------------------------------------------------------------
+# Global fallback.
+# ---------------------------------------------------------------------------
+*                                   @parveshgarg
+
+# ---------------------------------------------------------------------------
+# Language: surface, type system, grammar, front/middle-end.
+# ---------------------------------------------------------------------------
+/decisions/lang/                    @parveshgarg
+/crates/syntax/                     @parveshgarg
+/crates/sema/                       @parveshgarg
+/crates/sema_types/                 @parveshgarg
+/crates/ir/                         @parveshgarg
+/crates/ir_core/                    @parveshgarg
+/crates/mono/                       @parveshgarg
+/crates/analysis/                   @parveshgarg
+/SPEC.md                            @parveshgarg
+/docs/GRAMMAR.ebnf                  @parveshgarg
+
+# ---------------------------------------------------------------------------
+# Runtime: GC, scheduler, codegen and the runtime C translation units.
+# ---------------------------------------------------------------------------
+/decisions/runtime/                 @parveshgarg
+/crates/codegen/                    @parveshgarg
+/design/0008-precise-gc.md          @parveshgarg
+
+# ---------------------------------------------------------------------------
+# Standard library: module surface (seam) and the module runtime fragments.
+# Listed after runtime so these win for the stdlib-owned paths inside codegen.
+# ---------------------------------------------------------------------------
+/decisions/stdlib/                  @parveshgarg
+/crates/syntax/src/seam_sigs.rs     @parveshgarg
+/crates/sema/tests/seam_kwargs.rs   @parveshgarg
+/crates/codegen/src/runtime/        @parveshgarg
+
+# ---------------------------------------------------------------------------
+# Tooling: CLI, formatter, docs tool, packaging, editors, CI and repo process.
+# ---------------------------------------------------------------------------
+/decisions/tooling/                 @parveshgarg
+/crates/driver/                     @parveshgarg
+/crates/fmt/                        @parveshgarg
+/crates/doc/                        @parveshgarg
+/crates/pkg/                        @parveshgarg
+/crates/diag/                       @parveshgarg
+/crates/json/                       @parveshgarg
+/editors/                           @parveshgarg
+/scripts/                           @parveshgarg
+/.github/                           @parveshgarg
+/CI_DOCKER_IMAGES/                  @parveshgarg
+/decisions/                         @parveshgarg
+/changelog.d/                       @parveshgarg

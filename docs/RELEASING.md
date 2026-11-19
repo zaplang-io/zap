@@ -82,6 +82,29 @@ section with `Added` / `Changed` / `Deprecated` / `Removed` / `Fixed` /
   carve-outs that can affect real code go under `Fixed` / `Security` and are
   called out prominently.
 
+### 2.1 Changelog fragments (how PRs record entries)
+
+So that concurrent PRs stop conflicting on the `[Unreleased]` tail, a
+surface-changing PR adds a **fragment file** under
+[`changelog.d/`](../changelog.d/) — `changelog.d/<number>.<kind>.md` — instead of
+editing `CHANGELOG.md` directly. The fragment holds the same user-visible
+bullet(s) it would otherwise have added under `[Unreleased]`. See
+[`changelog.d/README.md`](../changelog.d/README.md) for the format.
+
+Distinct fragment files never conflict, so this removes the tail-append
+contention without changing what a changelog entry says. At release time (§3,
+step 2) the fragments are **assembled into `[Unreleased]`** and then deleted:
+
+```bash
+scripts/build-changelog.sh            # print the assembled Added/Changed/... block
+scripts/build-changelog.sh --check    # validate fragment filenames (also a CI gate)
+```
+
+Fold the printed block into the `[Unreleased]` section (merging with any
+pre-cutover inline entries already there), then `git rm` the consumed fragments,
+before running the `scripts/release.sh` roll in §5. `release.sh` warns if
+unassembled fragments are still present.
+
 ---
 
 ## 3. Cutting a release

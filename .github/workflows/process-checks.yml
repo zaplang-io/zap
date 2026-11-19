@@ -1,0 +1,34 @@
+name: process checks
+
+# Fast, host-only guards for the per-file decision log and the changelog
+# fragments (Epic #1088 / Discussion #1087). No LLVM, no network — sub-second —
+# so it belongs to the fast PR gate. It always reports a status (not path-gated),
+# so it is safe for the maintainer to add to the required status checks.
+#
+# Runs on pull_request for contributor feedback, on the merge_group candidate (so
+# it also gates inside the merge queue), and on push to main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: process-checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  process-docs:
+    name: decisions index + changelog fragments
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The decisions/ index is generated; fail if the committed copy is stale.
+      - name: Decisions index is up to date
+        run: scripts/gen-decisions-index.sh --check
+
+      # Changelog fragments must be named changelog.d/<number>.<kind>.md.
+      - name: Changelog fragment names are valid
+        run: scripts/build-changelog.sh --check
