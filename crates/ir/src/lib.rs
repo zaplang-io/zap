@@ -2400,6 +2400,23 @@ mod tests {
         assert!(text.contains("= call @zap_regex_group("), "text:\n{text}");
     }
 
+    #[test]
+    fn regex_global_match_lowers_to_match_all() {
+        // `=~ m/.../g` (global) lowers to the eager-collection runtime entry
+        // `zap_regex_match_all` (a `list[Match]`), NOT `zap_regex_match`, so a
+        // `for` loop iterates it like any list (#1078). Each yielded element is
+        // a match object, so `.group(...)` still routes to the accessor.
+        let m = lower_ok(
+            "def main():\n    for mt in \"a1 b2\" =~ m/(\\w)(\\d)/g:\n        print(mt.group(1))\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("= call @zap_regex_match_all"),
+            "text:\n{text}"
+        );
+        assert!(text.contains("= call @zap_regex_group("), "text:\n{text}");
+    }
+
     // --- Python interop (ticket #27, D-0012) ---
 
     #[test]

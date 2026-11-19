@@ -11,6 +11,7 @@ listed here (see [`README.md`](README.md)).
 | # | Title | Status | Date |
 |---|-------|--------|------|
 | [1075](lang/1075-bare-none-optional-lowering.md) | Type-contextual bare `None` lowering is one shared mechanism | Locked | 2026-11-19 |
+| [1078](lang/1078-global-regex-match-iter.md) | Global regex match `=~ m/.../g` yields an iterable `list[Match]` (eager) | Locked | 2026-11-19 |
 | [1082](lang/1106-bytesview.md) | Borrowed-bytes `bytesview` — non-owning view over `bytes` | Locked | 2026-11-19 |
 | [1082](lang/1082-borrowed-bytes-strview.md) | Borrowed-bytes `strview` — explicit non-owning string view for read-only consumers | Locked | 2026-11-19 |
 

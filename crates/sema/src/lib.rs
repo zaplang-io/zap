@@ -5401,6 +5401,7 @@ impl Checker {
             Expr::Lambda { .. } => Ty::Unknown,
             Expr::RegexMatch {
                 subject,
+                flags,
                 negated,
                 span,
                 ..
@@ -5416,10 +5417,16 @@ impl Checker {
                         *span,
                     );
                 }
-                // `!~` is a boolean test; `=~ m/.../` yields a match object
-                // (truthy on success, `None` on no match — D-0010).
+                // `!~` is a boolean test regardless of flags. `=~ m/.../` yields
+                // a single match object (truthy on success, `None` on no match).
+                // The global form `=~ m/.../g` instead yields an *iterable* of
+                // match objects — modeled as `list[Match]` (eager collection,
+                // Python `re.finditer` semantics) so ordinary iteration and
+                // capture access work with no new type (#1078, D-0010).
                 if *negated {
                     Ty::Bool
+                } else if flags.contains('g') {
+                    Ty::List(Box::new(Ty::Match))
                 } else {
                     Ty::Match
                 }
@@ -13335,6 +13342,45 @@ def main():
         assert_eq!(e.len(), 1, "expected a subject-type error, got {e:?}");
         let e = errors("def main():\n    auto s = 42 =~ s/a/b/\n");
         assert_eq!(e.len(), 1, "expected a subject-type error, got {e:?}");
+    }
+
+    #[test]
+    fn regex_global_match_is_iterable() {
+        // `=~ m/.../g` is an iterable of match objects (#1078, D-0010 —
+        // `re.finditer`): it type-checks as the subject of a `for` loop and
+        // each bound element is a `Match` supporting capture access.
+        ok("def main():\n    for mt in \"abc def\" =~ m/[a-z]+/g:\n        print(mt.group(0))\n");
+        // Numbered + named captures on each yielded match.
+        ok("def main():\n    for mt in \"a1\" =~ m/([a-z])([0-9])/g:\n        print(mt.group(1))\n        print(mt.group(2))\n");
+        ok("def main():\n    for mt in \"k=1\" =~ m/(?<k>[a-z])=(?<v>[0-9])/g:\n        print(mt.group(\"k\"))\n        print(mt.group(\"v\"))\n");
+    }
+
+    #[test]
+    fn regex_global_match_binds_a_match_element() {
+        // The loop variable is a `Match`; iterating it a second time (a `Match`
+        // is not itself iterable) is still a ZAP4070 error — i.e. `/g` yields
+        // `list[Match]`, not `list[list[Match]]`.
+        let e = errors(
+            "def main():\n    for mt in \"abc\" =~ m/[a-z]+/g:\n        for c in mt:\n            print(c)\n",
+        );
+        assert!(
+            e.iter().any(|x| x.message.contains("not iterable")),
+            "expected the Match element itself to be non-iterable, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn regex_non_global_match_is_not_iterable() {
+        // Regression: the single-match form `=~ m/.../` (no `g`) stays a bare
+        // `Match`, which is truthy/None but NOT iterable (#1078 must not change
+        // the non-global form's type).
+        let e = errors(
+            "def main():\n    for mt in \"abc\" =~ m/[a-z]+/:\n        print(mt.group(0))\n",
+        );
+        assert!(
+            e.iter().any(|x| x.message.contains("not iterable")),
+            "expected the non-global match to be non-iterable, got {e:?}"
+        );
     }
 
     #[test]

@@ -20312,6 +20312,31 @@ impl<'a> FnLower<'a> {
         let (sv, _st) = self.expr(subject)?;
         let pv = self.strconst(pattern);
         let fv = self.iconst(Ty::I64, regex_flag_bits(flags));
+        // The global form `=~ m/.../g` (non-negated) yields an iterable of all
+        // ordered, non-overlapping matches, collected eagerly into a
+        // `list[Match]` (#1078, D-0010 — Python `re.finditer`). `!~ m/.../g` is
+        // still a single truthiness test, so the `g` flag is irrelevant there
+        // and it takes the single-match path below. No new ZIR instruction: the
+        // value is an ordinary pointer result of a runtime call, rooted like any
+        // other `Inst::Call` dest (the string/collection pattern).
+        if !negated && flags.contains('g') {
+            // A `list[Match]`: match objects are reference values stored as
+            // pointer words (pushed with `zap_list_push_ptr`, read with
+            // `zap_list_get_ptr`), so the list traces them for GC like
+            // `list[str]`. We intern the element as `Elem::Nested(Ty::Match)`
+            // (the #625 mechanism) rather than a bare `Elem::Ptr` so read-back —
+            // `for mt in ...` — recovers the precise `Ty::Match` and `mt.group()`
+            // dispatches; a flat pointer would default to `str` (ZAP6001).
+            let elem = Elem::Nested(self.ctx.nested.borrow_mut().intern(Ty::Match));
+            let list_ty = Ty::List(elem);
+            let l = self.new_value(list_ty);
+            self.emit(Inst::Call {
+                dest: Some(l),
+                func: "zap_regex_match_all".to_string(),
+                args: vec![sv, pv, fv],
+            });
+            return Ok((l, list_ty));
+        }
         let m = self.new_value(Ty::Match);
         self.emit(Inst::Call {
             dest: Some(m),

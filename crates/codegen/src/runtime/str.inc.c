@@ -761,21 +761,13 @@ static pcre2_code *zap_regex_compile(const ZapStr *pattern, int64_t flags) {
     return re;
 }
 
-/* `subject =~ m/pattern/flags` → a ZapMatch* owning its captures, or NULL (no
- * match / falsy). */
-void *zap_regex_match(void *subject_, void *pattern_, int64_t flags) {
-    ZapStr *subject = (ZapStr *)subject_;
-    ZapStr *pattern = (ZapStr *)pattern_;
-    pcre2_code *re = zap_regex_compile(pattern, flags);
-    pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
-    int rc = pcre2_match(re, (PCRE2_SPTR)subject->data, (PCRE2_SIZE)subject->len, 0, 0, md, NULL);
-    if (rc < 0) {
-        /* PCRE2_ERROR_NOMATCH (and any other error) => no match. */
-        pcre2_match_data_free(md);
-        pcre2_code_free(re);
-        return NULL;
-    }
-
+/* Build a `ZapMatch` that owns copies of every captured group and of the
+ * pattern's name table from a *completed* PCRE2 match (`md` holds the ovector;
+ * `rc` is the `pcre2_match` return). Shared by the single-match and global
+ * (`/g`) paths so capture extraction lives in one place (#1078). The caller
+ * owns `re`/`md` and frees them after this returns. */
+static ZapMatch *zap_regex_build_match(pcre2_code *re, pcre2_match_data *md,
+                                       const ZapStr *subject, int rc) {
     PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
     uint32_t capcount = 0;
     pcre2_pattern_info(re, PCRE2_INFO_CAPTURECOUNT, &capcount);
@@ -819,10 +811,89 @@ void *zap_regex_match(void *subject_, void *pattern_, int64_t flags) {
         m->names = NULL;
         m->name_num = NULL;
     }
+    return m;
+}
 
+/* Advance one UTF-8 code point from byte offset `pos` within `[data, len)`,
+ * returning the offset of the next code-point boundary (clamped to `len`). Used
+ * to guarantee forward progress after a zero-length global match: we step a
+ * whole code point, not one byte, so multibyte input cannot land mid-character
+ * (#1078 done-criteria). Byte-mode PCRE2 still matches on bytes; this only
+ * governs how far the iterator skips an empty match. Callers only invoke it when
+ * `pos < len`, so the returned offset is always `> pos`. */
+static PCRE2_SIZE zap_regex_utf8_next(const uint8_t *data, PCRE2_SIZE len, PCRE2_SIZE pos) {
+    PCRE2_SIZE i = pos + 1;
+    while (i < len && (data[i] & 0xC0) == 0x80) {
+        i++; /* skip UTF-8 continuation bytes (10xxxxxx) */
+    }
+    return i;
+}
+
+/* `subject =~ m/pattern/flags` → a ZapMatch* owning its captures, or NULL (no
+ * match / falsy). */
+void *zap_regex_match(void *subject_, void *pattern_, int64_t flags) {
+    ZapStr *subject = (ZapStr *)subject_;
+    ZapStr *pattern = (ZapStr *)pattern_;
+    pcre2_code *re = zap_regex_compile(pattern, flags);
+    pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
+    int rc = pcre2_match(re, (PCRE2_SPTR)subject->data, (PCRE2_SIZE)subject->len, 0, 0, md, NULL);
+    if (rc < 0) {
+        /* PCRE2_ERROR_NOMATCH (and any other error) => no match. */
+        pcre2_match_data_free(md);
+        pcre2_code_free(re);
+        return NULL;
+    }
+    ZapMatch *m = zap_regex_build_match(re, md, subject, rc);
     pcre2_match_data_free(md);
     pcre2_code_free(re);
     return m;
+}
+
+/* `subject =~ m/pattern/g` → a `list[Match]` of all ordered, non-overlapping
+ * matches (Python `re.finditer` semantics, D-0010, #1078). Eager collection:
+ * every match is extracted up front into a GC'd list — simpler than a lazy
+ * per-step iterator, and GC-safe because the list (on the conservatively scanned
+ * C stack) keeps the matches live across each `zap_obj`. An empty subject or no
+ * match yields an empty list.
+ *
+ * Zero-length matches advance the search by one UTF-8 code point so the loop
+ * always makes forward progress and terminates (patterns that can match empty,
+ * such as a star-quantified group); a non-empty match continues from its end,
+ * which also keeps matches non-overlapping. */
+void *zap_regex_match_all(void *subject_, void *pattern_, int64_t flags) {
+    ZapStr *subject = (ZapStr *)subject_;
+    ZapStr *pattern = (ZapStr *)pattern_;
+    pcre2_code *re = zap_regex_compile(pattern, flags);
+    void *out = zap_list_new();
+    const uint8_t *data = (const uint8_t *)subject->data;
+    PCRE2_SIZE len = (PCRE2_SIZE)subject->len;
+    pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
+    PCRE2_SIZE start = 0;
+    for (;;) {
+        int rc = pcre2_match(re, (PCRE2_SPTR)data, len, start, 0, md, NULL);
+        if (rc < 0) {
+            break; /* NOMATCH (or any error) => no more matches. */
+        }
+        PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
+        PCRE2_SIZE mstart = ov[0];
+        PCRE2_SIZE mend = ov[1];
+        ZapMatch *m = zap_regex_build_match(re, md, subject, rc);
+        zap_list_push_ptr(out, m);
+        if (mend > mstart) {
+            /* Non-empty match: resume at its end (non-overlapping). */
+            start = mend;
+        } else {
+            /* Zero-length match: an empty match at the very end finishes the
+             * scan; otherwise step one whole code point to make progress. */
+            if (mend >= len) {
+                break;
+            }
+            start = zap_regex_utf8_next(data, len, mend);
+        }
+    }
+    pcre2_match_data_free(md);
+    pcre2_code_free(re);
+    return out;
 }
 
 /* `m.group(idx)` — positional capture; 0 is the whole match. Out-of-range or
@@ -898,6 +969,12 @@ static void *zap_regex_unavailable(void) {
     return NULL;
 }
 void *zap_regex_match(void *subject_, void *pattern_, int64_t flags) {
+    (void)subject_;
+    (void)pattern_;
+    (void)flags;
+    return zap_regex_unavailable();
+}
+void *zap_regex_match_all(void *subject_, void *pattern_, int64_t flags) {
     (void)subject_;
     (void)pattern_;
     (void)flags;
