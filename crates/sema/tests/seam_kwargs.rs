@@ -1995,3 +1995,39 @@ fn fractions_too_many_args_rejected() {
         "ZAP4025",
     );
 }
+
+// ---------------------------------------------------------------------------
+// collections (#972, epic #966) — Counter / defaultdict / OrderedDict.
+//
+// Unlike the `fractions`/`decimal` constructors (seam MODULE-facet functions
+// bound by `bind_seam_args` + a `seam_sigs.rs` row), every collections
+// convenience is a GENERIC prelude struct, so its `collections.Type[K](...)`
+// spelling is seam-GENERIC sugar (D-0202) rewritten to a bare prelude free
+// constructor (`new_counter` / `new_defaultdict` / `new_ordered_dict`) BEFORE
+// module dispatch — exactly like `concurrent.Queue`. Keyword binding therefore
+// comes from the ordinary prelude function/method machinery (I#298/I#481), NOT
+// the seam registry, so these take NO `seam_sigs.rs` rows. These cases pin that
+// the keyword surface (`items=` on the constructor, `n=` on `most_common`,
+// `key=`/`n=` on `add`/`subtract`, `factory=` on `defaultdict`) binds by name.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn collections_counter_constructor_keyword_binds() {
+    assert_ok(
+        "import collections\ndef f():\n    auto c = collections.Counter[str](items=[\"a\", \"a\"])\n    print(c.total())\n",
+    );
+}
+
+#[test]
+fn collections_counter_method_keywords_bind() {
+    assert_ok(
+        "import collections\ndef f():\n    collections.Counter[str] c = collections.Counter()\n    c.add(key=\"a\", n=2)\n    c.subtract(key=\"a\", n=1)\n    auto top = c.most_common(n=1)\n    print(len(top))\n",
+    );
+}
+
+#[test]
+fn collections_defaultdict_constructor_keyword_binds() {
+    assert_ok(
+        "import collections\ndef zero() -> int64:\n    return 0\ndef f():\n    auto d = collections.defaultdict[str, int64](factory=zero)\n    print(len(d))\n",
+    );
+}

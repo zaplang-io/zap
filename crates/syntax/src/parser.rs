@@ -2555,6 +2555,278 @@ def __argparse_first_in_group(ArgumentParser p, Argument a) -> bool:
         if b.group_title == a.group_title:
             return b.name == a.name
     return False
+
+# collections (#972, epic #966) — Python-`collections` conveniences, each a
+# generic prelude struct over the built-in capability-typed `dict`/`list`
+# (#812). Pure prelude Zap: no runtime C, no GC descriptor work (the element
+# buffers are the existing collection intrinsics). The Pythonic module-qualified
+# surface `collections.Counter[K]` / `collections.defaultdict[K, V]` /
+# `collections.OrderedDict[K, V]` is front-end seam sugar (`zapc_syntax::seam`,
+# I#996/D-0202) over the bare prelude free constructors below; the backing struct
+# names are intentionally distinct (`CounterMap`/`DefaultDict`/`OrderedMap`) so
+# the Python name `Counter` does not collide with the already-shipped lock-free
+# `concurrent.Counter` (D-0078) — a user never spells the backing name.
+
+# Counter[K] — a multiset / tally over `dict[K, int64]`. Missing keys read as 0.
+# Iteration order of the underlying dict is unspecified and per-run seeded
+# (D-0235), so `most_common`'s order among EQUAL counts is unspecified (a
+# documented divergence from CPython's insertion-order tie-break) and
+# `elements`/`keys` yield no defined order; counts and the count-descending
+# ordering of `most_common` are fully deterministic.
+struct CounterMap[K]:
+    dict[K, int64] counts
+
+    # Counter[key] — the count of `key`, or 0 if absent (never raises).
+    def __getitem__(self, K key) -> int64:
+        return self.counts.get(key, 0)
+
+    # Counter[key] = n — set the count directly.
+    def __setitem__(self, K key, int64 n):
+        self.counts[key] = n
+
+    # `key in Counter` — membership; does NOT create the key.
+    def __contains__(self, K key) -> bool:
+        return key in self.counts
+
+    # len(Counter) — the number of distinct keys (Python semantics).
+    def __len__(self) -> int64:
+        return len(self.counts)
+
+    # get(key) — the count of `key`, or 0 (the `dict.get(k, 0)` tally idiom).
+    def get(self, K key) -> int64:
+        return self.counts.get(key, 0)
+
+    # add(key, n=1) — increment the count of `key` by `n` (Counter[key] += n).
+    def add(self, K key, int64 n = 1):
+        self.counts[key] = self.counts.get(key, 0) + n
+
+    # subtract(key, n=1) — decrement by `n`. The count may go to zero or
+    # negative and is KEPT (Python's Counter.subtract keeps non-positive counts;
+    # only the `+`/`-` operators drop them).
+    def subtract(self, K key, int64 n = 1):
+        self.counts[key] = self.counts.get(key, 0) - n
+
+    # update(items) — tally every element of the iterable into self (+1 each).
+    def update(self, list[K] items):
+        for it in items:
+            self.counts[it] = self.counts.get(it, 0) + 1
+
+    # total() — the sum of all counts (Python 3.10+ Counter.total()).
+    def total(self) -> int64:
+        int64 t = 0
+        for k, v in self.counts.items():
+            t = t + v
+        return t
+
+    # keys() — the distinct keys, in unspecified order (D-0235).
+    def keys(self) -> list[K]:
+        return self.counts.keys()
+
+    # most_common(n) — the (key, count) pairs ordered by count DESCENDING; `n`
+    # omitted (or < 0) returns all. The ordering among EQUAL counts is
+    # unspecified (D-0235). Sorted with a manual insertion sort by count so no
+    # Ord capability is required of `K` (keys are only hashed/compared for
+    # equality by the dict, never ordered).
+    def most_common(self, int64 n = 0 - 1) -> list[(K, int64)]:
+        list[(K, int64)] pairs = []
+        for k, v in self.counts.items():
+            pairs.append((k, v))
+        int64 i = 1
+        while i < len(pairs):
+            (K, int64) cur = pairs[i]
+            int64 j = i - 1
+            while j >= 0 and pairs[j][1] < cur[1]:
+                pairs[j + 1] = pairs[j]
+                j = j - 1
+            pairs[j + 1] = cur
+            i = i + 1
+        if n < 0:
+            return pairs
+        list[(K, int64)] out = []
+        int64 taken = 0
+        while taken < n and taken < len(pairs):
+            out.append(pairs[taken])
+            taken = taken + 1
+        return out
+
+    # elements() — each key repeated as many times as its count (counts <= 0 are
+    # skipped, matching Python). Order is unspecified (D-0235).
+    def elements(self) -> list[K]:
+        list[K] out = []
+        for k, v in self.counts.items():
+            int64 c = 0
+            while c < v:
+                out.append(k)
+                c = c + 1
+        return out
+
+    # self + other — add counts, keeping only strictly-positive results (Python).
+    def __add__(self, CounterMap[K] other) -> CounterMap[K]:
+        dict[K, int64] d = {}
+        for k, v in self.counts.items():
+            if v > 0:
+                d[k] = v
+        for k, v in other.counts.items():
+            int64 sum = d.get(k, 0) + v
+            if sum > 0:
+                d[k] = sum
+            else:
+                if k in d:
+                    del d[k]
+        return CounterMap(counts=d)
+
+    # self - other — subtract counts, keeping only strictly-positive results.
+    def __sub__(self, CounterMap[K] other) -> CounterMap[K]:
+        dict[K, int64] d = {}
+        for k, v in self.counts.items():
+            if v > 0:
+                d[k] = v
+        for k, v in other.counts.items():
+            int64 diff = d.get(k, 0) - v
+            if diff > 0:
+                d[k] = diff
+            else:
+                if k in d:
+                    del d[k]
+        return CounterMap(counts=d)
+
+# Build a Counter from an iterable (the `collections.Counter(items)` surface) or
+# empty (`collections.Counter()` — `items` defaults to the empty list, element
+# type taken from the binding's annotation).
+def new_counter[K](list[K] items = []) -> CounterMap[K]:
+    dict[K, int64] d = {}
+    for it in items:
+        d[it] = d.get(it, 0) + 1
+    return CounterMap(counts=d)
+
+# defaultdict[K, V] — a dict that auto-initializes a missing key from a
+# zero-argument `factory` (`fn() -> V`) on first access, so the grouping idiom
+# `d[key].append(x)` works without a prior membership check. `key in d` and
+# `d.get(key, fallback)` are read-only and never create the key (Python).
+struct DefaultDict[K, V]:
+    dict[K, V] store
+    fn() -> V factory
+
+    # d[key] — return the stored value, or create it from the factory, store it,
+    # and return it (Python's __missing__ autovivification). The returned value
+    # is the stored object, so `d[key].append(x)` mutates it in place.
+    def __getitem__(self, K key) -> V:
+        if key in self.store:
+            return self.store[key]
+        fn() -> V mk = self.factory
+        V made = mk()
+        self.store[key] = made
+        return made
+
+    # d[key] = value — store a value directly.
+    def __setitem__(self, K key, V val):
+        self.store[key] = val
+
+    # `key in d` — membership; read-only, does NOT autovivify.
+    def __contains__(self, K key) -> bool:
+        return key in self.store
+
+    # len(d) — the number of keys actually present.
+    def __len__(self) -> int64:
+        return len(self.store)
+
+    # get(key, fallback) — read-only: the stored value or `fallback`, never
+    # creating the key (Python's dict.get on a defaultdict).
+    def get(self, K key, V fallback) -> V:
+        return self.store.get(key, fallback)
+
+    # keys() — the keys present, in unspecified order (D-0235).
+    def keys(self) -> list[K]:
+        return self.store.keys()
+
+# Build an empty defaultdict backed by `factory` (`collections.defaultdict(f)`).
+def new_defaultdict[K, V](fn() -> V factory) -> DefaultDict[K, V]:
+    dict[K, V] d = {}
+    return DefaultDict(store=d, factory=factory)
+
+# OrderedDict[K, V] — an insertion-ordered map. Because the built-in `dict`
+# iteration order is unspecified and per-run seeded (D-0235), this is a genuine
+# capability gap, NOT redundant: it composes the built-in `dict` (O(1) lookup)
+# with a `list[K]` recording insertion order (the same compose-from-existing
+# trick that shipped `oset`). `keys`/`values`/`items` iterate in insertion
+# order; re-assigning an existing key keeps its original position (Python).
+struct OrderedMap[K, V]:
+    dict[K, V] store
+    list[K] order
+
+    # d[key] — the stored value. A missing key reads as the built-in dict's
+    # zero/default word today (a real KeyError is a language-wide follow-up,
+    # #22); use `get(key, fallback)` for an explicit default. Unlike defaultdict
+    # this never inserts.
+    def __getitem__(self, K key) -> V:
+        return self.store[key]
+
+    # d[key] = value — insert or update, preserving first-insertion position.
+    def __setitem__(self, K key, V val):
+        if not (key in self.store):
+            self.order.append(key)
+        self.store[key] = val
+
+    # `key in d` — membership.
+    def __contains__(self, K key) -> bool:
+        return key in self.store
+
+    # len(d) — the number of entries.
+    def __len__(self) -> int64:
+        return len(self.store)
+
+    # get(key, fallback) — the stored value or `fallback` (never raises).
+    def get(self, K key, V fallback) -> V:
+        return self.store.get(key, fallback)
+
+    # keys() — the keys in insertion order (a fresh list; the internal order
+    # list is not exposed).
+    def keys(self) -> list[K]:
+        list[K] out = []
+        for k in self.order:
+            out.append(k)
+        return out
+
+    # values() — the values in insertion order.
+    def values(self) -> list[V]:
+        list[V] out = []
+        for k in self.order:
+            out.append(self.store[k])
+        return out
+
+    # items() — the (key, value) pairs in insertion order.
+    def items(self) -> list[(K, V)]:
+        list[(K, V)] out = []
+        for k in self.order:
+            out.append((k, self.store[k]))
+        return out
+
+    # delete(key) — remove `key` if present, compacting the order list (O(n)).
+    def delete(self, K key):
+        if key in self.store:
+            del self.store[key]
+            list[K] keep = []
+            for k in self.order:
+                if not (k == key):
+                    keep.append(k)
+            self.order = keep
+
+    # move_to_end(key) — move an existing `key` to the most-recent position
+    # (Python's OrderedDict.move_to_end(last=True)). A no-op if absent.
+    def move_to_end(self, K key):
+        if key in self.store:
+            list[K] keep = []
+            for k in self.order:
+                if not (k == key):
+                    keep.append(k)
+            keep.append(key)
+            self.order = keep
+
+# Build an empty OrderedDict (`collections.OrderedDict()`).
+def new_ordered_dict[K, V]() -> OrderedMap[K, V]:
+    dict[K, V] d = {}
+    list[K] ks = []
+    return OrderedMap(store=d, order=ks)
 ";
 
 /// Parse the built-in [`PRELUDE_SRC`] into AST items. The prelude is authored to
@@ -2760,6 +3032,23 @@ fn references_prelude(module: &Module) -> bool {
         // ...)`) or the struct.
         "\"fractions\"",
         "\"Fraction\"",
+        // The `collections` module (#972, epic #966): the generic conveniences
+        // `Counter` (backing struct `CounterMap`), `defaultdict` (`DefaultDict`)
+        // and `OrderedDict` (`OrderedMap`) + their `new_counter` /
+        // `new_defaultdict` / `new_ordered_dict` constructors ship in the
+        // prelude, injected for any program that names the module (so
+        // `collections.defaultdict(...)` / `collections.OrderedDict(...)` trigger
+        // it) or one of the surface / backing names directly. (`"Counter"` /
+        // `"Queue"` above already trigger it for `collections.Counter`.)
+        "\"collections\"",
+        "\"defaultdict\"",
+        "\"OrderedDict\"",
+        "\"CounterMap\"",
+        "\"DefaultDict\"",
+        "\"OrderedMap\"",
+        "\"new_counter\"",
+        "\"new_defaultdict\"",
+        "\"new_ordered_dict\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))
