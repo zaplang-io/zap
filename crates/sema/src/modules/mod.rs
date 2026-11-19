@@ -56,6 +56,7 @@ mod arch;
 mod argparse;
 mod base64;
 mod bisect;
+mod collections;
 mod concurrent;
 mod crypto;
 mod datetime;
@@ -144,6 +145,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     url::MODULE,
     uuid::MODULE,
     concurrent::MODULE,
+    collections::MODULE,
     xml::MODULE,
     // Architecture-specific low-level intrinsics (I#139 Tier 2, D-0199). Dotted
     // registry names; dispatched via the import-alias map (see `Checker`).

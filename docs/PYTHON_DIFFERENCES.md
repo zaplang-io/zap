@@ -368,6 +368,49 @@ places:
 - **No `Fraction` literal.** There is no rational literal syntax; construct via
   `fractions.Fraction(...)`.
 
+### `collections` (#972)
+
+Zap's `collections` conveniences — `Counter`, `defaultdict`, `OrderedDict` — are
+generic prelude structs over the built-in `dict`/`list`, and match CPython for
+the common operations: `Counter[k]` reads `0` for a missing key, `most_common`
+orders by count descending, `Counter.subtract` keeps non-positive counts while
+the `+`/`-` operators drop them, `defaultdict` autovivifies a missing key from
+its factory on `d[k]` (so `d[key].append(x)` works) while `k in d` and `get` do
+not create it, and `OrderedDict` iterates in insertion order. It deliberately
+differs in a few places:
+
+- **`namedtuple` is not provided.** Zap's `value struct` is a strict superset —
+  named, immutable, stack-resident, with `@derive(Eq, Ord, Repr)` and structural
+  hashing (so it is a dict/set key). Write `value struct Point: int64 x; int64 y`
+  instead of `namedtuple('Point', 'x y')`; for the anonymous positional case use
+  a tuple (`(a, b)` with `t[0]` access).
+- **`most_common` tie order is unspecified.** CPython breaks ties among equal
+  counts by first-insertion order. Zap's backing `dict` has no defined iteration
+  order (unspecified and per-run seeded, D-0235), so the order among **equal**
+  counts is unspecified; the count-descending order for distinct counts is
+  deterministic. Use `OrderedDict`, or sort the result, when a stable tie order
+  matters.
+- **`Counter` / `defaultdict` key iteration order is unspecified** (D-0235), as
+  for any `dict`. Use `OrderedDict`, `Counter.most_common`, or `sorted(...)` for
+  a deterministic order; `OrderedDict.keys()/values()/items()` are insertion
+  order.
+- **`Counter` is built from an iterable, not a mapping or `**kwargs`.**
+  `collections.Counter(items)` tallies an iterable (or `collections.Counter()`
+  empty, then `update`/`add`); there is no `Counter({'a': 2})` mapping form and
+  no `Counter(a=2)` keyword form (Zap is statically typed over a single element
+  type `K`).
+- **`defaultdict`'s factory is an explicit `fn() -> V`.** CPython takes a
+  callable or default class (`defaultdict(list)`, `defaultdict(int)`); Zap takes
+  a zero-argument function value returning `V` — e.g. a `def mk() -> list[int64]`
+  for grouping, or a `def zero() -> int64` for counting.
+- **A missing `OrderedDict[k]` read yields the dict's zero word**, not a
+  `KeyError` — a flat consequence of the built-in `dict` read pending a
+  language-wide `KeyError` (#22); use `get(k, fallback)` for an explicit default.
+- **The Python name `Counter` is served by two modules.**
+  `collections.Counter` is this multiset; `concurrent.Counter` is the pre-existing
+  lock-free integer counter (D-0078). They are distinct types (backed by distinct
+  prelude structs) and do not collide.
+
 ---
 
 ## Parity backlog

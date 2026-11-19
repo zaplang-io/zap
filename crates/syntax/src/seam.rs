@@ -34,37 +34,63 @@ use crate::ast::Expr;
 
 /// The seam-exposed prelude generic collections that admit module-qualified
 /// construction `module.Type[T](...)`, each mapped to the bare prelude free
-/// constructor the monomorphizer keys on.
+/// constructor the monomorphizer keys on and to the bare prelude type the
+/// surface name stands for.
 ///
-/// `(module, Type, bare free constructor)`.
-pub const SEAM_GENERIC_CTORS: &[(&str, &str, &str)] = &[
+/// `(module, surface Type, bare free constructor, bare prelude type)`.
+///
+/// The bare type is usually spelled the same as the surface name (`Queue`), but
+/// it is a distinct column because the Python-faithful surface name can differ
+/// from the backing prelude struct — e.g. `collections.Counter` is backed by
+/// `CounterMap` so the Python name does not collide with the already-shipped
+/// lock-free `concurrent.Counter` (D-0078). An annotation `module.Type[T]`
+/// resolves via [`seam_generic_bare_type`] to this bare type.
+pub const SEAM_GENERIC_CTORS: &[(&str, &str, &str, &str)] = &[
     // The lock-free MPSC `Queue[T]` (I#184, D-0078) — built by `new_queue[T]()`.
-    ("concurrent", "Queue", "new_queue"),
+    ("concurrent", "Queue", "new_queue", "Queue"),
     // The keep-alive HTTP client `http.Client(...)` (#990) — a non-generic
     // prelude struct built by the prelude factory `__http_client(...)`, which
     // creates the connection pool. Same callee-rewrite sugar: `http.Client(...)`
     // → `__http_client(...)`, args (the config keywords) carried through. Used
     // via `auto client = http.Client(...)`, so the dotted type head is not spelled
     // as an annotation (the bare prelude type is `HttpClient`, not `Client`).
-    ("http", "Client", "__http_client"),
+    ("http", "Client", "__http_client", "HttpClient"),
     // The streaming subprocess handle `process.Popen(...)` (#976, D-0237) — a
     // non-generic prelude struct built by the prelude factory `__process_popen`,
     // which spawns the child with pipes and returns this struct wrapping the
     // opaque runtime handle. Same callee-rewrite sugar as `http.Client`:
     // `process.Popen(...)` → `__process_popen(...)`, args carried through.
-    ("process", "Popen", "__process_popen"),
+    ("process", "Popen", "__process_popen", "Popen"),
+    // collections (#972, epic #966) — Python-`collections` conveniences, each a
+    // generic prelude struct over the built-in `dict`/`list`. The surface names
+    // match Python; the backing prelude structs are renamed so `Counter` does
+    // not collide with `concurrent.Counter` (D-0078) and so the whole set is
+    // uniform.
+    ("collections", "Counter", "new_counter", "CounterMap"),
+    (
+        "collections",
+        "defaultdict",
+        "new_defaultdict",
+        "DefaultDict",
+    ),
+    (
+        "collections",
+        "OrderedDict",
+        "new_ordered_dict",
+        "OrderedMap",
+    ),
 ];
 
 /// If the dotted type head `dotted` (`"concurrent.Queue"`) names a seam generic,
-/// the bare prelude type name it stands for (`"Queue"`). A non-dotted or
-/// unrecognized name yields `None`, so callers fall through to ordinary
-/// resolution unchanged.
+/// the bare prelude type name it stands for (`"Queue"`;
+/// `"collections.Counter"` → `"CounterMap"`). A non-dotted or unrecognized name
+/// yields `None`, so callers fall through to ordinary resolution unchanged.
 pub fn seam_generic_bare_type(dotted: &str) -> Option<&'static str> {
     let (module, ty) = dotted.split_once('.')?;
     SEAM_GENERIC_CTORS
         .iter()
-        .find(|(m, t, _)| *m == module && *t == ty)
-        .map(|(_, t, _)| *t)
+        .find(|(m, t, _, _)| *m == module && *t == ty)
+        .map(|(_, _, _, bare)| *bare)
 }
 
 /// If `module.ty` names a seam generic, its bare prelude free constructor
@@ -72,8 +98,8 @@ pub fn seam_generic_bare_type(dotted: &str) -> Option<&'static str> {
 pub fn seam_generic_ctor(module: &str, ty: &str) -> Option<&'static str> {
     SEAM_GENERIC_CTORS
         .iter()
-        .find(|(m, t, _)| *m == module && *t == ty)
-        .map(|(_, _, ctor)| *ctor)
+        .find(|(m, t, _, _)| *m == module && *t == ty)
+        .map(|(_, _, ctor, _)| *ctor)
 }
 
 /// Rewrite a seam module-qualified generic *constructor callee* to its bare
@@ -136,6 +162,21 @@ mod tests {
         assert_eq!(seam_generic_bare_type("Queue"), None);
         assert_eq!(seam_generic_bare_type("other.Queue"), None);
         assert_eq!(seam_generic_bare_type("a.b.Queue"), None);
+        // The collections surface names resolve to their distinct backing
+        // prelude structs (#972), so `collections.Counter` does NOT collide with
+        // the `concurrent.Counter` prelude struct (D-0078).
+        assert_eq!(
+            seam_generic_bare_type("collections.Counter"),
+            Some("CounterMap")
+        );
+        assert_eq!(
+            seam_generic_bare_type("collections.defaultdict"),
+            Some("DefaultDict")
+        );
+        assert_eq!(
+            seam_generic_bare_type("collections.OrderedDict"),
+            Some("OrderedMap")
+        );
     }
 
     #[test]
@@ -143,6 +184,18 @@ mod tests {
         assert_eq!(seam_generic_ctor("concurrent", "Queue"), Some("new_queue"));
         assert_eq!(seam_generic_ctor("concurrent", "Counter"), None);
         assert_eq!(seam_generic_ctor("other", "Queue"), None);
+        assert_eq!(
+            seam_generic_ctor("collections", "Counter"),
+            Some("new_counter")
+        );
+        assert_eq!(
+            seam_generic_ctor("collections", "defaultdict"),
+            Some("new_defaultdict")
+        );
+        assert_eq!(
+            seam_generic_ctor("collections", "OrderedDict"),
+            Some("new_ordered_dict")
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ listed here (see [`README.md`](README.md)).
 
 | # | Title | Status | Date |
 |---|-------|--------|------|
+| [972](stdlib/972-collections-conveniences.md) | stdlib collections — Counter / defaultdict / OrderedDict as prelude generics | Locked | 2026-11-19 |
 | [981](stdlib/981-decimal-exact-base10.md) | stdlib decimal — exact base-10 Decimal, software over bigint | Locked | 2026-11-19 |
 | [982](stdlib/982-fractions-exact-rational.md) | stdlib fractions — exact rational Fraction, software over bigint | Locked | 2026-11-19 |
 
