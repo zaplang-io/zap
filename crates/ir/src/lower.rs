@@ -12377,6 +12377,18 @@ impl<'a> FnLower<'a> {
         // method-call dispatch.
         if let Expr::Attr { base, name, .. } = callee {
             if let Expr::Name(tyname, _) = base.as_ref() {
+                // `bytes.maketrans(frm, to)` → bytes (ticket #1099): an associated
+                // constructor building a 256-byte table. Raises on unequal lengths,
+                // so a `throwing_call` (invoke) that `try/except` can catch.
+                // Intercepted before the module/value dispatch, mirroring the
+                // `Struct.from_json` associated-function path. Sema type-checked it.
+                if tyname == "bytes" && name == "maketrans" && self.lookup(tyname).is_none() {
+                    let (frm, _) = self.expr(&args[0].value)?;
+                    let (to, _) = self.expr(&args[1].value)?;
+                    let d = self.new_value(Ty::Bytes);
+                    self.throwing_call(Some(d), "zap_bytes_maketrans", vec![frm, to]);
+                    return Ok((d, Ty::Bytes));
+                }
                 if self.ctx.enums.contains_key(tyname) {
                     // `Enum.from_json(s)` — an open string-enum's decode function
                     // (ticket #346, D-0086), intercepted before variant
@@ -13479,6 +13491,31 @@ impl<'a> FnLower<'a> {
                     self.build_bytesview(recv, lo, has_lo, hi, has_hi),
                     self.bytesview_ty(),
                 ));
+            }
+            // `bytes.translate(table)` / `bytes.translate(table, delete)` → bytes
+            // (ticket #1099): one native pass over the whole buffer. Raises when
+            // `table` is not 256 bytes, so it is a `throwing_call` (invoke) a
+            // `try/except` can catch. The runtime takes a 0/1 `has_delete` flag;
+            // when 0, the delete-set pointer is unused (we pass `table` as a
+            // harmless non-null placeholder).
+            if bty == Ty::Bytes && name == "translate" {
+                if args.is_empty() || args.len() > 2 {
+                    return Err(err(
+                        "bytes.translate() takes 1 or 2 arguments (table[, delete])",
+                    ));
+                }
+                let (table, _) = self.expr(&args[0].value)?;
+                let (delete, has_delete) = match args.get(1) {
+                    Some(a) => (self.expr(&a.value)?.0, self.iconst(Ty::I64, 1)),
+                    None => (table, self.iconst(Ty::I64, 0)),
+                };
+                let d = self.new_value(Ty::Bytes);
+                self.throwing_call(
+                    Some(d),
+                    "zap_bytes_translate",
+                    vec![recv, table, delete, has_delete],
+                );
+                return Ok((d, Ty::Bytes));
             }
             // Tier-1 (unboxed-integer) enum method call (#731): the receiver is a
             // backing integer, not a struct, so the generic struct path below

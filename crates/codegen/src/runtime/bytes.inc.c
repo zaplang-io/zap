@@ -149,6 +149,70 @@ void *zap_bytes_to_str(void *bp) {
     return zap_str_new(b->data, b->len);
 }
 
+/* bytes.maketrans(frm, to) -> a freshly-allocated 256-byte translation table:
+ * the identity map (table[i] == i) except that each byte frm[i] maps to to[i]
+ * (ticket #1099, Python `bytes.maketrans` parity). `frm` and `to` must have
+ * equal length; a mismatch raises a catchable error (Python raises ValueError).
+ * A later frm[i] overrides an earlier one for the same source byte, matching
+ * CPython's left-to-right fill. The result is a fresh 256-byte ZapStr/bytes. */
+void *zap_bytes_maketrans(void *fp, void *tp) {
+    const ZapStr *frm = (const ZapStr *)fp;
+    const ZapStr *to = (const ZapStr *)tp;
+    if (frm->len != to->len) {
+        const char *m = "bytes.maketrans(): arguments must have equal length";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
+    char *buf = (char *)zap_buf(256);
+    for (int i = 0; i < 256; i++) {
+        buf[i] = (char)(unsigned char)i;
+    }
+    for (int64_t i = 0; i < frm->len; i++) {
+        buf[(unsigned char)frm->data[i]] = to->data[i];
+    }
+    return zap_str_adopt(buf, 256);
+}
+
+/* seq.translate(table) / seq.translate(table, delete) -> bytes (ticket #1099,
+ * Python `bytes.translate` parity). `table` must be exactly 256 bytes (a mismatch
+ * raises a catchable error). The whole buffer is rewritten in a single native
+ * pass: out[i] = table[seq[i]]. With a `delete` set (`has_delete` != 0), any
+ * input byte whose value appears in `delete` is dropped from the output BEFORE
+ * translation — i.e. deletion wins over remapping, matching CPython. Bytes are
+ * treated unsigned (0..=255), so the high bytes 0x80..0xFF index the table
+ * correctly with no sign extension. The result is a fresh ZapStr/bytes. */
+void *zap_bytes_translate(void *sp, void *tp, void *dp, int64_t has_delete) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *table = (const ZapStr *)tp;
+    if (table->len != 256) {
+        const char *m = "bytes.translate(): table must be exactly 256 bytes";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
+    int64_t n = s->len;
+    char *buf = (char *)zap_buf(n > 0 ? n : 1);
+    int64_t outlen = 0;
+    if (has_delete) {
+        const ZapStr *del = (const ZapStr *)dp;
+        unsigned char drop[256];
+        memset(drop, 0, sizeof(drop));
+        for (int64_t i = 0; i < del->len; i++) {
+            drop[(unsigned char)del->data[i]] = 1;
+        }
+        for (int64_t i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)s->data[i];
+            if (drop[c]) {
+                continue;
+            }
+            buf[outlen++] = table->data[c];
+        }
+    } else {
+        for (int64_t i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)s->data[i];
+            buf[outlen++] = table->data[c];
+        }
+    }
+    return zap_str_adopt(buf, outlen);
+}
+
 /* ---- base64 (RFC 4648) ---- */
 static const char ZAP_B64_STD[65] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

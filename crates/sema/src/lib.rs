@@ -6208,6 +6208,39 @@ impl Checker {
         // `Shape.Circle(2.0)` (D-0046), accepting named or positional args.
         if let Expr::Attr { base, name, .. } = callee {
             if let Expr::Name(tyname, _) = base.as_ref() {
+                // `bytes.maketrans(frm, to)` → `bytes` (ticket #1099): an
+                // associated constructor (classmethod-like) that builds a 256-byte
+                // translation table. `frm` and `to` are both `bytes` (equal length
+                // enforced at runtime). Intercepted here, before the `bytes` name
+                // is read as a module/value, mirroring the `Struct.from_json`
+                // associated-function dispatch. Positional-only (an intrinsic, not
+                // a seam module function — see the ADR).
+                if tyname == "bytes" && name == "maketrans" && self.lookup(tyname).is_none() {
+                    if args.len() != 2 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!(
+                                "bytes.maketrans(frm, to) takes 2 arguments, found {}",
+                                args.len()
+                            ),
+                            span,
+                        );
+                    }
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        if !assignable(&at, &Ty::Bytes) && !matches!(at, Ty::Unknown) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "bytes.maketrans() expects bytes arguments, found {}",
+                                    at.display()
+                                ),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::Bytes;
+                }
                 if let Some(info) = self.enums.get(tyname).cloned() {
                     // `Enum.from_json(s)` — the decode associated function an
                     // `@derive(Json)` (open) enum gets (ticket #346, D-0086).
@@ -7667,6 +7700,35 @@ impl Checker {
                     }
                 }
                 return Ty::BytesView;
+            }
+            // `bytes.translate(table)` / `bytes.translate(table, delete)` →
+            // `bytes` (ticket #1099): bulk byte-table translation. `table` and the
+            // optional `delete` set are both `bytes`. Positional-only (a built-in
+            // intrinsic method, not a seam module function — see the ADR), so no
+            // `seam_sigs.rs` row applies. Distinct from `str.translate(dict)`,
+            // which is a code-point dict map (#1034).
+            if matches!(bt, Ty::Bytes) && name == "translate" {
+                if args.is_empty() || args.len() > 2 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "bytes.translate() takes 1 or 2 arguments (table[, delete])".to_string(),
+                        *span,
+                    );
+                }
+                for a in args {
+                    let at = self.infer(&a.value);
+                    if !assignable(&at, &Ty::Bytes) && !matches!(at, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "bytes.translate() expects bytes arguments, found {}",
+                                at.display()
+                            ),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+                return Ty::Bytes;
             }
             // Borrowed `bytesview` (#1082 follow-up): the read-only subset.
             if matches!(bt, Ty::BytesView) {
@@ -10899,6 +10961,68 @@ def main():
             e.iter().any(|x| x.code == ErrorCode::ZAP4024),
             "expandtabs(str) should be ZAP4024, got {e:?}"
         );
+    }
+
+    // ---- bytes.translate / bytes.maketrans (#1099) -----------------------
+
+    #[test]
+    fn bytes_translate_maketrans_type_check() {
+        // maketrans(frm, to) -> bytes; translate(table[, delete]) -> bytes.
+        ok(r#"def main():
+    auto table = bytes.maketrans(b"ab", b"AB")
+    bytes x = b"abc".translate(table)
+    bytes y = b"abc".translate(table, b"c")
+    auto v = b"x".view()
+    print(str(x) + str(y))
+"#);
+        // The optional delete set and the table may be any bytes-typed value,
+        // including the result of another bytes expression.
+        ok(r#"def main():
+    auto t = bytes.maketrans(bytes([0]), bytes([255]))
+    bytes r = bytes([1, 2, 3]).translate(t, bytes([2]))
+    print(str(r))
+"#);
+    }
+
+    #[test]
+    fn bytes_translate_maketrans_reject_bad_args() {
+        // translate wants bytes arguments, not a dict or str (ZAP4024). (A
+        // dict is str.translate's shape — rejected on a bytes receiver.)
+        for bad in [
+            "b\"a\".translate(\"x\")",
+            "b\"a\".translate({\"a\": \"b\"})",
+            "b\"a\".translate(b\"\", \"x\")",
+        ] {
+            let e = errors(&format!("def main():\n    auto z = {bad}\n"));
+            assert!(
+                e.iter().any(|x| x.code == ErrorCode::ZAP4024),
+                "`{bad}` should be ZAP4024, got {e:?}"
+            );
+        }
+        // maketrans wants bytes arguments (ZAP4024).
+        for bad in [
+            "bytes.maketrans(\"a\", b\"b\")",
+            "bytes.maketrans(b\"a\", 1)",
+        ] {
+            let e = errors(&format!("def main():\n    auto z = {bad}\n"));
+            assert!(
+                e.iter().any(|x| x.code == ErrorCode::ZAP4024),
+                "`{bad}` should be ZAP4024, got {e:?}"
+            );
+        }
+        // Arity: translate takes 1 or 2; maketrans takes exactly 2 (ZAP4025).
+        for bad in [
+            "b\"a\".translate()",
+            "auto t = bytes.maketrans(b\"\", b\"\")\n    auto z = b\"a\".translate(t, t, t)",
+            "bytes.maketrans(b\"a\")",
+            "bytes.maketrans(b\"a\", b\"b\", b\"c\")",
+        ] {
+            let e = errors(&format!("def main():\n    {bad}\n"));
+            assert!(
+                e.iter().any(|x| x.code == ErrorCode::ZAP4025),
+                "`{bad}` should be ZAP4025, got {e:?}"
+            );
+        }
     }
 
     // ---- os.path: path_split / path_splitext (#1030, D-0219) --------------
