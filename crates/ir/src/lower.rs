@@ -19580,11 +19580,241 @@ impl<'a> FnLower<'a> {
                 self.position(done_bb);
                 Ok((self.iconst(Ty::I32, 0), Ty::I32))
             }
+            // pop([i]) -> elem (#1095): remove and return the element at index
+            // `i`, or the LAST element (O(1)) with no argument. A negative index
+            // counts from the end. An empty list or an out-of-range index raises
+            // a catchable IndexError in the runtime, so this must `invoke` the
+            // pop helper for a `try`/`except` to catch it. The result reads back
+            // as the element's full type (#625) and, being an `invoke` dest, is
+            // GC-rooted exactly like a `zap_list_get_*` / subscript-read result.
+            "pop" => {
+                if args.len() > 1 {
+                    return Err(err("pop() takes at most one argument (an index)"));
+                }
+                let (idx, has_index) = if let Some(a) = args.first() {
+                    let (iv, it) = self.expr(&a.value)?;
+                    (self.coerce_index(iv, it), self.iconst(Ty::I64, 1))
+                } else {
+                    (self.iconst(Ty::I64, 0), self.iconst(Ty::I64, 0))
+                };
+                let ety = self.elem_ty(elem);
+                let d = self.new_value(ety);
+                self.throwing_call(
+                    Some(d),
+                    &format!("zap_list_pop_{}", elem.val_suffix()),
+                    vec![recv, idx, has_index],
+                );
+                Ok((d, ety))
+            }
+            // index(value[, start[, stop]]) -> int64 (#1095): the position of the
+            // first element equal to `value` within `[start, stop)`; raises a
+            // catchable ValueError when none matches (CPython raises ValueError,
+            // not IndexError). The per-element equality routes through
+            // `binop(Eq, ..)`, so it matches `==`/`in` (numeric joins, str by
+            // contents, struct `__eq__`), exactly like `count`/`remove`. Optional
+            // `start`/`stop` are clamped the CPython slice way (negatives count
+            // from the end; both clamp to `[0, len]`), so the scan only ever
+            // reads valid indices and never itself faults.
+            "index" => {
+                if args.is_empty() || args.len() > 3 {
+                    return Err(err(
+                        "index() takes one to three arguments (value[, start[, stop]])",
+                    ));
+                }
+                let (x, xt) = self.expr(&args[0].value)?;
+                let len = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(len),
+                    func: "zap_list_len".to_string(),
+                    args: vec![recv],
+                });
+                let start = if let Some(a) = args.get(1) {
+                    let (sv, st) = self.expr(&a.value)?;
+                    let sv = self.coerce(sv, st, Ty::I64);
+                    self.clamp_index_bound(sv, len)
+                } else {
+                    self.iconst(Ty::I64, 0)
+                };
+                let stop = if let Some(a) = args.get(2) {
+                    let (sv, st) = self.expr(&a.value)?;
+                    let sv = self.coerce(sv, st, Ty::I64);
+                    self.clamp_index_bound(sv, len)
+                } else {
+                    len
+                };
+                let idx = self.alloca(Ty::I64);
+                self.store(idx, start);
+                let cond_bb = self.new_block();
+                let body_bb = self.new_block();
+                let incr_bb = self.new_block();
+                let found_bb = self.new_block();
+                let notfound_bb = self.new_block();
+                self.set_term(Term::Br(cond_bb));
+                self.position(cond_bb);
+                let cur = self.load(idx, Ty::I64);
+                let c = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: c,
+                    pred: CmpPred::Lt,
+                    lhs: cur,
+                    rhs: stop,
+                });
+                self.set_term(Term::BrIf {
+                    cond: c,
+                    then_bb: body_bb,
+                    else_bb: notfound_bb,
+                });
+                self.position(body_bb);
+                let i = self.load(idx, Ty::I64);
+                let e = self.new_value(elem.ty());
+                self.emit(Inst::Call {
+                    dest: Some(e),
+                    func: format!("zap_list_get_{}", elem.val_suffix()),
+                    args: vec![recv, i],
+                });
+                let (eq, _) = self.binop(AstBin::Eq, e, elem.ty(), x, xt)?;
+                self.set_term(Term::BrIf {
+                    cond: eq,
+                    then_bb: found_bb,
+                    else_bb: incr_bb,
+                });
+                self.position(incr_bb);
+                let cur2 = self.load(idx, Ty::I64);
+                let one = self.iconst(Ty::I64, 1);
+                let next = self.new_value(Ty::I64);
+                self.emit(Inst::Bin {
+                    dest: next,
+                    op: BinOp::Add,
+                    lhs: cur2,
+                    rhs: one,
+                });
+                self.store(idx, next);
+                self.set_term(Term::Br(cond_bb));
+                self.position(notfound_bb);
+                let m = self.new_value(Ty::Ptr);
+                self.emit(Inst::StrConst {
+                    dest: m,
+                    bytes: b"list.index(x): x not in list".to_vec(),
+                });
+                let value_error = self.iconst(Ty::I64, 3); // ZAP_EXC_VALUE_ERROR
+                self.throwing_call(None, "zap_panic_typed", vec![value_error, m]);
+                if !self.terminated() {
+                    self.set_term(Term::Unreachable);
+                }
+                self.position(found_bb);
+                let res = self.load(idx, Ty::I64);
+                Ok((res, Ty::I64))
+            }
+            // reverse() (#1095): reverse the elements in place (CPython
+            // `list.reverse`). Element-type-agnostic word swap in the runtime.
+            "reverse" => {
+                if !args.is_empty() {
+                    return Err(err("reverse() takes no arguments"));
+                }
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_list_reverse".to_string(),
+                    args: vec![recv],
+                });
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
+            // copy() -> list[elem] (#1095): a shallow copy — a new list with the
+            // same element words (shared referents), so mutating the copy's
+            // membership does not touch the original, but reference elements are
+            // shared (CPython `list.copy`). Reuses `zap_list_copy` (also used by
+            // `sorted()`), whose result inherits `elem_ptr` for precise tracing.
+            "copy" => {
+                if !args.is_empty() {
+                    return Err(err("copy() takes no arguments"));
+                }
+                let d = self.new_value(Ty::List(elem));
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_list_copy".to_string(),
+                    args: vec![recv],
+                });
+                Ok((d, Ty::List(elem)))
+            }
             other => Err(err(format!(
                 "list has no method '{other}' (supported: append, sort, extend, \
-                 insert, remove, count, clear)"
+                 insert, remove, pop, index, count, reverse, copy, clear)"
             ))),
         }
+    }
+
+    /// Clamp a `list.index(x, start, stop)` bound the CPython slice way (#1095):
+    /// a negative bound counts from the end (`+= len`), and the result is clamped
+    /// to `[0, len]` — the same forward-step clamp the runtime's `zap_slice_pos`
+    /// applies to a slice bound. Emitting it in compiled code (rather than adding
+    /// a runtime symbol) keeps the new runtime surface to just `pop`/`reverse`.
+    fn clamp_index_bound(&mut self, v: Value, len: Value) -> Value {
+        let slot = self.alloca(Ty::I64);
+        self.store(slot, v);
+        let zero = self.iconst(Ty::I64, 0);
+        let is_neg = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: is_neg,
+            pred: CmpPred::Lt,
+            lhs: v,
+            rhs: zero,
+        });
+        let neg_bb = self.new_block();
+        let pos_bb = self.new_block();
+        let join_bb = self.new_block();
+        self.set_term(Term::BrIf {
+            cond: is_neg,
+            then_bb: neg_bb,
+            else_bb: pos_bb,
+        });
+        // Negative: v += len, then floor at 0.
+        self.position(neg_bb);
+        let vln = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: vln,
+            op: BinOp::Add,
+            lhs: v,
+            rhs: len,
+        });
+        let still_neg = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: still_neg,
+            pred: CmpPred::Lt,
+            lhs: vln,
+            rhs: zero,
+        });
+        let floor_bb = self.new_block();
+        let keep_bb = self.new_block();
+        self.set_term(Term::BrIf {
+            cond: still_neg,
+            then_bb: floor_bb,
+            else_bb: keep_bb,
+        });
+        self.position(floor_bb);
+        self.store(slot, zero);
+        self.set_term(Term::Br(join_bb));
+        self.position(keep_bb);
+        self.store(slot, vln);
+        self.set_term(Term::Br(join_bb));
+        // Non-negative: cap at len.
+        self.position(pos_bb);
+        let too_big = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: too_big,
+            pred: CmpPred::Gt,
+            lhs: v,
+            rhs: len,
+        });
+        let cap_bb = self.new_block();
+        self.set_term(Term::BrIf {
+            cond: too_big,
+            then_bb: cap_bb,
+            else_bb: join_bb,
+        });
+        self.position(cap_bb);
+        self.store(slot, len);
+        self.set_term(Term::Br(join_bb));
+        self.position(join_bb);
+        self.load(slot, Ty::I64)
     }
 
     /// Build the shared arguments for a `zap_list_sort_by` call from the optional
