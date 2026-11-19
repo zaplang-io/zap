@@ -24,6 +24,7 @@ mod bisect;
 mod concurrent;
 mod crypto;
 mod datetime;
+mod decimal;
 mod fft;
 mod fs;
 mod gc;
@@ -89,6 +90,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     hash::MODULE,
     math::MODULE,
     statistics::MODULE,
+    decimal::MODULE,
     fft::MODULE,
     linalg::MODULE,
     random::MODULE,

@@ -565,6 +565,345 @@ struct TempFile:
     def __exit__(self):
         self.close_()
 
+# Decimal — exact base-10 arithmetic (#981, #981, epic #966). A reference
+# struct over the arbitrary-precision `bigint`: value = coeff * 10**exp, the sign
+# carried by `coeff`. Built by the `decimal` module (`decimal.Decimal(str|int)` /
+# `decimal.from_float`), never lossily from a float literal. `+ - *` are exact;
+# `/` (`__truediv__` / `.div`) rounds to a per-call precision; rounding modes are
+# string tags (\"ROUND_HALF_EVEN\" default, the full GDAS set). No Inf/NaN, no
+# signed zero (documented divergences). Pure prelude Zap — no runtime C.
+struct Decimal:
+    bigint coeff
+    int64 exp
+
+    def __add__(self, Decimal other) -> Decimal:
+        int64 te = self.exp
+        if other.exp < te:
+            te = other.exp
+        bigint a = __dec_at(self, te)
+        bigint b = __dec_at(other, te)
+        return Decimal(coeff=a + b, exp=te)
+
+    def __sub__(self, Decimal other) -> Decimal:
+        return self.__add__(other.__neg__())
+
+    def __neg__(self) -> Decimal:
+        return Decimal(coeff=bigint(0) - self.coeff, exp=self.exp)
+
+    def __mul__(self, Decimal other) -> Decimal:
+        return Decimal(coeff=self.coeff * other.coeff, exp=self.exp + other.exp)
+
+    def __cmp__(self, Decimal other) -> int64:
+        int64 te = self.exp
+        if other.exp < te:
+            te = other.exp
+        bigint a = __dec_at(self, te)
+        bigint b = __dec_at(other, te)
+        if a < b:
+            return 0 - 1
+        if a > b:
+            return 1
+        return 0
+
+    def __eq__(self, Decimal other) -> bool:
+        return self.__cmp__(other) == 0
+
+    def div(self, Decimal other, int64 prec=28, str rounding=\"ROUND_HALF_EVEN\") -> Decimal:
+        return __dec_divide(self, other, prec, rounding)
+
+    def __truediv__(self, Decimal other) -> Decimal:
+        return __dec_divide(self, other, 28, \"ROUND_HALF_EVEN\")
+
+    def quantize(self, Decimal exemplar, str rounding=\"ROUND_HALF_EVEN\") -> Decimal:
+        return __dec_quantize(self, exemplar.exp, rounding)
+
+    def to_integral_value(self, str rounding=\"ROUND_HALF_EVEN\") -> Decimal:
+        return __dec_quantize(self, 0, rounding)
+
+    def exponent(self) -> int64:
+        return self.exp
+
+    def is_zero(self) -> bool:
+        return self.coeff == bigint(0)
+
+    def to_int(self) -> int64:
+        if self.exp >= 0:
+            return int(self.coeff * __dec_pow10(self.exp))
+        bool neg = self.coeff < bigint(0)
+        bigint mag = self.coeff
+        if neg:
+            mag = bigint(0) - mag
+        mag = mag // __dec_pow10(0 - self.exp)
+        if neg:
+            mag = bigint(0) - mag
+        return int(mag)
+
+    def __str__(self) -> str:
+        return __dec_to_str(self)
+
+    def __repr__(self) -> str:
+        return \"Decimal('\" + __dec_to_str(self) + \"')\"
+
+
+def __dec_pow10(int64 k) -> bigint:
+    bigint r = bigint(1)
+    bigint ten = bigint(10)
+    int64 i = 0
+    while i < k:
+        r = r * ten
+        i = i + 1
+    return r
+
+
+def __dec_ndigits(bigint a) -> int64:
+    bigint m = a
+    if m < bigint(0):
+        m = bigint(0) - m
+    if m == bigint(0):
+        return 1
+    bigint ten = bigint(10)
+    int64 n = 0
+    while m > bigint(0):
+        m = m // ten
+        n = n + 1
+    return n
+
+
+def __dec_zeros(int64 n) -> str:
+    str s = \"\"
+    int64 i = 0
+    while i < n:
+        s = s + \"0\"
+        i = i + 1
+    return s
+
+
+def __dec_at(Decimal d, int64 target) -> bigint:
+    return d.coeff * __dec_pow10(d.exp - target)
+
+
+def __decimal_from_int(int64 i) -> Decimal:
+    return Decimal(coeff=bigint(i), exp=0)
+
+
+def __decimal_from_float(float f) -> Decimal:
+    return __decimal_parse(str(f))
+
+
+def __decimal_parse(str raw) -> Decimal:
+    int64 n = len(raw)
+    int64 i = 0
+    while i < n and (raw[i:i + 1] == \" \" or raw[i:i + 1] == \"\\t\"):
+        i = i + 1
+    int64 j = n
+    while j > i and (raw[j - 1:j] == \" \" or raw[j - 1:j] == \"\\t\"):
+        j = j - 1
+    str s = raw[i:j]
+    int64 m = len(s)
+    if m == 0:
+        raise ValueError(\"decimal: empty string\")
+    int64 k = 0
+    bool neg = False
+    if s[k:k + 1] == \"+\" or s[k:k + 1] == \"-\":
+        neg = s[k:k + 1] == \"-\"
+        k = k + 1
+    bigint coeff = bigint(0)
+    bigint ten = bigint(10)
+    int64 frac = 0
+    bool seen_dot = False
+    bool seen_digit = False
+    while k < m:
+        str c = s[k:k + 1]
+        if c == \".\":
+            if seen_dot:
+                raise ValueError(\"decimal: multiple decimal points\")
+            seen_dot = True
+            k = k + 1
+            continue
+        if c == \"e\" or c == \"E\":
+            break
+        if not c.isdigit():
+            raise ValueError(\"decimal: invalid character in literal\")
+        coeff = coeff * ten + bigint(int(c))
+        seen_digit = True
+        if seen_dot:
+            frac = frac + 1
+        k = k + 1
+    if not seen_digit:
+        raise ValueError(\"decimal: no digits in literal\")
+    int64 expv = 0
+    if k < m and (s[k:k + 1] == \"e\" or s[k:k + 1] == \"E\"):
+        k = k + 1
+        bool eneg = False
+        if k < m and (s[k:k + 1] == \"+\" or s[k:k + 1] == \"-\"):
+            eneg = s[k:k + 1] == \"-\"
+            k = k + 1
+        bool edig = False
+        while k < m:
+            str c = s[k:k + 1]
+            if not c.isdigit():
+                raise ValueError(\"decimal: invalid exponent\")
+            expv = expv * 10 + int(c)
+            edig = True
+            k = k + 1
+        if not edig:
+            raise ValueError(\"decimal: empty exponent\")
+        if eneg:
+            expv = 0 - expv
+    if neg:
+        coeff = bigint(0) - coeff
+    return Decimal(coeff=coeff, exp=expv - frac)
+
+
+def __dec_round_inc(bigint kept, bigint dropped, bigint divisor10, bool sticky, bool neg_flag, str mode) -> bool:
+    if dropped == bigint(0) and not sticky:
+        return False
+    bigint half = divisor10 // bigint(2)
+    int64 c = 0
+    if dropped < half:
+        c = 0 - 1
+    elif dropped > half:
+        c = 1
+    if mode == \"ROUND_DOWN\":
+        return False
+    if mode == \"ROUND_UP\":
+        return True
+    if mode == \"ROUND_FLOOR\":
+        return neg_flag
+    if mode == \"ROUND_CEILING\":
+        return not neg_flag
+    if mode == \"ROUND_HALF_UP\":
+        return c >= 0
+    if mode == \"ROUND_HALF_DOWN\":
+        if c > 0:
+            return True
+        if c < 0:
+            return False
+        return sticky
+    if mode == \"ROUND_HALF_EVEN\":
+        if c > 0:
+            return True
+        if c < 0:
+            return False
+        if sticky:
+            return True
+        int64 lastd = int(kept % bigint(10))
+        return lastd % 2 == 1
+    if mode == \"ROUND_05UP\":
+        int64 last = int(kept % bigint(10))
+        return last == 0 or last == 5
+    raise ValueError(\"decimal: unknown rounding mode: \" + mode)
+
+
+def __dec_quantize(Decimal d, int64 target, str rounding) -> Decimal:
+    __dec_check_mode(rounding)
+    if target <= d.exp:
+        return Decimal(coeff=d.coeff * __dec_pow10(d.exp - target), exp=target)
+    int64 extra = target - d.exp
+    bigint divisor10 = __dec_pow10(extra)
+    bool neg_flag = d.coeff < bigint(0)
+    bigint mag = d.coeff
+    if neg_flag:
+        mag = bigint(0) - mag
+    bigint kept = mag // divisor10
+    bigint dropped = mag % divisor10
+    if __dec_round_inc(kept, dropped, divisor10, False, neg_flag, rounding):
+        kept = kept + bigint(1)
+    if neg_flag:
+        kept = bigint(0) - kept
+    return Decimal(coeff=kept, exp=target)
+
+
+def __dec_check_mode(str mode):
+    if mode == \"ROUND_HALF_EVEN\" or mode == \"ROUND_HALF_UP\" or mode == \"ROUND_HALF_DOWN\" or mode == \"ROUND_DOWN\" or mode == \"ROUND_UP\" or mode == \"ROUND_FLOOR\" or mode == \"ROUND_CEILING\" or mode == \"ROUND_05UP\":
+        return
+    raise ValueError(\"decimal: unknown rounding mode: \" + mode)
+
+
+def __dec_divide(Decimal num, Decimal den, int64 prec, str rounding) -> Decimal:
+    __dec_check_mode(rounding)
+    if den.coeff == bigint(0):
+        raise ValueError(\"decimal: division by zero\")
+    if num.coeff == bigint(0):
+        return Decimal(coeff=bigint(0), exp=0)
+    bool neg_flag = (num.coeff < bigint(0)) != (den.coeff < bigint(0))
+    bigint a = num.coeff
+    if a < bigint(0):
+        a = bigint(0) - a
+    bigint b = den.coeff
+    if b < bigint(0):
+        b = bigint(0) - b
+    int64 e0 = num.exp - den.exp
+    int64 da = __dec_ndigits(a)
+    int64 db = __dec_ndigits(b)
+    int64 sh = prec + db - da + 2
+    bigint aS = a
+    bigint bS = b
+    if sh >= 0:
+        aS = a * __dec_pow10(sh)
+    else:
+        bS = b * __dec_pow10(0 - sh)
+    bigint q = aS // bS
+    bigint r = aS % bS
+    int64 dq = __dec_ndigits(q)
+    int64 extra = dq - prec
+    if extra < 1:
+        extra = 1
+    bigint divisor10 = __dec_pow10(extra)
+    bigint kept = q // divisor10
+    bigint dropped = q % divisor10
+    bool sticky = r != bigint(0)
+    bool inc = __dec_round_inc(kept, dropped, divisor10, sticky, neg_flag, rounding)
+    if inc:
+        kept = kept + bigint(1)
+    int64 resexp = e0 - sh + extra
+    bool exact = r == bigint(0) and dropped == bigint(0) and not inc
+    if __dec_ndigits(kept) > prec:
+        kept = kept // bigint(10)
+        resexp = resexp + 1
+    if exact:
+        while kept % bigint(10) == bigint(0) and resexp < e0 and kept != bigint(0):
+            kept = kept // bigint(10)
+            resexp = resexp + 1
+    if neg_flag:
+        kept = bigint(0) - kept
+    return Decimal(coeff=kept, exp=resexp)
+
+
+def __dec_to_str(Decimal d) -> str:
+    str sign = \"\"
+    bigint mag = d.coeff
+    if d.coeff < bigint(0):
+        sign = \"-\"
+        mag = bigint(0) - mag
+    str digits = str(mag)
+    int64 nd = len(digits)
+    int64 adj = d.exp + (nd - 1)
+    str body = \"\"
+    if d.exp <= 0 and adj >= 0 - 6:
+        if d.exp == 0:
+            body = digits
+        else:
+            int64 dotpos = nd + d.exp
+            if dotpos <= 0:
+                body = \"0.\" + __dec_zeros(0 - dotpos) + digits
+            else:
+                body = digits[0:dotpos] + \".\" + digits[dotpos:nd]
+    else:
+        str mant = \"\"
+        if nd == 1:
+            mant = digits
+        else:
+            mant = digits[0:1] + \".\" + digits[1:nd]
+        int64 e = adj
+        str esign = \"+\"
+        int64 ea = e
+        if e < 0:
+            esign = \"-\"
+            ea = 0 - e
+        body = mant + \"E\" + esign + str(ea)
+    return sign + body
+
 enum JsonValue:
     Null
     Bool(bool b)
@@ -2127,6 +2466,11 @@ fn references_prelude(module: &Module) -> bool {
         "\"SubParsers\"",
         "\"ArgumentGroup\"",
         "\"MutuallyExclusiveGroup\"",
+        // The `decimal` module (#981, #981): the `Decimal` reference struct +
+        // its `__dec_*` / `__decimal_*` helpers ship in the prelude, injected for
+        // any program that names the module (`decimal.Decimal(...)`) or the struct.
+        "\"decimal\"",
+        "\"Decimal\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))

@@ -59,6 +59,7 @@ mod bisect;
 mod concurrent;
 mod crypto;
 mod datetime;
+mod decimal;
 mod fft;
 mod fs;
 mod gc;
@@ -119,6 +120,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     hash::MODULE,
     math::MODULE,
     statistics::MODULE,
+    decimal::MODULE,
     fft::MODULE,
     linalg::MODULE,
     random::MODULE,

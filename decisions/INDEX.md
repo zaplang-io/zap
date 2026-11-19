@@ -6,6 +6,12 @@ Historical decisions `D-0001…D-0243` live in the frozen
 [`DECISIONS.md`](../DECISIONS.md); new decisions are the per-file ADRs
 listed here (see [`README.md`](README.md)).
 
+## stdlib
+
+| # | Title | Status | Date |
+|---|-------|--------|------|
+| [981](stdlib/981-decimal-exact-base10.md) | stdlib decimal — exact base-10 Decimal, software over bigint | Locked | 2026-11-19 |
+
 ## tooling
 
 | # | Title | Status | Date |
