@@ -32,6 +32,11 @@ pub mod mcp;
 pub mod playground;
 pub mod repl;
 pub mod testing;
+/// Shared test-only temp-path helpers (issue #917): one pid+counter mechanism
+/// for every test module, so the `SystemTime`-nanosecond collision class (#180)
+/// cannot reappear piecemeal.
+#[cfg(test)]
+mod testutil;
 
 /// The toolchain version (shared by both binaries and `zap version`).
 pub const VERSION: &str = zapc_syntax::VERSION;
@@ -482,13 +487,10 @@ mod render_tests {
 
     impl TmpFile {
         fn new(src: &str) -> TmpFile {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path =
-                std::env::temp_dir().join(format!("zap-diag-{}-{}.zap", std::process::id(), nonce));
+            // pid + process-global counter, no clock (#917): in-process test
+            // threads reading a microsecond-quantised clock in the same tick used
+            // to get the same `zap-diag-<pid>-<nanos>.zap` path. Same prefix/suffix.
+            let path = crate::testutil::unique_temp_path("zap-diag", ".zap");
             std::fs::write(&path, src).unwrap();
             TmpFile { path }
         }

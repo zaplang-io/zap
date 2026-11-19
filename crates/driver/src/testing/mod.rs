@@ -32,6 +32,91 @@ pub fn strip_test_items(module: &mut Module) {
     });
 }
 
+/// A process-unique path for a file's throwaway test binary, under the system
+/// temp dir, named `zaptest-<stem>-<pid>-<seq>`.
+///
+/// The name combines the process id with a process-global `AtomicU64` sequence
+/// and reads **no clock** (#917): the pid distinguishes concurrent `zap test`
+/// processes and the counter distinguishes repeated calls within one process —
+/// even for two entry files with the same stem. The previous
+/// `zaptest-<stem>-<nanos>` name had neither pid nor counter, so two concurrent
+/// runs (or one run compiling two same-named entry files) landing in the same
+/// clock tick were handed the same throwaway binary path and clobbered each
+/// other. Lives here (not in the codegen-gated `run_impl`) so its uniqueness is
+/// guarded without an LLVM build; gated to the paths that use it so the
+/// no-codegen non-test build does not warn it dead.
+#[cfg(any(feature = "codegen", test))]
+fn temp_exe_path(src: &std::path::Path) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("test");
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("zaptest-{stem}-{}-{seq}", std::process::id()))
+}
+
+#[cfg(test)]
+mod temp_exe_tests {
+    use super::temp_exe_path;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Barrier, Mutex};
+
+    /// Issue #917 scenario guard: two (here, many) threads compiling entry files
+    /// with the *same* stem under a barrier must be handed distinct throwaway
+    /// binary paths. The old `zaptest-<stem>-<nanos>` name had no pid and no
+    /// counter, so on a microsecond-quantised clock these collided and clobbered
+    /// each other. With pid + process-global counter every path is distinct, so
+    /// this passes deterministically; a regression to clock-based naming fails it
+    /// here instead of flaking a real `zap test` run.
+    #[test]
+    fn same_stem_exe_paths_are_distinct_under_parallel_allocation() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 256;
+
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..PER_THREAD)
+                        // Every thread uses the identical entry stem, so only the
+                        // pid+seq suffix can tell the paths apart — exactly the
+                        // same-file, same-tick collision the bug produced.
+                        .map(|_| temp_exe_path(Path::new("same_entry.zap")))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        let seen: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
+        for h in handles {
+            let paths = h.join().expect("allocation thread panicked");
+            let mut guard = seen.lock().unwrap();
+            for p in paths {
+                assert!(
+                    guard.insert(p.clone()),
+                    "temp exe path collided for same stem under parallel allocation: {}",
+                    p.display()
+                );
+            }
+        }
+        assert_eq!(seen.lock().unwrap().len(), THREADS * PER_THREAD);
+    }
+
+    /// The generated name keeps the `zaptest-<stem>-` prefix so anything that
+    /// greps for throwaway test binaries still matches.
+    #[test]
+    fn name_keeps_zaptest_stem_prefix() {
+        let p = temp_exe_path(Path::new("/some/dir/widget_test.zap"));
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with("zaptest-widget_test-"),
+            "prefix/stem lost: {name}"
+        );
+    }
+}
+
 #[cfg(feature = "codegen")]
 pub use run_impl::{run, run_json};
 
@@ -146,7 +231,7 @@ mod run_impl {
         }
 
         // Compile the harness to a temporary executable.
-        let exe = temp_exe(path);
+        let exe = super::temp_exe_path(path);
         // Test harnesses always use the full (non-portable) link: they run on the
         // build host, where CPython and the dynamic libs are present (I#287). The
         // harness binary builds with the optimized (`-O2`) runtime — the default,
@@ -207,16 +292,6 @@ mod run_impl {
             message,
             output: String::new(),
         }
-    }
-
-    /// A unique temp path for a file's test binary.
-    fn temp_exe(src: &Path) -> PathBuf {
-        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("test");
-        let nonce = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        std::env::temp_dir().join(format!("zaptest-{stem}-{nonce}"))
     }
 
     /// Render and return an exit code for one run.

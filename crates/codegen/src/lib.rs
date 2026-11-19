@@ -348,6 +348,20 @@ fn strip_target_attrs_bitcode(path: &Path) -> Result<(), String> {
 ///
 /// `rt_path` must already have `zaprt.c` + its `#include`d `zapgc.inc.c` /
 /// `zaprace.inc.c` written beside it (the caller does this).
+/// A process-global sequence for naming the runtime caches' pre-publish temp
+/// files. Combined with the pid it makes the temp name unique across threads in
+/// this process (same pid) and across concurrent builds (distinct pids), with
+/// **no clock reading** (#917): a microsecond-quantised clock could otherwise
+/// hand two threads compiling the same cache `key` the same `zaprt-<key>.<pid>.
+/// <nanos>.tmp[.o]` name, so they'd write the same temp and race the atomic
+/// rename that publishes it into the shared cache entry. `Relaxed` suffices —
+/// we need only that each call observe a distinct value.
+fn cache_tmp_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lto_runtime_bitcode(
     cc: &str,
@@ -411,11 +425,11 @@ fn lto_runtime_bitcode(
 
     // Miss: compile the runtime to bitcode, strip inline-blocking attrs, and
     // publish atomically. Compile into a unique temp beside the cache entry.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp = cache_dir.join(format!("zaprt-{key}.{}.{nanos}.tmp", std::process::id()));
+    let tmp = cache_dir.join(format!(
+        "zaprt-{key}.{}.{}.tmp",
+        std::process::id(),
+        cache_tmp_seq()
+    ));
     let mut rc = Command::new(cc);
     rc.arg("-O2")
         // Compile the runtime with C++/Itanium exceptions ENABLED. zaprt.c
@@ -580,11 +594,11 @@ fn native_runtime_object(
     // the old single-step `cc <prog.o> zaprt.c …` passed (no `-fexceptions`: the
     // non-LTO object link never merges modules or re-runs the optimizer, so the
     // runtime's default `nounwind` is harmless here — see `lto_runtime_bitcode`).
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp = cache_dir.join(format!("zaprt-{key}.{}.{nanos}.tmp.o", std::process::id()));
+    let tmp = cache_dir.join(format!(
+        "zaprt-{key}.{}.{}.tmp.o",
+        std::process::id(),
+        cache_tmp_seq()
+    ));
     let mut rc = Command::new(cc);
     rc.arg(opt_flag).arg("-c").arg(rt_path).arg("-o").arg(&tmp);
     if immix {
@@ -7872,3 +7886,44 @@ fn float_pred(p: CmpPred) -> FloatPredicate {
 mod tests_codegen_ir;
 #[cfg(test)]
 mod tests_runtime_contract;
+
+#[cfg(test)]
+mod cache_tmp_name_tests {
+    use super::cache_tmp_seq;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Barrier, Mutex};
+
+    /// Issue #917 guard for the runtime-cache pre-publish temp names. Many
+    /// threads draw sequence values behind a barrier so they start together —
+    /// the exact condition under which the old `SystemTime`-nanosecond name (on
+    /// a microsecond-quantised clock) handed two threads compiling the same
+    /// cache `key` the same temp path and raced the atomic rename. The
+    /// process-global counter yields all-distinct values, so this passes
+    /// deterministically; a regression to clock-based naming fails it here.
+    #[test]
+    fn cache_tmp_seq_values_are_distinct_under_parallel_allocation() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 256;
+
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..PER_THREAD).map(|_| cache_tmp_seq()).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        let seen: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+        for h in handles {
+            let seqs = h.join().expect("allocation thread panicked");
+            let mut guard = seen.lock().unwrap();
+            for s in seqs {
+                assert!(guard.insert(s), "cache temp sequence value collided: {s}");
+            }
+        }
+        assert_eq!(seen.lock().unwrap().len(), THREADS * PER_THREAD);
+    }
+}

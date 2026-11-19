@@ -12,12 +12,10 @@ struct Project {
 
 impl Project {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "zap-modlink-{tag}-{}-{}",
-            std::process::id(),
-            fastrand_u64()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        // pid + process-global counter, no clock (#917): a `SystemTime`-nanosecond
+        // name collided for two tests passing the same `tag` in the same tick on a
+        // microsecond-quantised clock. Same `zap-modlink-<tag>-` prefix as before.
+        let dir = crate::testutil::unique_temp_dir(&format!("zap-modlink-{tag}"));
         Project { dir }
     }
 
@@ -44,15 +42,6 @@ impl Drop for Project {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
-}
-
-// A tiny non-crypto pseudo-random for unique temp names (avoids a dep).
-fn fastrand_u64() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
 }
 
 fn target() -> Target {
