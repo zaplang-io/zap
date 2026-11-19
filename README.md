@@ -15,9 +15,10 @@ metaprogramming system for keeping business logic free of boilerplate.
 
 - [`docs/REPO_ARCHITECTURE.md`](docs/REPO_ARCHITECTURE.md) — "where to find what": the compiler pipeline, crate map, runtime/GC, stdlib, tooling, and tests.
 - [`SPEC.md`](SPEC.md) — the language specification (the source of truth).
-- [`DECISIONS.md`](DECISIONS.md) — the language and implementation decision log.
+- [`decisions/`](decisions/) — the going-forward decision log: one ADR file per decision, keyed to its issue/PR number (index: [`decisions/INDEX.md`](decisions/INDEX.md)).
+- [`DECISIONS.md`](DECISIONS.md) — the frozen historical decision log (`D-0001…D-0243`); new decisions live in [`decisions/`](decisions/).
 - [`docs/STABILITY.md`](docs/STABILITY.md) — versioning & stability policy (the 1.0 contract).
-- [`CHANGELOG.md`](CHANGELOG.md) — notable changes, per [Keep a Changelog](https://keepachangelog.com/) (pre-1.0 / editorial 0.x).
+- [`CHANGELOG.md`](CHANGELOG.md) — notable changes, per [Keep a Changelog](https://keepachangelog.com/) (pre-1.0 / editorial 0.x); PRs add fragments under [`changelog.d/`](changelog.d/).
 - [`docs/RELEASING.md`](docs/RELEASING.md) — the release process: tag convention and how the version bumps.
 - [`docs/OFFICIAL_PACKAGE_GUIDELINES.md`](docs/OFFICIAL_PACKAGE_GUIDELINES.md) — best practices for the official non-core packages (`jwt`, `jsonschema`, `redis`, `templates`, …).
 - [`ROADMAP.md`](ROADMAP.md) — the original phased build plan; use the issue tracker and stability policy for current project status.
@@ -39,6 +40,8 @@ crates/
   fmt/, doc/, pkg/, ...  formatter, API docs, package tooling, and support crates
 docs/                    language tooling and platform documentation
 design/                  feature and runtime designs
+decisions/               decision log — one ADR file per decision, by domain
+changelog.d/             release changelog fragments (one file per PR)
 tests/
   golden/               language and runtime regression programs
   conformance/           executable checks for documented language claims
