@@ -1322,6 +1322,72 @@ mod tests {
         assert!(text.contains("call @zap_set_items"), "text:\n{text}");
     }
 
+    // --- dict/set initial-capacity + reserve (#1083) --------------------------
+
+    #[test]
+    fn lower_dict_capacity_ctor() {
+        // `dict[K,V](capacity=n)` lowers to a fresh dict then a reserve on the
+        // hint, pre-sizing the SoA table.
+        let m = lower_ok(
+            "def main():\n    \
+             dict[str, int64] d = dict[str, int64](capacity=200000)\n    \
+             d[\"a\"] = 1\n    print(len(d))\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("call @zap_dict_new"), "text:\n{text}");
+        assert!(text.contains("call @zap_dict_reserve"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_dict_reserve_method() {
+        let m = lower_ok(
+            "def main():\n    \
+             dict[int64, int64] d = {}\n    d.reserve(1000)\n    \
+             d[1] = 2\n    print(len(d))\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("call @zap_dict_reserve"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_set_capacity_ctor_and_reserve() {
+        let m = lower_ok(
+            "def main():\n    \
+             set[str] s = set[str](capacity=1000)\n    \
+             s.add(\"a\")\n    s.reserve(5000)\n    print(len(s))\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("call @zap_set_new"), "text:\n{text}");
+        assert!(text.contains("call @zap_set_reserve"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_set_from_iterable_still_positional() {
+        // A positional iterable argument is NOT a capacity hint — it still builds
+        // the set from the iterable (no reserve emitted).
+        let m = lower_ok(
+            "def main():\n    \
+             set[int64] s = set[int64]([1, 2, 3])\n    print(len(s))\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("call @zap_set_new"), "text:\n{text}");
+        assert!(text.contains("call @zap_set_add_i64"), "text:\n{text}");
+        assert!(!text.contains("call @zap_set_reserve"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_dict_negative_capacity_is_rejected() {
+        // A negative literal capacity is a compile error at lowering.
+        let (ast, perrs, lerrs) =
+            parse_str("def main():\n    auto d = dict[int64, int64](capacity=-1)\n");
+        assert!(lerrs.is_empty() && perrs.is_empty());
+        let (_m, errs) = lower_module(&ast);
+        assert!(
+            errs.iter().any(|e| format!("{e:?}").contains("negative")),
+            "expected a negative-capacity lower error, got: {errs:?}"
+        );
+    }
+
     #[test]
     fn lower_heap() {
         // heap[int64] (D-0057): construction, push/pop/peek/len, and the
