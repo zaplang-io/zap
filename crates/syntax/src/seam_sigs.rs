@@ -452,6 +452,35 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("math", "fsum", &["xs"]),
     ("math", "dist", &["p", "q"]),
     ("math", "sumprod", &["p", "q"]),
+    // ---- statistics (#980, D-0243): descriptive stats over a scalar list ----
+    // Means + order statistics take one list; the list arg is named `xs`.
+    ("statistics", "mean", &["xs"]),
+    ("statistics", "fmean", &["xs"]),
+    ("statistics", "geometric_mean", &["xs"]),
+    ("statistics", "harmonic_mean", &["xs"]),
+    ("statistics", "median", &["xs"]),
+    ("statistics", "median_low", &["xs"]),
+    ("statistics", "median_high", &["xs"]),
+    ("statistics", "mode", &["xs"]),
+    ("statistics", "multimode", &["xs"]),
+    // Spread with an optional trailing centre (`xbar`/`mu`), left absent when
+    // omitted (filled in lowering) — no interior hole, so no default row.
+    ("statistics", "variance", &["xs", "xbar"]),
+    ("statistics", "pvariance", &["xs", "mu"]),
+    ("statistics", "stdev", &["xs", "xbar"]),
+    ("statistics", "pstdev", &["xs", "mu"]),
+    // quantiles(xs, n=4, method='exclusive'): `n` sits before the trailing
+    // `method`, so it carries a SeamDefault::Int(4) below for `quantiles(xs,
+    // method='inclusive')`. `method` is trailing (defaulted in lowering).
+    ("statistics", "quantiles", &["xs", "n", "method"]),
+    // Two-list relationships; `proportional` is a trailing optional.
+    ("statistics", "covariance", &["xs", "ys"]),
+    ("statistics", "correlation", &["xs", "ys"]),
+    (
+        "statistics",
+        "linear_regression",
+        &["xs", "ys", "proportional"],
+    ),
     // ---- net (ticket #104): plaintext TCP over opaque socket handles ----
     // (connect_ip_deadline is left on the legacy path pending a settled name
     // for its deadline parameter.)
@@ -540,6 +569,10 @@ pub enum SeamDefault {
     /// types + lowers exactly like the literal a caller would have written. The
     /// default for `math.isclose`'s interior `rel_tol` (#973, D-0234).
     Float(&'static str),
+    /// An `int` literal, carried as its raw source lexeme (e.g. `"4"`) so it
+    /// types + lowers exactly like the literal a caller would have written. The
+    /// default for `statistics.quantiles`'s interior `n` (#980, D-0243).
+    Int(&'static str),
     /// A `str` literal, carried as its raw (un-escaped) UTF-8 contents. Lowers
     /// exactly like a plain string literal a caller would have written. The
     /// default for `process.run`'s interior `cwd` / `input` (#976, D-0237).
@@ -589,6 +622,17 @@ pub const SEAM_METHOD_DEFAULTS: &[(&str, &str, &str, SeamDefault)] = &[
     // filled in lowering, but is listed for symmetry (#973, D-0234).
     ("math", "isclose", "rel_tol", SeamDefault::Float("1e-9")),
     ("math", "isclose", "abs_tol", SeamDefault::Float("0.0")),
+    // `statistics.quantiles(xs, n=4, method='exclusive')`: `n` precedes the
+    // trailing `method`, so it must default when a caller supplies only
+    // `method=` by keyword (#980, D-0243). `method` is trailing (filled in
+    // lowering), listed for symmetry.
+    ("statistics", "quantiles", "n", SeamDefault::Int("4")),
+    (
+        "statistics",
+        "quantiles",
+        "method",
+        SeamDefault::Str("exclusive"),
+    ),
     // `process.run(cmd, env={}, cwd="", timeout=0.0, input="",
     // capture_output=True, merge_stderr=False)` and its `check_run` / `run_shell`
     // siblings (#976, D-0237): each option before the last one supplied must

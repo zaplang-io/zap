@@ -37,6 +37,7 @@ mod process;
 mod random;
 mod runtime;
 mod signal;
+mod statistics;
 mod sync;
 mod sys;
 mod threading;
@@ -66,6 +67,7 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     arch::declare_rt(cg);
     hash::declare_rt(cg);
     math::declare_rt(cg);
+    statistics::declare_rt(cg);
     random::declare_rt(cg);
     time::declare_rt(cg);
     datetime::declare_rt(cg);
