@@ -10,6 +10,7 @@ listed here (see [`README.md`](README.md)).
 
 | # | Title | Status | Date |
 |---|-------|--------|------|
+| [1075](lang/1075-bare-none-optional-lowering.md) | Type-contextual bare `None` lowering is one shared mechanism | Locked | 2026-11-19 |
 | [1078](lang/1078-global-regex-match-iter.md) | Global regex match `=~ m/.../g` yields an iterable `list[Match]` (eager) | Locked | 2026-11-19 |
 | [1082](lang/1106-bytesview.md) | Borrowed-bytes `bytesview` — non-owning view over `bytes` | Locked | 2026-11-19 |
 | [1082](lang/1082-borrowed-bytes-strview.md) | Borrowed-bytes `strview` — explicit non-owning string view for read-only consumers | Locked | 2026-11-19 |
@@ -22,6 +23,12 @@ listed here (see [`README.md`](README.md)).
 | [981](stdlib/981-decimal-exact-base10.md) | stdlib decimal — exact base-10 Decimal, software over bigint | Locked | 2026-11-19 |
 | [982](stdlib/982-fractions-exact-rational.md) | stdlib fractions — exact rational Fraction, software over bigint | Locked | 2026-11-19 |
 | [1095](stdlib/1095-list-pop-and-methods.md) | list.pop plus index / reverse / copy — the remaining Python list methods | Locked | 2026-11-19 |
+
+## runtime
+
+| # | Title | Status | Date |
+|---|-------|--------|------|
+| [1100](runtime/1100-channel-element-type.md) | A typed channel's element keeps its precise type on receive | Locked | 2026-11-19 |
 
 ## tooling
 
