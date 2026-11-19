@@ -7549,6 +7549,14 @@ impl<'a> FnLower<'a> {
                 .count();
         let mut field_idx = 0usize;
         let mut pieces: Vec<Value> = Vec::new();
+        // A compile-time UPPER BOUND on the joined byte length (#1081). Starts at
+        // `Some(0)` and accumulates each piece's maximum width; it becomes `None`
+        // the moment a piece's length is not statically bounded (an interpolated
+        // string, a float, an enum, a spec'd/padded field). Over-estimating a
+        // width is always safe — it only forgoes the no-root optimization — while
+        // under-estimating would let a run-time heap spill go unrooted (a UAF), so
+        // every uncertain piece drops the bound to `None`.
+        let mut max_len: Option<u64> = Some(0);
         for part in &parts {
             let piece = match part {
                 FStringPart::Text(t) => {
@@ -7557,6 +7565,7 @@ impl<'a> FnLower<'a> {
                     } else {
                         unescape(t, false)?
                     };
+                    max_len = max_len.map(|acc| acc.saturating_add(data.len() as u64));
                     let d = self.new_value(Ty::Ptr);
                     self.emit(Inst::StrConst {
                         dest: d,
@@ -7572,6 +7581,8 @@ impl<'a> FnLower<'a> {
                     };
                     field_idx += 1;
                     let (v, vt) = self.expr(field_expr)?;
+                    let w = fstring_render_max_len(vt, spec.is_some());
+                    max_len = max_len.and_then(|acc| w.map(|w| acc.saturating_add(w)));
                     match spec {
                         None => self.render_str(v, vt)?,
                         Some(fs) => self.format_value(v, vt, fs)?,
@@ -7596,11 +7607,17 @@ impl<'a> FnLower<'a> {
             }
             1 => pieces[0],
             _ => {
+                // Bounded iff the whole join provably fits the stack buffer, so a
+                // stack promotion of it can never spill and needs no GC root
+                // (#1081). The escape pass sets `stack`/`cap`; `bounded` only
+                // gates whether codegen may drop the root.
+                let bounded = max_len.is_some_and(|l| l <= STR_STACK_CAP as u64);
                 let d = self.new_value(Ty::Ptr);
                 self.emit(Inst::StrBuild {
                     dest: d,
                     parts: pieces,
                     stack: false,
+                    bounded,
                     cap: 0,
                 });
                 d
@@ -25744,6 +25761,36 @@ fn push_codepoint(out: &mut Vec<u8>, cp: u32) -> Result<(), LowerError> {
     let mut buf = [0u8; 4];
     out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
     Ok(())
+}
+
+/// A compile-time UPPER BOUND, in bytes, on the rendered width of one f-string
+/// interpolation of static type `vt` (#1081), or `None` when the width is not
+/// statically bounded. Used by `lower_fstring` to decide a `StrBuild`'s `bounded`
+/// flag, which in turn lets codegen drop the GC root of a never-spilling stack
+/// string. SOUNDNESS: the returned width must be a true upper bound on what
+/// `render_str` can emit — over-estimating only forgoes the optimization, but an
+/// under-estimate would let a run-time heap spill go unrooted (a use-after-free),
+/// so anything uncertain (a float, an enum name, any spec'd / padded field, a
+/// nested string) returns `None`.
+fn fstring_render_max_len(vt: Ty, has_spec: bool) -> Option<u64> {
+    if has_spec {
+        // A format spec may pad to an arbitrary width / precision, so the result
+        // is not statically bounded by the value's natural render.
+        return None;
+    }
+    match vt {
+        // Integers: the widest 64-bit render is 20 chars (i64::MIN is
+        // "-9223372036854775808"; u64::MAX is "18446744073709551615"). 24 leaves
+        // headroom for any sign / radix prefix without risking an under-estimate.
+        Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 => Some(24),
+        // Booleans render as "true" / "false".
+        Ty::I1 => Some(8),
+        // A single character is at most 4 UTF-8 bytes.
+        Ty::Char => Some(4),
+        // Floats, enum variant names, strings, bytes, structs, and everything
+        // else have no tight static upper bound.
+        _ => None,
+    }
 }
 
 /// Process the escape sequences in a (non-raw) string or bytes literal (#374,
