@@ -18,6 +18,18 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_fs_is_file", &[p.into()], Some(i.into()));
     cg.declare_rt("zap_fs_size", &[p.into()], Some(i.into()));
     cg.declare_rt("zap_fs_mkdtemp", &[], Some(p.into()));
+    // Tempfile (#979, D-0239). mkstemp returns an opaque handle the lowering
+    // reads into an (fd, path) tuple via the two getters (the scandir/walk
+    // handle pattern); gettempdir -> str; write_atomic -> unit (may raise).
+    cg.declare_rt(
+        "zap_fs_mkstemp",
+        &[p.into(), p.into(), p.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt("zap_fs_mkstemp_fd", &[p.into()], Some(i.into()));
+    cg.declare_rt("zap_fs_mkstemp_path", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_fs_gettempdir", &[], Some(p.into()));
+    cg.declare_rt("zap_fs_write_atomic", &[p.into(), p.into()], None);
     // Filesystem gaps (#968, D-0211). Stat getters (one per `Stat` field):
     // str -> int64 (size/mtime/ctime/mode) or int64 bool (is_dir/is_file/
     // is_symlink); `size`/`is_symlink` and friends raise on a bad path.

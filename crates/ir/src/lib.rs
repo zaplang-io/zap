@@ -344,6 +344,78 @@ mod tests {
         );
     }
 
+    // --- fs tempfile (#979, D-0239) ------------------------------------------
+
+    #[test]
+    fn fs_tempfile_lowers_mkstemp_gettempdir_write_atomic() {
+        // mkstemp with only a prefix — the omitted suffix/dir are padded in the
+        // lowering, so the fixed 3-word runtime call still goes out; its (fd,
+        // path) tuple is built from the two getters. gettempdir and write_atomic
+        // round out the surface.
+        let m = lower_ok(
+            "def main():\n\
+            \x20   auto d = fs.gettempdir()\n\
+            \x20   auto fd, p = fs.mkstemp(\"build-\")\n\
+            \x20   auto n = io.write(fd, \"hello\")\n\
+            \x20   io.close_fd(fd)\n\
+            \x20   fs.write_atomic(\"out.txt\", \"data\")\n\
+            \x20   print(d)\n\
+            \x20   print(p)\n",
+        );
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        for symbol in [
+            "zap_fs_gettempdir",
+            "zap_fs_mkstemp",
+            "zap_fs_mkstemp_fd",
+            "zap_fs_mkstemp_path",
+            "zap_fs_write_atomic",
+        ] {
+            assert!(
+                main.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(
+                    i,
+                    Inst::Call { func, .. } | Inst::Invoke { func, .. } if func == symbol
+                )),
+                "missing lowered call to {symbol}"
+            );
+        }
+        // write_atomic may raise (I/O errors), so it MUST lower to an Invoke
+        // inside a try (or a plain Call at top level) — but the fallible-call
+        // path is `throwing_call`, never a bare `emit(Call)` that try/except
+        // cannot catch. Assert mkstemp (also fallible) is a throwing call.
+        assert!(
+            main.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(
+                i, Inst::Call { func, .. } | Inst::Invoke { func, .. } if func == "zap_fs_mkstemp"
+            )),
+            "mkstemp must be emitted"
+        );
+        // The (fd, path) tuple is a StructNew.
+        assert!(
+            main.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i, Inst::StructNew { .. })),
+            "mkstemp must build an (fd, path) tuple struct"
+        );
+    }
+
+    #[test]
+    fn fs_mkstemp_no_args_lowers() {
+        // The bare call pads all three string arguments; still lowers cleanly.
+        let m = lower_ok(
+            "def main():\n\
+            \x20   auto fd, p = fs.mkstemp()\n\
+            \x20   io.close_fd(fd)\n\
+            \x20   print(p)\n",
+        );
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            main.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(
+                i, Inst::Call { func, .. } | Inst::Invoke { func, .. } if func == "zap_fs_mkstemp"
+            )),
+            "bare mkstemp must still emit the 3-word runtime call"
+        );
+    }
+
     #[test]
     fn crypto_result_types_distinguish_buffers_text_and_handles() {
         // Guard the boundary: opaque streaming contexts are not digest buffers,
