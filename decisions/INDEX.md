@@ -6,6 +6,12 @@ Historical decisions `D-0001…D-0243` live in the frozen
 [`DECISIONS.md`](../DECISIONS.md); new decisions are the per-file ADRs
 listed here (see [`README.md`](README.md)).
 
+## lang
+
+| # | Title | Status | Date |
+|---|-------|--------|------|
+| [1082](lang/1082-borrowed-bytes-strview.md) | Borrowed-bytes `strview` — explicit non-owning string view for read-only consumers | Locked | 2026-11-19 |
+
 ## stdlib
 
 | # | Title | Status | Date |

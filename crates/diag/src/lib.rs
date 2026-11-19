@@ -807,6 +807,18 @@ define_codes! {
          resolver, never unguarded). The `@target_feature` decorator itself is \
          validated under ZAP5133's sibling rules (one positional feature name from \
          the `cpu_features` taxonomy, not `\"default\"`).";
+    ZAP5135 = 5135 : "strview escapes its backing's frame",
+        "A borrowed `strview` (#1082, borrowed-bytes RFC, discussion #1097) is a \
+         non-owning view of another string's bytes, valid only while its backing \
+         string is live. It is therefore affine and may not be stored anywhere \
+         that could outlive the frame holding the backing: it may NOT be a struct \
+         field type, a module-global type, a collection element / dict key-or-value \
+         type, or a function RETURN type. Within a function a `strview` local is \
+         fine — it keeps its own backing alive (the view embeds the backing as a \
+         traced pointer, rewritten on a moving-GC evacuation), and a `strview` \
+         PARAMETER is the intended read-only borrowing API. To keep bytes past the \
+         backing's lifetime, materialize an owned copy with `.str()`. (Cross-frame \
+         returning a view of a parameter needs lifetime tracking deferred past v1.)";
 
     // ---- ZAP6xxx — lowering / IR / codegen (Experimental) ------------------
     ZAP6001 = 6001 : "lowering error",

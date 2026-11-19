@@ -4041,6 +4041,153 @@ int64_t zap_str_contains(void *sp, void *subp) {
     return zap_str_find_bytes((const ZapStr *)sp, (const ZapStr *)subp) >= 0 ? 1 : 0;
 }
 
+/* ====================================================================== */
+/* Borrowed-bytes view ABI (#1082, borrowed-bytes RFC, discussion #1097).  */
+/*                                                                          */
+/* A `strview` is a non-owning view `(backing, byte_off, byte_len)` into an */
+/* existing `ZapStr`'s bytes. The front-end lowers it to a by-value tuple   */
+/* whose `backing` field is a traced GC pointer, so a moving-Immix          */
+/* evacuation rewrites it in place (the "2b" base+offset representation,    */
+/* via the aggregate-root pairs, #586) — these entry points therefore read  */
+/* `backing->data` fresh on every call and NEVER cache a raw data pointer   */
+/* across anything that could be a safepoint. They allocate nothing and     */
+/* copy nothing (except `zap_strview_to_str`, the explicit materializer).   */
+/*                                                                          */
+/* All indices on the surface are Unicode codepoints (D-0025, Python        */
+/* clamping incl. negatives); the stored `byte_off`/`byte_len` are BYTES.   */
+
+/* Byte offset within the window `[data, data+bytelen)` of codepoint index
+ * `cp`, Python slice-bound semantics (negatives from the end; clamp to the
+ * valid `[0, cp_count]` range). O(bytelen) UTF-8 walk. */
+static int64_t zap_sv_cp_byte(const char *data, int64_t bytelen, int64_t cp) {
+    const unsigned char *d = (const unsigned char *)data;
+    int64_t cplen = 0;
+    for (int64_t i = 0; i < bytelen;) {
+        i += zap_utf8_width(d[i]);
+        cplen++;
+    }
+    if (cp < 0) {
+        cp += cplen;
+    }
+    if (cp < 0) {
+        cp = 0;
+    }
+    if (cp > cplen) {
+        cp = cplen;
+    }
+    int64_t i = 0, k = 0;
+    while (k < cp && i < bytelen) {
+        i += zap_utf8_width(d[i]);
+        k++;
+    }
+    return i;
+}
+
+/* Creation: byte offset of codepoint `lo` within the whole backing (0 when
+ * `has_lo` is false → a full view's start). */
+int64_t zap_strview_off(void *bp, int64_t lo, int64_t has_lo) {
+    const ZapStr *s = (const ZapStr *)bp;
+    return has_lo ? zap_sv_cp_byte(s->data, s->len, lo) : 0;
+}
+
+/* Creation: byte length of the view from byte offset `off` to codepoint `hi`
+ * within the whole backing (to the end when `has_hi` is false). Never
+ * negative (an inverted range yields an empty view). */
+int64_t zap_strview_len(void *bp, int64_t off, int64_t hi, int64_t has_hi) {
+    const ZapStr *s = (const ZapStr *)bp;
+    int64_t end = has_hi ? zap_sv_cp_byte(s->data, s->len, hi) : s->len;
+    return end > off ? end - off : 0;
+}
+
+/* Sub-view (`v.view(lo, hi)`): byte offset within the BACKING of codepoint
+ * `lo` measured inside the parent view window `[voff, voff+vlen)`. */
+int64_t zap_strview_sub_off(void *bp, int64_t voff, int64_t vlen, int64_t lo, int64_t has_lo) {
+    const ZapStr *s = (const ZapStr *)bp;
+    return voff + (has_lo ? zap_sv_cp_byte(s->data + voff, vlen, lo) : 0);
+}
+
+/* Sub-view: byte length from the sub-view's byte offset `noff` to codepoint
+ * `hi` inside the parent window (to the parent end when `has_hi` is false). */
+int64_t zap_strview_sub_len(void *bp, int64_t voff, int64_t vlen, int64_t noff, int64_t hi,
+                            int64_t has_hi) {
+    const ZapStr *s = (const ZapStr *)bp;
+    int64_t end = has_hi ? voff + zap_sv_cp_byte(s->data + voff, vlen, hi) : voff + vlen;
+    return end > noff ? end - noff : 0;
+}
+
+/* startswith/endswith/contains, comparing two borrowed byte windows. Both
+ * windows are valid UTF-8, so a byte match is codepoint-aligned. */
+int64_t zap_strview_startswith(void *bp, int64_t off, int64_t len, void *ap, int64_t aoff,
+                               int64_t alen) {
+    if (alen > len) {
+        return 0;
+    }
+    const char *h = ((const ZapStr *)bp)->data + off;
+    const char *n = ((const ZapStr *)ap)->data + aoff;
+    return memcmp(h, n, (size_t)alen) == 0 ? 1 : 0;
+}
+
+int64_t zap_strview_endswith(void *bp, int64_t off, int64_t len, void *ap, int64_t aoff,
+                             int64_t alen) {
+    if (alen > len) {
+        return 0;
+    }
+    const char *h = ((const ZapStr *)bp)->data + off + (len - alen);
+    const char *n = ((const ZapStr *)ap)->data + aoff;
+    return memcmp(h, n, (size_t)alen) == 0 ? 1 : 0;
+}
+
+int64_t zap_strview_contains(void *bp, int64_t off, int64_t len, void *ap, int64_t aoff,
+                             int64_t alen) {
+    const char *h = ((const ZapStr *)bp)->data + off;
+    const char *n = ((const ZapStr *)ap)->data + aoff;
+    return zap_memmem_off(h, (size_t)len, n, (size_t)alen) >= 0 ? 1 : 0;
+}
+
+/* Codepoint count of the borrowed range (Python `len`). */
+int64_t zap_strview_cp_count(void *bp, int64_t off, int64_t len) {
+    const unsigned char *d = (const unsigned char *)((const ZapStr *)bp)->data + off;
+    int64_t k = 0;
+    for (int64_t i = 0; i < len;) {
+        i += zap_utf8_width(d[i]);
+        k++;
+    }
+    return k;
+}
+
+/* Materialize an owned `str` copy of the borrowed range — the one allocating
+ * entry point, the explicit escape hatch out of the borrow. */
+void *zap_strview_to_str(void *bp, int64_t off, int64_t len) {
+    return zap_str_new(((const ZapStr *)bp)->data + off, len);
+}
+
+/* Hash the borrowed bytes with the same seeded wyhash the owned `str` path and
+ * the dict use, so a view hashes identically to its materialized `str` (#1064).
+ * Used for dict/set probing and `v.__hash__()`. */
+int64_t zap_strview_hash(void *bp, int64_t off, int64_t len) {
+    return (int64_t)zap_wyhash(((const ZapStr *)bp)->data + off, (size_t)len, zap_hash_seed);
+}
+
+/* Equality of a borrowed view with an owned `str` (the `strview == str`
+ * operator path): same length and bytes. */
+int64_t zap_strview_eq_str(void *bp, int64_t off, int64_t len, void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    if (s->len != len) {
+        return 0;
+    }
+    return memcmp(((const ZapStr *)bp)->data + off, s->data, (size_t)len) == 0 ? 1 : 0;
+}
+
+/* Equality of two borrowed views. */
+int64_t zap_strview_eq(void *bp, int64_t off, int64_t len, void *ap, int64_t aoff, int64_t alen) {
+    if (len != alen) {
+        return 0;
+    }
+    const char *x = ((const ZapStr *)bp)->data + off;
+    const char *y = ((const ZapStr *)ap)->data + aoff;
+    return memcmp(x, y, (size_t)len) == 0 ? 1 : 0;
+}
+
 /* find(sub): codepoint index of the first match, or -1. */
 int64_t zap_str_find(void *sp, void *subp) {
     const ZapStr *s = (const ZapStr *)sp;

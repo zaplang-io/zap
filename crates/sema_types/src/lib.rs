@@ -41,6 +41,24 @@ pub enum Ty {
     Bool,
     Str,
     Bytes,
+    /// A **borrowed, non-owning view** of a `str`'s bytes (#1082, borrowed-bytes
+    /// RFC — discussion #1097). A `strview` names an existing string's bytes
+    /// `(backing, byte_offset, byte_len)` **without allocating an owned `ZapStr`
+    /// or copying**, for read-only consumers (`dict.get`/`in`, `set` membership,
+    /// hash, `==`, `startswith`/`endswith`/`contains`, `int()`/`float()`/parse,
+    /// write-to-output). It is created explicitly (`s.view()` / `s.view(lo, hi)`,
+    /// sub-viewed with `v[lo:hi]`), so `str[a:b]`'s copy semantics (D-0025) are
+    /// unchanged — views are opt-in.
+    ///
+    /// A `strview` is an **affine, non-escaping** value tied to its backing's
+    /// lifetime: the checker rejects storing it into a dict/list/field/global,
+    /// returning it, or capturing it in a closure/first-class-fn (`ZAP5130`),
+    /// reusing the `@scoped` machinery (#876). At the zir level it lowers to a
+    /// by-value tuple `(str, int64, int64)`, so the backing pointer is traced and
+    /// rewritten on a moving-Immix evacuation via the existing aggregate-root
+    /// `(base, desc)` pairs (#586) — the base+offset ("2b") representation the
+    /// RFC settled on, with no new GC-root machinery.
+    StrView,
     Char,
     Bigint,
     Complex,
@@ -175,6 +193,7 @@ impl Ty {
             Ty::Bool => "bool".into(),
             Ty::Str => "str".into(),
             Ty::Bytes => "bytes".into(),
+            Ty::StrView => "strview".into(),
             Ty::Char => "char".into(),
             Ty::Bigint => "bigint".into(),
             Ty::Complex => "complex".into(),
