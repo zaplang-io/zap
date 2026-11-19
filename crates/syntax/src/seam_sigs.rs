@@ -488,6 +488,15 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     // I#481), not seam functions, so they carry no rows here.
     ("decimal", "Decimal", &["value"]),
     ("decimal", "from_float", &["f"]),
+    // ---- fractions (#982): exact rational Fraction constructor ----
+    // `Fraction(numerator, denominator)` — `denominator` is the trailing
+    // optional (omitted for the single-argument `Fraction(int)` / `Fraction(str)`
+    // forms), so `fractions.Fraction(numerator=3, denominator=4)` and
+    // `fractions.Fraction(numerator="3/4")` both bind by name. All `Fraction`
+    // arithmetic / `limit_denominator` / `to_float` / comparison surface is
+    // prelude-struct methods (kwargs via method_param_info, I#481), not seam
+    // functions, so they carry no rows here.
+    ("fractions", "Fraction", &["numerator", "denominator"]),
     // ---- net (ticket #104): plaintext TCP over opaque socket handles ----
     // (connect_ip_deadline is left on the legacy path pending a settled name
     // for its deadline parameter.)

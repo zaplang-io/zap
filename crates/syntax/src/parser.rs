@@ -904,6 +904,289 @@ def __dec_to_str(Decimal d) -> str:
         body = mant + \"E\" + esign + str(ea)
     return sign + body
 
+# Fraction — exact rational arithmetic (#982, epic #966). A reference struct
+# over the arbitrary-precision `bigint`: value = num / den, ALWAYS stored in
+# lowest terms with a normalized sign (den > 0; zero is 0/1). Built by the
+# `fractions` module (`fractions.Fraction(num, den)` / `Fraction(int)` /
+# `Fraction(str)` such as \"3/4\" or \"0.25\"), never lossily from a float literal.
+# `+ - * /` are exact; division by a zero fraction raises `ValueError`. Pure
+# prelude Zap over `bigint` — no runtime C. Operators are Fraction-on-Fraction:
+# Zap performs no implicit int -> Fraction promotion (a documented divergence
+# from Python, matching `Decimal`), so mix with an int via `Fraction(k)`.
+struct Fraction:
+    bigint num
+    bigint den
+
+    def __add__(self, Fraction other) -> Fraction:
+        return __frac_make(self.num * other.den + other.num * self.den, self.den * other.den)
+
+    def __sub__(self, Fraction other) -> Fraction:
+        return __frac_make(self.num * other.den - other.num * self.den, self.den * other.den)
+
+    def __neg__(self) -> Fraction:
+        return Fraction(num=bigint(0) - self.num, den=self.den)
+
+    def __mul__(self, Fraction other) -> Fraction:
+        return __frac_make(self.num * other.num, self.den * other.den)
+
+    def __truediv__(self, Fraction other) -> Fraction:
+        # a/b / c/d = a*d / b*c; a zero divisor drives den to 0 -> ValueError.
+        return __frac_make(self.num * other.den, self.den * other.num)
+
+    def __cmp__(self, Fraction other) -> int64:
+        # den > 0 for both, so cross-multiplication preserves the sign.
+        bigint lhs = self.num * other.den
+        bigint rhs = other.num * self.den
+        if lhs < rhs:
+            return 0 - 1
+        if lhs > rhs:
+            return 1
+        return 0
+
+    def __eq__(self, Fraction other) -> bool:
+        # Both operands are reduced + sign-normalized, so structural equality
+        # is value equality.
+        return self.num == other.num and self.den == other.den
+
+    def numerator(self) -> bigint:
+        return self.num
+
+    def denominator(self) -> bigint:
+        return self.den
+
+    def to_float(self) -> float64:
+        return float(self.num) / float(self.den)
+
+    def limit_denominator(self, int64 max_denominator=1000000) -> Fraction:
+        # Closest fraction to self with denominator at most `max_denominator`,
+        # via the continued-fraction convergents (CPython's algorithm). Work on
+        # the magnitude so `//` only ever sees non-negative operands, then
+        # reapply the sign.
+        if max_denominator < 1:
+            raise ValueError(\"fractions: max_denominator must be at least 1\")
+        bigint maxd = bigint(max_denominator)
+        if self.den <= maxd:
+            return self
+        bool neg = self.num < bigint(0)
+        bigint n = self.num
+        if neg:
+            n = bigint(0) - n
+        bigint d = self.den
+        bigint p0 = bigint(0)
+        bigint q0 = bigint(1)
+        bigint p1 = bigint(1)
+        bigint q1 = bigint(0)
+        while True:
+            bigint a = n // d
+            bigint q2 = q0 + a * q1
+            if q2 > maxd:
+                break
+            bigint np1 = p0 + a * p1
+            p0 = p1
+            q0 = q1
+            p1 = np1
+            q1 = q2
+            bigint nn = d
+            bigint nd = n - a * d
+            n = nn
+            d = nd
+        bigint k = (maxd - q0) // q1
+        Fraction bound1 = __frac_make(p0 + k * p1, q0 + k * q1)
+        Fraction bound2 = __frac_make(p1, q1)
+        Fraction target = self
+        if neg:
+            target = Fraction(num=bigint(0) - self.num, den=self.den)
+        Fraction diff1 = __frac_abs(bound1.__sub__(target))
+        Fraction diff2 = __frac_abs(bound2.__sub__(target))
+        Fraction chosen = bound1
+        if diff2.__cmp__(diff1) <= 0:
+            chosen = bound2
+        if neg:
+            return Fraction(num=bigint(0) - chosen.num, den=chosen.den)
+        return chosen
+
+    def __str__(self) -> str:
+        if self.den == bigint(1):
+            return str(self.num)
+        return str(self.num) + \"/\" + str(self.den)
+
+    def __repr__(self) -> str:
+        return \"Fraction(\" + str(self.num) + \", \" + str(self.den) + \")\"
+
+
+def __frac_gcd(bigint a, bigint b) -> bigint:
+    # Euclid's algorithm; `a` and `b` must be non-negative.
+    bigint x = a
+    bigint y = b
+    while y != bigint(0):
+        bigint t = x % y
+        x = y
+        y = t
+    return x
+
+
+def __frac_abs(Fraction f) -> Fraction:
+    if f.num < bigint(0):
+        return Fraction(num=bigint(0) - f.num, den=f.den)
+    return f
+
+
+def __frac_pow10(int64 k) -> bigint:
+    bigint r = bigint(1)
+    bigint ten = bigint(10)
+    int64 i = 0
+    while i < k:
+        r = r * ten
+        i = i + 1
+    return r
+
+
+def __frac_make(bigint n, bigint d) -> Fraction:
+    # Normalize to lowest terms with den > 0, zero as 0/1. A zero denominator
+    # raises (throwing lowering -> catchable ValueError).
+    if d == bigint(0):
+        raise ValueError(\"fractions: denominator must not be zero\")
+    bigint num = n
+    bigint den = d
+    if den < bigint(0):
+        num = bigint(0) - num
+        den = bigint(0) - den
+    if num == bigint(0):
+        return Fraction(num=bigint(0), den=bigint(1))
+    bigint mag = num
+    if mag < bigint(0):
+        mag = bigint(0) - mag
+    bigint g = __frac_gcd(mag, den)
+    return Fraction(num=num // g, den=den // g)
+
+
+def __fraction_from_int(int64 i) -> Fraction:
+    return Fraction(num=bigint(i), den=bigint(1))
+
+
+def __fraction_from_pair(int64 n, int64 d) -> Fraction:
+    return __frac_make(bigint(n), bigint(d))
+
+
+def __frac_parse_int(str s) -> bigint:
+    # A plain signed integer (ratio numerator / denominator component).
+    int64 m = len(s)
+    if m == 0:
+        raise ValueError(\"fractions: empty integer in literal\")
+    int64 k = 0
+    bool neg = False
+    if s[k:k + 1] == \"+\" or s[k:k + 1] == \"-\":
+        neg = s[k:k + 1] == \"-\"
+        k = k + 1
+    bigint acc = bigint(0)
+    bigint ten = bigint(10)
+    bool seen = False
+    while k < m:
+        str c = s[k:k + 1]
+        if not c.isdigit():
+            raise ValueError(\"fractions: invalid integer in literal\")
+        acc = acc * ten + bigint(int(c))
+        seen = True
+        k = k + 1
+    if not seen:
+        raise ValueError(\"fractions: no digits in integer literal\")
+    if neg:
+        acc = bigint(0) - acc
+    return acc
+
+
+def __frac_parse_decimal(str s) -> Fraction:
+    # A decimal / integer literal: optional sign, digits, optional `.frac`,
+    # optional `e`/`E` exponent. Produces coeff * 10**exp, then num/den.
+    int64 m = len(s)
+    int64 k = 0
+    bool neg = False
+    if k < m and (s[k:k + 1] == \"+\" or s[k:k + 1] == \"-\"):
+        neg = s[k:k + 1] == \"-\"
+        k = k + 1
+    bigint coeff = bigint(0)
+    bigint ten = bigint(10)
+    int64 frac = 0
+    bool seen_dot = False
+    bool seen_digit = False
+    while k < m:
+        str c = s[k:k + 1]
+        if c == \".\":
+            if seen_dot:
+                raise ValueError(\"fractions: multiple decimal points\")
+            seen_dot = True
+            k = k + 1
+            continue
+        if c == \"e\" or c == \"E\":
+            break
+        if not c.isdigit():
+            raise ValueError(\"fractions: invalid character in literal\")
+        coeff = coeff * ten + bigint(int(c))
+        seen_digit = True
+        if seen_dot:
+            frac = frac + 1
+        k = k + 1
+    if not seen_digit:
+        raise ValueError(\"fractions: no digits in literal\")
+    int64 expv = 0
+    if k < m and (s[k:k + 1] == \"e\" or s[k:k + 1] == \"E\"):
+        k = k + 1
+        bool eneg = False
+        if k < m and (s[k:k + 1] == \"+\" or s[k:k + 1] == \"-\"):
+            eneg = s[k:k + 1] == \"-\"
+            k = k + 1
+        bool edig = False
+        while k < m:
+            str c = s[k:k + 1]
+            if not c.isdigit():
+                raise ValueError(\"fractions: invalid exponent\")
+            expv = expv * 10 + int(c)
+            edig = True
+            k = k + 1
+        if not edig:
+            raise ValueError(\"fractions: empty exponent\")
+        if eneg:
+            expv = 0 - expv
+    if neg:
+        coeff = bigint(0) - coeff
+    int64 e = expv - frac
+    if e >= 0:
+        return __frac_make(coeff * __frac_pow10(e), bigint(1))
+    return __frac_make(coeff, __frac_pow10(0 - e))
+
+
+def __fraction_parse(str raw) -> Fraction:
+    # Strip surrounding ASCII whitespace.
+    int64 n0 = len(raw)
+    int64 i = 0
+    while i < n0 and (raw[i:i + 1] == \" \" or raw[i:i + 1] == \"\\t\"):
+        i = i + 1
+    int64 j = n0
+    while j > i and (raw[j - 1:j] == \" \" or raw[j - 1:j] == \"\\t\"):
+        j = j - 1
+    str s = raw[i:j]
+    int64 m = len(s)
+    if m == 0:
+        raise ValueError(\"fractions: empty string\")
+    # A ratio `num/den` (both plain signed integers), or a decimal literal.
+    int64 slash = 0 - 1
+    int64 p = 0
+    while p < m:
+        if s[p:p + 1] == \"/\":
+            slash = p
+            break
+        p = p + 1
+    if slash >= 0:
+        str dens = s[slash + 1:m]
+        # Like CPython: a sign is allowed only on the numerator; the
+        # denominator of a `num/den` ratio is unsigned.
+        if len(dens) > 0 and (dens[0:1] == \"+\" or dens[0:1] == \"-\"):
+            raise ValueError(\"fractions: signed denominator in ratio literal\")
+        bigint pn = __frac_parse_int(s[0:slash])
+        bigint pd = __frac_parse_int(dens)
+        return __frac_make(pn, pd)
+    return __frac_parse_decimal(s)
+
 enum JsonValue:
     Null
     Bool(bool b)
@@ -2471,6 +2754,12 @@ fn references_prelude(module: &Module) -> bool {
         // any program that names the module (`decimal.Decimal(...)`) or the struct.
         "\"decimal\"",
         "\"Decimal\"",
+        // The `fractions` module (#982, epic #966): the `Fraction` reference
+        // struct + its `__frac_*` / `__fraction_*` helpers ship in the prelude,
+        // injected for any program that names the module (`fractions.Fraction(
+        // ...)`) or the struct.
+        "\"fractions\"",
+        "\"Fraction\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))

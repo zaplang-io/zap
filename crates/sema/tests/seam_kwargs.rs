@@ -1958,3 +1958,40 @@ fn decimal_too_many_args_rejected() {
         "ZAP4025",
     );
 }
+
+// ---------------------------------------------------------------------------
+// fractions (#982) — the `Fraction` constructor binds `numerator` /
+// `denominator` by keyword; `denominator` is the trailing optional dropped by
+// the single-argument int / str forms. (The Fraction arithmetic /
+// limit_denominator / to_float surface is prelude-struct methods, so their
+// keyword arguments ride method_param_info, not the seam.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fractions_constructor_keyword_binds() {
+    assert_ok(
+        "import fractions\ndef f():\n    auto a = fractions.Fraction(numerator=3, denominator=4)\n",
+    );
+    assert_ok("import fractions\ndef f():\n    auto a = fractions.Fraction(numerator=5)\n");
+    assert_ok("import fractions\ndef f():\n    auto a = fractions.Fraction(numerator=\"3/4\")\n");
+    // reordered keywords bind by name, not position
+    assert_ok(
+        "import fractions\ndef f():\n    auto a = fractions.Fraction(denominator=4, numerator=3)\n",
+    );
+}
+
+#[test]
+fn fractions_constructor_unknown_keyword_rejected() {
+    assert_code(
+        "import fractions\ndef f():\n    auto a = fractions.Fraction(num=3, den=4)\n",
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn fractions_too_many_args_rejected() {
+    assert_code(
+        "import fractions\ndef f():\n    auto a = fractions.Fraction(1, 2, 3)\n",
+        "ZAP4025",
+    );
+}
