@@ -4188,6 +4188,49 @@ int64_t zap_strview_eq(void *bp, int64_t off, int64_t len, void *ap, int64_t aof
     return memcmp(x, y, (size_t)len) == 0 ? 1 : 0;
 }
 
+/* ---- bytesview creation (#1082 follow-up) -------------------------------- */
+/* The `bytes` counterpart of the strview creation helpers. `bytes` is BYTE-
+ * indexed (I#337), so these do no UTF-8 walk — a bounds index is clamped against
+ * the backing's byte length with Python slice semantics (negatives from the end).
+ * The read-only probes / hash / eq / materializer are shared with strview (both
+ * are `(base, off, len)` over the same `ZapStr` storage), so only these four
+ * byte-indexed entry points are bytes-specific. */
+
+/* Clamp a (possibly negative) byte index into `[0, bytelen]`, Python-style. */
+static int64_t zap_bv_clamp(int64_t idx, int64_t bytelen) {
+    if (idx < 0) {
+        idx += bytelen;
+    }
+    if (idx < 0) {
+        return 0;
+    }
+    return idx > bytelen ? bytelen : idx;
+}
+
+int64_t zap_bytesview_off(void *bp, int64_t lo, int64_t has_lo) {
+    const ZapStr *s = (const ZapStr *)bp;
+    return has_lo ? zap_bv_clamp(lo, s->len) : 0;
+}
+
+int64_t zap_bytesview_len(void *bp, int64_t off, int64_t hi, int64_t has_hi) {
+    const ZapStr *s = (const ZapStr *)bp;
+    int64_t end = has_hi ? zap_bv_clamp(hi, s->len) : s->len;
+    return end > off ? end - off : 0;
+}
+
+/* Sub-view within the parent byte window [voff, voff+vlen). */
+int64_t zap_bytesview_sub_off(void *bp, int64_t voff, int64_t vlen, int64_t lo, int64_t has_lo) {
+    (void)bp;
+    return voff + (has_lo ? zap_bv_clamp(lo, vlen) : 0);
+}
+
+int64_t zap_bytesview_sub_len(void *bp, int64_t voff, int64_t vlen, int64_t noff, int64_t hi,
+                              int64_t has_hi) {
+    (void)bp;
+    int64_t end = has_hi ? voff + zap_bv_clamp(hi, vlen) : voff + vlen;
+    return end > noff ? end - noff : 0;
+}
+
 /* find(sub): codepoint index of the first match, or -1. */
 int64_t zap_str_find(void *sp, void *subp) {
     const ZapStr *s = (const ZapStr *)sp;

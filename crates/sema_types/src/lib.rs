@@ -59,6 +59,16 @@ pub enum Ty {
     /// `(base, desc)` pairs (#586) — the base+offset ("2b") representation the
     /// RFC settled on, with no new GC-root machinery.
     StrView,
+    /// A **borrowed, non-owning view** of a `bytes` value's bytes (#1082
+    /// follow-up): the `bytes` counterpart of [`Ty::StrView`]. A `bytesview`
+    /// names an existing `bytes`'s storage `(backing, byte_offset, byte_len)`
+    /// **without allocating or copying**, for the same read-only consumers. It is
+    /// created with `b.view()` / `b.view(lo, hi)`; unlike `strview`, its bounds
+    /// are **byte** indices (I#337 — `bytes` is byte-indexed, not codepoint-
+    /// indexed). It is affine under the identical rule (`ZAP5135`) and lowers to a
+    /// by-value tuple `(bytes, int64, int64)`, tracked through evacuation by the
+    /// same aggregate-root pairs (#586).
+    BytesView,
     Char,
     Bigint,
     Complex,
@@ -194,6 +204,7 @@ impl Ty {
             Ty::Str => "str".into(),
             Ty::Bytes => "bytes".into(),
             Ty::StrView => "strview".into(),
+            Ty::BytesView => "bytesview".into(),
             Ty::Char => "char".into(),
             Ty::Bigint => "bigint".into(),
             Ty::Complex => "complex".into(),

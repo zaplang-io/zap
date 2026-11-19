@@ -2640,6 +2640,7 @@ impl Checker {
                 "bytes" => Ty::Bytes,
                 // A borrowed, non-owning view of a `str`'s bytes (#1082).
                 "strview" => Ty::StrView,
+                "bytesview" => Ty::BytesView,
                 "char" => Ty::Char,
                 "bigint" => Ty::Bigint,
                 "complex" => Ty::Complex,
@@ -2759,6 +2760,7 @@ impl Checker {
                 "str" => Ty::Str,
                 "bytes" => Ty::Bytes,
                 "strview" => Ty::StrView,
+                "bytesview" => Ty::BytesView,
                 "char" => Ty::Char,
                 "bigint" => Ty::Bigint,
                 "complex" => Ty::Complex,
@@ -3543,7 +3545,9 @@ impl Checker {
                         // even as a local, since storing a view into a container
                         // outlives the backing (#1082, ZAP5135). A *bare* `strview`
                         // local is fine — it is frame-scoped and roots its backing.
-                        if dt != Ty::StrView && Self::ty_mentions_strview(&dt) {
+                        if !matches!(dt, Ty::StrView | Ty::BytesView)
+                            && Self::ty_mentions_strview(&dt)
+                        {
                             self.error(
                                 ErrorCode::ZAP5135,
                                 format!(
@@ -3973,7 +3977,9 @@ impl Checker {
                         // even as a local, since storing a view into a container
                         // outlives the backing (#1082, ZAP5135). A *bare* `strview`
                         // local is fine — it is frame-scoped and roots its backing.
-                        if dt != Ty::StrView && Self::ty_mentions_strview(&dt) {
+                        if !matches!(dt, Ty::StrView | Ty::BytesView)
+                            && Self::ty_mentions_strview(&dt)
+                        {
                             self.error(
                                 ErrorCode::ZAP5135,
                                 format!(
@@ -7585,6 +7591,7 @@ impl Checker {
                         | Ty::Str
                         | Ty::Bytes
                         | Ty::StrView
+                        | Ty::BytesView
                         | Ty::Float64
                         | Ty::Float32
                         | Ty::UntypedFloat
@@ -7608,6 +7615,32 @@ impl Checker {
             // Borrowed `strview` (#1082): the read-only consumer subset only.
             if matches!(bt, Ty::StrView) {
                 return self.check_strview_method(name, args, *span);
+            }
+            // `bytes.view()` → a borrowed `bytesview` (#1082 follow-up). `view` is
+            // the only method `bytes` carries; bounds are byte indices (I#337).
+            if matches!(bt, Ty::Bytes) && name == "view" {
+                if args.len() > 2 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "bytes.view() takes 0, 1, or 2 arguments".to_string(),
+                        *span,
+                    );
+                }
+                for a in args {
+                    let at = self.infer(&a.value);
+                    if !assignable(&at, &Ty::Int64) && !matches!(at, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!("bytes.view() bounds must be int, found {}", at.display()),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+                return Ty::BytesView;
+            }
+            // Borrowed `bytesview` (#1082 follow-up): the read-only subset.
+            if matches!(bt, Ty::BytesView) {
+                return self.check_bytesview_method(name, args, *span);
             }
             // Built-in `dict` methods (ticket #299), typed precisely so that
             // `for k in d.keys()`, `for k, v in d.items()`, and a `copy()` that
@@ -8294,6 +8327,103 @@ impl Checker {
         }
     }
 
+    /// Type-check a method on a borrowed `bytesview` (#1082 follow-up) — the
+    /// `bytes` counterpart of [`Self::check_strview_method`]. Same read-only
+    /// subset; a string-taking argument may be a `bytes` or a `bytesview`;
+    /// `view` bounds and `len` are in **bytes** (I#337). The owning materializer
+    /// is `.to_bytes()`.
+    fn check_bytesview_method(&mut self, name: &str, args: &[Arg], span: Span) -> Ty {
+        if matches!(name, "startswith" | "endswith" | "contains") {
+            if args.len() != 1 {
+                self.error(
+                    ErrorCode::ZAP4025,
+                    format!("bytesview.{name}() takes exactly one argument"),
+                    span,
+                );
+            }
+            for a in args {
+                let at = self.infer(&a.value);
+                if !matches!(at, Ty::Bytes | Ty::BytesView | Ty::Unknown) {
+                    self.error(
+                        ErrorCode::ZAP4024,
+                        format!(
+                            "bytesview.{name}() expects a bytes or bytesview argument, found {}",
+                            at.display()
+                        ),
+                        expr_span(&a.value),
+                    );
+                }
+            }
+            return Ty::Bool;
+        }
+        match name {
+            "len" => {
+                if !args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "bytesview.len() takes no arguments".to_string(),
+                        span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                }
+                Ty::Int64
+            }
+            "view" => {
+                if args.len() > 2 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "bytesview.view() takes 0, 1, or 2 arguments".to_string(),
+                        span,
+                    );
+                }
+                for a in args {
+                    let at = self.infer(&a.value);
+                    if !assignable(&at, &Ty::Int64) && !matches!(at, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "bytesview.view() bounds must be int, found {}",
+                                at.display()
+                            ),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+                Ty::BytesView
+            }
+            // Materialize an owned `bytes` copy — the one allocating method.
+            "to_bytes" => {
+                if !args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "bytesview.to_bytes() takes no arguments".to_string(),
+                        span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                }
+                Ty::Bytes
+            }
+            _ => {
+                self.error(
+                    ErrorCode::ZAP4080,
+                    format!(
+                        "bytesview has no method '{name}' (bytesview is a borrowed, read-only \
+                         view; materialize with .to_bytes() for owning methods)"
+                    ),
+                    span,
+                );
+                for a in args {
+                    self.infer(&a.value);
+                }
+                Ty::Unknown
+            }
+        }
+    }
+
     /// Type-check a built-in `dict[K, V]` method call (tickets #299, #281).
     /// `keys() -> list[K]`, `values() -> list[V]`,
     /// `items() -> list[(K, V)]`, and `copy() -> dict[K, V]` (a shallow copy)
@@ -8811,6 +8941,7 @@ impl Checker {
                     && !assignable(&at, k)
                     && !matches!(at, Ty::Unknown)
                     && !(matches!(at, Ty::StrView) && *k == Ty::Str)
+                    && !(matches!(at, Ty::BytesView) && *k == Ty::Bytes)
                 {
                     self.error(
                         ErrorCode::ZAP4025,
