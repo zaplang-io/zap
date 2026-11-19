@@ -12209,3 +12209,85 @@ Relates to [[D-0056]] (the v1 singleton this supersedes), [[D-0230]] (the
 prelude-struct value pattern), [[D-0204]] (the seam keyword-binding convention)
 and [[D-0202]] (seam ctor sugar). No grammar change — a prelude struct, its
 methods, and one seam constructor.
+
+## D-0239 — stdlib io: buffered writer / file object — `io.writer(fd)` + a `Writer` struct (#1071 / epic #966)
+
+**Context.** [[D-0212]] (#969) shipped the *read* side of line-oriented I/O — an
+opaque buffered `io.reader(fd)` handle with `io.readline`/`readall`/`readn` — and
+**explicitly deferred the writer / stream-object shape**. So a program could
+stream input but not output: writing still meant the raw, unbuffered
+`io.write(fd, data)` with a manual `io.close_fd(fd)`, and there was no object to
+hang a context manager off for guaranteed close. That object is also the thing
+`fs.temp_file` (Python `NamedTemporaryFile`, deferred from #979) and `sys.stdout`/
+`sys.stderr` stream objects (#1035) need to build on. Writer twin of gap #3,
+Discussion #965.
+
+**Decision.** Add an 8 KiB-buffered **writer** as the twin of the #969 reader,
+surfaced as a **file object** rather than free functions.
+
+- **`io.writer(fd) -> Writer`** — wraps an already-open, writable fd (from
+  `io.open(path, "w")`, `fs.mkstemp` (#979), …) in a buffered writer. Like
+  `io.reader`, it does not open anything itself.
+- **`w.write(data: str) -> int64`** — writes `data`, returning the byte count
+  (always `len(data)` once it returns). Buffered; bytes may sit in the writer
+  until a `flush`/`close_`. A write at least as large as the buffer is sent
+  straight through (after draining, to keep output ordered) to skip a pointless
+  copy.
+- **`w.flush()`** — drain the buffer to the fd.
+- **`w.close_()`** — flush, then `close()` the underlying fd. Idempotent (a second
+  `close_` is a no-op). `write`/`flush` after `close_` raise.
+- **`with io.writer(fd) as w:`** — auto-flush + auto-close on scope exit via the
+  existing [[D-0069]] `__enter__`/`__exit__` protocol, **including on unwind** (the
+  partial output is flushed before the exception leaves the `with`). This is the
+  piece `fs.temp_file` most needs.
+
+**Handle + thin prelude struct (not a bare handle, not a value struct).** The
+mutable writer state (fd + byte buffer + `closed` flag) lives in a **pointer-free
+C struct inside a `bytes` value** — exactly the #969 reader / crypto-streaming
+([[D-0133]]) pattern, traced and freed by the precise/moving collector with no
+finalizer. That handle is then wrapped in a thin **prelude `Writer` struct**
+(field 0 = the `bytes` handle), the `LineReader`/`Lock` reference-wrapper pattern,
+because the object surface is what this slice is *for*: the reader's
+free-function style (`io.readline(r)`) offers neither method syntax nor the
+`with` protocol, and the natural free-function names would **collide with the
+existing fd-based `io.write(fd, data)`**. The object's `write`/`flush`/`close_`
+delegate to internal flat `io._writer_write`/`_writer_flush`/`_writer_close`
+entry points over the handle (the `threading._*` / `http._pool_*` precedent) —
+internal, positional-only, so they get no `seam_sigs` row; only the public
+`io.writer(fd)` constructor gets one ([[D-0213]]).
+
+**Buffered, and `close_` owns the fd — two deliberate divergences.** The writer
+is **buffered** (8 KiB), matching the reader, with explicit `flush`; this is
+Go's `bufio.Writer` and CPython's buffered file. Unlike the reader — which never
+touches the fd's lifetime — **`w.close_()` closes the underlying fd**, matching
+CPython's `file.close()` and giving the `with` form and `fs.temp_file` real
+resource release. Errors are **catchable**: `write`/`flush`/`close_` after close
+raise `ValueError` ("I/O operation on closed writer", CPython's wording); a
+syscall failure raises `RuntimeError` via the shared `zap_sys_fail`. The
+delegate lowerings use `throwing_call` (invoke), so `try`/`except` catches both.
+
+**`close_`, not `close`.** `close` is a reserved word in Zap (channel close), so
+the method is spelled `close_` — the trailing-underscore convention `Event.set_`
+uses for Python's reserved `set`. (The `with` form does not depend on the public
+name: `__exit__` calls the internal `io._writer_close` directly.)
+
+**Portable.** The runtime uses only `write()`/`close()`, which are portable, so
+no `#if !ZAP_PLATFORM_WINDOWS` guard is needed (the #969 reader likewise used
+plain `read()`).
+
+**Scope / relationship to `sys.stdout`.** The standard-stream objects
+`sys.stdout()`/`sys.stderr()` already shipped ([[D-0217]] / #1035) as a **distinct,
+deliberately simpler** surface: an *unbuffered* `bytes` handle wrapping the fd,
+written with the free function `sys.write(stream, data)` (so a line printed to
+stdout is not silently withheld in a buffer). `io.writer` is the complementary
+**buffered file object** for streaming to an fd you opened, with the method and
+context-manager surface; the two do not overlap (different runtime symbols,
+different result types), and a caller wanting a buffered stdout composes them as
+`io.writer(sys.stdout_fd())`. `fs.temp_file` (Python `NamedTemporaryFile`) builds
+on this `Writer` later (tracked under #979). This slice is `io.writer` + the
+`Writer` object only.
+
+Relates to [[D-0212]] (the #969 reader this twins), [[D-0069]] (the `with`
+protocol reused), [[D-0133]] (the opaque pointer-free handle precedent),
+[[D-0056]] / #97 (the `io` seam), [[D-0213]] (the single-argument seam row),
+[[D-0204]] (seam kwargs), epic #966, and Discussion #965 (gap #3).

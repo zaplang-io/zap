@@ -2898,6 +2898,118 @@ void *zap_io_readn(void *h_, int64_t n) {
     return s;
 }
 
+/* Buffered writer over an fd — the write twin of zap_io_reader (#1071). All
+ * fields are pointer-free, so the handle's ZapStr buffer is traced safely by the
+ * precise collector (the crypto-streaming/D-0133 pattern). None of the writer
+ * entry points allocates a Zap object, so the raw `w`/`s` pointers into GC
+ * buffers stay valid across the blocking read/write syscalls (same discipline
+ * as zap_io_reader_fill). */
+#define ZAP_IO_WBUF 8192
+typedef struct {
+    int64_t fd;
+    int32_t len;    /* bytes currently buffered in buf (0..ZAP_IO_WBUF) */
+    int32_t closed; /* 1 once close() has run; write/flush then raise */
+    char buf[ZAP_IO_WBUF];
+} zap_io_writer;
+
+/* io.writer(fd) -> handle: wrap an open, writable fd in an 8 KiB-buffered
+ * writer. Only allocates the handle; never does I/O, so it cannot raise. */
+void *zap_io_writer_new(int64_t fd) {
+    ZapStr *h = zap_str_alloc((int64_t)sizeof(zap_io_writer));
+    zap_io_writer *w = (zap_io_writer *)(void *)h->data;
+    w->fd = fd;
+    w->len = 0;
+    w->closed = 0;
+    return h;
+}
+
+/* Write exactly `n` bytes from `p` to the fd, looping over short writes and
+ * retrying on EINTR. Raises (RuntimeError) on a real error. Never allocates. */
+static void zap_io_write_full(zap_io_writer *w, const char *p, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t got = write((int)w->fd, p + off, n - off);
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            zap_sys_fail("io.writer", strerror(errno));
+        }
+        off += (size_t)got;
+    }
+}
+
+/* Drain any buffered bytes to the fd (no-op when empty). */
+static void zap_io_writer_drain(zap_io_writer *w) {
+    if (w->len > 0) {
+        zap_io_write_full(w, w->buf, (size_t)w->len);
+        w->len = 0;
+    }
+}
+
+/* Raise ValueError on any write/flush after close (matches Python's
+ * "I/O operation on closed file"). */
+static void zap_io_writer_closed_fail(void) {
+    const char *m = "I/O operation on closed writer";
+    zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+}
+
+/* io._writer_write(handle, data) -> int64: write `data`, returning the number
+ * of bytes written (always len(data) once it returns). Buffered: bytes may sit
+ * in the writer until a flush/close. A write at least as large as the buffer is
+ * sent straight through (after draining, to keep output ordered) to avoid a
+ * pointless copy. Raises ValueError on a closed writer, RuntimeError on I/O. */
+int64_t zap_io_writer_write(void *h_, void *data_) {
+    zap_io_writer *w = (zap_io_writer *)(void *)((ZapStr *)h_)->data;
+    if (w->closed) {
+        zap_io_writer_closed_fail();
+    }
+    ZapStr *s = (ZapStr *)data_;
+    size_t n = (size_t)s->len;
+    if (n == 0) {
+        return 0;
+    }
+    if (n >= (size_t)ZAP_IO_WBUF) {
+        zap_io_writer_drain(w);
+        zap_io_write_full(w, s->data, n);
+        return (int64_t)n;
+    }
+    if ((size_t)w->len + n > (size_t)ZAP_IO_WBUF) {
+        zap_io_writer_drain(w);
+    }
+    memcpy(w->buf + w->len, s->data, n);
+    w->len += (int32_t)n;
+    return (int64_t)n;
+}
+
+/* io._writer_flush(handle): drain the buffer to the fd. Raises ValueError on a
+ * closed writer, RuntimeError on I/O. */
+void zap_io_writer_flush(void *h_) {
+    zap_io_writer *w = (zap_io_writer *)(void *)((ZapStr *)h_)->data;
+    if (w->closed) {
+        zap_io_writer_closed_fail();
+    }
+    zap_io_writer_drain(w);
+}
+
+/* io._writer_close(handle): flush any buffered bytes, then close the underlying
+ * fd. Idempotent — a second close is a no-op, so the `with` __exit__ may always
+ * call it even after an explicit close in the body. Raises RuntimeError if the
+ * final flush or the close fails. Unlike the reader (which never touches the
+ * fd), the writer owns the fd's lifetime once closed, matching Python's
+ * file.close() and the resource release the `with` form and fs.temp_file need. */
+void zap_io_writer_close(void *h_) {
+    zap_io_writer *w = (zap_io_writer *)(void *)((ZapStr *)h_)->data;
+    if (w->closed) {
+        return;
+    }
+    zap_io_writer_drain(w); /* may raise; leave closed=0 so a retry can flush */
+    w->closed = 1;
+    if (close((int)w->fd) != 0) {
+        zap_sys_fail("io.writer", strerror(errno));
+    }
+}
+
 /* fs.lines(path) -> list[str]: read the whole file and split into lines with the
  * terminators stripped (`str.splitlines` semantics). A convenience for files
  * that fit in memory; stream larger inputs with io.reader + io.readline. */

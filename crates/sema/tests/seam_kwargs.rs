@@ -1228,6 +1228,45 @@ fn io_lines_and_fs_open_reader_unknown_keyword_rejected() {
     );
 }
 
+// Buffered writer / file object (#1071, D-0239): io.writer(fd) + the prelude
+// `Writer` methods. `io.writer` is the only public seam fn (one row); the
+// `_writer_*` delegates are internal and positional (no rows).
+#[test]
+fn io_writer_keyword_and_positional() {
+    assert_ok(&prog(
+        "    auto fd = io.open(\"/tmp/x\", \"w\")\n    \
+         auto w = io.writer(fd=fd)\n",
+    ));
+    assert_ok(&prog(
+        "    auto fd = io.open(\"/tmp/x\", \"w\")\n    \
+         auto w = io.writer(fd)\n",
+    ));
+}
+
+#[test]
+fn io_writer_unknown_keyword_rejected() {
+    assert_code(&prog("    auto w = io.writer(descriptor=0)\n"), "ZAP4023");
+}
+
+// The `Writer` object surface and its context-manager form type-check: `write`
+// returns int64, `flush`/`close_` return unit, and `with io.writer(fd) as w:`
+// binds `w` to a Writer (D-0069 __enter__). Shape coverage for #1071.
+#[test]
+fn io_writer_object_methods_and_with_form() {
+    assert_ok(&prog(
+        "    auto fd = io.open(\"/tmp/x\", \"w\")\n    \
+         auto w = io.writer(fd)\n    \
+         auto n = w.write(\"hello\\n\")\n    \
+         w.flush()\n    \
+         w.close_()\n",
+    ));
+    assert_ok(&prog(
+        "    auto fd = io.open(\"/tmp/x\", \"w\")\n    \
+         with io.writer(fd) as w:\n        \
+             auto n = w.write(\"line\\n\")\n",
+    ));
+}
+
 // Directory traversal (#1032, D-0224): scandir / walk / copytree.
 #[test]
 fn fs_traversal_keyword_and_positional() {

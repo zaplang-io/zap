@@ -26,4 +26,11 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_io_readline", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_io_readall", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_io_readn", &[p.into(), i.into()], Some(p.into()));
+    // Buffered writer / file-object (#1071). `writer(fd)` allocates the opaque
+    // handle (bytes); the flat `_writer_*` ops operate on it. The prelude
+    // `Writer` struct wraps the handle for the method + context-manager surface.
+    cg.declare_rt("zap_io_writer_new", &[i.into()], Some(p.into()));
+    cg.declare_rt("zap_io_writer_write", &[p.into(), p.into()], Some(i.into()));
+    cg.declare_rt("zap_io_writer_flush", &[p.into()], None);
+    cg.declare_rt("zap_io_writer_close", &[p.into()], None);
 }
