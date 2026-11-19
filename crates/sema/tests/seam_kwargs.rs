@@ -2031,3 +2031,114 @@ fn collections_defaultdict_constructor_keyword_binds() {
         "import collections\ndef zero() -> int64:\n    return 0\ndef f():\n    auto d = collections.defaultdict[str, int64](factory=zero)\n    print(len(d))\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// dict/set initial-capacity hint (#1083) — `capacity=` constructor keyword +
+// `reserve(n)` method.
+//
+// These are BUILT-IN collection constructors/methods, handled directly in the
+// sema/lowering dispatch (like every `dict`/`set` form), NOT seam-module
+// functions — there is no `dict`/`set` seam module, so they carry NO
+// `seam_sigs.rs` row and do not flow through `bind_seam_args`. `capacity` is
+// keyword-only by construction; `reserve`'s single arg stays POSITIONAL
+// (Rust-style, one obvious arg). The acceptance/rejection behaviour is still
+// pinned here alongside the other keyword-surface tests.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dict_capacity_keyword_is_accepted() {
+    assert_ok(&prog(
+        "    dict[str, int64] d = dict[str, int64](capacity=200000)\n    print(len(d))\n",
+    ));
+}
+
+#[test]
+fn set_capacity_keyword_is_accepted() {
+    assert_ok(&prog(
+        "    set[str] s = set[str](capacity=1000)\n    print(len(s))\n",
+    ));
+}
+
+#[test]
+fn dict_capacity_zero_is_accepted() {
+    // Zero is a valid hint (behaves as the default / no pre-size).
+    assert_ok(&prog(
+        "    dict[int64, int64] d = dict[int64, int64](capacity=0)\n    print(len(d))\n",
+    ));
+}
+
+#[test]
+fn dict_capacity_unknown_keyword_is_rejected() {
+    // Only `capacity` is accepted; a misspelled keyword is the #998 footgun.
+    assert_code(
+        &prog("    auto d = dict[int64, int64](capcity=8)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn dict_positional_capacity_is_rejected() {
+    // The hint is keyword-only; a bare positional argument is rejected (a
+    // populated dict uses a `{...}` literal).
+    assert_code(&prog("    auto d = dict[int64, int64](8)\n"), "ZAP4025");
+}
+
+#[test]
+fn dict_capacity_negative_literal_is_rejected() {
+    assert_code(
+        &prog("    auto d = dict[int64, int64](capacity=-1)\n"),
+        "ZAP4024",
+    );
+}
+
+#[test]
+fn set_capacity_negative_literal_is_rejected() {
+    assert_code(&prog("    auto s = set[int64](capacity=-5)\n"), "ZAP4024");
+}
+
+#[test]
+fn dict_capacity_non_integer_is_rejected() {
+    assert_code(
+        &prog("    auto d = dict[int64, int64](capacity=\"big\")\n"),
+        "ZAP4024",
+    );
+}
+
+#[test]
+fn set_still_accepts_positional_iterable() {
+    // The capacity keyword must not break the existing `set[T](iterable)` form.
+    assert_ok(&prog(
+        "    set[int64] s = set[int64]([1, 2, 3])\n    print(len(s))\n",
+    ));
+}
+
+#[test]
+fn dict_reserve_positional_is_accepted() {
+    assert_ok(&prog(
+        "    dict[int64, int64] d = {}\n    d.reserve(1000)\n    print(len(d))\n",
+    ));
+}
+
+#[test]
+fn dict_reserve_negative_literal_is_rejected() {
+    assert_code(
+        &prog("    dict[int64, int64] d = {}\n    d.reserve(-1)\n"),
+        "ZAP4024",
+    );
+}
+
+#[test]
+fn dict_reserve_wrong_arity_is_rejected() {
+    assert_code(
+        &prog("    dict[int64, int64] d = {}\n    d.reserve(1, 2)\n"),
+        "ZAP4025",
+    );
+}
+
+#[test]
+fn dict_reserve_non_integer_is_rejected() {
+    assert_code(
+        &prog("    dict[int64, int64] d = {}\n    d.reserve(\"big\")\n"),
+        "ZAP4024",
+    );
+}

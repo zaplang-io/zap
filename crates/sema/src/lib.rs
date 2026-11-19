@@ -564,6 +564,12 @@ const BUILTINS: &[&str] = &[
     // precise collector's register + post-mark finalizer queue end-to-end with a
     // stand-in finalizer and returns the number that ran. Not public surface.
     "__gc_finalizer_selftest",
+    // Internal hash-table regrow counter (#1083): the cumulative number of
+    // dict/set table reallocations so far. Lets the capacity / reserve goldens
+    // assert that a pre-sized table performs ZERO regrows while filling to the
+    // hinted size — a deterministic check a wall-clock timing never could be.
+    // Not public surface.
+    "__ht_resize_count",
 ];
 
 fn is_exception_type(name: &str) -> bool {
@@ -6619,6 +6625,10 @@ impl Checker {
             // Python's `set(xs)`.
             if matches!(base.as_ref(), Expr::Name(n, _) if n == "set") {
                 let elem = self.chan_elem_from_expr(index);
+                // Either one positional iterable (`set[T](xs)`, D17 #609) or one
+                // `capacity=` initial-capacity hint (`set[T](capacity=n)`, #1083)
+                // that pre-sizes the empty table. The two forms are not combined
+                // (building from an iterable already right-sizes as it adds).
                 match args.len() {
                     0 => {}
                     1 if args[0].name.is_none() => {
@@ -6627,9 +6637,12 @@ impl Checker {
                         // is checked against `T` at lowering (element-rep match).
                         self.iter_element(&at, expr_span(&args[0].value));
                     }
+                    1 => self.check_capacity_kwarg(&args[0], "set", span),
                     _ => self.error(
                         ErrorCode::ZAP4025,
-                        "set[T](...) takes at most one positional iterable argument".to_string(),
+                        "set[T](...) takes at most one positional iterable argument \
+                         or one `capacity=` keyword"
+                            .to_string(),
                         span,
                     ),
                 }
@@ -6675,14 +6688,19 @@ impl Checker {
                         (Ty::Unknown, Ty::Unknown)
                     }
                 };
-                if !args.is_empty() {
-                    self.error(
+                // `dict[K, V]()` takes no positional arguments (a populated dict
+                // uses a `{...}` literal), but accepts an optional `capacity=`
+                // initial-capacity hint (#1083) that pre-sizes the SoA table.
+                match args.len() {
+                    0 => {}
+                    1 => self.check_capacity_kwarg(&args[0], "dict", span),
+                    _ => self.error(
                         ErrorCode::ZAP4025,
-                        "dict[K, V]() takes no arguments; build a populated dict with a \
-                         `{...}` literal"
+                        "dict[K, V](...) takes at most one `capacity=` keyword; \
+                         build a populated dict with a `{...}` literal"
                             .to_string(),
                         span,
-                    );
+                    ),
                 }
                 self.warn_struct_key(&k, span);
                 let ty = Ty::Dict(Box::new(k), Box::new(v));
@@ -7367,6 +7385,18 @@ impl Checker {
                         self.error(
                             ErrorCode::ZAP4025,
                             "__gc_finalizer_selftest() takes no arguments".to_string(),
+                            span,
+                        );
+                    }
+                    return Ty::Int64;
+                }
+                // `__ht_resize_count()` (#1083): the cumulative dict/set table
+                // regrow count. Internal; takes no arguments, returns int64.
+                "__ht_resize_count" => {
+                    if !args.is_empty() {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "__ht_resize_count() takes no arguments".to_string(),
                             span,
                         );
                     }
@@ -8907,7 +8937,96 @@ impl Checker {
         }
     }
 
+    /// Type-check a `capacity=` initial-capacity keyword on a `dict[K,V](...)` /
+    /// `set[T](...)` constructor (#1083). `capacity` is a keyword-only hint:
+    /// exactly one argument, named `capacity`, of integer type, and (when a
+    /// literal) non-negative — a negative literal is a compile error, mirroring
+    /// Rust `with_capacity`/Java `HashMap(int)` which reject a negative size.
+    /// `container` names the surface for the message (`"dict"` / `"set"`). A
+    /// run-time-negative (non-literal) value is clamped to a no-op by the runtime.
+    fn check_capacity_kwarg(&mut self, arg: &Arg, container: &str, span: Span) {
+        match arg.name.as_deref() {
+            Some("capacity") => {}
+            // A misspelled keyword is the #998 silent-accept footgun — reject it
+            // as an unknown parameter (ZAP4023), the same a user function emits.
+            Some(other) => self.error(
+                ErrorCode::ZAP4023,
+                format!(
+                    "{container}[...](...) accepts only the keyword `capacity` \
+                     (an initial-capacity hint); unknown keyword `{other}`"
+                ),
+                span,
+            ),
+            // A bare positional argument: the hint is keyword-only, and a
+            // populated collection is built with a literal — ZAP4025, matching
+            // the pre-#1083 "takes no arguments" rejection.
+            None => self.error(
+                ErrorCode::ZAP4025,
+                format!(
+                    "{container}[...](...) takes no positional arguments; pass an \
+                     initial-capacity hint as `capacity=n`, or build a populated \
+                     {container} with a literal"
+                ),
+                span,
+            ),
+        }
+        let at = self.infer(&arg.value);
+        if !at.is_int() && !matches!(at, Ty::Unknown) {
+            self.error(
+                ErrorCode::ZAP4024,
+                format!(
+                    "{container} capacity must be an integer, got {}",
+                    at.display()
+                ),
+                span,
+            );
+        }
+        if is_negative_int_literal(&arg.value) {
+            self.error(
+                ErrorCode::ZAP4024,
+                format!("{container} capacity cannot be negative"),
+                expr_span(&arg.value),
+            );
+        }
+    }
+
     fn check_dict_method(&mut self, name: &str, args: &[Arg], k: &Ty, v: &Ty, span: Span) -> Ty {
+        // `reserve(n)` (#1083): pre-size the table so the next ~n inserts do not
+        // regrow. A single positional integer argument (Rust-style — one obvious
+        // arg, so it stays positional, not a seam kwarg); a negative literal is a
+        // compile error. Returns unit. Handled before the shared no-argument
+        // check below, like `get`.
+        if name == "reserve" {
+            if args.len() != 1 || args.iter().any(|a| a.name.is_some()) {
+                self.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "dict.reserve(n) takes exactly one positional argument \
+                         (the capacity hint), got {}",
+                        args.len()
+                    ),
+                    span,
+                );
+            }
+            if let Some(a) = args.first() {
+                let at = self.infer(&a.value);
+                if !at.is_int() && !matches!(at, Ty::Unknown) {
+                    self.error(
+                        ErrorCode::ZAP4024,
+                        format!("dict.reserve(n) expects an integer, got {}", at.display()),
+                        span,
+                    );
+                }
+                if is_negative_int_literal(&a.value) {
+                    self.error(
+                        ErrorCode::ZAP4024,
+                        "dict.reserve(n) capacity cannot be negative".to_string(),
+                        expr_span(&a.value),
+                    );
+                }
+            }
+            return Ty::Unit;
+        }
         // `get` is the one dict method that takes arguments, so it is handled
         // before the shared no-argument check below. Two forms (ticket #570):
         //   `get(key)`          -> `Optional[V]` — a safe, non-aborting read
@@ -8984,7 +9103,7 @@ impl Checker {
                     ErrorCode::ZAP4080,
                     format!(
                         "dict has no method '{other}' \
-                         (supported: keys, values, items, copy, get)"
+                         (supported: keys, values, items, copy, get, reserve)"
                     ),
                     span,
                 );
@@ -9790,6 +9909,18 @@ fn next_elem(ret: &Ty) -> Ty {
         }
     }
     ret.clone()
+}
+
+/// True for a statically-negative integer literal — a unary minus applied to an
+/// int literal, e.g. `-5` (#1083). The lexer never folds the sign into the
+/// literal, so a bare `Expr::Int` is always non-negative; a negative value is
+/// always `Unary { Neg, Int }`. Used to reject a negative `capacity=` / reserve
+/// hint at compile time (a run-time-negative value is clamped by the runtime).
+fn is_negative_int_literal(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Unary { op: UnOp::Neg, expr, .. } if matches!(expr.as_ref(), Expr::Int(_, _))
+    )
 }
 
 fn expr_span(e: &Expr) -> Span {

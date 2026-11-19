@@ -2852,8 +2852,15 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             Some(i.into()),
         );
         self.declare_rt("zap_dict_copy", &[p.into()], Some(p.into()));
+        // Pre-size the SoA table for ~n entries without a regrow (#1083): the
+        // `dict[K,V](capacity=n)` constructor keyword and the `d.reserve(n)`
+        // method both lower to this; `__ht_resize_count()` reads the cumulative
+        // regrow counter the capacity goldens assert against.
+        self.declare_rt("zap_dict_reserve", &[p.into(), i.into()], None);
+        self.declare_rt("zap_ht_resize_count", &[], Some(i.into()));
         // set
         self.declare_rt("zap_set_new", &[], Some(p.into()));
+        self.declare_rt("zap_set_reserve", &[p.into(), i.into()], None);
         self.declare_rt("zap_set_len", &[p.into()], Some(i.into()));
         self.declare_rt("zap_set_add_i64", &[p.into(), i.into()], None);
         self.declare_rt("zap_set_add_str", &[p.into(), p.into()], None);

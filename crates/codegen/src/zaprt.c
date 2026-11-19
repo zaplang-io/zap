@@ -2531,10 +2531,54 @@ void zap_list_sort_by(void *dstp, void *keysp, int64_t cmp_kind, int64_t reverse
     free(out);
 }
 
+/* Cumulative count of dict/set table reallocations (regrows), bumped by every
+ * `*_resize_to` below. Not a language surface: read from a program only through
+ * the internal `__ht_resize_count()` builtin (#1083), which lets the capacity /
+ * reserve goldens assert that a pre-sized table performs ZERO regrows while
+ * inserting up to the hinted number of entries — a deterministic check that a
+ * wall-clock timing never could be. */
+static int64_t zap_ht_resize_count_v = 0;
+int64_t zap_ht_resize_count(void) { return zap_ht_resize_count_v; }
+
+/* Smallest power-of-two capacity that holds >= `n` entries below the 0.75 load
+ * factor without a regrow, shared by dict and set (identical layout policy). The
+ * insert path regrows when `(len+1)*4 >= cap*3`, so holding `n` entries with no
+ * regrow needs `n*4 < cap*3`, i.e. `cap > 4n/3`; `want = n + n/3 + 1` is a lower
+ * bound strictly greater than `4n/3` (the `+1` clears the exact-boundary case
+ * such as n=3 -> 4n/3=4 needing cap>4), rounded up to a power of two, minimum 8
+ * (the organic table's first size). `n <= 0` means "use the default" (returns 0,
+ * so the caller leaves an empty table untouched).
+ *
+ * Space guard (#1083, consistent with the #697/D-0119 clean-abort OOM policy):
+ * the backing buffer is `25*cap` (dict) / `17*cap` (set) bytes, so a hint past
+ * ~1<<56 slots could never be allocated and the `want`/pow2 arithmetic would
+ * itself overflow int64 — fail through `zap_oom` exactly as an organically
+ * growing table would when the heap is exhausted. OOM is process-fatal, not a
+ * catchable exception (the mutator may hold GC locks), so pre-sizing aborts the
+ * same way an organic grow to that size would; it is never a try/except-able
+ * error. */
+static int64_t zap_ht_cap_for(int64_t n) {
+    if (n <= 0) {
+        return 0;
+    }
+    if (n > ((int64_t)1 << 56)) {
+        zap_oom("hash-table capacity hint too large");
+    }
+    int64_t want = n + n / 3 + 1;
+    int64_t cap = 8;
+    while (cap < want) {
+        cap <<= 1;
+    }
+    return cap;
+}
+
 /* Rehash from each entry's cached hash (#837) — no keykind needed, since the
- * stored hash word is already correct regardless of key kind. */
-static void zap_dict_resize(ZapDict *d) {
-    int64_t ncap = d->cap < 8 ? 8 : d->cap * 2;
+ * stored hash word is already correct regardless of key kind. `ncap` is the
+ * target slot count (a power of two): the doubling `zap_dict_resize` and the
+ * capacity-hint `zap_dict_reserve` (#1083) share this one rehash routine so a
+ * pre-sized table is byte-for-byte what an organically grown one would be. */
+static void zap_dict_resize_to(ZapDict *d, int64_t ncap) {
+    zap_ht_resize_count_v++;
     void *nbuf = zap_ptrbuf(zap_d_bytes(ncap));
     uint8_t *ntags = (uint8_t *)nbuf;
     int64_t *nkeys = (int64_t *)((char *)nbuf + ncap);
@@ -2568,6 +2612,24 @@ static void zap_dict_resize(ZapDict *d) {
     }
     d->buf = nbuf;
     d->cap = ncap;
+}
+
+static void zap_dict_resize(ZapDict *d) {
+    int64_t ncap = d->cap < 8 ? 8 : d->cap * 2;
+    zap_dict_resize_to(d, ncap);
+}
+
+/* Pre-size the table so the next ~`n` inserts do not regrow (#1083). A hint, not
+ * a hard bound: rounds `n` up to the pow2 size policy, grows an existing live
+ * table (rehashing its entries, losing none), never shrinks (a no-op when the
+ * table is already big enough), and treats `n <= 0` as "use the default". Both
+ * the `capacity=` constructor keyword and the `reserve(n)` method lower to this. */
+void zap_dict_reserve(void *dp, int64_t n) {
+    ZapDict *d = (ZapDict *)dp;
+    int64_t want = zap_ht_cap_for(n);
+    if (want > d->cap) {
+        zap_dict_resize_to(d, want);
+    }
 }
 
 static void zap_dict_set(void *dp, int64_t key, int keykind, int64_t val) {
@@ -3102,8 +3164,10 @@ void *zap_set_new(void) {
     return s;
 }
 
-static void zap_set_resize(ZapSet *s) {
-    int64_t ncap = s->cap < 8 ? 8 : s->cap * 2;
+/* Target-capacity rehash shared by the doubling `zap_set_resize` and the
+ * capacity-hint `zap_set_reserve` (#1083); see `zap_dict_resize_to`. */
+static void zap_set_resize_to(ZapSet *s, int64_t ncap) {
+    zap_ht_resize_count_v++;
     void *nbuf = zap_ptrbuf(zap_s_bytes(ncap));
     uint8_t *ntags = (uint8_t *)nbuf;
     int64_t *nkeys = (int64_t *)((char *)nbuf + ncap);
@@ -3129,6 +3193,21 @@ static void zap_set_resize(ZapSet *s) {
     }
     s->buf = nbuf;
     s->cap = ncap;
+}
+
+static void zap_set_resize(ZapSet *s) {
+    int64_t ncap = s->cap < 8 ? 8 : s->cap * 2;
+    zap_set_resize_to(s, ncap);
+}
+
+/* Pre-size the set table so the next ~`n` adds do not regrow (#1083); the set
+ * twin of `zap_dict_reserve` (same hint semantics, same pow2 policy). */
+void zap_set_reserve(void *sp, int64_t n) {
+    ZapSet *s = (ZapSet *)sp;
+    int64_t want = zap_ht_cap_for(n);
+    if (want > s->cap) {
+        zap_set_resize_to(s, want);
+    }
 }
 
 static void zap_set_add(void *sp, int64_t key, int keykind) {
