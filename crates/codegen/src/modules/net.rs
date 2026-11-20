@@ -43,4 +43,10 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_udp_dgram_data", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_udp_dgram_host", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_udp_dgram_port", &[p.into()], Some(i.into()));
+
+    // ---- DNS resolution surface (ticket #992, epic #985) ----
+    cg.declare_rt("zap_net_lookup_host", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_net_lookup_ipv4", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_net_lookup_ipv6", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_net_lookup_addr", &[p.into()], Some(p.into()));
 }

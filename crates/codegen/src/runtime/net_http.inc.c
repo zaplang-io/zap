@@ -1050,3 +1050,146 @@ void *zap_udp_dgram_data(void *d_) { return ((ZapDatagram *)d_)->data; }
 void *zap_udp_dgram_host(void *d_) { return ((ZapDatagram *)d_)->host; }
 int64_t zap_udp_dgram_port(void *d_) { return ((ZapDatagram *)d_)->port; }
 
+/* ===========================================================================
+ * net: DNS resolution surface (ticket #992, epic #985). The name-resolution
+ * primitives — forward (`lookup_host` + family-restricted `lookup_ipv4` /
+ * `lookup_ipv6`) and reverse (`lookup_addr`) — so a program can resolve a name
+ * to addresses itself (pre-resolve, cache, pick a family, health-check by IP)
+ * instead of only resolving implicitly inside `net.connect`. Matches Python's
+ * `socket.getaddrinfo` / `gethostbyname` and Go's `net.LookupHost` /
+ * `LookupIP` / `LookupAddr`. The results are plain `list[str]` of numeric IPs
+ * (forward) or hostnames (reverse), which the existing `net.connect(ip, port)`
+ * / `net.connect_ip_deadline` consume directly — no opaque addrinfo handle.
+ *
+ * Real DNS can block, so every getaddrinfo/getnameinfo is bracketed by
+ * enter/leave_blocking (the collector treats the thread as stopped); numeric
+ * inputs resolve without network I/O. GC discipline: the C library's addrinfo
+ * is malloc (never GC) and is consulted only before the GC list/strings are
+ * built, so no GC pointer is held across the blocking window — the same shape
+ * `fs.glob` uses to build a `list[str]`.
+ * ========================================================================== */
+
+/* net.lookup_host / lookup_ipv4 / lookup_ipv6 shared core: resolve `name` to a
+ * list[str] of numeric IPs, restricted to `family` (AF_UNSPEC = both A + AAAA).
+ * `ai_socktype = SOCK_STREAM` so each address appears once (not once per
+ * socktype). Raises on a resolve failure. */
+static void *zap_net_lookup_family(void *name_, int family) {
+    const ZapStr *name = (const ZapStr *)name_;
+    char *hz = zap_net_dupz(name);
+    if (!hz) {
+        zap_net_panic("net: out of memory");
+        return NULL;
+    }
+    zap_net_startup();
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = family;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    zap_enter_blocking();
+    int rc = getaddrinfo(hz, NULL, &hints, &res);
+    zap_leave_blocking();
+    free(hz);
+    if (rc != 0) {
+        char msg[256];
+        snprintf(msg, sizeof msg, "net: lookup failed: %s", gai_strerror(rc));
+        zap_net_panic(msg);
+        return NULL;
+    }
+    if (g_is_cancelled()) {
+        freeaddrinfo(res);
+        zap_raise(cancelled_exc());
+        return NULL;
+    }
+    void *out = zap_list_new();
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        char ipbuf[INET6_ADDRSTRLEN];
+        ipbuf[0] = '\0';
+        if (ai->ai_family == AF_INET6) {
+            inet_ntop(AF_INET6, &((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr, ipbuf,
+                      sizeof ipbuf);
+        } else if (ai->ai_family == AF_INET) {
+            inet_ntop(AF_INET, &((struct sockaddr_in *)ai->ai_addr)->sin_addr, ipbuf,
+                      sizeof ipbuf);
+        } else {
+            continue;
+        }
+        zap_list_push_ptr(out, zap_str_new(ipbuf, (int64_t)strlen(ipbuf)));
+    }
+    freeaddrinfo(res);
+    zap_check_cancel();
+    return out;
+}
+
+/* net.lookup_host(name) -> list[str]. All addresses (A + AAAA). */
+void *zap_net_lookup_host(void *name_) { return zap_net_lookup_family(name_, AF_UNSPEC); }
+
+/* net.lookup_ipv4(name) -> list[str]. IPv4 (A) addresses only. */
+void *zap_net_lookup_ipv4(void *name_) { return zap_net_lookup_family(name_, AF_INET); }
+
+/* net.lookup_ipv6(name) -> list[str]. IPv6 (AAAA) addresses only. */
+void *zap_net_lookup_ipv6(void *name_) { return zap_net_lookup_family(name_, AF_INET6); }
+
+/* net.lookup_addr(ip) -> list[str]. Reverse (PTR) lookup of a numeric IP to its
+ * hostname(s). A malformed (non-numeric) IP raises ValueError; an IP with no
+ * reverse record yields an EMPTY list (not an error), so the common "no PTR"
+ * case is distinguishable from a bad address. getnameinfo returns one canonical
+ * name, so the list carries at most one entry (the `list[str]` shape still
+ * mirrors Go's `LookupAddr`). */
+void *zap_net_lookup_addr(void *ip_) {
+    const ZapStr *ip = (const ZapStr *)ip_;
+    char *ipz = zap_net_dupz(ip);
+    if (!ipz) {
+        zap_net_panic("net: out of memory");
+        return NULL;
+    }
+    zap_net_startup();
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof ss);
+    socklen_t sl = 0;
+    unsigned char bin[16];
+    if (inet_pton(AF_INET, ipz, bin) == 1) {
+        struct sockaddr_in *a4 = (struct sockaddr_in *)&ss;
+        a4->sin_family = AF_INET;
+        memcpy(&a4->sin_addr, bin, 4);
+        sl = (socklen_t)sizeof(struct sockaddr_in);
+    } else if (inet_pton(AF_INET6, ipz, bin) == 1) {
+        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&ss;
+        a6->sin6_family = AF_INET6;
+        memcpy(&a6->sin6_addr, bin, 16);
+        sl = (socklen_t)sizeof(struct sockaddr_in6);
+    } else {
+        free(ipz);
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("net: lookup_addr requires a numeric IP",
+                                    sizeof("net: lookup_addr requires a numeric IP") - 1));
+        return NULL;
+    }
+    free(ipz);
+    char host[NI_MAXHOST];
+    host[0] = '\0';
+    zap_enter_blocking();
+    int rc = getnameinfo((struct sockaddr *)&ss, sl, host, sizeof host, NULL, 0, NI_NAMEREQD);
+    zap_leave_blocking();
+    if (g_is_cancelled()) {
+        zap_raise(cancelled_exc());
+        return NULL;
+    }
+    int no_record = (rc == EAI_NONAME);
+#ifdef EAI_NODATA
+    no_record = no_record || (rc == EAI_NODATA);
+#endif
+    if (rc != 0 && !no_record) {
+        char msg[256];
+        snprintf(msg, sizeof msg, "net: reverse lookup failed: %s", gai_strerror(rc));
+        zap_net_panic(msg);
+        return NULL;
+    }
+    void *out = zap_list_new();
+    if (rc == 0) {
+        zap_list_push_ptr(out, zap_str_new(host, (int64_t)strlen(host)));
+    }
+    zap_check_cancel();
+    return out;
+}
+

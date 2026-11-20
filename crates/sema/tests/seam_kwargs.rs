@@ -771,6 +771,32 @@ fn net_udp_positional_unchanged() {
     ));
 }
 
+#[test]
+fn net_dns_keyword_and_positional() {
+    // lookup_host/ipv4/ipv6(name) and lookup_addr(ip): keyword + positional.
+    assert_ok(&prog(
+        "    auto a = net.lookup_host(name=\"example.com\")\n",
+    ));
+    assert_ok(&prog("    auto a = net.lookup_host(\"example.com\")\n"));
+    assert_ok(&prog(
+        "    auto a = net.lookup_ipv4(name=\"example.com\")\n",
+    ));
+    assert_ok(&prog(
+        "    auto a = net.lookup_ipv6(name=\"example.com\")\n",
+    ));
+    assert_ok(&prog("    auto a = net.lookup_addr(ip=\"127.0.0.1\")\n"));
+    assert_ok(&prog("    auto a = net.lookup_addr(\"127.0.0.1\")\n"));
+    // The result is a list[str] — index + iterate type-check.
+    assert_ok(&prog(
+        "    auto a = net.lookup_host(\"h\")\n    auto first = a[0]\n    print(len(a))\n",
+    ));
+    // An unknown keyword is rejected by the central binder (ZAP4023).
+    assert_code(
+        &prog("    auto a = net.lookup_host(host=\"example.com\")\n"),
+        "ZAP4023",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // linalg — LAPACK-backed linear algebra; NumPy names (a / b / n / x / ord).
 // The check facet only infers + arity-checks (arrays type loosely), so these

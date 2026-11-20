@@ -6,8 +6,9 @@
 //! net.connect(...)` binds and flows through args/assign without new `Ty`
 //! machinery), exactly like the `crypto`/`sync` handle pattern. TLS lives in the
 //! `tls` module; UDP datagram sockets (`udp_socket`/`udp_bind`/`udp_connect`/
-//! `sendto`/`recvfrom`) were added in #991 (epic #985) over the same opaque
-//! handle. `import net` is accepted but not required.
+//! `sendto`/`recvfrom`) were added in #991 and the DNS resolution surface
+//! (`lookup_host`/`lookup_ipv4`/`lookup_ipv6`/`lookup_addr`, returning
+//! `list[str]`) in #992 (epic #985). `import net` is accepted but not required.
 
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
@@ -112,6 +113,20 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "recvfrom" => {
             expect_argc(checker, "net", method, args, 2, span);
             Ty::Tuple(vec![Ty::Str, Ty::Str, Ty::Int64])
+        }
+
+        // ---- DNS resolution surface (ticket #992, epic #985) ----
+        // net.lookup_host(name) -> list[str]: numeric IPs (A + AAAA).
+        // net.lookup_ipv4 / lookup_ipv6 restrict to one family.
+        "lookup_host" | "lookup_ipv4" | "lookup_ipv6" => {
+            expect_argc(checker, "net", method, args, 1, span);
+            Ty::List(Box::new(Ty::Str))
+        }
+        // net.lookup_addr(ip) -> list[str]: reverse (PTR) hostname(s) of a
+        // numeric IP; empty when the address has no reverse record.
+        "lookup_addr" => {
+            expect_argc(checker, "net", method, args, 1, span);
+            Ty::List(Box::new(Ty::Str))
         }
         _ => return None,
     })

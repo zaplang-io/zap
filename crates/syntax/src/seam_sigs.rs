@@ -517,6 +517,11 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("net", "udp_connect", &["sock", "host", "port"]),
     ("net", "sendto", &["sock", "data", "host", "port"]),
     ("net", "recvfrom", &["sock", "n"]),
+    // DNS resolution surface (#992, epic #985).
+    ("net", "lookup_host", &["name"]),
+    ("net", "lookup_ipv4", &["name"]),
+    ("net", "lookup_ipv6", &["name"]),
+    ("net", "lookup_addr", &["ip"]),
     // ---- linalg (tickets #926-#928): LAPACK-backed linear algebra (NumPy names) ----
     ("linalg", "solve", &["a", "b"]),
     ("linalg", "inv", &["a"]),

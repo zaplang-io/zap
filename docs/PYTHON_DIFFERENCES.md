@@ -434,6 +434,25 @@ differs in a few places:
   `net.recvfrom(sock, n)` take the socket explicitly (as every other `net`
   function does).
 
+### `net` DNS resolution (#992, decisions/stdlib/992-dns-resolution.md)
+
+- **Resolution returns plain `list[str]`.** CPython's `socket.getaddrinfo`
+  returns a list of `(family, type, proto, canonname, sockaddr)` 5-tuples and
+  `gethostbyaddr` returns a `(hostname, aliaslist, addrlist)` triple. Zap's
+  `net.lookup_host` / `lookup_ipv4` / `lookup_ipv6` return a list of numeric IP
+  strings, and `net.lookup_addr` a list of hostname strings — the shape Go's
+  `net.LookupHost` / `LookupAddr` use. The strings feed `net.connect(ip, port)`
+  directly.
+- **Address family is selected by the function, not an `AF_*` constant.** CPython
+  passes `socket.AF_INET` / `AF_INET6` to `getaddrinfo`; Zap exposes no such
+  constants, so `lookup_host` (both), `lookup_ipv4`, and `lookup_ipv6` are
+  distinct functions.
+- **A missing reverse record is an empty list, not an exception.** CPython's
+  `gethostbyaddr` raises `socket.herror` when an address has no PTR record;
+  `net.lookup_addr` returns `[]`. A non-numeric `ip` argument raises `ValueError`.
+- **No service-name resolution.** There is no `getaddrinfo(host, "http")`
+  service→port form; ports are plain integers.
+
 ---
 
 ## Parity backlog
