@@ -1390,9 +1390,7 @@ impl Mono<'_> {
         if let Some(s) = self.gstructs.get(generic).copied() {
             let mut fields = Vec::with_capacity(s.fields.len());
             for f in &s.fields {
-                let mut nf = f.clone();
-                nf.ty = self.rewrite_type(&f.ty);
-                fields.push(nf);
+                fields.push(self.rewrite_field(f)?);
             }
             let mut methods = Vec::with_capacity(s.methods.len());
             for m in &s.methods {
@@ -1452,6 +1450,63 @@ impl Mono<'_> {
         Ok(())
     }
 
+    /// Rewrite a struct field under the ambient type-parameter substitution
+    /// (`cur_subst`/`cur_self`): rename any generic type it references, and —
+    /// crucially — monomorphize its per-instance **default initializer** (#1152).
+    ///
+    /// A field default (D-0038) is a value expression evaluated fresh in the
+    /// constructor, so it must be specialized exactly like a function body or a
+    /// parameter default: a generic constructor in the default
+    /// (`Atomic[int64] state = Atomic(0)`) is rewritten to its mangled instance
+    /// (`Atomic$int64(0)`), driven by the field's declared instance type as the
+    /// expected-type sink (so an arg-less or inference-ambiguous generic
+    /// constructor still picks the right instance, mirroring the `Stmt::Let`
+    /// rule). Rewriting only the field *type* — as the field loops did before
+    /// #1152 — left the bare generic name in the default, which then reached IR
+    /// lowering and failed as "call to unknown function 'Atomic'". A computed
+    /// default supplied via `@default(expr)` carries the same kind of
+    /// initializer and is rewritten too.
+    ///
+    /// The default is evaluated with no locals in scope; the environment is
+    /// seeded only with module globals (epic #661 / D-0112), matching the
+    /// parameter-default rewrite, so a default may reference a `const` global.
+    fn rewrite_field(&mut self, f: &ast::Field) -> Result<ast::Field, LowerError> {
+        let mut nf = f.clone();
+        nf.ty = self.rewrite_type(&f.ty);
+        // Expected-type sink for the default: the field's declared type under
+        // the current substitution (concrete for a non-generic owner; the
+        // instantiated type for a generic owner).
+        let expected = self.apply_subst(&f.ty);
+        if let Some(d) = &f.default {
+            let mut env = self.field_default_env();
+            nf.default = Some(self.rewrite_expr(d, &mut env, Some(&expected))?.0);
+        }
+        for dec in &mut nf.decorators {
+            if dec.name == "default" {
+                let mut env = self.field_default_env();
+                for a in &mut dec.args {
+                    let rewritten = self.rewrite_expr(&a.value, &mut env, Some(&expected))?.0;
+                    a.value = rewritten;
+                }
+            }
+        }
+        Ok(nf)
+    }
+
+    /// A fresh rewrite environment for a field-default initializer: one scope
+    /// seeded with the module globals (epic #661 / D-0112), so a default may
+    /// reference a `const` global, mirroring the parameter-default rewrite in
+    /// [`Self::rewrite_fn_inner`]. No `self`, parameters, or locals are in scope
+    /// for a field default.
+    fn field_default_env(&self) -> Env {
+        let mut env = Env::default();
+        env.push();
+        for (name, ty) in &self.globals {
+            env.declare(name, CTy::Ty(ty.clone()));
+        }
+        env
+    }
+
     /// Rewrite a non-generic struct declaration: rename any generic types its
     /// fields reference, and rewrite its method bodies.
     fn rewrite_struct_nongeneric(&mut self, s: &StructDef) -> Result<StructDef, LowerError> {
@@ -1464,9 +1519,7 @@ impl Mono<'_> {
         self.cur_self = Some((s.name.clone(), Vec::new()));
         let mut fields = Vec::with_capacity(s.fields.len());
         for f in &s.fields {
-            let mut nf = f.clone();
-            nf.ty = self.rewrite_type(&f.ty);
-            fields.push(nf);
+            fields.push(self.rewrite_field(f)?);
         }
         let mut methods = Vec::with_capacity(s.methods.len());
         for m in &s.methods {
@@ -4720,6 +4773,152 @@ mod tests {
         assert!(
             rendered.contains("Optional$") && !rendered.contains("Optional[int64]"),
             "set[Optional[int64]]() subscript not mangled: {rendered}"
+        );
+    }
+
+    // ---- struct field-default initializers (#1152) -----------------------
+    //
+    // A per-instance field default (D-0038) is an initializer expression that
+    // must be monomorphized exactly like a function body or a parameter
+    // default: a generic constructor in the default (`Atomic[int64] state =
+    // Atomic(0)`) has to be specialized to its mangled instance
+    // (`Atomic$int64(0)`). Before #1152 the field loops rewrote only the field
+    // *type* and left the default expression untouched, so the bare generic
+    // name survived into IR lowering and failed as "call to unknown function
+    // 'Atomic'". These tests pin the rewrite at the mono boundary (the mangled
+    // symbol must appear, the bare generic name must not); the golden suite
+    // covers the end-to-end runtime behavior against the real prelude `Atomic`.
+
+    /// The default expression of field `fname` on struct `sname`, rendered.
+    fn field_default_rendered(m: &Module, sname: &str, fname: &str) -> String {
+        let s = struct_named(m, sname).unwrap_or_else(|| panic!("struct {sname} emitted"));
+        let f = s
+            .fields
+            .iter()
+            .find(|f| f.name == fname)
+            .unwrap_or_else(|| panic!("field {fname} on {sname}"));
+        let d = f
+            .default
+            .as_ref()
+            .unwrap_or_else(|| panic!("field {fname} has a default"));
+        zapc_syntax::ast::render_expr(d)
+    }
+
+    #[test]
+    fn field_default_generic_ctor_is_mangled_nongeneric_struct() {
+        // The non-generic-struct path (`rewrite_struct_nongeneric`): a generic
+        // constructor used as a field default must be specialized, driven by
+        // the field's declared instance type.
+        let m = mono_ok(
+            "struct Box[T]:\n    T value\n\
+             struct Client:\n    Box[int64] state = Box(0)\n\
+             def main():\n    auto c = Client()\n    print(c.state.value)\n",
+        );
+        let rendered = field_default_rendered(&m, "Client", "state");
+        assert!(
+            rendered.contains("Box$int64") && !rendered.contains("Box(0)"),
+            "field default generic ctor not mangled: {rendered}"
+        );
+        assert!(
+            struct_named(&m, "Box$int64").is_some(),
+            "the field default's generic instance must be emitted"
+        );
+    }
+
+    #[test]
+    fn field_default_generic_ctor_is_mangled_generic_struct() {
+        // The generic-struct specialization path
+        // (`rewrite_struct_instance`): a field default that constructs another
+        // generic instance keyed off the *owner's* type parameter is rewritten
+        // under the ambient substitution.
+        let m = mono_ok(
+            "struct Box[T]:\n    T value\n\
+             struct Holder[T]:\n    Box[T] slot = Box(0)\n\
+             def main():\n    auto h = Holder[int64]()\n    print(h.slot.value)\n",
+        );
+        let rendered = field_default_rendered(&m, "Holder$int64", "slot");
+        assert!(
+            rendered.contains("Box$int64") && !rendered.contains("Box(0)"),
+            "generic-struct field default not mangled under subst: {rendered}"
+        );
+    }
+
+    #[test]
+    fn field_default_rewrite_matches_let_initializer() {
+        // The field default must be monomorphized *identically* to the same
+        // expression written as a `let` initializer — that parity is the fix.
+        // Here the generic constructor is resolved by argument unification
+        // (exactly as `auto x = Box(0)` is), so both forms yield `Box$int64`.
+        let fd = {
+            let m = mono_ok(
+                "struct Box[T]:\n    T value\n\
+                 struct Client:\n    Box[int64] state = Box(0)\n\
+                 def main():\n    auto c = Client()\n    print(c.state.value)\n",
+            );
+            field_default_rendered(&m, "Client", "state")
+        };
+        let letv = {
+            let m = mono_ok(
+                "struct Box[T]:\n    T value\n\
+                 def main():\n    Box[int64] x = Box(0)\n    print(x.value)\n",
+            );
+            let f = m
+                .items
+                .iter()
+                .find_map(|i| match i {
+                    Item::Function(f) if f.name == "main" => Some(f),
+                    _ => None,
+                })
+                .expect("main present");
+            let Stmt::Let { value, .. } = &f.body.stmts[0] else {
+                panic!("expected a let, got {:?}", f.body.stmts[0]);
+            };
+            zapc_syntax::ast::render_expr(value)
+        };
+        assert_eq!(
+            fd, letv,
+            "a field default must monomorphize exactly like the same `let` initializer"
+        );
+    }
+
+    #[test]
+    fn field_default_argless_generic_ctor_uses_field_type_sink() {
+        // An *arg-less* generic constructor cannot infer its instance from
+        // arguments, so the field's declared type is the expected-type sink
+        // (mirroring the `Stmt::Let` rule). Without threading the field type
+        // through, this would fail to resolve `T`.
+        let m = mono_ok(
+            "struct Box[T]:\n    T value = 0\n\
+             struct Client:\n    Box[int64] state = Box()\n\
+             def main():\n    auto c = Client()\n    print(c.state.value)\n",
+        );
+        let rendered = field_default_rendered(&m, "Client", "state");
+        assert!(
+            rendered.contains("Box$int64") && !rendered.contains("Box()"),
+            "arg-less generic ctor default not resolved via field-type sink: {rendered}"
+        );
+    }
+
+    #[test]
+    fn field_default_decorator_generic_ctor_is_mangled() {
+        // A computed default via `@default(expr)` carries the same kind of
+        // initializer expression and must be rewritten too.
+        let m = mono_ok(
+            "struct Box[T]:\n    T value\n\
+             struct Client:\n    @default(Box(0))\n    Box[int64] state\n\
+             def main():\n    auto c = Client()\n    print(c.state.value)\n",
+        );
+        let s = struct_named(&m, "Client").expect("Client emitted");
+        let f = s.fields.iter().find(|f| f.name == "state").unwrap();
+        let dec = f
+            .decorators
+            .iter()
+            .find(|d| d.name == "default")
+            .expect("@default decorator preserved");
+        let rendered = zapc_syntax::ast::render_expr(&dec.args[0].value);
+        assert!(
+            rendered.contains("Box$int64") && !rendered.contains("Box(0)"),
+            "@default decorator generic ctor not mangled: {rendered}"
         );
     }
 }
