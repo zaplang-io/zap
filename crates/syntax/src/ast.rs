@@ -274,11 +274,24 @@ pub struct Field {
     pub span: Span,
 }
 
+/// An associated (output) type declared on an interface (#1207): the `Out` in
+/// `interface Producer[In]: type Out`. A conformer binds it structurally (by the
+/// return type of the method that produces it), and bounded generic code names
+/// it as a dotted type projection `T.Out`.
+#[derive(Clone, Debug)]
+pub struct AssocType {
+    pub name: String,
+    pub span: Span,
+}
+
 /// A structural interface (D-0016).
 #[derive(Clone, Debug)]
 pub struct InterfaceDef {
     pub name: String,
     pub generics: Vec<TypeParam>,
+    /// Associated/output types declared in the body with `type Name` (#1207), in
+    /// declaration order. Empty for an interface with none.
+    pub assoc_types: Vec<AssocType>,
     /// Refined supertypes (D-0139/#806): the `Equatable` in
     /// `interface Hashable: Equatable`. Each names an interface this interface
     /// refines; a type conforming to this interface must conform to every

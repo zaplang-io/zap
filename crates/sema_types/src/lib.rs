@@ -724,6 +724,12 @@ pub struct InterfaceInfo {
     /// it as a `Ty::Named(param)` type variable so structural conformance can
     /// substitute the concrete type arguments (`T := A`) before matching.
     pub generics: Vec<String>,
+    /// The interface's associated/output type names in declaration order
+    /// (#1207): the `Out` in `interface Producer[In]: type Out`. A method that
+    /// names one keeps it as a `Ty::Named(assoc)` type variable; a conformer
+    /// binds it structurally, and bounded code projects it as `T.Out`. Empty for
+    /// an interface with no associated types.
+    pub assoc_types: Vec<String>,
     /// Interface method name -> signature (`self` is the first parameter, typed
     /// as the interface itself), in declaration order.
     pub methods: Vec<(String, FnSig)>,

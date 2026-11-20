@@ -3935,8 +3935,27 @@ impl Parser {
         self.expect(&TokenKind::Newline, "newline");
         self.expect(&TokenKind::Indent, "indented block");
         let mut methods = Vec::new();
+        let mut assoc_types = Vec::new();
         while !self.is(&TokenKind::Dedent) && !self.at_eof() {
             let before = self.pos;
+            // An associated-type declaration `type Name` (#1207). `type` is a
+            // soft keyword (the alias form `type X = …` at module scope is an
+            // `Ident("type")` followed by a name); here, inside an interface
+            // body, a bare `type Name` declares an associated/output type the
+            // conformer binds structurally.
+            if matches!(self.peek(), TokenKind::Ident(n) if n == "type")
+                && matches!(self.peek2(), TokenKind::Ident(_))
+            {
+                let tstart = self.peek_span().start;
+                self.bump(); // `type`
+                let aname = self.ident("associated type name");
+                self.expect(&TokenKind::Newline, "newline after associated type");
+                assoc_types.push(AssocType {
+                    name: aname,
+                    span: self.span_from(tstart),
+                });
+                continue;
+            }
             let mstart = self.peek_span().start;
             self.expect_kw(Keyword::Def, "'def'");
             let mname = self.ident("method name");
@@ -3963,6 +3982,7 @@ impl Parser {
         InterfaceDef {
             name,
             generics,
+            assoc_types,
             supertypes,
             methods,
             span: self.span_from(start),
@@ -6532,6 +6552,56 @@ mod tests {
         let m = parse_ok("interface C: A, B\n    def c(self) -> int64\n");
         let i = interface_of(&m);
         assert_eq!(supertype_names(i), vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn interface_associated_type_parses() {
+        // `type Out` in an interface body declares an associated type (#1207);
+        // the method block parses alongside it.
+        let m =
+            parse_ok("interface Producer[In]:\n    type Out\n    def make(self, In seed) -> Out\n");
+        let i = interface_of(&m);
+        assert_eq!(
+            i.assoc_types
+                .iter()
+                .map(|a| a.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["Out".to_string()]
+        );
+        assert_eq!(
+            i.generics
+                .iter()
+                .map(|g| g.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["In".to_string()]
+        );
+        assert_eq!(i.methods.len(), 1);
+        assert_eq!(i.methods[0].name, "make");
+    }
+
+    #[test]
+    fn interface_multiple_associated_types_parse_in_order() {
+        // Several `type` lines are recorded in declaration order, interleaved
+        // with methods.
+        let m = parse_ok(
+            "interface Two:\n    type A\n    def one(self) -> A\n    type B\n    def two(self) -> B\n",
+        );
+        let i = interface_of(&m);
+        assert_eq!(
+            i.assoc_types
+                .iter()
+                .map(|a| a.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["A".to_string(), "B".to_string()]
+        );
+        assert_eq!(i.methods.len(), 2);
+    }
+
+    #[test]
+    fn interface_without_associated_types_has_empty_list() {
+        // Regression: a plain interface carries no associated types.
+        let m = parse_ok("interface Shape:\n    def area(self) -> f64\n");
+        assert!(interface_of(&m).assoc_types.is_empty());
     }
 
     #[test]

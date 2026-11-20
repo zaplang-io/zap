@@ -20,6 +20,7 @@ listed here (see [`README.md`](README.md)).
 | [1199](lang/1199-operator-capability-interfaces.md) | Operator capabilities are declared prelude generic interfaces (forward + reflected) | Accepted | 2026-11-20 |
 | [1205](lang/1205-generic-interface-conformance.md) | Generic-interface conformance — substitute the interface's type parameters | Accepted | 2026-11-20 |
 | [1206](lang/1206-param-referencing-bounds.md) | Bounds referencing other type parameters — capture and substitute the bound's arguments | Accepted | 2026-11-20 |
+| [1207](lang/1207-associated-output-types.md) | Associated / output types on interfaces (`type Out`), projected as `T.Out` | Accepted | 2026-11-20 |
 
 ## stdlib
 

@@ -179,7 +179,13 @@ field         ::= decorators type IDENT [ ":" INT ] [ "=" expr ] NEWLINE ;
                      1 <= INT <= type width; widths of one struct sum to <= 64. *)
 
 interface_def ::= "interface" IDENT [ generics ] ":" [ supertype_list ] NEWLINE
-                  INDENT { method_sig } DEDENT ;
+                  INDENT { assoc_type | method_sig } DEDENT ;
+assoc_type    ::= "type" IDENT NEWLINE ;
+                  (* Associated/output type (#1207): `interface Producer[In]:
+                     type Out`. A conformer binds it structurally (by the
+                     producing method's return); bounded generic code names it as
+                     the dotted type projection `T.Out`. Distinguished from the
+                     module-scope `type_alias` by the absence of a `=`. *)
 supertype_list ::= type { "," type } ;
                   (* Interface refinement (D-0139/I#806): `interface Hashable:
                      Equatable` refines `Equatable`. Each `type` names an

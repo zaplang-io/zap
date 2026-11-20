@@ -460,11 +460,36 @@ impl<'a> Printer<'a> {
         ));
         self.indent += 1;
         self.block_fresh = true;
-        for m in &i.methods {
-            self.advance_to(m.span.start, 1);
-            self.emit_signature("def ", &m.name, &[], &m.params, &m.ret, false);
-            self.last_end = m.span.end;
-            self.take_trailing(m.span.end);
+        // Associated/output types (`type Out`, #1207) and method signatures are
+        // emitted in source order (their spans interleave), so blank lines and
+        // comments between them are preserved and a `type` declaration is never
+        // dropped on a reformat.
+        enum IMember<'a> {
+            Assoc(&'a AssocType),
+            Method(&'a MethodSig),
+        }
+        let mut members: Vec<(u32, IMember)> = Vec::new();
+        members.extend(
+            i.assoc_types
+                .iter()
+                .map(|a| (a.span.start, IMember::Assoc(a))),
+        );
+        members.extend(i.methods.iter().map(|m| (m.span.start, IMember::Method(m))));
+        members.sort_by_key(|(start, _)| *start);
+        for (start, member) in members {
+            self.advance_to(start, 1);
+            match member {
+                IMember::Assoc(a) => {
+                    self.push_line(&format!("type {}", a.name));
+                    self.last_end = a.span.end;
+                    self.take_trailing(a.span.end);
+                }
+                IMember::Method(m) => {
+                    self.emit_signature("def ", &m.name, &[], &m.params, &m.ret, false);
+                    self.last_end = m.span.end;
+                    self.take_trailing(m.span.end);
+                }
+            }
         }
         self.flush_dangling(i.span.end);
         self.indent -= 1;
@@ -1283,6 +1308,18 @@ mod tests {
         let src = "type Count = int64\n\ntype Pair[T] = (T, T)\n\n\
                    type Table = dict[str, int64]\n\ntype Pred = fn(int64) -> bool\n";
         assert_eq!(format_source(src).unwrap(), src);
+    }
+
+    #[test]
+    fn interface_associated_types_round_trip() {
+        // Associated/output types (`type Out`, #1207) re-emit byte-for-byte,
+        // interleaved with methods in source order — a reformat must never drop a
+        // `type` declaration (regression guard for the AST-reconstruction path).
+        let src = "interface Producer[In]:\n    type Out\n    def make(self, In seed) -> Out\n";
+        assert_eq!(format_source(src).unwrap(), src);
+        // Multiple associated types interleaved with methods keep their order.
+        let two = "interface Two:\n    type A\n    def one(self) -> A\n    type B\n    def two(self) -> B\n";
+        assert_eq!(format_source(two).unwrap(), two);
     }
 
     #[test]
