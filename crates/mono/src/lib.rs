@@ -55,7 +55,19 @@ pub struct LowerError {
 /// Monomorphize a module: produce an equivalent AST with all user generics
 /// instantiated to concrete declarations and every generic reference rewritten.
 pub fn monomorphize(module: &Module) -> Result<Module, LowerError> {
-    Mono::new(module).run()
+    monomorphize_with_types(module, &TypeMap::default())
+}
+
+/// Monomorphize `module`, consulting sema's inferred types (#1167): when the
+/// pass's own best-effort inferer cannot type a generic constructor / call
+/// argument, it falls back to `types.type_at(arg_span)` — the type sema already
+/// computed — bridged to an `ast::Type`. This closes the inference gaps the
+/// hand-rolled inferer leaves (built-in call returns #1132, module constants
+/// #1162, generators, …) without changing any argument it already types.
+/// `types` comes from the driver (via `zapc_sema::analyze_types`); `zapc_ir`
+/// cannot build it, since it does not depend on the sema checker.
+pub fn monomorphize_with_types(module: &Module, types: &TypeMap) -> Result<Module, LowerError> {
+    Mono::new(module, types).run()
 }
 
 /// A concrete (fully type-param-free) type, the result of the pass's focused
@@ -134,7 +146,52 @@ fn same_sequence(l: &CTy, r: &CTy) -> CTy {
     CTy::Unknown
 }
 
+/// The source span of an expression, for looking its inferred type up in the
+/// sema `TypeMap` (#1167). Mirrors `zapc_sema`'s own `expr_span` over the shared
+/// `ast::Expr`.
+fn expr_span(e: &Expr) -> Span {
+    match e {
+        Expr::Int(_, s)
+        | Expr::Float(_, s)
+        | Expr::Imaginary(_, s)
+        | Expr::Bool(_, s)
+        | Expr::None(s)
+        | Expr::Name(_, s)
+        | Expr::Tuple(_, s)
+        | Expr::List(_, s)
+        | Expr::Dict(_, s)
+        | Expr::Set(_, s) => *s,
+        Expr::Str { span, .. }
+        | Expr::Starred { span, .. }
+        | Expr::ListComp { span, .. }
+        | Expr::DictComp { span, .. }
+        | Expr::SetComp { span, .. }
+        | Expr::GenExp { span, .. }
+        | Expr::Unary { span, .. }
+        | Expr::Binary { span, .. }
+        | Expr::Compare { span, .. }
+        | Expr::Call { span, .. }
+        | Expr::Index { span, .. }
+        | Expr::Slice { span, .. }
+        | Expr::SliceSpec { span, .. }
+        | Expr::Attr { span, .. }
+        | Expr::Lambda { span, .. }
+        | Expr::RegexMatch { span, .. }
+        | Expr::RegexSubst { span, .. }
+        | Expr::ChanRecv { span, .. }
+        | Expr::Yield { span, .. }
+        | Expr::IfElse { span, .. }
+        | Expr::Named { span, .. } => *span,
+    }
+}
+
 struct Mono<'a> {
+    /// Sema's inferred type for every expression, keyed by span (#1167). When
+    /// the pass's own best-effort inferer leaves an argument `Unknown`,
+    /// `rewrite_expr` falls back to this (bridged to an `ast::Type`). Empty on
+    /// the paths that pass no types (most tests, `lower_module` without a map),
+    /// in which case behaviour is exactly as before.
+    types: &'a TypeMap,
     /// Generic type-parameter name lists, keyed by type name.
     params: HashMap<String, Vec<String>>,
     /// Generic struct declarations by name.
@@ -508,8 +565,9 @@ fn type_eq(a: &Type, b: &Type) -> bool {
 }
 
 impl<'a> Mono<'a> {
-    fn new(module: &'a Module) -> Mono<'a> {
+    fn new(module: &'a Module, types: &'a TypeMap) -> Mono<'a> {
         let mut m = Mono {
+            types,
             params: HashMap::new(),
             gstructs: HashMap::new(),
             genums: HashMap::new(),
@@ -2319,7 +2377,37 @@ impl Mono<'_> {
         }
     }
 
+    /// Rewrite `e` and infer its best-effort concrete type. Thin wrapper over
+    /// [`Mono::rewrite_expr_inner`] (the per-form inferer) that backfills an
+    /// `Unknown` result from sema's inferred types (#1167): when the pass's own
+    /// arms cannot type an expression, `self.types.type_at(span)` — the type
+    /// sema already computed — is bridged to an `ast::Type` and used instead.
+    ///
+    /// This only *augments*: a type the arms already produce is kept untouched,
+    /// so no previously-inferring site changes, and `NoneLit` (the bare-`None`
+    /// sink) is preserved. A sema type that cannot be bridged, or a span sema
+    /// never typed, leaves the result `Unknown` — fail-closed, exactly as
+    /// before. The map is empty on paths that pass no types, making this a
+    /// no-op there.
     fn rewrite_expr(
+        &mut self,
+        e: &Expr,
+        env: &mut Env,
+        expected: Option<&Type>,
+    ) -> Result<(Expr, CTy), LowerError> {
+        let (node, cty) = self.rewrite_expr_inner(e, env, expected)?;
+        let cty = match cty {
+            CTy::Unknown => self
+                .types
+                .type_at(expr_span(e))
+                .and_then(|ty| ty.to_ast_type())
+                .map_or(CTy::Unknown, CTy::Ty),
+            other => other,
+        };
+        Ok((node, cty))
+    }
+
+    fn rewrite_expr_inner(
         &mut self,
         e: &Expr,
         env: &mut Env,

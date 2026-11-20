@@ -951,14 +951,31 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
 /// emission is identical to today — no race hooks — so the `main` prologue and
 /// every golden stay byte-identical.
 pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<LowerError>) {
+    lower_module_opts_with_types(module, race, &crate::mono::TypeMap::default())
+}
+
+/// Like [`lower_module_opts`], but given sema's inferred types (#1167): the
+/// monomorphizer consults `types` to pin a generic argument whose type its own
+/// best-effort inferer cannot derive (built-in call returns #1132, module
+/// constants #1162, …). The driver produces `types` with
+/// `zapc_sema::analyze_types` and passes it here; `zapc_ir` cannot build it (it
+/// does not depend on the sema checker). An empty map reproduces
+/// [`lower_module_opts`] exactly.
+pub fn lower_module_opts_with_types(
+    module: &ast::Module,
+    race: bool,
+    types: &crate::mono::TypeMap,
+) -> (Module, Vec<LowerError>) {
     // Prepend the built-in prelude (`Signal` enum, `MemStats` struct) so the
     // signals surface lowers through the ordinary enum/struct paths. Must match
-    // the set sema sees (both call the same helper), ticket #77.
+    // the set sema sees (both call the same helper), ticket #77. `with_prelude`
+    // preserves user-expression spans, so they still key into `types` (which
+    // sema recorded over its own `with_prelude` module).
     let module = zapc_syntax::parser::with_prelude(module);
     // Monomorphize user generics to concrete declarations (I#154, D-0017/D-0064)
     // before any id/type collection runs, so the rest of lowering and all of
     // codegen only ever see concrete types.
-    let module = match crate::mono::monomorphize(&module) {
+    let module = match crate::mono::monomorphize_with_types(&module, types) {
         Ok(m) => m,
         Err(e) => return (Module::default(), vec![e]),
     };

@@ -61,6 +61,7 @@ fn optimized_llvm_ir(src: &str) -> String {
         &ctx,
         &builder,
         &ast,
+        &zapc_ir::TypeMap::default(),
         "test",
         false,
         false,

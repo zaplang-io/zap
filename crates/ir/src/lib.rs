@@ -15,7 +15,7 @@ pub mod lower;
 // re-export it as the `mono` module so `crate::mono::monomorphize` is unchanged.
 pub use zapc_mono as mono;
 
-pub use lower::{lower_module, lower_module_opts};
+pub use lower::{lower_module, lower_module_opts, lower_module_opts_with_types};
 pub use zapc_ir_core::{
     ArrayMathOp, AtomicOrd, AtomicRmwOp, BinOp, Block, BlockId, CastKind, CmpPred, Dtype, Elem,
     FpPolicy, Func, Inst, Module, MvGroup, MvTier, Owner, Term, Ty, UnOp, Value,
@@ -23,6 +23,10 @@ pub use zapc_ir_core::{
 // `LowerError` moved to `zapc_mono` with monomorphization (#129); re-export it
 // here (and at `zapc_ir::lower::LowerError`, via `lower.rs`) unchanged.
 pub use zapc_mono::LowerError;
+// The sema inferred-type carrier (#1167): re-exported so `zapc_codegen` (which
+// depends on `zapc_ir`, not on the sema checker) can name the `TypeMap` it
+// passes to `lower_module_opts_with_types`.
+pub use zapc_mono::TypeMap;
 
 #[cfg(test)]
 mod tests {
