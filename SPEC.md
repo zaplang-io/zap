@@ -2201,7 +2201,9 @@ for the numeric TCP dial and verified TLS handshake, retaining hostname/SNI and
 system trust verification. IPv4/IPv6 literals only on the address parameter;
 DNS resolution is a separate prerequisite and is not covered by these APIs.
 Existing named connects retain synchronous resolution. A zero dial deadline
-is unbounded, a negative deadline or invalid numeric IP/port is ValueError.
+is unbounded, a negative deadline or invalid numeric IP/port is ValueError. Both
+bounded dials name the deadline argument `deadline_ns` and accept it by keyword
+(#1158).
 
 `net.connect_deadline(host, port, deadline_ns)` (#1138) is the **hostname-aware**
 bounded TCP dial: unlike `connect_ip_deadline`, it accepts a DNS name, and the

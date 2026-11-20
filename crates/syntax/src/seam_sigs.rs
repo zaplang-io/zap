@@ -505,10 +505,12 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     // functions, so they carry no rows here.
     ("fractions", "Fraction", &["numerator", "denominator"]),
     // ---- net (ticket #104): plaintext TCP over opaque socket handles ----
-    // (connect_ip_deadline is left on the legacy path pending a settled name
-    // for its deadline parameter.)
+    // The two bounded dials use `deadline_ns` for the absolute monotonic-ns
+    // budget (#1158, settling the name #559/#1138 reserved).
     ("net", "listen", &["host", "port"]),
     ("net", "connect", &["host", "port"]),
+    ("net", "connect_ip_deadline", &["ip", "port", "deadline_ns"]),
+    ("net", "connect_deadline", &["host", "port", "deadline_ns"]),
     ("net", "accept", &["listener"]),
     ("net", "recv", &["conn", "n"]),
     ("net", "send", &["conn", "data"]),
