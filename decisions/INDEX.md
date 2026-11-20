@@ -16,6 +16,7 @@ listed here (see [`README.md`](README.md)).
 | [1082](lang/1082-borrowed-bytes-strview.md) | Borrowed-bytes `strview` — explicit non-owning string view for read-only consumers | Locked | 2026-11-19 |
 | [1169](lang/1169-mono-consumes-sema-types.md) | Monomorphization consumes sema's inferred types instead of re-deriving them | Locked | 2026-11-20 |
 | [1180](lang/1180-reflected-operators.md) | Reflected binary operators — right-operand fallback dispatch (capability-based) | Accepted | 2026-11-20 |
+| [1198](lang/1198-reflected-comparison.md) | Reflected comparison operators — __req__ / __rcmp__ on the right operand | Accepted | 2026-11-20 |
 
 ## stdlib
 

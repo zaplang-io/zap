@@ -130,14 +130,45 @@ fn neither_forward_nor_reflected_is_missing_dunder_error() {
 }
 
 #[test]
-fn comparison_is_not_reflected() {
-    // `<` dispatches on the left `__cmp__` only; a right-operand reflected-style
-    // handler must NOT satisfy it. Missing `__cmp__` is still an error.
+fn comparison_needs_rcmp_not_other_reflected_dunder() {
+    // Comparison reflects only through `__rcmp__`/`__req__` (#1198): a right
+    // operand that defines an arithmetic reflected dunder (`__radd__`) but no
+    // `__rcmp__` does not satisfy `<`, which still errors naming `__cmp__`.
     lower_err_contains(
         "value struct DT:\n    int64 month\n\n\
          struct Rel:\n    int64 months\n\n    \
          def __radd__(self, DT dt) -> DT:\n        return dt\n\n\
          def main():\n    auto dt = DT(month=1)\n    if dt < Rel(months=1):\n        print(1)\n",
         "__cmp__",
+    );
+}
+
+// ----- reflected comparison (#1198) -----
+
+#[test]
+fn reflected_comparison_lowers_via_right_operand() {
+    // Left `DT` has no `__cmp__`/`__eq__`; right `Rel` supplies `__rcmp__` /
+    // `__req__`. All relationals and equality lower to the reflected call.
+    lower_ok(
+        "value struct DT:\n    int64 month\n\n\
+         struct Rel:\n    int64 months\n\n    \
+         def __rcmp__(self, DT dt) -> int64:\n        return 0\n\n    \
+         def __req__(self, DT dt) -> bool:\n        return True\n\n\
+         def main():\n    auto dt = DT(month=1)\n    auto rd = Rel(months=1)\n    \
+         if dt < rd:\n        print(1)\n    if dt >= rd:\n        print(2)\n    \
+         if dt == rd:\n        print(3)\n    if dt != rd:\n        print(4)\n",
+    );
+}
+
+#[test]
+fn reflected_comparison_builtin_left_lowers() {
+    // Built-in left (`int64`) with a struct right defining the reflected
+    // comparison dunders: `3 < v` / `3 == v`.
+    lower_ok(
+        "struct Money:\n    int64 cents\n\n    \
+         def __rcmp__(self, int64 n) -> int64:\n        return 0\n\n    \
+         def __req__(self, int64 n) -> bool:\n        return False\n\n\
+         def main():\n    auto m = Money(cents=100)\n    if 3 < m:\n        print(1)\n    \
+         if 3 == m:\n        print(2)\n",
     );
 }

@@ -17337,7 +17337,20 @@ impl<'a> FnLower<'a> {
         let lt = Ty::Struct(sid);
         match op {
             Eq | Ne => {
-                let (bit, _) = self.call_dunder(sid, "__eq__", vec![(l, lt), (r, rt)])?;
+                // Left `__eq__` by name wins; else reflected `__req__` on the
+                // right (`a == b` -> `b.__req__(a)`, symmetric), #1198.
+                let rsid = if let Ty::Struct(s) = &rt {
+                    Some(*s)
+                } else {
+                    None
+                };
+                let use_reflected = !self.struct_has_dunder(sid, "__eq__")
+                    && rsid.is_some_and(|s| self.struct_has_dunder(s, "__req__"));
+                let (bit, _) = if use_reflected {
+                    self.call_dunder(rsid.unwrap(), "__req__", vec![(r, rt), (l, lt)])?
+                } else {
+                    self.call_dunder(sid, "__eq__", vec![(l, lt), (r, rt)])?
+                };
                 if matches!(op, Ne) {
                     let d = self.new_value(Ty::I1);
                     self.emit(Inst::Un {
@@ -17351,8 +17364,21 @@ impl<'a> FnLower<'a> {
                 }
             }
             Lt | Le | Gt | Ge => {
-                // `a < b` -> `a.__cmp__(b) < 0`, and likewise for the others.
-                let (cmp, _) = self.call_dunder(sid, "__cmp__", vec![(l, lt), (r, rt)])?;
+                // `a < b` -> `a.__cmp__(b) < 0`. Left `__cmp__` by name wins; else
+                // reflected `__rcmp__` on the right (`b.__rcmp__(a)`, which returns
+                // the sign of `a <=> b`, so the derivation is identical), #1198.
+                let rsid = if let Ty::Struct(s) = &rt {
+                    Some(*s)
+                } else {
+                    None
+                };
+                let use_reflected = !self.struct_has_dunder(sid, "__cmp__")
+                    && rsid.is_some_and(|s| self.struct_has_dunder(s, "__rcmp__"));
+                let (cmp, _) = if use_reflected {
+                    self.call_dunder(rsid.unwrap(), "__rcmp__", vec![(r, rt), (l, lt)])?
+                } else {
+                    self.call_dunder(sid, "__cmp__", vec![(l, lt), (r, rt)])?
+                };
                 let pred = match op {
                     Lt => CmpPred::Lt,
                     Le => CmpPred::Le,
@@ -17801,6 +17827,47 @@ impl<'a> FnLower<'a> {
         if let (Some(rdunder), Ty::Struct(rsid)) = (reflected_op_dunder(op), rt) {
             if self.struct_has_dunder(rsid, rdunder) {
                 return self.call_dunder(rsid, rdunder, vec![(r, rt), (l, lt)]);
+            }
+        }
+        // Reflected COMPARISON fallback when the LEFT is a built-in (non-struct)
+        // and the RIGHT is a user struct defining the reflected comparison dunder
+        // (#1198): `1 == v` -> `v.__req__(1)`; `1 < v` -> `v.__rcmp__(1) < 0`.
+        if let Ty::Struct(rsid) = &rt {
+            let rsid = *rsid;
+            match op {
+                Eq | Ne if self.struct_has_dunder(rsid, "__req__") => {
+                    let (bit, _) = self.call_dunder(rsid, "__req__", vec![(r, rt), (l, lt)])?;
+                    if matches!(op, Ne) {
+                        let d = self.new_value(Ty::I1);
+                        self.emit(Inst::Un {
+                            dest: d,
+                            op: UnOp::Not,
+                            val: bit,
+                        });
+                        return Ok((d, Ty::I1));
+                    }
+                    return Ok((bit, Ty::I1));
+                }
+                Lt | Le | Gt | Ge if self.struct_has_dunder(rsid, "__rcmp__") => {
+                    let (cmp, _) = self.call_dunder(rsid, "__rcmp__", vec![(r, rt), (l, lt)])?;
+                    let pred = match op {
+                        Lt => CmpPred::Lt,
+                        Le => CmpPred::Le,
+                        Gt => CmpPred::Gt,
+                        Ge => CmpPred::Ge,
+                        _ => unreachable!(),
+                    };
+                    let zero = self.iconst(Ty::I64, 0);
+                    let d = self.new_value(Ty::I1);
+                    self.emit(Inst::ICmp {
+                        dest: d,
+                        pred,
+                        lhs: cmp,
+                        rhs: zero,
+                    });
+                    return Ok((d, Ty::I1));
+                }
+                _ => {}
             }
         }
         if matches!(op, In) {
