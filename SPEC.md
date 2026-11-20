@@ -2066,10 +2066,13 @@ Keepalive *timing* (#1141) is tuned with `net.set_keepalive_idle(sock, seconds)`
 (between probes) and `net.set_keepalive_count(sock, count)` (failed probes before
 the connection is dropped), with `net.get_keepalive_idle` / `_interval` /
 `_count` returning the `int64` current values; enable `set_keepalive(sock, True)`
-first. A non-positive value is a `ValueError`. These are the POSIX
-`TCP_KEEPIDLE`/`TCP_KEEPALIVE`, `TCP_KEEPINTVL` and `TCP_KEEPCNT` knobs; a knob a
-platform does not expose (all three on Windows) raises a catchable "not
-supported" error.
+first. A non-positive value is a `ValueError`. On POSIX these are the per-knob
+`TCP_KEEPIDLE`/`TCP_KEEPALIVE`, `TCP_KEEPINTVL` and `TCP_KEEPCNT` options. On
+Windows (#1157) `set_keepalive_idle` / `_interval` route to the
+`SIO_KEEPALIVE_VALS` ioctl, which sets both times together (so setting one keeps
+the other's last value, Windows default if unset) and enables keepalive;
+`set_keepalive_count` and all three getters raise a catchable "not supported"
+error there (no probe-count knob, no symmetric read).
 
 **`tls` client + server (#147, #488).** TLS over OpenSSL on the netpoller.
 *Client (#147):* `tls.connect(host, port)` verifies the certificate chain

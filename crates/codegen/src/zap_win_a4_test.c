@@ -63,8 +63,13 @@ extern int64_t zap_list_len(void *l);
 extern void *zap_crypto_random_bytes(int64_t n);
 /* net */
 extern void *zap_net_listen(void *host, int64_t port);
+extern void *zap_net_connect(void *host, int64_t port);
 extern int64_t zap_net_port(void *s);
 extern void zap_net_close(void *s);
+/* keepalive timing (I#1157): on Windows these route to SIO_KEEPALIVE_VALS */
+extern void zap_net_set_keepalive(void *s, int64_t on);
+extern void zap_net_set_keepalive_idle(void *s, int64_t seconds);
+extern void zap_net_set_keepalive_interval(void *s, int64_t seconds);
 /* scheduler + channels */
 extern void *zap_chan_new(int64_t cap);
 extern void zap_spawn(void *fn, void *arg);
@@ -94,6 +99,23 @@ static int streq(void *zs, const char *c) {
 static void *producer(void *arg) {
     void *ch = arg;
     zap_chan_send_i64(ch, 0x5A33); /* 'Z3' */
+    return NULL;
+}
+
+/* T5b coroutine body (I#1157): connect to the loopback listener and tune the
+ * keepalive idle time + inter-probe interval — the Windows SIO_KEEPALIVE_VALS
+ * path needs a CONNECTED socket, and a non-blocking connect parks, so this must
+ * run on a green stack under the scheduler (not from bare main). A failed ioctl
+ * raises and aborts the harness, failing the job. Signals 1 on success. */
+static int64_t g_ka_port = 0;
+static void *ka_probe(void *arg) {
+    void *ch = arg;
+    void *c = zap_net_connect(s("127.0.0.1"), g_ka_port);
+    zap_net_set_keepalive(c, 1);
+    zap_net_set_keepalive_idle(c, 120);
+    zap_net_set_keepalive_interval(c, 30);
+    zap_net_close(c);
+    zap_chan_send_i64(ch, 1);
     return NULL;
 }
 
@@ -137,6 +159,17 @@ int main(void) {
     void *lst = zap_net_listen(s("127.0.0.1"), 0);
     int64_t port = zap_net_port(lst);
     CHECK(port > 0 && port < 65536, "T5 net.listen binds an ephemeral port");
+
+    /* T5b keepalive timing on a connected loopback socket (I#1157): connect to
+     * the still-open listener (the handshake completes into its backlog without
+     * an accept) and set idle/interval via SIO_KEEPALIVE_VALS, inside a coroutine
+     * so the parking non-blocking connect runs under the scheduler. */
+    g_ka_port = port;
+    void *kach = zap_chan_new(1);
+    zap_spawn((void *)ka_probe, kach);
+    int64_t ka_ok = zap_chan_recv_i64(kach);
+    CHECK(ka_ok == 1, "T5b keepalive idle/interval on a connected socket");
+
     zap_net_close(lst);
 
     /* T6 the M:N scheduler runs a coroutine on Windows (A1 ctx switch + A4). */

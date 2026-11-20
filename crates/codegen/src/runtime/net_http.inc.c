@@ -39,6 +39,7 @@
  * top under the platform seam). getaddrinfo/sockaddr_in/ntohs and the SOCKET type
  * come from there; the fd model is the netpoller's int64_t-carries-SOCKET
  * convention (A2 #196), so sockets created here are IOCP/AFD-pollable. */
+#include <mstcpip.h> /* SIO_KEEPALIVE_VALS / struct tcp_keepalive (I#1157) */
 #endif
 
 #ifndef MSG_NOSIGNAL
@@ -182,6 +183,13 @@ typedef struct {
      * aliased leading `kind` and the `read_timeout_ms` / `read_deadline_ms`
      * offsets the TLS seam reads are unchanged. */
     int family;
+    /* Windows keepalive timing in ms (I#1157). SIO_KEEPALIVE_VALS sets the idle
+     * time and the inter-probe interval TOGETHER, but `net.set_keepalive_idle` /
+     * `_interval` set them one at a time, so the last value of each is held here
+     * and both are re-applied on every call. 0 = use the Windows default for
+     * that field. Unused on POSIX (per-knob setsockopt options instead). */
+    int64_t ka_idle_ms;
+    int64_t ka_intvl_ms;
 } ZapSock;
 
 static const ZapTypeDesc zap_desc_sock = {(int64_t)sizeof(ZapSock), ZAP_TD_ATOMIC, 0, NULL};
@@ -198,6 +206,8 @@ static ZapSock *zap_sock_wrap(zap_fd_t fd) {
     s->read_timeout_ms = 0;  /* ATOMIC objects are not zeroed; init explicitly. */
     s->read_deadline_ms = 0; /* ATOMIC objects are not zeroed; init explicitly. */
     s->family = AF_UNSPEC;   /* ATOMIC objects are not zeroed; init explicitly. */
+    s->ka_idle_ms = 0;       /* ATOMIC objects are not zeroed; init explicitly. */
+    s->ka_intvl_ms = 0;      /* ATOMIC objects are not zeroed; init explicitly. */
     return s;
 }
 
@@ -432,6 +442,7 @@ static void *zap_net_connect_impl(void *host_, int64_t port, int64_t deadline_ns
             s->kind = ZAP_CONN_PLAIN; s->fd = fd; s->pd = pd;
             s->read_timeout_ms = 0; s->read_deadline_ms = 0;
             s->family = AF_UNSPEC;
+            s->ka_idle_ms = 0; s->ka_intvl_ms = 0;
             return s;
         }
         if (pd) zap_netpoll_close(pd);
@@ -1347,6 +1358,8 @@ void *zap_net_connect_unix(void *path_) {
     s->read_timeout_ms = 0;
     s->read_deadline_ms = 0;
     s->family = AF_UNIX;
+    s->ka_idle_ms = 0;
+    s->ka_intvl_ms = 0;
     return s;
 }
 
@@ -1688,12 +1701,15 @@ int64_t zap_net_get_send_buffer(void *s) {
  * connection is dropped — in seconds / count, matching the POSIX knobs. Call
  * `net.set_keepalive(sock, True)` first for them to take effect.
  *
- * The idle-time option differs by OS (Linux TCP_KEEPIDLE vs macOS/BSD
- * TCP_KEEPALIVE, both seconds); interval and count are TCP_KEEPINTVL /
- * TCP_KEEPCNT where present. A knob the platform does not expose (notably on
- * Windows, whose SIO_KEEPALIVE_VALS ioctl has no count) raises a catchable "not
- * supported" error — this is the POSIX subset (the Windows ioctl path is a
- * follow-up). A non-positive value is a ValueError.
+ * POSIX uses the per-knob setsockopt options: the idle-time option differs by OS
+ * (Linux TCP_KEEPIDLE vs macOS/BSD TCP_KEEPALIVE, both seconds), interval and
+ * count are TCP_KEEPINTVL / TCP_KEEPCNT. Windows (I#1157) has no per-knob options
+ * and no probe-count knob: idle + interval are set TOGETHER, in milliseconds, via
+ * the SIO_KEEPALIVE_VALS ioctl (which also turns keepalive on), so the two setters
+ * each stash their value on the handle and re-apply both; `set_keepalive_count`
+ * and all three getters raise a catchable "not supported" error there. A knob a
+ * platform does not expose at all raises likewise. A non-positive value is a
+ * ValueError.
  * ========================================================================== */
 
 /* The idle-before-first-probe option: TCP_KEEPIDLE on Linux, TCP_KEEPALIVE on
@@ -1702,6 +1718,25 @@ int64_t zap_net_get_send_buffer(void *s) {
 #define ZAP_TCP_KEEPIDLE TCP_KEEPIDLE
 #elif defined(TCP_KEEPALIVE)
 #define ZAP_TCP_KEEPIDLE TCP_KEEPALIVE
+#endif
+
+#if defined(ZAP_PLATFORM_WINDOWS)
+/* Re-apply both keepalive times via SIO_KEEPALIVE_VALS (I#1157). Windows couples
+ * the idle time and the inter-probe interval in one ioctl and has no count knob;
+ * `onoff = 1` also enables keepalive. An unset (0) value uses the Windows default
+ * (7200000 ms idle / 1000 ms interval), so setting one does not clobber the other.
+ * Raises on failure (e.g. called on an unconnected socket). */
+static void zap_net_win_apply_keepalive(ZapSock *s, const char *what) {
+    struct tcp_keepalive ka;
+    ka.onoff = 1;
+    ka.keepalivetime = (u_long)(s->ka_idle_ms > 0 ? s->ka_idle_ms : 7200000);
+    ka.keepaliveinterval = (u_long)(s->ka_intvl_ms > 0 ? s->ka_intvl_ms : 1000);
+    DWORD out = 0;
+    if (WSAIoctl(s->fd, SIO_KEEPALIVE_VALS, &ka, (DWORD)sizeof ka, NULL, 0, &out, NULL,
+                 NULL) != 0) {
+        zap_net_panic(what);
+    }
+}
 #endif
 
 static void zap_net_keepalive_check_positive(int64_t v) {
@@ -1716,7 +1751,11 @@ static void zap_net_keepalive_check_positive(int64_t v) {
  * the first keepalive probe. */
 void zap_net_set_keepalive_idle(void *s, int64_t seconds) {
     zap_net_keepalive_check_positive(seconds);
-#if defined(ZAP_TCP_KEEPIDLE)
+#if defined(ZAP_PLATFORM_WINDOWS)
+    ZapSock *sk = (ZapSock *)s;
+    sk->ka_idle_ms = seconds * 1000;
+    zap_net_win_apply_keepalive(sk, "net: set_keepalive_idle failed");
+#elif defined(ZAP_TCP_KEEPIDLE)
     zap_net_setopt_int(s, IPPROTO_TCP, ZAP_TCP_KEEPIDLE, (int)seconds,
                        "net: set_keepalive_idle failed");
 #else
@@ -1728,7 +1767,11 @@ void zap_net_set_keepalive_idle(void *s, int64_t seconds) {
 /* net.set_keepalive_interval(sock, seconds) — seconds between probes. */
 void zap_net_set_keepalive_interval(void *s, int64_t seconds) {
     zap_net_keepalive_check_positive(seconds);
-#if defined(TCP_KEEPINTVL)
+#if defined(ZAP_PLATFORM_WINDOWS)
+    ZapSock *sk = (ZapSock *)s;
+    sk->ka_intvl_ms = seconds * 1000;
+    zap_net_win_apply_keepalive(sk, "net: set_keepalive_interval failed");
+#elif defined(TCP_KEEPINTVL)
     zap_net_setopt_int(s, IPPROTO_TCP, TCP_KEEPINTVL, (int)seconds,
                        "net: set_keepalive_interval failed");
 #else
@@ -1738,10 +1781,13 @@ void zap_net_set_keepalive_interval(void *s, int64_t seconds) {
 }
 
 /* net.set_keepalive_count(sock, count) — failed probes before the connection is
- * dropped. */
+ * dropped. Windows has no count knob (SIO_KEEPALIVE_VALS) -> raises. */
 void zap_net_set_keepalive_count(void *s, int64_t count) {
     zap_net_keepalive_check_positive(count);
-#if defined(TCP_KEEPCNT)
+#if defined(ZAP_PLATFORM_WINDOWS)
+    (void)s;
+    zap_net_panic("net: keepalive probe count is not supported on this platform");
+#elif defined(TCP_KEEPCNT)
     zap_net_setopt_int(s, IPPROTO_TCP, TCP_KEEPCNT, (int)count,
                        "net: set_keepalive_count failed");
 #else
@@ -1750,9 +1796,14 @@ void zap_net_set_keepalive_count(void *s, int64_t count) {
 #endif
 }
 
-/* net.get_keepalive_idle(sock) -> int64 seconds. */
+/* net.get_keepalive_idle(sock) -> int64 seconds. Windows has no symmetric read
+ * for the SIO_KEEPALIVE_VALS settings -> raises. */
 int64_t zap_net_get_keepalive_idle(void *s) {
-#if defined(ZAP_TCP_KEEPIDLE)
+#if defined(ZAP_PLATFORM_WINDOWS)
+    (void)s;
+    zap_net_panic("net: reading keepalive timing is not supported on this platform");
+    return 0;
+#elif defined(ZAP_TCP_KEEPIDLE)
     return zap_net_getopt_int(s, IPPROTO_TCP, ZAP_TCP_KEEPIDLE, "net: get_keepalive_idle failed");
 #else
     (void)s;
@@ -1763,7 +1814,11 @@ int64_t zap_net_get_keepalive_idle(void *s) {
 
 /* net.get_keepalive_interval(sock) -> int64 seconds. */
 int64_t zap_net_get_keepalive_interval(void *s) {
-#if defined(TCP_KEEPINTVL)
+#if defined(ZAP_PLATFORM_WINDOWS)
+    (void)s;
+    zap_net_panic("net: reading keepalive timing is not supported on this platform");
+    return 0;
+#elif defined(TCP_KEEPINTVL)
     return zap_net_getopt_int(s, IPPROTO_TCP, TCP_KEEPINTVL, "net: get_keepalive_interval failed");
 #else
     (void)s;
@@ -1774,7 +1829,11 @@ int64_t zap_net_get_keepalive_interval(void *s) {
 
 /* net.get_keepalive_count(sock) -> int64. */
 int64_t zap_net_get_keepalive_count(void *s) {
-#if defined(TCP_KEEPCNT)
+#if defined(ZAP_PLATFORM_WINDOWS)
+    (void)s;
+    zap_net_panic("net: keepalive probe count is not supported on this platform");
+    return 0;
+#elif defined(TCP_KEEPCNT)
     return zap_net_getopt_int(s, IPPROTO_TCP, TCP_KEEPCNT, "net: get_keepalive_count failed");
 #else
     (void)s;
