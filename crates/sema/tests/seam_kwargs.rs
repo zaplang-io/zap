@@ -720,12 +720,30 @@ fn net_keyword_reorder_and_unknown() {
         &prog("    auto l = net.listen(host=\"0.0.0.0\", porta=8080)\n"),
         "ZAP4023",
     );
+    // The two bounded dials take a `deadline_ns` keyword (#1158), reorderable.
+    assert_ok(&prog(
+        "    auto c = net.connect_deadline(host=\"localhost\", port=80, deadline_ns=0)\n",
+    ));
+    assert_ok(&prog(
+        "    auto c = net.connect_deadline(deadline_ns=0, port=80, host=\"h\")\n",
+    ));
+    assert_ok(&prog(
+        "    auto c = net.connect_ip_deadline(ip=\"127.0.0.1\", port=80, deadline_ns=0)\n",
+    ));
+    assert_code(
+        &prog("    auto c = net.connect_deadline(host=\"h\", port=80, deadline=0)\n"),
+        "ZAP4023",
+    );
 }
 
 #[test]
 fn math_net_positional_unchanged() {
     assert_ok(&prog("    auto p = math.pow(2.0, 10.0)\n"));
     assert_ok(&prog("    auto l = net.listen(\"0.0.0.0\", 8080)\n"));
+    assert_ok(&prog("    auto c = net.connect_deadline(\"h\", 80, 0)\n"));
+    assert_ok(&prog(
+        "    auto c = net.connect_ip_deadline(\"127.0.0.1\", 80, 0)\n",
+    ));
 }
 
 #[test]
