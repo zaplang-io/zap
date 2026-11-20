@@ -17,6 +17,7 @@ listed here (see [`README.md`](README.md)).
 | [1169](lang/1169-mono-consumes-sema-types.md) | Monomorphization consumes sema's inferred types instead of re-deriving them | Locked | 2026-11-20 |
 | [1180](lang/1180-reflected-operators.md) | Reflected binary operators — right-operand fallback dispatch (capability-based) | Accepted | 2026-11-20 |
 | [1198](lang/1198-reflected-comparison.md) | Reflected comparison operators — __req__ / __rcmp__ on the right operand | Accepted | 2026-11-20 |
+| [1199](lang/1199-operator-capability-interfaces.md) | Operator capabilities are declared prelude generic interfaces (forward + reflected) | Accepted | 2026-11-20 |
 
 ## stdlib
 
