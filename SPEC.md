@@ -1991,6 +1991,24 @@ raises a catchable error. The datagram payload is `str` (as `net.recv` /
 `net.send` already are), not Python `bytes`. `net` remains **Experimental**
 (STABILITY.md §4.4).
 
+**`net` DNS resolution (#992, epic #985).** An explicit name-resolution surface
+so code can resolve a name itself (pre-resolve, cache, pick a family,
+health-check by IP) instead of only resolving implicitly inside `net.connect`;
+matches Go's `net.LookupHost` / `LookupIP` / `LookupAddr` and Python's
+`socket.getaddrinfo` / `gethostbyname`. `net.lookup_host(name) -> list[str]`
+returns every address (A + AAAA) as a numeric IP string; `net.lookup_ipv4(name)`
+and `net.lookup_ipv6(name)` restrict to one family (Zap exposes no `AF_*`
+constants, so the family is selected by the function name). `net.lookup_addr(ip)
+-> list[str]` is the reverse (PTR) lookup of a numeric IP — an empty list when
+the address has no reverse record (distinct from a malformed `ip`, which raises
+`ValueError`). Resolution runs on the platform resolver bracketed so a real DNS
+query parks the coroutine (a numeric input resolves without network I/O); a
+resolve failure raises a catchable error. The returned IP strings feed the
+existing `net.connect(ip, port)` / `net.connect_ip_deadline(ip, port,
+deadline_ns)` directly, so pre-resolution + a bounded numeric dial compose
+without an opaque addrinfo handle. `net` remains **Experimental** (STABILITY.md
+§4.4).
+
 **`tls` client + server (#147, #488).** TLS over OpenSSL on the netpoller.
 *Client (#147):* `tls.connect(host, port)` verifies the certificate chain
 against the system trust store **and** the hostname (on by default);

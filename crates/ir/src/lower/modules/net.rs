@@ -106,6 +106,14 @@ fn lower(
             lowerer.throwing_call(Some(h), "zap_udp_recvfrom", a);
             unpack_datagram_tuple(lowerer, h)
         }
+
+        // ---- DNS resolution surface (ticket #992, epic #985) ----
+        // Each resolves to a `list[str]` (element kind `Ptr` = str, #1074) and may
+        // raise (resolve failure / malformed IP), so emitted as a throwing call.
+        "lookup_host" => call_ret(lowerer, "zap_net_lookup_host", a, Ty::List(Elem::Ptr), true),
+        "lookup_ipv4" => call_ret(lowerer, "zap_net_lookup_ipv4", a, Ty::List(Elem::Ptr), true),
+        "lookup_ipv6" => call_ret(lowerer, "zap_net_lookup_ipv6", a, Ty::List(Elem::Ptr), true),
+        "lookup_addr" => call_ret(lowerer, "zap_net_lookup_addr", a, Ty::List(Elem::Ptr), true),
         _ => return Ok(None),
     }))
 }
