@@ -118,6 +118,16 @@ they can raise):
 - `datetime.resolve_imaginary(dt) -> DateTime` — shift a gap time forward by the
   gap length (dateutil `resolve_imaginary`); a no-op for a real time.
 
+> **Clarification (#1173).** "No-op for a real time" is *strict*: it covers both
+> a **unique** and an **ambiguous** (fall-back overlap) wall clock. On an overlap
+> both `fold=0` and `fold=1` are real and one offset-step apart, so
+> `resolve_imaginary` must return the supplied value's **own** offset and instant
+> unchanged — it must not collapse the later fold onto the earlier instant. Only a
+> genuinely imaginary (spring-forward gap) value — the case `is_imaginary` is true
+> for — is advanced across the transition. See the native golden
+> `tests/golden/datetime_resolve_imaginary_noop.zap`, which asserts the instant
+> (`to_timestamp`) and offset, not only the wall-clock fields.
+
 The classifiers / `resolve_imaginary` take a single `DateTime` and read its own
 `zone_id` (dateutil's `datetime_ambiguous` / `datetime_exists` /
 `resolve_imaginary` operate on the value's own `tzinfo`); a naive / fixed value

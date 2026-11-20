@@ -1172,10 +1172,16 @@ int64_t zap_tz_resolve_local(int64_t zone_id, int64_t y, int64_t mo, int64_t d,
 }
 
 /* The canonical real UTC instant for a wall clock in a zone, used by
- * `resolve_imaginary`: a unique / overlap time maps to its (earlier) real
- * instant, so the value rebuilds unchanged; a gap time maps just past the
- * transition, so rebuilding shifts the wall clock forward by the gap length
- * onto the real post-transition time (dateutil `resolve_imaginary`). */
+ * `resolve_imaginary`: a real time (unique OR overlap) is a strict no-op — it
+ * maps to the instant denoted by the value's OWN carried offset (`fixed_off`),
+ * so rebuilding reproduces the same offset and instant (#1173). This matters on
+ * a fall-back overlap, where both `fold=0` and `fold=1` are real: the supplied
+ * value already picked its side, and `resolve_imaginary` must leave it there
+ * rather than snapping it to the earlier (`off0`) instant. A gap time (no
+ * matching interval) maps just past the transition, so rebuilding shifts the
+ * wall clock forward by the gap length onto the real post-transition time
+ * (dateutil `resolve_imaginary`). Mirrors `is_imaginary` (true only for a gap),
+ * the predicate `resolve_imaginary` keys off. */
 int64_t zap_tz_imaginary_instant(int64_t zone_id, int64_t y, int64_t mo,
                                  int64_t d, int64_t h, int64_t mi, int64_t s,
                                  int64_t fixed_off) {
@@ -1187,7 +1193,10 @@ int64_t zap_tz_imaginary_instant(int64_t zone_id, int64_t y, int64_t mo,
     int64_t off0 = 0, off1 = 0;
     int c = zap_tz_wall_candidates(z, w, &off0, &off1);
     if (c >= 1) {
-        return w - off0;
+        /* Real (unique or ambiguous): preserve the value's own offset/instant.
+         * For a unique time `fixed_off == off0`; on an overlap it is whichever
+         * fold the value carries, so we must not collapse it to `off0`. */
+        return w - fixed_off;
     }
     int64_t ob = 0, oa = 0;
     if (zap_tz_gap_offsets(z, w, &ob, &oa)) {
