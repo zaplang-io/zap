@@ -142,8 +142,11 @@ fn run_with_timeout(
                     let _ = child.kill();
                     let _ = child.wait();
                     panic!(
-                        "golden {label} did not finish within {timeout:?} \
-                         (likely a deadlock/hang in the compiled program)"
+                        "golden {label} did not finish within {timeout:?} — timed out and \
+                         was killed. A `[run]` timeout means the compiled program hung \
+                         (deadlock/livelock); a `[build]` timeout means the compiler/linker \
+                         stalled — usually CPU starvation on an overloaded runner, not a \
+                         program bug (see zaplang-io/zap#1113)."
                     );
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -157,6 +160,103 @@ fn run_with_timeout(
         stdout,
         stderr,
     }
+}
+
+/// A unique, per-invocation output path for a fixture's compiled binary, so the
+/// parallel pool never collides on `-o`. Derived from the fixture stem, this
+/// process id, and a monotonic counter.
+#[cfg(feature = "codegen")]
+fn unique_out_path(source: &std::path::Path) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CTR: AtomicUsize = AtomicUsize::new(0);
+    let n = CTR.fetch_add(1, Ordering::Relaxed);
+    let stem = source
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("fixture");
+    std::env::temp_dir().join(format!("zap-golden-{stem}-{}-{n}", std::process::id()))
+}
+
+/// Compile a fixture with `zapc build -o <tmp>` under a GENEROUS ceiling, then
+/// run the produced binary under the TIGHT `run_timeout`. This is the whole
+/// point of the split (zaplang-io/zap#1113): the tight per-fixture deadline must
+/// cover only the compiled program's execution, never `cc`/`ld` — otherwise a
+/// linker starved of CPU on an overloaded runner trips the deadline and is
+/// misreported as a "hang in the compiled program". The build still has its own
+/// (large) ceiling so a genuine compiler/linker *deadlock* still fails, just not
+/// on mere slowness. `envs` are applied to BOTH phases: some are build-time
+/// (e.g. `ZAP_ZENV` for project dependency resolution), others run-time (e.g.
+/// scheduler knobs like `MAXPROCS`).
+///
+/// Returns `(status, stdout, stderr)` matching what `zapc run` used to produce:
+/// on a build failure, the build's own output (so a compile-diagnostic fixture
+/// still works); on success, the run's exit status and stdout, with build and
+/// run stderr concatenated (so a compile *warning* a fixture asserts on is still
+/// present).
+#[cfg(feature = "codegen")]
+fn compile_then_run(
+    bin: &str,
+    source: &std::path::Path,
+    envs: &[(String, String)],
+    run_timeout: std::time::Duration,
+) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
+    use std::process::Command;
+    // Large enough that normal compile+link, even on a saturated runner, never
+    // reaches it, but a true compiler/linker deadlock still fails deterministically.
+    let build_ceiling = std::time::Duration::from_secs(300);
+    let out = unique_out_path(source);
+
+    let mut build = Command::new(bin);
+    build.arg("build").arg(source).arg("-o").arg(&out);
+    for (k, v) in envs {
+        build.env(k, v);
+    }
+    let build_out = run_with_timeout(
+        build,
+        build_ceiling,
+        &format!("{} [build]", source.display()),
+    );
+    if !build_out.status.success() {
+        // Compile/link failed (or a diagnostic fixture that expects a nonzero
+        // exit): surface the build output verbatim, exactly as `zapc run` would
+        // have on a compile failure.
+        return (build_out.status, build_out.stdout, build_out.stderr);
+    }
+
+    let mut run = Command::new(&out);
+    for (k, v) in envs {
+        run.env(k, v);
+    }
+    let run_out = run_with_timeout(run, run_timeout, &format!("{} [run]", source.display()));
+    let _ = std::fs::remove_file(&out);
+
+    let mut stderr = build_out.stderr;
+    stderr.extend_from_slice(&run_out.stderr);
+    (run_out.status, run_out.stdout, stderr)
+}
+
+/// Parse an optional `KEY=VALUE` env sidecar into pairs, skipping blanks and
+/// `#` comments. `$PROJDIR` in a value is replaced with `projdir` when given
+/// (used by project fixtures to point `ZAP_ZENV` at a prebuilt `zenv/`).
+#[cfg(feature = "codegen")]
+fn parse_env_sidecar(path: &std::path::Path, projdir: Option<&str>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Ok(contents) = std::fs::read_to_string(path) {
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                let v = match projdir {
+                    Some(p) => v.trim().replace("$PROJDIR", p),
+                    None => v.trim().to_string(),
+                };
+                out.push((k.trim().to_string(), v));
+            }
+        }
+    }
+    out
 }
 
 /// Optional `*.skip_arch` sidecar: whitespace/newline-separated architecture
@@ -297,11 +397,11 @@ where
 #[cfg(feature = "codegen")]
 #[test]
 fn golden_programs_match() {
-    use std::process::Command;
-    // Generous per-fixture ceiling: a fixture compiles (cc + LLVM) and runs a
-    // small program in a second or two; 60s only trips on a true hang, matching
-    // GitHub's own "running for over 60 seconds" warning so a deadlock fails
-    // this test fast rather than burning the job's budget.
+    // Tight per-fixture ceiling for the RUN phase only: the compiled program runs
+    // in a second or two, so 60s trips only on a true program hang. Compilation
+    // and linking are timed separately and generously (see `compile_then_run`),
+    // so a `cc`/`ld` slowdown on a loaded runner no longer masquerades as a hang
+    // (zaplang-io/zap#1113).
     let per_test = std::time::Duration::from_secs(60);
     let bin = env!("CARGO_BIN_EXE_zapc");
     run_goldens_parallel(zap_fixtures(), |zap| {
@@ -325,34 +425,20 @@ fn golden_programs_match() {
             .unwrap_or(0);
         let expected_stderr = std::fs::read_to_string(zap.with_extension("stderr")).ok();
 
-        let mut cmd = Command::new(bin);
-        cmd.arg("run").arg(zap);
-        // Optional `*.env` sidecar: `KEY=VALUE` lines set on the child's
-        // environment. Used to make a scheduler knob load-bearing in a fixture —
-        // e.g. `MAXPROCS=1` so the preemption golden forces all coroutines onto a
-        // single worker M (ticket #172).
-        if let Ok(env) = std::fs::read_to_string(zap.with_extension("env")) {
-            for line in env.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some((k, v)) = line.split_once('=') {
-                    cmd.env(k.trim(), v.trim());
-                }
-            }
-        }
-        // `zap run` now writes its throwaway binary to a per-invocation unique
-        // temp dir (driver #634), so concurrent fixtures no longer collide and
-        // need no TMPDIR isolation here.
-        let output = run_with_timeout(cmd, per_test, &zap.display().to_string());
+        // Compile with a generous ceiling, then time ONLY the program's run
+        // (zaplang-io/zap#1113): `per_test` must not cover `cc`/`ld`, or a linker
+        // starved of CPU on an overloaded runner trips it and is misreported as a
+        // program hang. The `*.env` sidecar — e.g. `MAXPROCS=1` to pin the
+        // preemption golden to one worker M (ticket #172) — applies to both phases.
+        let envs = parse_env_sidecar(&zap.with_extension("env"), None);
+        let (status, stdout, stderr) = compile_then_run(bin, zap, &envs, per_test);
 
-        let got = String::from_utf8_lossy(&output.stdout);
-        let got_err = String::from_utf8_lossy(&output.stderr);
-        if output.status.code() != Some(expected_exit) {
+        let got = String::from_utf8_lossy(&stdout);
+        let got_err = String::from_utf8_lossy(&stderr);
+        if status.code() != Some(expected_exit) {
             return Outcome::Failed(format!(
                 "exit code mismatch: got {:?}, want {expected_exit} (stderr:\n{got_err})",
-                output.status.code()
+                status.code()
             ));
         }
         if got.trim_end() != expected.trim_end() {
@@ -379,7 +465,8 @@ fn golden_programs_match() {
 #[cfg(feature = "codegen")]
 #[test]
 fn golden_projects_match() {
-    use std::process::Command;
+    // Tight RUN-phase-only ceiling; compile/link is timed separately and
+    // generously in `compile_then_run` (zaplang-io/zap#1113).
     let per_test = std::time::Duration::from_secs(60);
     let bin = env!("CARGO_BIN_EXE_zapc");
     run_goldens_parallel(project_fixtures(), |main| {
@@ -392,35 +479,21 @@ fn golden_projects_match() {
             .unwrap_or(0);
         let expected_stderr = std::fs::read_to_string(proj.join("stderr")).ok();
 
-        let mut cmd = Command::new(bin);
-        cmd.arg("run").arg(main);
-        // Optional `env` sidecar: `KEY=VALUE` lines set on the child's
-        // environment, with `$PROJDIR` expanded to the project's absolute path.
-        // Used by the cross-package fixture to point `ZAP_ZENV` at a prebuilt
-        // `zenv/` holding materialized dependency packages (I#283/D-0081 Stage B).
-        if let Ok(env) = std::fs::read_to_string(proj.join("env")) {
-            let projdir = proj.display().to_string();
-            for line in env.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some((k, v)) = line.split_once('=') {
-                    cmd.env(k.trim(), v.trim().replace("$PROJDIR", &projdir));
-                }
-            }
-        }
-        // Every project entry is `main.zap`, which used to collide at a shared
-        // `$TMPDIR/zap-main`; the driver's per-invocation unique output dir
-        // (#634) removes that collision, so no TMPDIR isolation is needed here.
-        let output = run_with_timeout(cmd, per_test, &main.display().to_string());
+        // Optional `env` sidecar: `KEY=VALUE` lines, with `$PROJDIR` expanded to
+        // the project's absolute path. Used by the cross-package fixture to point
+        // `ZAP_ZENV` at a prebuilt `zenv/` of materialized dependency packages
+        // (I#283/D-0081 Stage B) — a BUILD-time concern, so it must reach the
+        // compile phase too; `compile_then_run` applies it to both.
+        let projdir = proj.display().to_string();
+        let envs = parse_env_sidecar(&proj.join("env"), Some(&projdir));
+        let (status, stdout, stderr) = compile_then_run(bin, main, &envs, per_test);
 
-        let got = String::from_utf8_lossy(&output.stdout);
-        let got_err = String::from_utf8_lossy(&output.stderr);
-        if output.status.code() != Some(expected_exit) {
+        let got = String::from_utf8_lossy(&stdout);
+        let got_err = String::from_utf8_lossy(&stderr);
+        if status.code() != Some(expected_exit) {
             return Outcome::Failed(format!(
                 "exit code mismatch: got {:?}, want {expected_exit} (stderr:\n{got_err})",
-                output.status.code()
+                status.code()
             ));
         }
         if got.trim_end() != expected.trim_end() {
