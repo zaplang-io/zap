@@ -659,6 +659,7 @@ fn native_runtime_object(
 /// offsets (ticket #48). The `builder` must outlive the returned module's
 /// construction; it is unused afterwards. `jit` selects the REPL JIT code path
 /// (shadow-head access via a runtime helper; see [`Cg::gc_head`]).
+#[allow(clippy::too_many_arguments)] // +`types` for sema-driven inference (#1167)
 pub(crate) fn build_llvm_module<'ctx>(
     ctx: &'ctx Context,
     builder: &Builder<'ctx>,
