@@ -35,6 +35,7 @@ listed here (see [`README.md`](README.md)).
 | [1143](stdlib/1143-peer-credentials.md) | net AF_UNIX peer credentials — peer_cred (uid/gid/pid) | Locked | 2026-11-20 |
 | [1148](stdlib/1148-subsecond-datetime.md) | stdlib datetime — subsecond precision on core DateTime (nanoseconds-of-second) | Accepted | 2026-11-20 |
 | [1149](stdlib/1149-named-zone-retention.md) | stdlib datetime — retain named zones on DateTime and resolve civil times across DST gaps/folds | Accepted | 2026-11-20 |
+| [1157](stdlib/1157-windows-keepalive.md) | net keepalive timing on Windows — SIO_KEEPALIVE_VALS (idle + interval) | Locked | 2026-11-20 |
 | [1158](stdlib/1158-connect-deadline-kwargs.md) | net bounded-dial deadline parameter name — deadline_ns (kwargs-enabled) | Locked | 2026-11-20 |
 | [1159](stdlib/1159-netport-unix.md) | net.port raises ValueError on a Unix-domain socket | Locked | 2026-11-20 |
 | [1171](stdlib/1171-system-local-zone.md) | stdlib datetime — expose the system local zone as a reusable TimeZone | Accepted | 2026-11-20 |
