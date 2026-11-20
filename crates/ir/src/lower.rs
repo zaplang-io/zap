@@ -9451,6 +9451,21 @@ impl<'a> FnLower<'a> {
             (Expr::Dict(items, _), Ty::Dict(key, value)) => {
                 self.lower_dict_lit_expected(items, Some((key, value)))
             }
+            // A tuple literal against a declared tuple type (#1195): thread each
+            // declared field type to its element, so a bare `None` element
+            // lowers as that field's `Optional[T]` null (e.g.
+            // `(Optional[bytes], Optional[bytes])` returned as `(None, None)`).
+            // A non-tuple `Ty::Struct` destination (a user struct) has no field
+            // types here, so it falls through to the natural lowering.
+            (Expr::Tuple(elems, _), Ty::Struct(sid)) => {
+                // `fields` returns an owned clone, so no `tuples` borrow is held
+                // across the `&mut self` lowering call below.
+                let ftys = self.ctx.tuples.borrow().fields(sid);
+                match ftys {
+                    Some(ftys) => self.lower_tuple_lit_expected(elems, Some(&ftys)),
+                    None => self.expr(e),
+                }
+            }
             (
                 Expr::IfElse {
                     cond, then, els, ..
@@ -13345,9 +13360,53 @@ impl<'a> FnLower<'a> {
     /// `FieldSet` per element build the value — exactly the struct path, so
     /// codegen needs no tuple-specific handling.
     fn lower_tuple_lit(&mut self, elems: &[Expr]) -> Result<(Value, Ty), LowerError> {
+        self.lower_tuple_lit_expected(elems, None)
+    }
+
+    /// Lower a tuple literal in a position whose expected type is the tuple
+    /// `expected` field types (#1195): each element is lowered against its
+    /// declared field type via `expr_coerced`, so a bare `None` element reaches
+    /// the shared type-contextual `None` mechanism (`lower_none_expr`) and gets
+    /// its `Optional[T]` null — exactly as a bare `None` struct-constructor field
+    /// (#1075) or `list[Optional[T]]` element (#1080) does. With no expected
+    /// type (a tuple display in an un-annotated context, e.g. `auto t = (a, b)`)
+    /// each element lowers with its own natural type, unchanged.
+    ///
+    /// Per-element expected types are threaded only when the expected arity
+    /// matches the element count and no `*t` splice is present — a splice
+    /// expands to a statically-unknown-here number of fields, so a 1:1 source
+    /// element↦declared field mapping would not hold. In that case (and for any
+    /// arity mismatch, which sema reports separately) every element falls back
+    /// to its natural type, preserving the prior behaviour.
+    fn lower_tuple_lit_expected(
+        &mut self,
+        elems: &[Expr],
+        expected: Option<&[Ty]>,
+    ) -> Result<(Value, Ty), LowerError> {
         let mut vals = Vec::with_capacity(elems.len());
         let mut tys = Vec::with_capacity(elems.len());
-        for e in elems {
+        // Thread per-element expected types only for a 1:1 splice-free literal.
+        let per_elem = match expected {
+            Some(ftys)
+                if ftys.len() == elems.len()
+                    && !elems.iter().any(|e| matches!(e, Expr::Starred { .. })) =>
+            {
+                Some(ftys)
+            }
+            _ => None,
+        };
+        for (idx, e) in elems.iter().enumerate() {
+            if let Some(ftys) = per_elem {
+                // The declared field type drives the element — a bare `None`
+                // lowers as that field's `Optional[T]` null, and a present
+                // element is coerced to the declared field type (a no-op when it
+                // already matches, e.g. an `Optional.Some(...)`).
+                let ft = ftys[idx];
+                let v = self.expr_coerced(e, ft, zapc_diag::ErrorCode::ZAP4003)?;
+                vals.push(v);
+                tys.push(ft);
+                continue;
+            }
             match e {
                 // `*t` splices a statically-sized tuple's fields in place (#598);
                 // only a tuple can be spliced into a tuple, since the result's
