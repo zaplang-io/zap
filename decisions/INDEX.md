@@ -33,6 +33,7 @@ listed here (see [`README.md`](README.md)).
 | [1141](stdlib/1141-keepalive-interval.md) | net TCP keepalive interval tuning — idle / interval / count | Locked | 2026-11-20 |
 | [1142](stdlib/1142-multicast.md) | net UDP multicast — join/leave + TTL/loopback, family-dispatched | Locked | 2026-11-20 |
 | [1143](stdlib/1143-peer-credentials.md) | net AF_UNIX peer credentials — peer_cred (uid/gid/pid) | Locked | 2026-11-20 |
+| [1159](stdlib/1159-netport-unix.md) | net.port raises ValueError on a Unix-domain socket | Locked | 2026-11-20 |
 
 ## runtime
 
