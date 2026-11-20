@@ -119,6 +119,13 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("datetime", "isoformat", &["dt"]),
     ("datetime", "rfc3339", &["dt"]),
     ("datetime", "rfc3339_parse", &["s"]),
+    // ---- datetime named-zone retention + civil resolution (#1149) ----
+    // NOTE: `resolve` is intentionally NOT listed — its trailing `fold` is an
+    // optional argument, which the trailing-only seam binder (D-0204) rejects,
+    // so `resolve` binds its own arguments (like `replace`).
+    ("datetime", "is_ambiguous", &["dt"]),
+    ("datetime", "is_imaginary", &["dt"]),
+    ("datetime", "resolve_imaginary", &["dt"]),
     // ---- datetime date/time types (#1046, D-0226) ----
     // NOTE: `replace` is intentionally NOT listed — its fields are all-optional,
     // any-subset keywords (interior holes), which the trailing-only seam binder

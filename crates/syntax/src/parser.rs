@@ -161,6 +161,7 @@ value struct DateTime:
     int64 second
     int64 offset
     bool is_aware
+    int64 zone_id
 
 value struct TimeZone:
     str name

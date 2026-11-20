@@ -397,3 +397,135 @@ fn date_field_helpers() {
         "ZAP4024",
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1149 — named-zone retention + civil-time resolution.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resolve_returns_datetime() {
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    \
+         DateTime d = datetime.resolve(z, 2024, 3, 10, 2, 30, 0)\n",
+    ));
+    // Optional trailing fold, positional and keyword.
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    \
+         DateTime d = datetime.resolve(z, 2024, 11, 3, 1, 30, 0, 1)\n",
+    ));
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    \
+         DateTime d = datetime.resolve(z, 2024, 11, 3, 1, 30, 0, fold=1)\n",
+    ));
+    // A fixed-offset zone resolves too (never a gap/overlap).
+    assert_ok(&prog(
+        "    auto z = datetime.fixed_offset(-300)\n    \
+         auto d = datetime.resolve(z, 2024, 3, 10, 2, 30, 0)\n    \
+         auto s = datetime.isoformat(d)\n",
+    ));
+}
+
+#[test]
+fn classifiers_return_bool() {
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    \
+         auto d = datetime.resolve(z, 2024, 3, 10, 2, 30, 0)\n    \
+         bool b = datetime.is_imaginary(d)\n",
+    ));
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    \
+         auto d = datetime.resolve(z, 2024, 11, 3, 1, 30, 0)\n    \
+         bool b = datetime.is_ambiguous(d)\n",
+    ));
+}
+
+#[test]
+fn resolve_imaginary_returns_datetime() {
+    // Result is itself a DateTime, so it flows into the other facets.
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    \
+         auto d = datetime.resolve(z, 2024, 3, 10, 2, 30, 0)\n    \
+         DateTime r = datetime.resolve_imaginary(d)\n    \
+         auto s = datetime.isoformat(r)\n",
+    ));
+}
+
+#[test]
+fn resolve_rejects_bad_operands() {
+    // First arg must be a TimeZone.
+    assert_code(
+        &prog("    auto d = datetime.resolve(42, 2024, 3, 10, 2, 30, 0)\n"),
+        "ZAP4024",
+    );
+    // Civil fields must be ints.
+    assert_code(
+        &prog(
+            "    auto z = datetime.zone(\"UTC\")\n    \
+             auto d = datetime.resolve(z, 2024, \"x\", 10, 2, 30, 0)\n",
+        ),
+        "ZAP4024",
+    );
+    // fold must be an int.
+    assert_code(
+        &prog(
+            "    auto z = datetime.zone(\"UTC\")\n    \
+             auto d = datetime.resolve(z, 2024, 1, 1, 0, 0, 0, \"x\")\n",
+        ),
+        "ZAP4024",
+    );
+    // The TimeZone must be positional.
+    assert_code(
+        &prog(
+            "    auto z = datetime.zone(\"UTC\")\n    \
+             auto d = datetime.resolve(tz=z, 2024, 1, 1, 0, 0, 0)\n",
+        ),
+        "ZAP4023",
+    );
+    // Only `fold` may be a keyword; a stray name is rejected.
+    assert_code(
+        &prog(
+            "    auto z = datetime.zone(\"UTC\")\n    \
+             auto d = datetime.resolve(z, 2024, 1, 1, 0, 0, 0, bogus=1)\n",
+        ),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn resolve_arity_errors() {
+    // Too few (missing civil fields).
+    assert_code(
+        &prog(
+            "    auto z = datetime.zone(\"UTC\")\n    auto d = datetime.resolve(z, 2024, 1, 1)\n",
+        ),
+        "ZAP4025",
+    );
+    // Too many (beyond the optional fold).
+    assert_code(
+        &prog(
+            "    auto z = datetime.zone(\"UTC\")\n    \
+             auto d = datetime.resolve(z, 2024, 1, 1, 0, 0, 0, 0, 0)\n",
+        ),
+        "ZAP4025",
+    );
+}
+
+#[test]
+fn classifiers_and_resolve_imaginary_reject_non_datetime() {
+    assert_code(&prog("    auto b = datetime.is_ambiguous(5)\n"), "ZAP4024");
+    assert_code(
+        &prog("    auto b = datetime.is_imaginary(\"x\")\n"),
+        "ZAP4024",
+    );
+    assert_code(
+        &prog("    auto r = datetime.resolve_imaginary(5)\n"),
+        "ZAP4024",
+    );
+    // Arity.
+    assert_code(
+        &prog(
+            "    auto t = datetime.from_timestamp(0)\n    auto b = datetime.is_ambiguous(t, t)\n",
+        ),
+        "ZAP4025",
+    );
+}

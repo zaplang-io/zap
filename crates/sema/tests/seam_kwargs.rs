@@ -1565,6 +1565,62 @@ fn datetime_date_time_types_keyword_and_positional() {
 }
 
 #[test]
+fn datetime_zone_resolution_keyword_and_positional() {
+    // Named-zone civil resolution (#1149).
+    // resolve — the TimeZone is positional first, then the six civil ints, with
+    // an optional trailing `fold` (keyword or positional). Bespoke binding, so
+    // it is NOT in the seam signatures (like `replace`).
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    auto d = datetime.resolve(z, 2024, 3, 10, 2, 30, 0)\n",
+    ));
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    auto d = datetime.resolve(z, 2024, 11, 3, 1, 30, 0, fold=1)\n",
+    ));
+    // The trailing fold may also be positional.
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    auto d = datetime.resolve(z, 2024, 11, 3, 1, 30, 0, 1)\n",
+    ));
+    // The TimeZone must be positional (a `tz=` keyword in slot 0 is rejected).
+    assert_code(
+        &prog("    auto z = datetime.zone(\"UTC\")\n    auto d = datetime.resolve(tz=z, 2024, 1, 1, 0, 0, 0)\n"),
+        "ZAP4023",
+    );
+    // A stray keyword other than the trailing `fold` is rejected.
+    assert_code(
+        &prog("    auto z = datetime.zone(\"UTC\")\n    auto d = datetime.resolve(z, 2024, 1, 1, 0, 0, 0, fld=1)\n"),
+        "ZAP4023",
+    );
+    // Wrong arity is rejected.
+    assert_code(
+        &prog(
+            "    auto z = datetime.zone(\"UTC\")\n    auto d = datetime.resolve(z, 2024, 1, 1)\n",
+        ),
+        "ZAP4025",
+    );
+
+    // is_ambiguous / is_imaginary / resolve_imaginary — a single DateTime, so
+    // they bind the `dt=` keyword like the other DateTime-consuming facets.
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    auto d = datetime.resolve(z, 2024, 11, 3, 1, 30, 0)\n    auto b = datetime.is_ambiguous(dt=d)\n",
+    ));
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    auto d = datetime.resolve(z, 2024, 3, 10, 2, 30, 0)\n    auto b = datetime.is_imaginary(dt=d)\n",
+    ));
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    auto d = datetime.resolve(z, 2024, 3, 10, 2, 30, 0)\n    auto r = datetime.resolve_imaginary(dt=d)\n",
+    ));
+    // Positional unchanged.
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    auto d = datetime.resolve(z, 2024, 3, 10, 2, 30, 0)\n    auto b = datetime.is_imaginary(d)\n",
+    ));
+    // A misspelled keyword is rejected.
+    assert_code(
+        &prog("    auto z = datetime.zone(\"UTC\")\n    auto d = datetime.resolve(z, 2024, 1, 1, 0, 0, 0)\n    auto b = datetime.is_ambiguous(x=d)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
 fn datetime_time_refinements_keyword_and_positional() {
     // #1055 refinements: keyword binding for the new 1-arg helpers.
     assert_ok(&prog(

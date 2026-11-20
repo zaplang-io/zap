@@ -556,6 +556,87 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             });
             Some(Ty::Named(DATETIME.to_string()))
         }
+        // resolve(tz, year, month, day, hour, minute, second, fold=0) -> DateTime
+        // (#1149): localize a wall clock into `tz`, classifying gap / overlap and
+        // selecting the instant with `fold`. The TimeZone is positional first,
+        // then six int civil fields; `fold` is an optional trailing int (keyword
+        // `fold=` or an 8th positional). Bespoke binding (an optional trailing
+        // arg, like `replace`), so it is omitted from the seam signatures.
+        "resolve" => {
+            let n = args.len();
+            if !(7..=8).contains(&n) {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "datetime.resolve() takes a TimeZone, 6 civil fields and an \
+                         optional fold ({}–{} arguments), found {}",
+                        7, 8, n
+                    ),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                if args[0].name.is_some() {
+                    checker.error(
+                        ErrorCode::ZAP4023,
+                        "datetime.resolve() takes the TimeZone as a positional first argument"
+                            .to_string(),
+                        args[0].span,
+                    );
+                }
+                let tz = checker.infer(&args[0].value);
+                if !is_timezone(&tz) && !matches!(tz, Ty::Unknown) {
+                    checker.error(
+                        ErrorCode::ZAP4024,
+                        format!(
+                            "datetime.resolve() expects a TimeZone, found {}",
+                            tz.display()
+                        ),
+                        expr_span(&args[0].value),
+                    );
+                }
+                for (i, a) in args.iter().enumerate().skip(1) {
+                    // The 8th argument may be named `fold`; all others positional.
+                    if let Some(name) = &a.name {
+                        if !(i == n - 1 && name == "fold") {
+                            checker.error(
+                                ErrorCode::ZAP4023,
+                                format!("datetime.resolve() has no keyword argument '{name}'"),
+                                a.span,
+                            );
+                        }
+                    }
+                    let v = checker.infer(&a.value);
+                    if !v.is_int() && !matches!(v, Ty::Unknown) {
+                        checker.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "datetime.resolve() civil fields and fold must be ints, found {}",
+                                v.display()
+                            ),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+            }
+            Some(Ty::Named(DATETIME.to_string()))
+        }
+        // is_ambiguous(dt) / is_imaginary(dt) -> bool (#1149): does dt's wall
+        // clock occur twice (fall-back) / never (spring-forward) in its retained
+        // zone. Naive / fixed values are always unique, so both are false.
+        "is_ambiguous" | "is_imaginary" => {
+            expect1(checker, method, args, span, "a DateTime", is_datetime);
+            Some(Ty::Bool)
+        }
+        // resolve_imaginary(dt) -> DateTime (#1149): shift a gap (imaginary) wall
+        // clock forward onto the real post-transition time; other values are
+        // returned unchanged (dateutil `resolve_imaginary`).
+        "resolve_imaginary" => {
+            expect1(checker, method, args, span, "a DateTime", is_datetime);
+            Some(Ty::Named(DATETIME.to_string()))
+        }
         _ => None,
     }
 }
