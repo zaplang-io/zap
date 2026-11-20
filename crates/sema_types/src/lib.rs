@@ -10,7 +10,8 @@
 
 use std::collections::HashMap;
 
-use zapc_syntax::ast::BinOp;
+use zapc_syntax::ast::{BinOp, Type};
+use zapc_syntax::span::Span;
 
 /// A resolved type.
 #[derive(Clone, Debug, PartialEq)]
@@ -238,6 +239,121 @@ impl Ty {
             Ty::Py => "py".into(),
             Ty::Unknown => "<unknown>".into(),
         }
+    }
+
+    /// Convert this inferred type into the AST [`Type`] the monomorphizer works
+    /// with (#1166), so mono can unify sema's inferred argument types against a
+    /// generic's parameters and mangle instances — instead of re-deriving the
+    /// type with its own partial inferer (epic I#1169).
+    ///
+    /// Returns `None` for a type with no meaningful concrete AST form as a
+    /// generic argument — `Unknown` / `Py` / `Unit` / `Match`, the affine
+    /// `strview` / `bytesview` views (which sema forbids storing anyway), and
+    /// any composite one of whose elements is itself `None` — so mono leaves
+    /// that argument uninferred (fail-closed) rather than mangling a bogus name.
+    ///
+    /// Untyped literals take their default (`int` → `int64`, `float` →
+    /// `float64`, D-0003), matching the type a bare literal pins today. The
+    /// named spellings are exactly the source type names (`list`, `dict`,
+    /// `channel`, `AtomicArray`, …), so the result mangles identically to a
+    /// hand-written annotation. Synthesized nodes carry a default span.
+    pub fn to_ast_type(&self) -> Option<Type> {
+        fn named(name: &str, args: Vec<Type>) -> Type {
+            Type::Named {
+                name: name.to_string(),
+                args,
+                span: Span::default(),
+            }
+        }
+        Some(match self {
+            Ty::Int64 | Ty::UntypedInt => named("int64", vec![]),
+            Ty::Int32 => named("int32", vec![]),
+            Ty::Uint8 => named("uint8", vec![]),
+            Ty::Uint16 => named("uint16", vec![]),
+            Ty::Uint32 => named("uint32", vec![]),
+            Ty::Uint64 => named("uint64", vec![]),
+            Ty::Usize => named("usize", vec![]),
+            Ty::Float64 | Ty::UntypedFloat => named("float64", vec![]),
+            Ty::Float32 => named("float32", vec![]),
+            Ty::Bool => named("bool", vec![]),
+            Ty::Str => named("str", vec![]),
+            Ty::Bytes => named("bytes", vec![]),
+            Ty::Char => named("char", vec![]),
+            Ty::Bigint => named("bigint", vec![]),
+            Ty::Complex => named("complex", vec![]),
+            Ty::Range => named("range", vec![]),
+            Ty::List(e) => named("list", vec![e.to_ast_type()?]),
+            Ty::Set(e) => named("set", vec![e.to_ast_type()?]),
+            Ty::Heap(e) => named("heap", vec![e.to_ast_type()?]),
+            Ty::Deque(e) => named("deque", vec![e.to_ast_type()?]),
+            Ty::OSet(e) => named("oset", vec![e.to_ast_type()?]),
+            Ty::Chan(e) => named("channel", vec![e.to_ast_type()?]),
+            Ty::AtomicArray(e) => named("AtomicArray", vec![e.to_ast_type()?]),
+            Ty::Dict(k, v) => named("dict", vec![k.to_ast_type()?, v.to_ast_type()?]),
+            Ty::Tuple(elems) => {
+                let mut out = Vec::with_capacity(elems.len());
+                for e in elems {
+                    out.push(e.to_ast_type()?);
+                }
+                Type::Tuple {
+                    elems: out,
+                    span: Span::default(),
+                }
+            }
+            Ty::Named(n) => named(n, vec![]),
+            Ty::Unit | Ty::StrView | Ty::BytesView | Ty::Match | Ty::Py | Ty::Unknown => {
+                return None
+            }
+        })
+    }
+}
+
+/// A span-keyed lookup of the type the checker inferred for every expression it
+/// visited (#1165), folded from `zapc_sema`'s per-expression records. It lives
+/// in this low-level crate (which `zapc_sema` and `zapc_ir`/`zapc_mono` both
+/// depend on) so monomorphization can read sema's inferred types as *data*,
+/// without depending on the sema checker itself (epic I#1169). A generic
+/// constructor / call argument's type is `type_at(arg_span)`.
+#[derive(Clone, Debug, Default)]
+pub struct TypeMap {
+    by_span: HashMap<Span, Ty>,
+}
+
+impl TypeMap {
+    /// Build a map from `(span, ty)` records in visitation order. A span that
+    /// repeats keeps the **last** entry, so a re-inference wins; with the
+    /// built-in prelude prepended, prelude item bodies are visited before the
+    /// user's, so a user expression wins on the rare event its byte span
+    /// coincides with a prelude expression's — which is what a consumer keyed on
+    /// user source (monomorphization) wants. (A span is only locally unique; a
+    /// future hardening may key on a stable node id — tracked in the epic.)
+    pub fn from_records<I>(records: I) -> Self
+    where
+        I: IntoIterator<Item = (Span, Ty)>,
+    {
+        let mut by_span = HashMap::new();
+        for (span, ty) in records {
+            by_span.insert(span, ty);
+        }
+        Self { by_span }
+    }
+
+    /// The inferred type of the expression at `span`, or `None` if no expression
+    /// with that span was typed (e.g. a span from a different source, or a node
+    /// the checker never reached because an earlier error cut analysis short).
+    pub fn type_at(&self, span: Span) -> Option<&Ty> {
+        self.by_span.get(&span)
+    }
+
+    /// The number of distinct expression spans recorded.
+    pub fn len(&self) -> usize {
+        self.by_span.len()
+    }
+
+    /// Whether no expression types were recorded (the normal non-analysis path,
+    /// or an empty module).
+    pub fn is_empty(&self) -> bool {
+        self.by_span.is_empty()
     }
 }
 

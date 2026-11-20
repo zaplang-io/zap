@@ -33,6 +33,13 @@ use zapc_syntax::ast::{
 };
 use zapc_syntax::span::Span;
 
+// The type model shared with sema (I#1169): `TypeMap` (sema's inferred types,
+// keyed by expression span) and `Ty` (with its `to_ast_type` bridge). Re-exported
+// so `zapc_ir` — which depends on `zapc_mono`, not on the sema checker — reaches
+// them through monomorphization. Threaded into the inference path in a later
+// slice (#1167); re-exported here so the carrier crosses the sema->ir boundary.
+pub use zapc_sema_types::{Ty as SemaTy, TypeMap};
+
 /// A lowering error: a human-readable message. Produced by monomorphization and
 /// by the main AST->ZIR lowering pass, which share this type (monomorphization
 /// is the first lowering stage). `zapc_ir` re-exports it as `zapc_ir::LowerError`

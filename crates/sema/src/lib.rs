@@ -24,8 +24,8 @@ mod scoped;
 // `Checker` and the per-module type-check twins keep referring to those names
 // unqualified (and via `crate::` from submodules) as before; re-export `Ty` so
 // the public `zapc_sema::Ty` is unchanged for downstream code.
-pub use zapc_sema_types::Ty;
 use zapc_sema_types::*;
+pub use zapc_sema_types::{Ty, TypeMap};
 
 /// Built-in stdlib module registry (ticket #121): per-module type-checking lives
 /// in `modules/<name>.rs`, dispatched by a data table instead of a hand-written
@@ -488,55 +488,11 @@ pub struct AnalysisFacts {
 }
 
 impl AnalysisFacts {
-    /// Fold [`AnalysisFacts::expr_types`] into a span-keyed lookup (#1165): the
-    /// inferred type of each expression, addressable by the expression's span.
-    ///
-    /// `expr_types` is recorded in visitation (post-order) sequence and may hold
-    /// more than one entry for a span if the checker inferred that node more
-    /// than once; the fold keeps the **last** entry, so a re-inference wins.
-    /// With the built-in prelude prepended (see `with_prelude`), prelude item
-    /// bodies are visited *before* the user's, so on the rare event that a
-    /// prelude expression's byte span coincides with a user expression's, the
-    /// user expression's type wins — which is what a consumer keyed on user
-    /// source (monomorphization, I#1169) wants. (A span is only locally unique;
-    /// a future hardening may key on a stable node id instead — tracked in the
-    /// epic.)
+    /// Fold [`AnalysisFacts::expr_types`] into a span-keyed [`TypeMap`] lookup
+    /// (#1165) — the inferred type of each expression, addressable by span. See
+    /// [`TypeMap::from_records`] for the fold's ordering/collision contract.
     pub fn type_map(&self) -> TypeMap {
-        let mut by_span = HashMap::with_capacity(self.expr_types.len());
-        for (span, ty) in &self.expr_types {
-            by_span.insert(*span, ty.clone());
-        }
-        TypeMap { by_span }
-    }
-}
-
-/// A span-keyed lookup of the type the checker inferred for every expression it
-/// visited (#1165), folded from [`AnalysisFacts::expr_types`]. It is the
-/// foundation for monomorphization reading sema's inferred types instead of
-/// re-deriving them (epic I#1169): a generic constructor / call argument's type
-/// is `type_at(arg_span)`, exactly as sema computed it.
-#[derive(Clone, Debug, Default)]
-pub struct TypeMap {
-    by_span: HashMap<Span, Ty>,
-}
-
-impl TypeMap {
-    /// The inferred type of the expression at `span`, or `None` if no expression
-    /// with that span was typed (e.g. a span from a different source, or a node
-    /// the checker never reached because an earlier error cut analysis short).
-    pub fn type_at(&self, span: Span) -> Option<&Ty> {
-        self.by_span.get(&span)
-    }
-
-    /// The number of distinct expression spans recorded.
-    pub fn len(&self) -> usize {
-        self.by_span.len()
-    }
-
-    /// Whether no expression types were recorded (the normal non-analysis path,
-    /// or an empty module).
-    pub fn is_empty(&self) -> bool {
-        self.by_span.is_empty()
+        TypeMap::from_records(self.expr_types.iter().cloned())
     }
 }
 

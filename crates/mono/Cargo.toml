@@ -20,3 +20,8 @@ path = "src/lib.rs"
 [dependencies]
 zapc_diag = { path = "../diag" }
 zapc_syntax = { path = "../syntax" }
+# Data-only dependency on the type model (I#1169): the `TypeMap` sema produces
+# and the `Ty -> ast::Type` bridge, so monomorphization can consume sema's
+# inferred types without depending on the sema *checker*. `zapc_sema_types` is a
+# leaf over `zapc_syntax`, so this adds no dependency cycle.
+zapc_sema_types = { path = "../sema_types" }
