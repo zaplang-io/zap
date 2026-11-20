@@ -6020,7 +6020,47 @@ impl Checker {
             }
             return None;
         }
-        // Every other operator dispatches on the left operand.
+        // Arithmetic / bitwise / shift / matmul (the operators with a reflected
+        // form, D-0047/#1180). The left operand owns the operator; the RIGHT
+        // operand's reflected dunder (`__radd__` etc.) is a FALLBACK consulted
+        // only where the expression would otherwise error, so this is purely
+        // additive and never changes an already-resolving operator.
+        if let (Some((dunder, iface)), Some(rdunder)) =
+            (binary_op_dunder(op), reflected_op_dunder(op))
+        {
+            let left_is_struct = self.struct_info(l).is_some();
+            // 1. Left wins: a struct left that defines the forward dunder by
+            //    name. The RHS type is not re-checked against the parameter —
+            //    selecting the forward dunder by name is the existing D-0047
+            //    rule, and keeping it unchanged is what makes this additive.
+            if left_is_struct && self.lookup_dunder(l, dunder).is_some() {
+                return Some(self.op_result(l, dunder, iface, binop_symbol(op), span));
+            }
+            // 2. Reflected fallback: the right operand is a struct whose
+            //    reflected dunder accepts the left operand's type. The result is
+            //    that dunder's declared return type.
+            if self.struct_info(r).is_some() {
+                if let Some(sig) = self.lookup_dunder(r, rdunder) {
+                    if self.reflected_accepts(&sig, l) {
+                        return Some(sig.ret);
+                    }
+                }
+            }
+            // 3. A struct left with neither a forward dunder nor a reflected
+            //    handler on the right: the original "operator not supported"
+            //    (ZAP4071). A left that DOES define the forward dunder but whose
+            //    parameter does not accept this RHS is NOT rerouted here — it was
+            //    taken in step 1 (left commits by name; see #1180 RFC §3.3).
+            if left_is_struct {
+                self.require_dunder(l, dunder, iface, binop_symbol(op), span);
+                return Some(Ty::Unknown);
+            }
+            // 4. A non-struct (built-in) left with no reflected handler on the
+            //    right: defer to the built-in arithmetic rules.
+            return None;
+        }
+        // Every other operator (comparison / logical / membership / send)
+        // dispatches on the left operand only — no reflected form.
         self.struct_info(l)?;
         match op {
             Eq | Ne => {
@@ -6039,6 +6079,18 @@ impl Checker {
                 Some(self.op_result(l, dunder, iface, binop_symbol(op), span))
             }
         }
+    }
+
+    /// Whether a reflected operator dunder (`__radd__` etc.) accepts `left` as
+    /// the left operand (#1180). Its `self` is the right operand, so the left
+    /// operand's type must be assignable to the first non-`self` parameter
+    /// (`params[1]`). An arity-short signature accepts nothing, so the operator
+    /// falls through to the ordinary "not supported" error rather than
+    /// resolving against a malformed reflected method.
+    fn reflected_accepts(&self, sig: &FnSig, left: &Ty) -> bool {
+        sig.params
+            .get(1)
+            .is_some_and(|p| self.coercible(left, &p.ty))
     }
 
     /// Check an augmented assignment `a OP= b` with a user-struct LHS (D-0047),
@@ -13937,6 +13989,175 @@ def main():
         );
         assert_eq!(e.len(), 1, "got {e:?}");
         assert!(e[0].message.contains("__add__"), "{e:?}");
+    }
+
+    // --- reflected binary operators (D-0047 / #1180) ---------------------------
+
+    #[test]
+    fn reflected_add_sub_on_right_struct_when_left_has_no_dunder() {
+        // The motivating shape: a core-like value struct with NO forward
+        // arithmetic dunder on the left, and a right struct that supplies the
+        // reflected handler. `dt + rd` / `dt - rd` resolve via __radd__/__rsub__,
+        // typed from the reflected dunder's return.
+        ok("value struct DT:\n    int64 month\n\n\
+            struct Rel:\n    int64 months\n\n    \
+            def __radd__(self, DT dt) -> DT:\n        return dt\n\n    \
+            def __rsub__(self, DT dt) -> DT:\n        return dt\n\n\
+            def main():\n    auto dt = DT(month=1)\n    auto rd = Rel(months=1)\n    \
+            DT a = dt + rd\n    DT b = dt - rd\n    print(a.month + b.month)\n");
+    }
+
+    #[test]
+    fn reflected_result_type_is_the_reflected_dunder_return() {
+        // The expression's type is the reflected dunder's declared return type,
+        // not the left operand's type: assigning to an incompatible binding is a
+        // real error (an `Unknown` result would have slipped through).
+        let e = errors(
+            "value struct DT:\n    int64 month\n\n\
+             struct Rel:\n    int64 months\n\n    \
+             def __radd__(self, DT dt) -> DT:\n        return dt\n\n\
+             def main():\n    auto dt = DT(month=1)\n    \
+             int64 bad = dt + Rel(months=1)\n    print(bad)\n",
+        );
+        assert!(
+            !e.is_empty(),
+            "reflected result should be DT, not Unknown: {e:?}"
+        );
+    }
+
+    #[test]
+    fn reflected_full_operator_set() {
+        // Every binary operator with a reflected form (arithmetic + bitwise +
+        // shift + matmul) resolves through the right operand's reflected dunder
+        // when the left is a bare scalar with no rule for the struct.
+        for (sym, rdunder) in [
+            ("+", "__radd__"),
+            ("-", "__rsub__"),
+            ("*", "__rmul__"),
+            ("/", "__rtruediv__"),
+            ("//", "__rfloordiv__"),
+            ("%", "__rmod__"),
+            ("**", "__rpow__"),
+            ("&", "__rand__"),
+            ("|", "__ror__"),
+            ("^", "__rxor__"),
+            ("<<", "__rlshift__"),
+            (">>", "__rrshift__"),
+            ("@", "__rmatmul__"),
+        ] {
+            let src = format!(
+                "struct W:\n    int64 n\n\n    \
+                 def {rdunder}(self, int64 k) -> W:\n        return W(n=k)\n\n\
+                 def main():\n    W r = 3 {sym} W(n=0)\n    print(r.n)\n"
+            );
+            ok(&src);
+        }
+    }
+
+    #[test]
+    fn reflected_scalar_left_times_struct_right() {
+        // `3.0 * v` where the built-in `f64 *` has no rule for the struct and
+        // the struct defines `__rmul__`. The built-in-left entry point must fall
+        // through to the reflected handler rather than erroring (ZAP4012).
+        ok("value struct Vec2:\n    f64 x\n\n    \
+            def __rmul__(self, f64 k) -> Vec2:\n        return Vec2(x=self.x * k)\n\n\
+            def main():\n    Vec2 v = Vec2(x=2.0)\n    Vec2 w = 3.0 * v\n    print(w.x)\n");
+    }
+
+    #[test]
+    fn left_dunder_wins_over_right_reflected() {
+        // When BOTH a left forward dunder and a right reflected dunder could
+        // apply, the left wins (name-level precedence). Here the left `__add__`
+        // returns `L`, the right `__radd__` returns `R`; the result must be `L`.
+        let e = errors(
+            "struct L:\n    int64 n\n\n    \
+             def __add__(self, R other) -> L:\n        return L(n=self.n)\n\n\
+             struct R:\n    int64 m\n\n    \
+             def __radd__(self, L other) -> R:\n        return R(m=self.m)\n\n\
+             def main():\n    auto a = L(n=1)\n    auto b = R(m=2)\n    \
+             R bad = a + b\n    print(bad.m)\n",
+        );
+        // `a + b` is `L` (left `__add__`), so binding it to `R` is an error —
+        // proving the left path won, not the right reflected one.
+        assert!(!e.is_empty(), "left forward dunder should win: {e:?}");
+    }
+
+    #[test]
+    fn left_forward_dunder_commits_by_name_no_fallthrough() {
+        // A left struct that DEFINES the forward dunder commits the operator to
+        // the left even when its parameter does not accept the RHS; dispatch
+        // does NOT reroute to the right operand's reflected dunder (#1180 §3.3).
+        // The left `__add__` takes a `V`, so `a + rd` is typed `V`; the reflected
+        // `__radd__` returning `str` is never consulted. Binding to `str` errors.
+        let e = errors(
+            "struct V:\n    int64 x\n\n    \
+             def __add__(self, V other) -> V:\n        return V(x=self.x)\n\n\
+             struct Rd:\n    int64 n\n\n    \
+             def __radd__(self, V v) -> str:\n        return \"x\"\n\n\
+             def main():\n    auto a = V(x=1)\n    str bad = a + Rd(n=2)\n    print(bad)\n",
+        );
+        assert!(
+            !e.is_empty(),
+            "left committed by name; reflected must not be used: {e:?}"
+        );
+    }
+
+    #[test]
+    fn no_reflected_handler_still_errors_zap4071() {
+        // A struct left with no forward dunder and a right struct WITHOUT the
+        // matching reflected dunder is still the original ZAP4071, naming the
+        // forward dunder/interface.
+        let e = errors(
+            "value struct DT:\n    int64 month\n\n\
+             struct Rel:\n    int64 months\n\n\
+             def main():\n    auto dt = DT(month=1)\n    auto c = dt + Rel(months=1)\n",
+        );
+        assert_eq!(e.len(), 1, "got {e:?}");
+        assert_eq!(e[0].code, ErrorCode::ZAP4071, "{e:?}");
+        assert!(e[0].message.contains("__add__"), "{e:?}");
+    }
+
+    #[test]
+    fn reflected_requires_param_to_accept_left() {
+        // A reflected dunder whose parameter does NOT accept the left operand's
+        // type does not resolve the operator — it falls through to ZAP4071. Here
+        // `__radd__` wants a `str`, but the left is a `DT`.
+        let e = errors(
+            "value struct DT:\n    int64 month\n\n\
+             struct Rel:\n    int64 months\n\n    \
+             def __radd__(self, str s) -> DT:\n        return DT(month=1)\n\n\
+             def main():\n    auto dt = DT(month=1)\n    auto c = dt + Rel(months=1)\n",
+        );
+        assert_eq!(e.len(), 1, "got {e:?}");
+        assert_eq!(e[0].code, ErrorCode::ZAP4071, "{e:?}");
+    }
+
+    #[test]
+    fn reflected_does_not_apply_to_comparison_or_builtins() {
+        // Reflected dispatch is scoped to arithmetic/bitwise/shift/matmul:
+        // a right-operand `__radd__`-style handler is NOT consulted for `<`
+        // (comparison dispatches on the left `__cmp__` only).
+        let e = errors(
+            "value struct DT:\n    int64 month\n\n\
+             struct Rel:\n    int64 months\n\n    \
+             def __rcmp__(self, DT dt) -> int64:\n        return 0\n\n\
+             def main():\n    auto dt = DT(month=1)\n    if dt < Rel(months=1):\n        print(1)\n",
+        );
+        assert!(!e.is_empty(), "comparison has no reflected form: {e:?}");
+        // And built-in arithmetic between two scalars is completely unaffected.
+        ok("def main():\n    int64 x = 2 + 3\n    float64 y = 1.5 * 2.0\n    print(x)\n    print(str(y))\n");
+    }
+
+    #[test]
+    fn reflected_dunder_can_be_derived_free_of_left_changes() {
+        // End-to-end intent: the right type owns the whole operator surface for
+        // the pair, with the left type (DT) completely unaware of it.
+        ok("value struct DT:\n    int64 v\n\n\
+            struct Delta:\n    int64 k\n\n    \
+            def __radd__(self, DT d) -> DT:\n        return DT(v=d.v + self.k)\n\n    \
+            def __rsub__(self, DT d) -> DT:\n        return DT(v=d.v - self.k)\n\n\
+            def main():\n    DT base = DT(v=10)\n    auto up = base + Delta(k=5)\n    \
+            auto down = base - Delta(k=3)\n    print(up.v + down.v)\n");
     }
 
     #[test]
