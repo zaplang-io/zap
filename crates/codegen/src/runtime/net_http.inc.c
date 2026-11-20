@@ -1671,3 +1671,106 @@ int64_t zap_net_get_recv_buffer(void *s) {
 int64_t zap_net_get_send_buffer(void *s) {
     return zap_net_getopt_int(s, SOL_SOCKET, SO_SNDBUF, "net: get_send_buffer failed");
 }
+
+/* ===========================================================================
+ * net: TCP keepalive interval tuning (ticket #1141, follow-up to #994). #994's
+ * `set_keepalive` only toggles SO_KEEPALIVE on/off, leaving the probe timing at
+ * the OS default (often a ~2h idle on Linux). These tune the idle time before
+ * the first probe, the interval between probes, and the probe count before the
+ * connection is dropped — in seconds / count, matching the POSIX knobs. Call
+ * `net.set_keepalive(sock, True)` first for them to take effect.
+ *
+ * The idle-time option differs by OS (Linux TCP_KEEPIDLE vs macOS/BSD
+ * TCP_KEEPALIVE, both seconds); interval and count are TCP_KEEPINTVL /
+ * TCP_KEEPCNT where present. A knob the platform does not expose (notably on
+ * Windows, whose SIO_KEEPALIVE_VALS ioctl has no count) raises a catchable "not
+ * supported" error — this is the POSIX subset (the Windows ioctl path is a
+ * follow-up). A non-positive value is a ValueError.
+ * ========================================================================== */
+
+/* The idle-before-first-probe option: TCP_KEEPIDLE on Linux, TCP_KEEPALIVE on
+ * macOS/BSD (both take seconds). */
+#if defined(TCP_KEEPIDLE)
+#define ZAP_TCP_KEEPIDLE TCP_KEEPIDLE
+#elif defined(TCP_KEEPALIVE)
+#define ZAP_TCP_KEEPIDLE TCP_KEEPALIVE
+#endif
+
+static void zap_net_keepalive_check_positive(int64_t v) {
+    if (v <= 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("net: keepalive value must be positive",
+                                    sizeof("net: keepalive value must be positive") - 1));
+    }
+}
+
+/* net.set_keepalive_idle(sock, seconds) — seconds a connection may be idle before
+ * the first keepalive probe. */
+void zap_net_set_keepalive_idle(void *s, int64_t seconds) {
+    zap_net_keepalive_check_positive(seconds);
+#if defined(ZAP_TCP_KEEPIDLE)
+    zap_net_setopt_int(s, IPPROTO_TCP, ZAP_TCP_KEEPIDLE, (int)seconds,
+                       "net: set_keepalive_idle failed");
+#else
+    (void)s;
+    zap_net_panic("net: keepalive idle tuning is not supported on this platform");
+#endif
+}
+
+/* net.set_keepalive_interval(sock, seconds) — seconds between probes. */
+void zap_net_set_keepalive_interval(void *s, int64_t seconds) {
+    zap_net_keepalive_check_positive(seconds);
+#if defined(TCP_KEEPINTVL)
+    zap_net_setopt_int(s, IPPROTO_TCP, TCP_KEEPINTVL, (int)seconds,
+                       "net: set_keepalive_interval failed");
+#else
+    (void)s;
+    zap_net_panic("net: keepalive interval tuning is not supported on this platform");
+#endif
+}
+
+/* net.set_keepalive_count(sock, count) — failed probes before the connection is
+ * dropped. */
+void zap_net_set_keepalive_count(void *s, int64_t count) {
+    zap_net_keepalive_check_positive(count);
+#if defined(TCP_KEEPCNT)
+    zap_net_setopt_int(s, IPPROTO_TCP, TCP_KEEPCNT, (int)count,
+                       "net: set_keepalive_count failed");
+#else
+    (void)s;
+    zap_net_panic("net: keepalive count tuning is not supported on this platform");
+#endif
+}
+
+/* net.get_keepalive_idle(sock) -> int64 seconds. */
+int64_t zap_net_get_keepalive_idle(void *s) {
+#if defined(ZAP_TCP_KEEPIDLE)
+    return zap_net_getopt_int(s, IPPROTO_TCP, ZAP_TCP_KEEPIDLE, "net: get_keepalive_idle failed");
+#else
+    (void)s;
+    zap_net_panic("net: keepalive idle tuning is not supported on this platform");
+    return 0;
+#endif
+}
+
+/* net.get_keepalive_interval(sock) -> int64 seconds. */
+int64_t zap_net_get_keepalive_interval(void *s) {
+#if defined(TCP_KEEPINTVL)
+    return zap_net_getopt_int(s, IPPROTO_TCP, TCP_KEEPINTVL, "net: get_keepalive_interval failed");
+#else
+    (void)s;
+    zap_net_panic("net: keepalive interval tuning is not supported on this platform");
+    return 0;
+#endif
+}
+
+/* net.get_keepalive_count(sock) -> int64. */
+int64_t zap_net_get_keepalive_count(void *s) {
+#if defined(TCP_KEEPCNT)
+    return zap_net_getopt_int(s, IPPROTO_TCP, TCP_KEEPCNT, "net: get_keepalive_count failed");
+#else
+    (void)s;
+    zap_net_panic("net: keepalive count tuning is not supported on this platform");
+    return 0;
+#endif
+}

@@ -2042,8 +2042,18 @@ value, which may be rounded up or doubled from what was set). A setsockopt/
 getsockopt failure (for example a TCP-level option on a non-TCP socket) raises a
 catchable error. Set address-reuse options on an unbound socket (e.g.
 `net.udp_socket`) before the matching bind; `TCP_NODELAY` and the buffer sizes
-apply to an established connection. Keepalive-interval tuning and multicast
-membership are follow-ups. `net` remains **Experimental** (STABILITY.md §4.4).
+apply to an established connection. Multicast membership is a follow-up. `net`
+remains **Experimental** (STABILITY.md §4.4).
+
+Keepalive *timing* (#1141) is tuned with `net.set_keepalive_idle(sock, seconds)`
+(idle before the first probe), `net.set_keepalive_interval(sock, seconds)`
+(between probes) and `net.set_keepalive_count(sock, count)` (failed probes before
+the connection is dropped), with `net.get_keepalive_idle` / `_interval` /
+`_count` returning the `int64` current values; enable `set_keepalive(sock, True)`
+first. A non-positive value is a `ValueError`. These are the POSIX
+`TCP_KEEPIDLE`/`TCP_KEEPALIVE`, `TCP_KEEPINTVL` and `TCP_KEEPCNT` knobs; a knob a
+platform does not expose (all three on Windows) raises a catchable "not
+supported" error.
 
 **`tls` client + server (#147, #488).** TLS over OpenSSL on the netpoller.
 *Client (#147):* `tls.connect(host, port)` verifies the certificate chain
