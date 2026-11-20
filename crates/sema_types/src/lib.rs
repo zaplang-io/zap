@@ -300,6 +300,18 @@ impl Ty {
                     span: Span::default(),
                 }
             }
+            // A `$`-prefixed name is a compiler-synthesized, unspellable type —
+            // the shared generator-expression iterator `$genexpr`, a generator
+            // function's state type `$gen:<name>`, an interface fat-pointer
+            // layout `$iface:<name>` (I#67/D-0048, #596). These are not
+            // user-nameable nominal types and must never be bridged into
+            // monomorphization: taking one down the struct/enum instance path
+            // would mint a bogus `Foo$$genexpr`-style instance over an untested,
+            // element-erased layout (a miscompile/ICE risk) instead of the
+            // intended fail-closed `ZAP6001`. Returning `None` leaves the
+            // generic argument `Unknown`, so it is rejected cleanly — exactly as
+            // before the #1167 backfill (#1190).
+            Ty::Named(n) if n.starts_with('$') => return None,
             Ty::Named(n) => named(n, vec![]),
             Ty::Unit | Ty::StrView | Ty::BytesView | Ty::Match | Ty::Py | Ty::Unknown => {
                 return None
