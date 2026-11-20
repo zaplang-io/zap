@@ -127,6 +127,48 @@ fn subst_type(t: &Type, subst: &HashMap<&str, &Type>) -> Type {
     }
 }
 
+/// Substitute generic type-parameter names with concrete [`Ty`]s inside a
+/// [`Ty`] (#1205, generic-interface conformance). A `Ty::Named` whose name is a
+/// parameter in `subst` becomes the mapped type; the built-in container families
+/// and tuples are rebuilt with their element types substituted; every other
+/// `Ty` is returned unchanged (a user named type carries no element `Ty`s). This
+/// is the `Ty`-level counterpart of [`subst_type`] (which works on AST `Type`s).
+fn subst_ty(ty: &Ty, subst: &HashMap<&str, &Ty>) -> Ty {
+    match ty {
+        Ty::Named(name) => subst
+            .get(name.as_str())
+            .map(|t| (*t).clone())
+            .unwrap_or(ty.clone()),
+        Ty::List(e) => Ty::List(Box::new(subst_ty(e, subst))),
+        Ty::Set(e) => Ty::Set(Box::new(subst_ty(e, subst))),
+        Ty::Heap(e) => Ty::Heap(Box::new(subst_ty(e, subst))),
+        Ty::Deque(e) => Ty::Deque(Box::new(subst_ty(e, subst))),
+        Ty::OSet(e) => Ty::OSet(Box::new(subst_ty(e, subst))),
+        Ty::Chan(e) => Ty::Chan(Box::new(subst_ty(e, subst))),
+        Ty::AtomicArray(e) => Ty::AtomicArray(Box::new(subst_ty(e, subst))),
+        Ty::Dict(k, v) => Ty::Dict(Box::new(subst_ty(k, subst)), Box::new(subst_ty(v, subst))),
+        Ty::Tuple(elems) => Ty::Tuple(elems.iter().map(|e| subst_ty(e, subst)).collect()),
+        _ => ty.clone(),
+    }
+}
+
+/// Substitute generic type-parameter names in every parameter type and the
+/// return type of a [`FnSig`] (#1205). The parameter *names*, defaults, and
+/// variadic/kw flags are preserved; only the carried [`Ty`]s change.
+fn subst_fn_sig(sig: &FnSig, subst: &HashMap<&str, &Ty>) -> FnSig {
+    FnSig {
+        params: sig
+            .params
+            .iter()
+            .map(|p| ParamInfo {
+                ty: subst_ty(&p.ty, subst),
+                ..p.clone()
+            })
+            .collect(),
+        ret: subst_ty(&sig.ret, subst),
+    }
+}
+
 /// Collect the names of the aliases referenced anywhere in `t` (#606 cycle
 /// detection). Only names present in `aliases` are recorded.
 fn collect_alias_refs(
@@ -1686,6 +1728,8 @@ impl Checker {
             (
                 name.to_string(),
                 InterfaceInfo {
+                    // The built-in capability interfaces are not generic.
+                    generics: Vec::new(),
                     methods: method
                         .into_iter()
                         .map(|(n, s)| (n.to_string(), s))
@@ -1720,10 +1764,20 @@ impl Checker {
     /// method signature, in declaration order. `self` is typed as the interface
     /// itself; the remaining parameter and return types are resolved normally.
     fn interface_info_of(&self, i: &InterfaceDef) -> InterfaceInfo {
+        // The interface's own generic type-parameter names (#1205), threaded
+        // into method-signature resolution so a method that names one keeps it
+        // as a `Ty::Named(param)` type variable (substitutable at conformance),
+        // rather than resolving to the opaque `Ty::Unknown` of an unknown name.
+        let generics: Vec<String> = i.generics.iter().map(|g| g.name.clone()).collect();
         let methods = i
             .methods
             .iter()
-            .map(|m| (m.name.clone(), self.sig_of_method_sig(m, &i.name)))
+            .map(|m| {
+                (
+                    m.name.clone(),
+                    self.sig_of_method_sig(m, &i.name, &generics),
+                )
+            })
             .collect();
         // Refined supertypes (D-0139/#806): record each named supertype. Only a
         // plain `Named` type can name an interface; anything else is validated and
@@ -1738,14 +1792,18 @@ impl Checker {
             })
             .collect();
         InterfaceInfo {
+            generics,
             methods,
             supertypes,
         }
     }
 
     /// Resolve an interface [`MethodSig`] to a [`FnSig`] (its `self` typed as the
-    /// enclosing interface `iname`).
-    fn sig_of_method_sig(&self, m: &MethodSig, iname: &str) -> FnSig {
+    /// enclosing interface `iname`). `generics` are the interface's own
+    /// type-parameter names (#1205); a parameter/return that names one resolves
+    /// to the `Ty::Named(param)` type variable so conformance can substitute the
+    /// concrete type argument.
+    fn sig_of_method_sig(&self, m: &MethodSig, iname: &str, generics: &[String]) -> FnSig {
         let params = m
             .params
             .iter()
@@ -1754,7 +1812,7 @@ impl Checker {
                     Ty::Named(iname.to_string())
                 } else {
                     p.ty.as_ref()
-                        .map(|t| self.resolve_type_self(t, iname))
+                        .map(|t| self.resolve_type_scoped(t, iname, generics))
                         .unwrap_or(Ty::Unknown)
                 };
                 ParamInfo {
@@ -1771,7 +1829,7 @@ impl Checker {
         let ret = m
             .ret
             .as_ref()
-            .map(|t| self.resolve_type_self(t, iname))
+            .map(|t| self.resolve_type_scoped(t, iname, generics))
             .unwrap_or(Ty::Unit);
         FnSig { params, ret }
     }
@@ -1962,6 +2020,26 @@ impl Checker {
     /// precise diagnostic. A non-struct `sname` (e.g. not yet registered) simply
     /// fails to conform.
     fn conforms(&self, sname: &str, iname: &str) -> Result<(), Vec<String>> {
+        self.conforms_with_args(sname, iname, &[])
+    }
+
+    /// Structural conformance of `sname` to the generic interface `iname`
+    /// instantiated at `type_args` (#1205): the interface's own type parameters
+    /// are substituted (`T := type_args[i]`) in each of *its* required method
+    /// signatures before matching, so a struct conforms to `Container[int64]`
+    /// iff it provides `Container`'s methods with `T` replaced by `int64`.
+    /// `type_args` empty (or a non-generic interface) reduces to the plain
+    /// non-parametrized conformance check, unchanged. Refined-supertype method
+    /// requirements (D-0139/#806) are matched against the supertype's own
+    /// signatures; a *generic supertype* is not substituted through here (its
+    /// arguments are not carried on the refinement edge — deferred), which is
+    /// moot while the refined capability supertypes are non-generic.
+    fn conforms_with_args(
+        &self,
+        sname: &str,
+        iname: &str,
+        type_args: &[Ty],
+    ) -> Result<(), Vec<String>> {
         if !self.interfaces.contains_key(iname) {
             return Err(vec![format!("'{iname}' is not an interface")]);
         }
@@ -1983,6 +2061,22 @@ impl Checker {
         // of `iname` *and* of all its transitive supertypes. A method missing
         // because of a supertype names that supertype in the diagnostic, so
         // "satisfies `Hashable` but not `Equatable`" points at `Equatable`.
+        // Substitution of the interface's own type parameters by `type_args`
+        // (#1205), `param -> arg`, applied only to `iname`'s *own* method
+        // signatures (its supertypes carry their own, unsubstituted). Empty when
+        // the interface is non-generic or no arguments were supplied, in which
+        // case every signature is matched verbatim (the pre-#1205 behavior).
+        let subst: HashMap<&str, &Ty> = self
+            .interfaces
+            .get(iname)
+            .map(|info| {
+                info.generics
+                    .iter()
+                    .zip(type_args.iter())
+                    .map(|(p, a)| (p.as_str(), a))
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut reasons = Vec::new();
         for (mname, isig, origin) in self.required_methods(iname) {
             let from = if origin == iname {
@@ -1990,10 +2084,17 @@ impl Checker {
             } else {
                 format!(" (required by supertype '{origin}')")
             };
+            // Only the direct interface's signatures are instantiated; a
+            // supertype requirement is matched against the supertype's own sig.
+            let want = if origin == iname && !subst.is_empty() {
+                subst_fn_sig(&isig, &subst)
+            } else {
+                isig
+            };
             match methods.get(&mname) {
                 None => reasons.push(format!("missing method '{mname}'{from}")),
                 Some(msig) => {
-                    if !sigs_match(msig, &isig) {
+                    if !sigs_match(msig, &want) {
                         reasons.push(format!("method '{mname}' has a mismatched signature{from}"));
                     }
                 }
@@ -2470,6 +2571,53 @@ impl Checker {
             }
         }
         self.resolve_type(t)
+    }
+
+    /// Resolve a type that appears inside a generic interface's method signature
+    /// (#1205). `generics` are the interface's own type-parameter names; a bare
+    /// reference to one resolves to the `Ty::Named(param)` type variable (kept
+    /// substitutable at conformance) instead of the opaque `Ty::Unknown` an
+    /// unknown name would otherwise yield. The type variable is also threaded
+    /// through the element positions of the built-in container families and of a
+    /// tuple, so `list[T]` / `(T, T)` conform precisely too. `Self` resolves to
+    /// the interface itself, as in [`Self::resolve_type_self`]. Everything else
+    /// (primitives, user types, user generic types whose arguments `Ty::Named`
+    /// erases) falls through to the ordinary resolver, so a non-generic
+    /// interface — `generics` empty — resolves exactly as before.
+    fn resolve_type_scoped(&self, t: &Type, iname: &str, generics: &[String]) -> Ty {
+        match t {
+            Type::Named { name, args, .. } => {
+                if name == "Self" {
+                    return Ty::Named(iname.to_string());
+                }
+                if args.is_empty() && generics.iter().any(|g| g == name) {
+                    return Ty::Named(name.clone());
+                }
+                let elem = |idx: usize| {
+                    args.get(idx)
+                        .map(|a| self.resolve_type_scoped(a, iname, generics))
+                        .unwrap_or(Ty::Unknown)
+                };
+                match name.as_str() {
+                    "list" => Ty::List(Box::new(elem(0))),
+                    "set" => Ty::Set(Box::new(elem(0))),
+                    "heap" => Ty::Heap(Box::new(elem(0))),
+                    "deque" => Ty::Deque(Box::new(elem(0))),
+                    "oset" => Ty::OSet(Box::new(elem(0))),
+                    "channel" => Ty::Chan(Box::new(elem(0))),
+                    "AtomicArray" => Ty::AtomicArray(Box::new(elem(0))),
+                    "dict" => Ty::Dict(Box::new(elem(0)), Box::new(elem(1))),
+                    _ => self.resolve_type(t),
+                }
+            }
+            Type::Tuple { elems, .. } => Ty::Tuple(
+                elems
+                    .iter()
+                    .map(|e| self.resolve_type_scoped(e, iname, generics))
+                    .collect(),
+            ),
+            Type::Func { .. } => self.resolve_type(t),
+        }
     }
 
     fn collect_sigs(&mut self, module: &Module) {
@@ -15061,6 +15209,149 @@ def main():
         // unconstrained generic behavior (slices 1-4) unchanged.
         ok("def identity[T](T x) -> T:\n    return x\n\ndef main():\n    print(identity(1))\n");
     }
+
+    // --- generic-interface conformance (#1205) -------------------------------
+    //
+    // A generic interface `interface X[T]` conforms *structurally* with its
+    // type parameters substituted (`T := A`). Conformance is enforced at each
+    // concrete instantiation (mono unit tests + a golden); these host tests pin
+    // the sema `conforms_with_args` substitution routine directly, and confirm
+    // the surrounding sema surface (declaration, non-generic regression) holds.
+
+    /// Build a checker with the module's interfaces/structs/enums registered,
+    /// for a direct conformance query (`collect_types` is the registration pass
+    /// `analyze` runs first).
+    fn checker_with_types(src: &str) -> Checker {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty(), "parse errors: {perrs:?}");
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        let mut c = Checker::new();
+        c.collect_types(&module);
+        c
+    }
+
+    const CONTAINER_IFACE: &str = "interface Container[E]:\n    def get(self) -> E\n\n\
+        struct IntBox:\n    int64 v\n\
+        \x20   def get(self) -> int64:\n        return self.v\n\n\
+        struct StrBox:\n    str s\n\
+        \x20   def get(self) -> str:\n        return self.s\n\n\
+        def main():\n    print(1)\n";
+
+    #[test]
+    fn generic_interface_records_its_type_parameters() {
+        // `interface Container[E]` registers `E` as the interface's generic, and
+        // the method `get(self) -> E` keeps `E` as a type variable (not erased
+        // to `Unknown`) so it can be substituted at conformance.
+        let c = checker_with_types(CONTAINER_IFACE);
+        let info = c.interfaces.get("Container").expect("Container registered");
+        assert_eq!(info.generics, vec!["E".to_string()]);
+        let (_, get) = info.methods.iter().find(|(n, _)| n == "get").unwrap();
+        assert_eq!(get.ret, Ty::Named("E".to_string()));
+    }
+
+    #[test]
+    fn conformer_matches_generic_interface_with_substituted_arg() {
+        // IntBox.get -> int64 matches Container[int64] (E := int64); StrBox.get
+        // -> str does not. The substitution is per instantiation: StrBox matches
+        // Container[str], IntBox does not.
+        let c = checker_with_types(CONTAINER_IFACE);
+        assert!(c
+            .conforms_with_args("IntBox", "Container", &[Ty::Int64])
+            .is_ok());
+        assert!(c
+            .conforms_with_args("StrBox", "Container", &[Ty::Int64])
+            .is_err());
+        assert!(c
+            .conforms_with_args("StrBox", "Container", &[Ty::Str])
+            .is_ok());
+        assert!(c
+            .conforms_with_args("IntBox", "Container", &[Ty::Str])
+            .is_err());
+    }
+
+    #[test]
+    fn generic_interface_mismatch_names_the_method() {
+        // The failure reason is the same precise clause the non-generic path
+        // emits, so the instantiation diagnostic can point at the method.
+        let c = checker_with_types(CONTAINER_IFACE);
+        let reasons = c
+            .conforms_with_args("StrBox", "Container", &[Ty::Int64])
+            .unwrap_err();
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("get") && r.contains("mismatched signature")),
+            "got: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn generic_interface_substitutes_inside_containers() {
+        // A type variable nested in a built-in container position is substituted
+        // too: `def items(self) -> list[E]` requires `list[int64]` at
+        // Container2[int64].
+        let src = "interface Boxed[E]:\n    def items(self) -> list[E]\n\n\
+            struct Ints:\n    int64 n\n\
+            \x20   def items(self) -> list[int64]:\n        return [self.n]\n\n\
+            struct Strs:\n    str s\n\
+            \x20   def items(self) -> list[str]:\n        return [self.s]\n\n\
+            def main():\n    print(1)\n";
+        let c = checker_with_types(src);
+        assert!(c.conforms_with_args("Ints", "Boxed", &[Ty::Int64]).is_ok());
+        assert!(c.conforms_with_args("Strs", "Boxed", &[Ty::Int64]).is_err());
+    }
+
+    #[test]
+    fn two_parameter_generic_interface_substitutes_each() {
+        // Both parameters are substituted independently (the `[L, Out]` shape the
+        // operator-capability interfaces use, #1199 — modeled here with plain
+        // methods so this stays generics-only).
+        let src =
+            "interface Pairish[A, B]:\n    def first(self) -> A\n    def second(self) -> B\n\n\
+            struct IS:\n    int64 i\n    str s\n\
+            \x20   def first(self) -> int64:\n        return self.i\n\
+            \x20   def second(self) -> str:\n        return self.s\n\n\
+            def main():\n    print(1)\n";
+        let c = checker_with_types(src);
+        assert!(c
+            .conforms_with_args("IS", "Pairish", &[Ty::Int64, Ty::Str])
+            .is_ok());
+        // Swapped arguments no longer match.
+        assert!(c
+            .conforms_with_args("IS", "Pairish", &[Ty::Str, Ty::Int64])
+            .is_err());
+    }
+
+    #[test]
+    fn non_generic_conformance_is_unchanged_by_the_generic_path() {
+        // A non-generic interface conforms with no arguments exactly as before:
+        // `conforms` and `conforms_with_args(_, _, &[])` agree, and a generic
+        // interface queried with no arguments does not substitute (so its type
+        // variables stay unmatched — generic interface *values* remain out of
+        // scope, bounds are the realized surface).
+        let c = checker_with_types(&format!("{SHAPE_IFACE}def main():\n    print(1)\n"));
+        assert!(c.conforms("Circle", "Shape").is_ok());
+        assert!(c.conforms_with_args("Circle", "Shape", &[]).is_ok());
+        let gc = checker_with_types(CONTAINER_IFACE);
+        // No arguments -> `E` is not substituted, so a concrete `get` cannot
+        // match the bare type variable (documented limitation for bare values).
+        assert!(gc.conforms_with_args("IntBox", "Container", &[]).is_err());
+    }
+
+    #[test]
+    fn generic_interface_declaration_and_bound_type_check() {
+        // A generic interface declaration and a bound naming it with a concrete
+        // argument both type-check at the definition site (the instantiation
+        // check lives in mono); nothing here is rejected as malformed.
+        ok(&format!(
+            "{CONTAINER_IFACE_DECL}def unwrap[T: Container[int64]](T c) -> int64:\n    return 0\n\n\
+             def main():\n    print(unwrap(IntBox(v=1)))\n"
+        ));
+    }
+
+    const CONTAINER_IFACE_DECL: &str = "interface Container[E]:\n    def get(self) -> E\n\n\
+        struct IntBox:\n    int64 v\n\
+        \x20   def get(self) -> int64:\n        return self.v\n\n";
 
     // --- interface refinement `interface X: Y` (D-0139/#806) ---
     //

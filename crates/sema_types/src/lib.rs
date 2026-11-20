@@ -718,6 +718,12 @@ impl StructInfo {
 /// order a conforming struct is checked against and lowered to).
 #[derive(Clone)]
 pub struct InterfaceInfo {
+    /// The interface's own generic type-parameter names in declaration order
+    /// (#1205): the `T` in `interface Container[T]`. Empty for a plain,
+    /// non-generic interface. A method signature that names one of these keeps
+    /// it as a `Ty::Named(param)` type variable so structural conformance can
+    /// substitute the concrete type arguments (`T := A`) before matching.
+    pub generics: Vec<String>,
     /// Interface method name -> signature (`self` is the first parameter, typed
     /// as the interface itself), in declaration order.
     pub methods: Vec<(String, FnSig)>,

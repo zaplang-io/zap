@@ -213,7 +213,7 @@ enum Optional[T]:            # generic enum (the flagship)
 def map[T, U](list[T] xs, fn(T) -> U f) -> list[U]:
     ...
 
-interface Container[T]:    # generic interface (reserved; realized in a later slice)
+interface Container[T]:    # generic interface (conformance realized, #1205)
     def get(self, int64 i) -> T
 ```
 
@@ -312,9 +312,16 @@ def max_of[T: Ord](list[T] xs) -> T:    # body may call __cmp__; nothing else
   runtime.
 - Operator-overload dunder interfaces (`Add`, `Ord`, …, D-0047) are valid bounds
   for free: `def sum[T: Add](xs: list[T]) -> T` just works once bounds land.
+- **Generic-interface bounds (#1205, realized).** A bound may name a *generic*
+  interface at concrete type arguments, `[T: Container[int64]]`: the interface's
+  own type parameters are substituted (`T := int64`) and the resulting method
+  set is the structural requirement checked at each instantiation. Interface
+  *values* of a generic interface stay a separate (Fork X) concern.
 - **Deferred:** multiple bounds per param (`[T: Add + Ord]`), where-clauses,
-  associated types, and bounds referencing other type params. Single interface
-  bound per param is the v1-of-bounds surface.
+  associated types, resolving a *call through* a generic-interface-bounded type
+  parameter to its substituted signature and bounds referencing other type
+  params (`[T: X[…, T]]`) — tracked as #1206. Single interface bound per param
+  (generic or not) is the v1-of-bounds surface.
 
 ### Fork X — Interaction with existing machinery
 
