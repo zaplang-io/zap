@@ -825,6 +825,35 @@ fn net_unix_keyword_and_positional() {
     );
 }
 
+#[test]
+fn net_sockopt_keyword_and_positional() {
+    // Setters take (sock, on|nbytes), reorderable by name.
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    net.set_reuseaddr(on=True, sock=s)\n",
+    ));
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    net.set_nodelay(s, True)\n",
+    ));
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    net.set_recv_buffer(nbytes=65536, sock=s)\n",
+    ));
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    net.set_send_buffer(s, 65536)\n",
+    ));
+    // Getters: bool getters feed a condition; int getters feed arithmetic.
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    if net.get_nodelay(sock=s):\n        print(1)\n",
+    ));
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    auto n = net.get_recv_buffer(s) + 1\n",
+    ));
+    // An unknown keyword is rejected by the central binder (ZAP4023).
+    assert_code(
+        &prog("    auto s = net.udp_socket()\n    net.set_nodelay(sock=s, enable=True)\n"),
+        "ZAP4023",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // linalg — LAPACK-backed linear algebra; NumPy names (a / b / n / x / ord).
 // The check facet only infers + arity-checks (arrays type loosely), so these

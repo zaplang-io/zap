@@ -10,7 +10,9 @@
 //! (`lookup_host`/`lookup_ipv4`/`lookup_ipv6`/`lookup_addr`, returning
 //! `list[str]`) in #992, and Unix domain sockets (`listen_unix`/`connect_unix`
 //! stream + `unixgram_socket`/`unixgram_bind`/`sendto_unix`/`recvfrom_unix`
-//! datagram) in #993 (epic #985). `import net` is accepted but not required.
+//! datagram) in #993, and socket options (`set_nodelay`/`set_keepalive`/
+//! `set_reuseaddr`/`set_reuseport`/`set_recv_buffer`/`set_send_buffer` + the
+//! `get_*` twins) in #994 (epic #985). `import net` is accepted but not required.
 
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
@@ -160,6 +162,26 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "recvfrom_unix" => {
             expect_argc(checker, "net", method, args, 2, span);
             Ty::Tuple(vec![Ty::Str, Ty::Str])
+        }
+
+        // ---- socket options (ticket #994, epic #985) ----
+        // Setters take (sock, value); the on/off ones a bool, the buffer ones an
+        // int64 byte count. A setsockopt failure (e.g. a TCP option on a non-TCP
+        // socket) raises.
+        "set_reuseaddr" | "set_reuseport" | "set_nodelay" | "set_keepalive" | "set_recv_buffer"
+        | "set_send_buffer" => {
+            expect_argc(checker, "net", method, args, 2, span);
+            Ty::Unit
+        }
+        // Boolean option getters.
+        "get_nodelay" | "get_keepalive" => {
+            expect_argc(checker, "net", method, args, 1, span);
+            Ty::Bool
+        }
+        // Buffer-size getters -> int64 (the OS value, possibly rounded/doubled).
+        "get_recv_buffer" | "get_send_buffer" => {
+            expect_argc(checker, "net", method, args, 1, span);
+            Ty::Int64
         }
         _ => return None,
     })

@@ -14,6 +14,23 @@ use crate::lower::{FnLower, LowerError};
 
 pub(super) const MODULE: ModuleLower = ModuleLower { name: "net", lower };
 
+/// Emit a throwing runtime call returning a 0/1 `i64` word and compare it to 0
+/// for a `bool` (`i1`) result — the throwing counterpart of `support::call_bool`,
+/// used by the socket-option getters whose `getsockopt` may raise.
+fn call_bool_throwing(lowerer: &mut FnLower, func: &str, args: Vec<Value>) -> (Value, Ty) {
+    let word = lowerer.new_value(Ty::I64);
+    lowerer.throwing_call(Some(word), func, args);
+    let zero = lowerer.iconst(Ty::I64, 0);
+    let d = lowerer.new_value(Ty::I1);
+    lowerer.emit(Inst::ICmp {
+        dest: d,
+        pred: CmpPred::Ne,
+        lhs: word,
+        rhs: zero,
+    });
+    (d, Ty::I1)
+}
+
 /// Unpack a `ZapDatagram` handle (from `zap_udp_recvfrom`) into a
 /// `(str, str, int64)` tuple via the three infallible field getters and the
 /// tuple aggregate path (intern + StructNew + FieldSet) — the same shape
@@ -163,6 +180,23 @@ fn lower(
             lowerer.throwing_call(Some(h), "zap_net_recvfrom_unix", a);
             unpack_unix_datagram_tuple(lowerer, h)
         }
+
+        // ---- socket options (ticket #994, epic #985) ----
+        // Setters: bool/int value passes through as an i64 word (lower_args
+        // coerces the bool). setsockopt may raise, so a throwing call.
+        "set_reuseaddr" => call_void(lowerer, "zap_net_set_reuseaddr", a, true),
+        "set_reuseport" => call_void(lowerer, "zap_net_set_reuseport", a, true),
+        "set_nodelay" => call_void(lowerer, "zap_net_set_nodelay", a, true),
+        "set_keepalive" => call_void(lowerer, "zap_net_set_keepalive", a, true),
+        "set_recv_buffer" => call_void(lowerer, "zap_net_set_recv_buffer", a, true),
+        "set_send_buffer" => call_void(lowerer, "zap_net_set_send_buffer", a, true),
+        // Boolean getters: the runtime returns a 0/1 i64 word (throwing on a
+        // getsockopt error), compared to 0 for the `bool` result.
+        "get_nodelay" => call_bool_throwing(lowerer, "zap_net_get_nodelay", a),
+        "get_keepalive" => call_bool_throwing(lowerer, "zap_net_get_keepalive", a),
+        // Buffer-size getters -> int64.
+        "get_recv_buffer" => call_ret(lowerer, "zap_net_get_recv_buffer", a, Ty::I64, true),
+        "get_send_buffer" => call_ret(lowerer, "zap_net_get_send_buffer", a, Ty::I64, true),
         _ => return Ok(None),
     }))
 }

@@ -529,6 +529,17 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("net", "unixgram_bind", &["sock", "path"]),
     ("net", "sendto_unix", &["sock", "data", "path"]),
     ("net", "recvfrom_unix", &["sock", "n"]),
+    // Socket options (#994, epic #985).
+    ("net", "set_reuseaddr", &["sock", "on"]),
+    ("net", "set_reuseport", &["sock", "on"]),
+    ("net", "set_nodelay", &["sock", "on"]),
+    ("net", "set_keepalive", &["sock", "on"]),
+    ("net", "set_recv_buffer", &["sock", "nbytes"]),
+    ("net", "set_send_buffer", &["sock", "nbytes"]),
+    ("net", "get_nodelay", &["sock"]),
+    ("net", "get_keepalive", &["sock"]),
+    ("net", "get_recv_buffer", &["sock"]),
+    ("net", "get_send_buffer", &["sock"]),
     // ---- linalg (tickets #926-#928): LAPACK-backed linear algebra (NumPy names) ----
     ("linalg", "solve", &["a", "b"]),
     ("linalg", "inv", &["a"]),
