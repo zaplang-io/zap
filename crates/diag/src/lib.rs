@@ -497,6 +497,10 @@ define_codes! {
     ZAP4083 = 4083 : "duplicate interface supertype",
         "An `interface X: …` refinement lists the same supertype more than once \
          (D-0139/#806). Name each refined interface at most once.";
+    ZAP4084 = 4084 : "generic-interface bound arity mismatch",
+        "A type parameter's bound names a generic interface with the wrong number \
+         of type arguments (#1206). A bound `[T: Iface[A, …]]` must supply exactly \
+         as many arguments as the interface declares type parameters.";
 
     ZAP4090 = 4090 : "cyclic type alias",
         "A transparent type alias (`type X = …`) expands, directly or through \

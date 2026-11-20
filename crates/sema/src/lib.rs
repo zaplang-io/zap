@@ -373,6 +373,19 @@ pub fn apply_suppressions(src: &str, warnings: Vec<TypeError>) -> Vec<TypeError>
         .collect()
 }
 
+/// An interface bound captured on a type parameter (I#164; parametrized form
+/// #1206): the bound interface name plus the bound's type arguments resolved to
+/// [`Ty`], with references to the enclosing/own type parameters preserved as
+/// `Ty::Named(param)`. `args` is empty for a bare `[T: Iface]` bound; for a
+/// parametrized bound `[T: RMul[f64, T]]` it is `[Float64, Named("T")]`, so a
+/// call through the bounded parameter can substitute the interface's type
+/// parameters (`L := f64`, `Out := T`) and type the result precisely.
+#[derive(Clone)]
+struct TyBound {
+    iface: String,
+    args: Vec<Ty>,
+}
+
 struct Checker {
     sigs: HashMap<String, FnSig>,
     user_types: HashSet<String>,
@@ -466,8 +479,10 @@ struct Checker {
     /// checking a bounded generic body so that a method call on a value of a
     /// bounded type parameter `T: Iface` resolves through `Iface` (static
     /// dispatch after monomorphization), and calling a method the bound does not
-    /// provide is rejected at definition (check-at-definition, Fork M1).
-    tyvar_bounds: HashMap<String, String>,
+    /// provide is rejected at definition (check-at-definition, Fork M1). The
+    /// value carries the bound's type arguments too (#1206), so a call through
+    /// the parameter resolves the interface's substituted method signatures.
+    tyvar_bounds: HashMap<String, TyBound>,
     /// Interface bounds on the type parameters of the *enclosing* type whose
     /// methods are currently being checked (I#811): e.g. the `K: Comparable` of
     /// `struct BST[K: Comparable, V]` while checking `BST`'s methods. These are
@@ -475,7 +490,13 @@ struct Checker {
     /// body may call the bound's methods (`__cmp__`/`__hash__`) on a parameter
     /// typed as the enclosing type parameter — the user-container counterpart of
     /// the bounded-free-function body check. Empty for free functions.
-    enclosing_type_bounds: Vec<(String, String)>,
+    enclosing_type_bounds: Vec<(String, TyBound)>,
+    /// The *names* of every type parameter of the enclosing type whose methods
+    /// are currently being checked (#1206), bounded or not. Used to resolve a
+    /// parametrized bound's arguments that reference an enclosing type parameter
+    /// (e.g. a method bound `[V: Iface[K]]` naming the owner's `K`). Empty for
+    /// free functions.
+    enclosing_type_params: Vec<String>,
     ret_ty: Ty,
     /// `true` while checking the body of a generator function (a free `def`
     /// whose body contains `yield`, I#67/D-0026). Gates `yield`/`return`
@@ -1095,6 +1116,7 @@ impl Checker {
             const_scopes: Vec::new(),
             tyvar_bounds: HashMap::new(),
             enclosing_type_bounds: Vec::new(),
+            enclosing_type_params: Vec::new(),
             ret_ty: Ty::Unit,
             in_generator: false,
             errors: Vec::new(),
@@ -2131,6 +2153,32 @@ impl Checker {
             }
         }
         out
+    }
+
+    /// Substitute interface `iname`'s type parameters by `args` in `sig`
+    /// (#1206). Used to type a call through a parametrized-bound type parameter:
+    /// the interface's declared signature carries its type variables
+    /// (`Ty::Named(param)`), which this replaces by the bound's arguments. Empty
+    /// `args` (a non-generic interface, or a bare bound) returns `sig` unchanged.
+    /// A supertype method's signature contains none of `iname`'s own parameter
+    /// names, so substituting across it is a safe no-op.
+    fn subst_iface_sig(&self, iname: &str, args: &[Ty], sig: &FnSig) -> FnSig {
+        let subst: HashMap<&str, &Ty> = self
+            .interfaces
+            .get(iname)
+            .map(|info| {
+                info.generics
+                    .iter()
+                    .map(|s| s.as_str())
+                    .zip(args.iter())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if subst.is_empty() {
+            sig.clone()
+        } else {
+            subst_fn_sig(sig, &subst)
+        }
     }
 
     /// Resolve method `mname` on interface `iname`, searching `iname` and then its
@@ -3774,11 +3822,15 @@ impl Checker {
             match item {
                 Item::Function(f) => self.check_function(f, None),
                 Item::Struct(s) => {
-                    self.enclosing_type_bounds = self.type_param_bounds(&s.generics);
+                    let params: Vec<String> = s.generics.iter().map(|g| g.name.clone()).collect();
+                    self.validate_bound_arity(&s.generics);
+                    self.enclosing_type_bounds = self.type_param_bounds(&s.generics, &params);
+                    self.enclosing_type_params = params;
                     for m in &s.methods {
                         self.check_function(m, Some(&s.name));
                     }
                     self.enclosing_type_bounds = Vec::new();
+                    self.enclosing_type_params = Vec::new();
                 }
                 Item::Enum(e) => {
                     // A tier-1 (constant) enum's `Equatable`/`Hashable` are
@@ -3812,11 +3864,15 @@ impl Checker {
                     // body may use only universal operations (bind/pass/return/
                     // match), which is the unconstrained check-at-definition rule
                     // (Fork B/M1). Enum-method *lowering* lands in the ir slice.
-                    self.enclosing_type_bounds = self.type_param_bounds(&e.generics);
+                    let params: Vec<String> = e.generics.iter().map(|g| g.name.clone()).collect();
+                    self.validate_bound_arity(&e.generics);
+                    self.enclosing_type_bounds = self.type_param_bounds(&e.generics, &params);
+                    self.enclosing_type_params = params;
                     for m in &e.methods {
                         self.check_function(m, Some(&e.name));
                     }
                     self.enclosing_type_bounds = Vec::new();
+                    self.enclosing_type_params = Vec::new();
                 }
                 // Module-level bindings (const and mutable) were already declared
                 // and checked in the pre-pass above (D-0112); skip them here so
@@ -3878,19 +3934,76 @@ impl Checker {
         }
     }
 
-    /// The `(type-parameter name, bound interface name)` pairs of a declaration's
-    /// type parameters whose bound names a known interface (I#811). Used to seed
-    /// [`Self::enclosing_type_bounds`] for a generic type's method bodies.
-    fn type_param_bounds(&self, generics: &[TypeParam]) -> Vec<(String, String)> {
+    /// The `(type-parameter name, bound)` pairs of a declaration's type
+    /// parameters whose bound names a known interface (I#811). The bound carries
+    /// its type arguments (#1206), resolved against `in_scope` — the type
+    /// parameters visible where the bound is written — so an argument that
+    /// references one (`[T: RMul[f64, T]]`) is kept as a `Ty::Named(param)` type
+    /// variable rather than erased. Used to seed [`Self::tyvar_bounds`] /
+    /// [`Self::enclosing_type_bounds`] for a bounded generic body.
+    fn type_param_bounds(
+        &self,
+        generics: &[TypeParam],
+        in_scope: &[String],
+    ) -> Vec<(String, TyBound)> {
         generics
             .iter()
             .filter_map(|tp| match &tp.bound {
-                Some(Type::Named { name: iface, .. }) if self.interfaces.contains_key(iface) => {
-                    Some((tp.name.clone(), iface.clone()))
+                Some(Type::Named {
+                    name: iface, args, ..
+                }) if self.interfaces.contains_key(iface) => {
+                    let args = args
+                        .iter()
+                        .map(|a| self.resolve_type_scoped(a, "", in_scope))
+                        .collect();
+                    Some((
+                        tp.name.clone(),
+                        TyBound {
+                            iface: iface.clone(),
+                            args,
+                        },
+                    ))
                 }
                 _ => None,
             })
             .collect()
+    }
+
+    /// Report a generic-interface bound supplied with the wrong number of type
+    /// arguments (#1206, ZAP4084), at the definition. A bound naming a
+    /// non-generic interface with no arguments, or a bound that does not name an
+    /// interface at all, is left to the existing paths.
+    fn validate_bound_arity(&mut self, generics: &[TypeParam]) {
+        for tp in generics {
+            let Some(Type::Named {
+                name: iface,
+                args,
+                span,
+            }) = &tp.bound
+            else {
+                continue;
+            };
+            let Some(info) = self.interfaces.get(iface) else {
+                continue;
+            };
+            // A bare `[T: Iface]` (no arguments) is accepted for any interface:
+            // a non-generic interface needs none, and a generic interface used
+            // bare is the #1205 bound-value shape (its parameters are simply not
+            // pinned here). Only a *mismatched non-zero* count is an error.
+            if !args.is_empty() && args.len() != info.generics.len() {
+                let n = info.generics.len();
+                self.error(
+                    ErrorCode::ZAP4084,
+                    format!(
+                        "interface '{iface}' takes {n} type argument(s), but the bound on type \
+                         parameter '{}' supplies {}",
+                        tp.name,
+                        args.len()
+                    ),
+                    *span,
+                );
+            }
+        }
     }
 
     fn check_function(&mut self, f: &Function, self_ty: Option<&str>) {
@@ -3921,20 +4034,27 @@ impl Checker {
         // Bounds on the *enclosing* type's parameters (I#811): a method of
         // `struct BST[K: Comparable, V]` may call `Comparable`'s methods on a
         // parameter typed `K`. A method's own type parameter shadows an enclosing
-        // one of the same name (inserted after, below).
-        for (name, iface) in &self.enclosing_type_bounds {
-            self.tyvar_bounds.insert(name.clone(), iface.clone());
+        // one of the same name (inserted after, below). Each bound carries its
+        // type arguments (#1206).
+        for (name, bound) in &self.enclosing_type_bounds {
+            self.tyvar_bounds.insert(name.clone(), bound.clone());
         }
+        // The function's own type-parameter bounds (#1206). An argument of a
+        // parametrized bound `[T: RMul[f64, T]]` may reference the function's own
+        // type parameters or an enclosing type parameter, so both are in scope
+        // when resolving the arguments. Validate the arity of a generic-interface
+        // bound once, here at the definition.
+        let mut in_scope: Vec<String> = self.enclosing_type_params.clone();
+        in_scope.extend(f.generics.iter().map(|g| g.name.clone()));
+        let own_bounds = self.type_param_bounds(&f.generics, &in_scope);
+        self.validate_bound_arity(&f.generics);
         for tp in &f.generics {
             // A method's own type parameter is a fresh variable that shadows an
-            // enclosing one of the same name: drop any inherited bound first, then
-            // apply this parameter's own (an unbounded own parameter stays opaque).
+            // enclosing one of the same name: drop any inherited bound first.
             self.tyvar_bounds.remove(&tp.name);
-            if let Some(Type::Named { name: iface, .. }) = &tp.bound {
-                if self.interfaces.contains_key(iface) {
-                    self.tyvar_bounds.insert(tp.name.clone(), iface.clone());
-                }
-            }
+        }
+        for (name, bound) in own_bounds {
+            self.tyvar_bounds.insert(name, bound);
         }
         // Generator validation (I#67, D-0026/D-0048): a `def` whose body contains
         // `yield` is a generator and returns an `Iterator`. Free functions,
@@ -7845,17 +7965,25 @@ impl Checker {
                     // the call is typed by the method's return type and a method
                     // the interface/bound does not provide is caught here.
                     let is_iface = self.interfaces.contains_key(&tn);
-                    let iface_name = if is_iface {
-                        Some(tn.clone())
+                    // The bound interface name and, for a parametrized bound
+                    // `[T: Iface[A, …]]`, its type arguments (#1206). An interface
+                    // *value* has none (generic-interface values are out of scope).
+                    let bound: Option<(String, Vec<Ty>)> = if is_iface {
+                        Some((tn.clone(), Vec::new()))
                     } else {
-                        self.tyvar_bounds.get(&tn).cloned()
+                        self.tyvar_bounds
+                            .get(&tn)
+                            .map(|b| (b.iface.clone(), b.args.clone()))
                     };
-                    if let Some(iname) = iface_name {
+                    if let Some((iname, bound_args)) = bound {
                         // Resolve against the bound/interface *and its refined
                         // supertypes* (D-0139/#806): a supertype method is
-                        // callable on a value of a bounded type parameter.
+                        // callable on a value of a bounded type parameter. For a
+                        // parametrized bound, substitute the interface's type
+                        // parameters by the bound's arguments (#1206) so the
+                        // call's result is typed precisely (e.g. `Out := T`).
                         let ret = match self.iface_method(&iname, name) {
-                            Some(sig) => sig.ret.clone(),
+                            Some(sig) => self.subst_iface_sig(&iname, &bound_args, &sig).ret,
                             None => {
                                 let what = if is_iface {
                                     format!("interface '{tn}' has no method '{name}'")
@@ -15352,6 +15480,134 @@ def main():
     const CONTAINER_IFACE_DECL: &str = "interface Container[E]:\n    def get(self) -> E\n\n\
         struct IntBox:\n    int64 v\n\
         \x20   def get(self) -> int64:\n        return self.v\n\n";
+
+    // --- bounds referencing other type params (#1206) ------------------------
+    //
+    // A parametrized bound `[T: Scaler[f64, T]]` whose argument references the
+    // type parameter being bound: inside the body a call through the parameter
+    // resolves the interface's substituted signature (here `In := f64`,
+    // `Out := T`), so the call's result is typed precisely as `T`. The
+    // instantiation-time conformance check (substituting `T` by the concrete
+    // argument first) lives in mono (mono unit tests + a golden).
+
+    // `Scaler[In, Out]` models the two-parameter operator-capability shape
+    // (`RMul[L, Out]`, #1199) with a plain method, to stay generics-only.
+    const SCALER_IFACE: &str = "interface Scaler[In, Out]:\n    def scale(self, In factor) -> Out\n\n\
+        struct Meters:\n    f64 v\n\
+        \x20   def scale(self, f64 factor) -> Meters:\n        return Meters(v=self.v * factor)\n\n";
+
+    #[test]
+    fn call_through_param_ref_bound_resolves_to_substituted_type() {
+        // `x.scale(k)` on a value of `T: Scaler[f64, T]` returns `Out := T`, so
+        // returning it where `T` is declared type-checks. (If the result were
+        // left `Unknown` or an unsubstituted `Out`, this would not hold.)
+        ok(&format!(
+            "{SCALER_IFACE}def scale_all[T: Scaler[f64, T]](T x, f64 k) -> T:\n    return x.scale(k)\n\n\
+             def main():\n    print(scale_all(Meters(v=2.0), 3.0).v)\n"
+        ));
+    }
+
+    #[test]
+    fn param_ref_bound_result_type_is_enforced() {
+        // The substituted result type is real, not `Unknown`: binding
+        // `x.scale(k)` (type `T`) to a `str` local is a type error. This is what
+        // distinguishes #1206 from the pre-substitution behavior (where the call
+        // typed loosely and slipped through).
+        let m = msgs(&format!(
+            "{SCALER_IFACE}def scale_all[T: Scaler[f64, T]](T x, f64 k) -> T:\n    str bad = x.scale(k)\n    return x\n\n\
+             def main():\n    print(scale_all(Meters(v=2.0), 3.0).v)\n"
+        ));
+        assert!(
+            !m.is_empty(),
+            "assigning a T result to a str must error; got none"
+        );
+    }
+
+    #[test]
+    fn param_ref_bound_argument_in_parameter_position() {
+        // `In := f64` substitution reaches the parameter position too: the bound
+        // method takes `In`, so passing an `f64` is accepted. (A wrong argument
+        // type is left to the ordinary call-argument check.)
+        ok(&format!(
+            "{SCALER_IFACE}def once[T: Scaler[f64, T]](T x) -> T:\n    return x.scale(2.0)\n\n\
+             def main():\n    print(once(Meters(v=1.0)).v)\n"
+        ));
+    }
+
+    #[test]
+    fn enclosing_param_ref_bound_resolves_in_a_method() {
+        // The bound lives on a generic *type*'s parameter and its argument
+        // references that same parameter (`Pipe[E: Scaler[f64, E]]`). A method
+        // whose parameter is typed `E` resolves a call through it to `Out := E`.
+        ok("interface Scaler[In, Out]:\n    def scale(self, In factor) -> Out\n\n\
+            struct Meters:\n    f64 v\n\
+            \x20   def scale(self, f64 factor) -> Meters:\n        return Meters(v=self.v * factor)\n\n\
+            struct Pipe[E: Scaler[f64, E]]:\n    int64 n\n\
+            \x20   def run(self, E item, f64 k) -> E:\n        return item.scale(k)\n\n\
+            def main():\n    Pipe[Meters] p = Pipe(n=1)\n    print(p.run(Meters(v=2.0), 3.0).v)\n");
+    }
+
+    #[test]
+    fn param_ref_bound_records_resolved_args() {
+        // The captured bound carries its arguments resolved as type variables:
+        // `[T: Scaler[f64, T]]` records `In := f64` (a concrete `Float64`) and
+        // `Out := T` (the `Ty::Named("T")` type variable), which is what lets the
+        // call site substitute the result to `T`.
+        let c = checker_with_types(SCALER_IFACE);
+        // Mirror the check_function seeding for a lone `[T: Scaler[f64, T]]`.
+        let bounds = c.type_param_bounds(
+            &[TypeParam {
+                name: "T".into(),
+                bound: Some(Type::Named {
+                    name: "Scaler".into(),
+                    args: vec![
+                        Type::Named {
+                            name: "f64".into(),
+                            args: vec![],
+                            span: Span::default(),
+                        },
+                        Type::Named {
+                            name: "T".into(),
+                            args: vec![],
+                            span: Span::default(),
+                        },
+                    ],
+                    span: Span::default(),
+                }),
+                span: Span::default(),
+            }],
+            &["T".to_string()],
+        );
+        assert_eq!(bounds.len(), 1);
+        let (name, bound) = &bounds[0];
+        assert_eq!(name, "T");
+        assert_eq!(bound.iface, "Scaler");
+        assert_eq!(bound.args, vec![Ty::Float64, Ty::Named("T".to_string())]);
+    }
+
+    #[test]
+    fn generic_interface_bound_arity_mismatch_rejected_at_definition() {
+        // Too few type arguments to a generic-interface bound is ZAP4084 at the
+        // definition, before any instantiation.
+        let m = msgs(&format!(
+            "{SCALER_IFACE}def bad[T: Scaler[f64]](T x) -> T:\n    return x\n\n\
+             def main():\n    print(1)\n"
+        ));
+        assert!(
+            m.contains("takes 2 type argument(s)") && m.contains("supplies 1"),
+            "got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn bare_bound_on_non_generic_interface_still_ok() {
+        // Regression: a bare `[T: Display]` bound (no arguments, non-generic
+        // interface) is unchanged — no arity error, body resolves as before.
+        ok(&format!(
+            "{DISPLAY_IFACE}def announce[T: Display](T x) -> str:\n    return x.show()\n\n\
+             def main():\n    print(announce(Greeter(msg=\"hi\")))\n"
+        ));
+    }
 
     // --- interface refinement `interface X: Y` (D-0139/#806) ---
     //

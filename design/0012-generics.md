@@ -317,11 +317,17 @@ def max_of[T: Ord](list[T] xs) -> T:    # body may call __cmp__; nothing else
   own type parameters are substituted (`T := int64`) and the resulting method
   set is the structural requirement checked at each instantiation. Interface
   *values* of a generic interface stay a separate (Fork X) concern.
-- **Deferred:** multiple bounds per param (`[T: Add + Ord]`), where-clauses,
-  associated types, resolving a *call through* a generic-interface-bounded type
-  parameter to its substituted signature and bounds referencing other type
-  params (`[T: X[…, T]]`) — tracked as #1206. Single interface bound per param
-  (generic or not) is the v1-of-bounds surface.
+- **Bounds referencing other type params (#1206, realized).** A bound's type
+  arguments may reference other type parameters in scope, including the one being
+  bound: `[T: RMul[f64, T]]` / `struct S[E: Scaler[f64, E]]`. The arguments are
+  captured and substituted — at the definition a call through the parameter is
+  typed by the interface's substituted signature (result `T`), and at each
+  instantiation the parameter is substituted into the bound before the #1205
+  conformance check. A wrong argument count is `ZAP4084` at the definition.
+- **Deferred:** multiple bounds per param (`[T: Add + Ord]`), where-clauses, and
+  associated / output types (`type Out`, #1207). Single interface bound per
+  param (generic or not, and now parameter-referencing) is the v1-of-bounds
+  surface.
 
 ### Fork X — Interaction with existing machinery
 
