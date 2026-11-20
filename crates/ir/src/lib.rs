@@ -205,6 +205,107 @@ mod tests {
         );
     }
 
+    // --- variadic struct method calls (#1218, D-0038) -------------------------
+
+    /// The comma-separated argument list of each `invoke`/`call` to `callee` in
+    /// the ZIR dump, so a test can assert the arity the call site passes.
+    fn call_arg_counts(text: &str, callee: &str) -> Vec<usize> {
+        let needle = format!("@{callee}(");
+        text.lines()
+            .filter(|line| {
+                // Count call sites only, not the `func @name(...)` definition.
+                let t = line.trim_start();
+                t.contains("call @") || t.contains("invoke @")
+            })
+            .filter_map(|line| {
+                let start = line.find(&needle)? + needle.len();
+                // Arguments run to the matching close paren; names never nest
+                // parens, so the first `)` after the opener ends the list.
+                let inner = &line[start..];
+                let end = inner.find(')')?;
+                let inner = inner[..end].trim();
+                Some(if inner.is_empty() {
+                    0
+                } else {
+                    inner.split(',').count()
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn variadic_struct_method_collects_trailing_args_into_one_list() {
+        // #1218: a `TYPE... args` struct method is lowered to a callee taking the
+        // receiver plus a single collected `list` (D-0038). Every call site must
+        // forward exactly those two arguments — a bare call builds and passes an
+        // EMPTY list, and N trailing arguments are packed into ONE list — never
+        // the receiver alone or the receiver plus each vararg separately (the
+        // arg-count mismatch the native backend rejected).
+        let m = lower_ok(
+            "struct Client:\n    \
+             int64 offset\n\n    \
+             def count(self, bytes... args) -> int64:\n        \
+             return self.offset + len(args)\n\n\
+             def main():\n    \
+             auto c = Client(0)\n    \
+             print(c.count())\n    \
+             print(c.count(b\"a\"))\n    \
+             print(c.count(b\"a\", b\"b\"))\n",
+        );
+        let text = format!("{m}");
+        // The callee has the receiver + one `list[ptr]` parameter.
+        assert!(
+            text.contains("@Client__count(%0: struct#0, %1: list[ptr])"),
+            "callee should take receiver + one list; text:\n{text}"
+        );
+        // Every call site passes exactly two arguments (receiver + the list) —
+        // not 1 (bare call) nor 3 (two separate varargs), the pre-fix shapes.
+        let arities = call_arg_counts(&text, "Client__count");
+        assert_eq!(
+            arities,
+            vec![2, 2, 2],
+            "each variadic method call forwards receiver + one collected list; text:\n{text}"
+        );
+        // The bare `c.count()` still materializes an (empty) list argument.
+        assert!(
+            text.contains("call @zap_list_new("),
+            "a collected list is built even for the bare call; text:\n{text}"
+        );
+        // The two-arg call pushes each element into one list before the call.
+        assert!(
+            text.contains("call @zap_list_push_ptr("),
+            "trailing args are pushed into the collected list; text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn variadic_method_with_fixed_param_before_rest() {
+        // A fixed parameter preceding the variadic is bound positionally; only
+        // the overflow feeds the collected list. The callee takes receiver +
+        // the fixed `i64` + one `list`, and every call passes those three.
+        let m = lower_ok(
+            "struct S:\n    \
+             int64 k\n\n    \
+             def tally(self, int64 base, bytes... parts) -> int64:\n        \
+             return base + len(parts)\n\n\
+             def main():\n    \
+             auto s = S(0)\n    \
+             print(s.tally(100))\n    \
+             print(s.tally(100, b\"a\", b\"b\"))\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("@S__tally(%0: struct#0, %1: i64, %2: list[ptr])"),
+            "callee: receiver + fixed i64 + collected list; text:\n{text}"
+        );
+        let arities = call_arg_counts(&text, "S__tally");
+        assert_eq!(
+            arities,
+            vec![3, 3],
+            "receiver + fixed arg + one collected list, for both calls; text:\n{text}"
+        );
+    }
+
     #[test]
     fn raw_crypto_results_support_inferred_bytes_operations() {
         // #647: compile the reduced repro for every affected API. No runtime or

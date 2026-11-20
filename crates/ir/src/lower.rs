@@ -6973,8 +6973,9 @@ impl<'a> FnLower<'a> {
         self.copy_if_value(v, ty, src)
     }
 
-    /// Lower a free-function call that carries `*`/`**` spread arguments (#597)
-    /// or targets a callee with a `V **name` keyword-collector (#601).
+    /// Lower a call that carries `*`/`**` spread arguments (#597), or targets a
+    /// callee with a variadic `TYPE... name` (#1218) or a `V **name`
+    /// keyword-collector (#601) parameter.
     ///
     /// The call's arguments are assembled into the callee's declaration order:
     /// explicit positionals (and the elements of a statically-sized `*tuple`)
@@ -6984,14 +6985,24 @@ impl<'a> FnLower<'a> {
     /// the entries of a `**dict` spread — are collected into the `V **name`
     /// dict. Sema (`check_user_call_spread`) has already validated the shapes;
     /// the errors here are a defensive backstop.
-    fn lower_free_call_assembled(
+    ///
+    /// `recv` is the already-lowered `self` of a method call (#1218): when
+    /// present it is forwarded as the leading argument and the callee's recorded
+    /// `call_params` (which drop the implicit `self`, so index `pi` maps to the
+    /// declared type `ptys[pi + 1]`) are indexed with that `+1` offset. For a
+    /// free function `recv` is `None` and the offset is `0`.
+    fn lower_call_assembled(
         &mut self,
         fname: &str,
+        recv: Option<Value>,
         ptys: &[Ty],
         ret: Ty,
         args: &[ast::Arg],
     ) -> Result<(Value, Ty), LowerError> {
         let ctx = self.ctx;
+        // Declared-type offset for the implicit `self` of a method call: the
+        // callee's parameter metadata excludes `self`, but `ptys` includes it.
+        let off = usize::from(recv.is_some());
         let pinfo = ctx.call_params.get(fname).cloned().unwrap_or_default();
         let n = pinfo.len();
         let var_idx = pinfo.iter().position(|p| p.variadic);
@@ -7057,19 +7068,21 @@ impl<'a> FnLower<'a> {
             }
         }
 
-        // Assemble one value per parameter, in declaration order.
-        let mut argvals: Vec<Value> = Vec::with_capacity(n);
+        // Assemble one value per parameter, in declaration order. A method
+        // call's `self` leads the argument vector (#1218).
+        let mut argvals: Vec<Value> = Vec::with_capacity(n + off);
+        argvals.extend(recv);
         for pi in 0..n {
             if Some(pi) == var_idx {
                 let overflow = &pos_srcs[n_fixed_pos..];
-                let v = self.build_variadic_list(ptys[pi], overflow, seq_spread)?;
+                let v = self.build_variadic_list(ptys[pi + off], overflow, seq_spread)?;
                 argvals.push(v);
             } else if Some(pi) == kw_idx {
-                let v = self.build_kwargs_dict(ptys[pi], &kw_for_collector, map_spread)?;
+                let v = self.build_kwargs_dict(ptys[pi + off], &kw_for_collector, map_spread)?;
                 argvals.push(v);
             } else {
                 let fi = fixed.iter().position(|&x| x == pi).unwrap();
-                let target = ptys[pi];
+                let target = ptys[pi + off];
                 let v = if fi < n_fixed_pos {
                     self.lower_pos_src(&pos_srcs[fi], target)?
                 } else if let Some(e) = fixed_kw[fi] {
@@ -8968,7 +8981,7 @@ impl<'a> FnLower<'a> {
                     .get(fname)
                     .is_some_and(|pi| pi.iter().any(|p| p.kwargs));
                 if has_spread || callee_kwargs {
-                    return self.lower_free_call_assembled(fname, &ptys, ret, args);
+                    return self.lower_call_assembled(fname, None, &ptys, ret, args);
                 }
                 // Default arguments and out-of-order keyword arguments (D-0038,
                 // I#298): assemble the call's arguments into declaration order,
@@ -9314,6 +9327,24 @@ impl<'a> FnLower<'a> {
             .get(&mangled)
             .cloned()
             .ok_or_else(|| err(format!("no method '{name}' on that value")))?;
+        let ctx = self.ctx;
+        // A method call carrying `*`/`**` spreads (#597), or whose callee has a
+        // variadic `TYPE... args` (#1218, D-0038) or a `V **name` keyword
+        // collector (#601), is assembled by the shared path: it collects the
+        // trailing arguments into the single `list` the callee expects (an empty
+        // list for a bare call, so the arg count always matches) and forwards
+        // `self` first. Without this the call site passed the receiver alone or
+        // the receiver plus each vararg separately — an arg-count mismatch that
+        // only the native/LLVM backend rejects ("Incorrect number of arguments
+        // passed to called function!").
+        let has_spread = args.iter().any(|a| a.spread != ast::ArgSpread::None);
+        let callee_collects = ctx
+            .call_params
+            .get(&mangled)
+            .is_some_and(|pi| pi.iter().any(|p| p.variadic || p.kwargs));
+        if has_spread || callee_collects {
+            return self.lower_call_assembled(&mangled, Some(recv), &ptys, ret, args);
+        }
         // `self` is passed first (by reference for a struct receiver, by value for
         // a tier-1 enum's backing integer); the remaining arguments are copied
         // when they are value structs (D-0051). An inline-eligible argument is
@@ -9325,9 +9356,9 @@ impl<'a> FnLower<'a> {
                                       // arguments into declaration order, filling omitted defaulted
                                       // parameters, before lowering. The recorded `call_params` drop the
                                       // implicit `self`, so a plan slot `i` corresponds to parameter type
-                                      // `ptys[i + 1]`. A variadic method (or one with no recorded metadata,
-                                      // e.g. a derived method) keeps the positional lowering path.
-        let ctx = self.ctx;
+                                      // `ptys[i + 1]`. A method with no recorded metadata (e.g. a derived
+                                      // method) keeps the positional lowering path; the variadic case is
+                                      // handled above by the shared assembled path (#1218).
         let plan = match ctx.call_params.get(&mangled) {
             Some(pinfo) if !pinfo.iter().any(|p| p.variadic) => {
                 Some((pinfo, plan_call_args(&mangled, pinfo, args)?))
