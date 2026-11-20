@@ -186,6 +186,122 @@ fn list_scalar_optional_element() {
     );
 }
 
+// ----- #1195: bare None in a tuple-literal element against a declared tuple -----
+
+#[test]
+fn tuple_return_two_missing_pointer_payload() {
+    // The issue's minimal repro: a function returning `(Optional[bytes],
+    // Optional[bytes])` as `(None, None)` must lower (the declared tuple type
+    // supplies each `None`'s `Optional[bytes]` context).
+    lower_ok(
+        "def get() -> (Optional[bytes], Optional[bytes]):\n\
+        \x20   return (None, None)\n\
+        def main():\n\
+        \x20   auto value, cas = get()\n\
+        \x20   print(value.is_none(), cas.is_none())\n",
+    );
+}
+
+#[test]
+fn tuple_return_one_missing_pointer_payload() {
+    // A present + missing mix: the `Some` element stays unchanged while the
+    // bare `None` takes its declared `Optional[bytes]` context.
+    lower_ok(
+        "def get() -> (Optional[bytes], Optional[bytes]):\n\
+        \x20   return (Optional.Some(b\"x\"), None)\n\
+        def main():\n\
+        \x20   auto a, b = get()\n\
+        \x20   print(a.is_some(), b.is_none())\n",
+    );
+}
+
+#[test]
+fn tuple_return_all_present_pointer_payload_unchanged() {
+    // The all-present control must keep lowering — the fix must not disturb it.
+    lower_ok(
+        "def get() -> (Optional[bytes], Optional[bytes]):\n\
+        \x20   return (Optional.Some(b\"value\"), Optional.Some(b\"cas\"))\n\
+        def main():\n\
+        \x20   auto a, b = get()\n\
+        \x20   print(a.unwrap(), b.unwrap())\n",
+    );
+}
+
+#[test]
+fn tuple_return_str_payload() {
+    lower_ok(
+        "def get() -> (Optional[str], Optional[str]):\n\
+        \x20   return (None, None)\n\
+        def main():\n\
+        \x20   auto a, b = get()\n\
+        \x20   print(a.is_none(), b.is_none())\n",
+    );
+}
+
+#[test]
+fn tuple_return_reference_struct_payload() {
+    // A reference-struct payload uses the niche null; the bare `None` tuple
+    // element must still lower, both missing and mixed with a `Some`.
+    lower_ok(
+        "struct Item:\n\
+        \x20   int value\n\
+        def miss() -> (Optional[Item], Optional[Item]):\n\
+        \x20   return (None, None)\n\
+        def mixed() -> (Optional[Item], Optional[Item]):\n\
+        \x20   return (None, Optional.Some(Item(42)))\n\
+        def main():\n\
+        \x20   auto a, b = miss()\n\
+        \x20   auto c, d = mixed()\n\
+        \x20   print(a.is_none(), b.is_none())\n\
+        \x20   print(c.is_none(), d.unwrap().value)\n",
+    );
+}
+
+#[test]
+fn tuple_return_scalar_payloads() {
+    // Scalar payloads (`int64`, `bool`) use the tagged discriminant `None`, a
+    // different representation from the pointer-payload null — both must lower.
+    lower_ok(
+        "def ints() -> (Optional[int64], Optional[int64]):\n\
+        \x20   return (None, None)\n\
+        def ints_mixed() -> (Optional[int64], Optional[int64]):\n\
+        \x20   return (Optional.Some(7), None)\n\
+        def bools() -> (Optional[bool], Optional[bool]):\n\
+        \x20   return (None, None)\n\
+        def main():\n\
+        \x20   auto a, b = ints()\n\
+        \x20   auto c, d = ints_mixed()\n\
+        \x20   auto e, f = bools()\n\
+        \x20   print(a.is_none(), b.is_none())\n\
+        \x20   print(c.unwrap(), d.is_none())\n\
+        \x20   print(e.is_none(), f.is_none())\n",
+    );
+}
+
+#[test]
+fn tuple_typed_binding_bare_none() {
+    // A typed tuple binding (not a return) threads the same per-element context.
+    lower_ok(
+        "def main():\n\
+        \x20   (Optional[bytes], Optional[bytes]) pair = (None, None)\n\
+        \x20   print(pair[0].is_none(), pair[1].is_none())\n",
+    );
+}
+
+#[test]
+fn tuple_return_rejects_bare_none_for_non_optional_element() {
+    // A bare `None` tuple element against a non-nullable declared element type
+    // is still a clear type error, not a silent lowering.
+    lower_err_contains(
+        "def get() -> (int, int):\n\
+        \x20   return (None, None)\n\
+        def main():\n\
+        \x20   auto a, b = get()\n\
+        \x20   print(a, b)\n",
+        "None is not a valid",
+    );
+}
+
 // ----- Negative: a bare None against a non-nullable destination -----
 
 #[test]
