@@ -32,6 +32,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/un.h> /* AF_UNIX / sockaddr_un (I#993) */
 #else
 /* Windows TCP sockets run on Winsock2 (<winsock2.h>/<ws2tcpip.h>, included at the
  * top under the platform seam). getaddrinfo/sockaddr_in/ntohs and the SOCKET type
@@ -1192,4 +1193,375 @@ void *zap_net_lookup_addr(void *ip_) {
     zap_check_cancel();
     return out;
 }
+
+/* ===========================================================================
+ * net: Unix domain sockets (AF_UNIX; ticket #993, epic #985). Local IPC over a
+ * filesystem socket path — the transport Docker, systemd, local databases and
+ * agent daemons speak. Stream sockets (`listen_unix` / `connect_unix`) mirror
+ * the TCP server/client exactly and REUSE `net.accept` / `recv` / `send` /
+ * `close_conn` / `close_listener` / the read deadlines unchanged (they drive the
+ * `ZapSock` fd/pd). Datagram sockets (`unixgram_socket` / `unixgram_bind` /
+ * `sendto_unix` / `recvfrom_unix`) mirror the #991 UDP paths but address peers by
+ * path. Everything runs non-blocking on the netpoller, parking on a would-block,
+ * exactly like the INET transports.
+ *
+ * POSIX-only: AF_UNIX `SOCK_DGRAM` does not exist on Windows and `SOCK_STREAM`
+ * AF_UNIX there carries caveats, so the Windows build raises a clear "not
+ * supported" error (peer credentials, abstract namespaces etc. are POSIX too).
+ * ========================================================================== */
+#if defined(ZAP_PLATFORM_POSIX)
+
+/* Fill a sockaddr_un from a pathname. Returns the addrlen, or 0 when the path is
+ * empty, too long for sun_path, or contains an embedded NUL (all ValueErrors in
+ * the callers). Only filesystem pathnames are supported (not Linux abstract
+ * names, whose leading NUL this rejects). */
+static socklen_t zap_unix_fill(struct sockaddr_un *addr, const ZapStr *path) {
+    size_t plen = (size_t)(path->len < 0 ? 0 : path->len);
+    if (plen == 0 || plen >= sizeof(addr->sun_path)) {
+        return 0;
+    }
+    if (memchr(path->data, '\0', plen)) {
+        return 0;
+    }
+    memset(addr, 0, sizeof *addr);
+    addr->sun_family = AF_UNIX;
+    memcpy(addr->sun_path, path->data, plen);
+    addr->sun_path[plen] = '\0';
+    return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + plen + 1);
+}
+
+static void zap_unix_bad_path(void) {
+    zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                    zap_str_new("net: invalid unix socket path",
+                                sizeof("net: invalid unix socket path") - 1));
+}
+
+/* net.listen_unix(path) -> listener. Bind a stream AF_UNIX socket to `path` and
+ * listen. The path must not already exist (bind fails EADDRINUSE on a stale
+ * socket file — remove it first, as in Python/Go). */
+void *zap_net_listen_unix(void *path_) {
+    struct sockaddr_un addr;
+    socklen_t al = zap_unix_fill(&addr, (const ZapStr *)path_);
+    if (al == 0) {
+        zap_unix_bad_path();
+        return NULL;
+    }
+    zap_fd_t fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (!ZAP_FD_VALID(fd)) {
+        zap_net_panic("net: listen_unix failed");
+        return NULL;
+    }
+    if (bind(fd, (struct sockaddr *)&addr, al) != 0 || listen(fd, 128) != 0) {
+        zap_sock_close_fd(fd);
+        zap_net_panic("net: listen_unix failed");
+        return NULL;
+    }
+    ZapSock *s = zap_sock_wrap(fd);
+    s->family = AF_UNIX;
+    return s;
+}
+
+/* net.connect_unix(path) -> conn. Non-blocking AF_UNIX stream connect, parking
+ * for writability on EINPROGRESS and checking SO_ERROR (a full listener backlog
+ * is the usual would-block). */
+void *zap_net_connect_unix(void *path_) {
+    zap_check_cancel();
+    struct sockaddr_un addr;
+    socklen_t al = zap_unix_fill(&addr, (const ZapStr *)path_);
+    if (al == 0) {
+        zap_unix_bad_path();
+        return NULL;
+    }
+    zap_fd_t fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (!ZAP_FD_VALID(fd)) {
+        zap_net_panic("net: connect_unix failed");
+        return NULL;
+    }
+    zap_sock_make_nonblocking(fd);
+    void *pd = zap_netpoll_open((int64_t)fd);
+    int ok = 0;
+    for (;;) {
+        int rc = connect(fd, (struct sockaddr *)&addr, al);
+        if (rc == 0) {
+            ok = 1;
+            break;
+        }
+        int e = ZAP_SOCK_ERR();
+        if (ZAP_SOCK_EINTR(e)) {
+            continue;
+        }
+        if (ZAP_SOCK_INPROGRESS(e) || ZAP_SOCK_ALREADY(e)) {
+            int p = zap_sock_park(fd, pd, ZAP_POLL_WRITE, 0);
+            if (p < 0) {
+                break;
+            }
+            int soerr = 0;
+            socklen_t sl = sizeof soerr;
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&soerr, &sl) < 0 || soerr != 0) {
+                break;
+            }
+            ok = 1;
+            break;
+        }
+        if (ZAP_SOCK_ISCONN(e)) {
+            ok = 1;
+        }
+        break;
+    }
+    if (!ok) {
+        if (pd) {
+            zap_netpoll_close(pd);
+        }
+        zap_sock_close_fd(fd);
+        zap_net_panic("net: connect_unix failed");
+        return NULL;
+    }
+    ZapSock *s = (ZapSock *)zap_obj(&zap_desc_sock);
+    s->kind = ZAP_CONN_PLAIN;
+    s->fd = fd;
+    s->pd = pd;
+    s->read_timeout_ms = 0;
+    s->read_deadline_ms = 0;
+    s->family = AF_UNIX;
+    return s;
+}
+
+/* net.unixgram_socket() -> sock. An unbound AF_UNIX datagram socket. */
+void *zap_net_unixgram_socket(void) {
+    zap_fd_t fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (!ZAP_FD_VALID(fd)) {
+        zap_net_panic("net: unixgram_socket failed");
+        return NULL;
+    }
+    ZapSock *s = zap_sock_wrap(fd);
+    s->family = AF_UNIX;
+    return s;
+}
+
+/* net.unixgram_bind(sock, path). Bind a datagram AF_UNIX socket to `path` so it
+ * can receive (and so peers learn its address for replies). */
+void zap_net_unixgram_bind(void *sock_, void *path_) {
+    ZapSock *s = (ZapSock *)sock_;
+    struct sockaddr_un addr;
+    socklen_t al = zap_unix_fill(&addr, (const ZapStr *)path_);
+    if (al == 0) {
+        zap_unix_bad_path();
+        return;
+    }
+    if (bind(s->fd, (struct sockaddr *)&addr, al) != 0) {
+        zap_net_panic("net: unixgram_bind failed");
+    }
+}
+
+/* net.sendto_unix(sock, data, path) -> int64 bytes sent. Send ONE datagram to a
+ * path. Payload copied to malloc scratch before any park (GC discipline). */
+int64_t zap_net_sendto_unix(void *sock_, void *data_, void *path_) {
+    ZapSock *s = (ZapSock *)sock_;
+    const ZapStr *data = (const ZapStr *)data_;
+    size_t len = (size_t)(data->len < 0 ? 0 : data->len);
+    struct sockaddr_un addr;
+    socklen_t al = zap_unix_fill(&addr, (const ZapStr *)path_);
+    if (al == 0) {
+        zap_unix_bad_path();
+        return 0;
+    }
+    char *scratch = (char *)malloc(len + 1);
+    if (!scratch) {
+        zap_net_panic("net: out of memory");
+        return 0;
+    }
+    if (len > 0) {
+        memcpy(scratch, data->data, len);
+    }
+    int initial = zap_io_status(s->pd, 0);
+    if (initial) {
+        free(scratch);
+        zap_io_panic(initial, "net: sendto_unix failed");
+        return 0;
+    }
+    ssize_t sent = -1;
+    for (;;) {
+        int status = zap_io_status(s->pd, 0);
+        if (status) {
+            free(scratch);
+            zap_io_panic(status, "net: sendto_unix failed");
+            return 0;
+        }
+        ssize_t w = (ssize_t)sendto(s->fd, scratch, len, MSG_NOSIGNAL,
+                                    (struct sockaddr *)&addr, al);
+        if (w >= 0) {
+            sent = w;
+            break;
+        }
+        int e = ZAP_SOCK_ERR();
+        if (ZAP_SOCK_EINTR(e)) {
+            continue;
+        }
+        if (ZAP_SOCK_WOULDBLOCK(e)) {
+            int p = zap_sock_park(s->fd, s->pd, ZAP_POLL_WRITE, 0);
+            if (p < 0) {
+                free(scratch);
+                zap_io_panic(p, "net: sendto_unix failed");
+                return 0;
+            }
+            continue;
+        }
+        free(scratch);
+        zap_net_panic("net: sendto_unix failed");
+        return 0;
+    }
+    free(scratch);
+    return (int64_t)sent;
+}
+
+/* The result of net.recvfrom_unix: one datagram's payload + the sender's bound
+ * path ("" for an unbound/abstract sender). Precise GC (two pointer fields), the
+ * same aggregate shape as ZapDatagram, unpacked into a (str, str) tuple. */
+typedef struct {
+    ZapStr *data;
+    ZapStr *path;
+} ZapUnixDatagram;
+
+static const int32_t zap_off_unixdgram[] = {
+    (int32_t)offsetof(ZapUnixDatagram, data),
+    (int32_t)offsetof(ZapUnixDatagram, path),
+};
+static const ZapTypeDesc zap_desc_unixdgram = {(int64_t)sizeof(ZapUnixDatagram),
+                                               ZAP_TD_PRECISE, 2, zap_off_unixdgram};
+
+/* net.recvfrom_unix(sock, n) -> (data, path). Receive ONE datagram and report
+ * the sender's bound pathname. Honors net.set_read_timeout / set_read_deadline,
+ * exactly as net.recvfrom. A zero-length datagram is a valid empty payload; a
+ * socket closed under a parked recvfrom yields an empty payload + empty path. */
+void *zap_net_recvfrom_unix(void *sock_, int64_t n) {
+    ZapSock *s = (ZapSock *)sock_;
+    zap_fd_t fd = s->fd;
+    void *pd = s->pd;
+    int64_t timeout_ms = s->read_timeout_ms;
+    int64_t whole_deadline_ns =
+        (s->read_deadline_ms > 0) ? zap_deadline_after_ms(s->read_deadline_ms) : 0;
+    if (n < 0) {
+        n = 0;
+    }
+    int initial = zap_io_status(pd, whole_deadline_ns);
+    if (initial) {
+        zap_io_panic(initial, "net: recvfrom_unix failed");
+        return NULL;
+    }
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (!buf) {
+        zap_net_panic("net: out of memory");
+        return NULL;
+    }
+    struct sockaddr_un src;
+    memset(&src, 0, sizeof src);
+    ssize_t got = 0;
+    int have = 0;
+    socklen_t slen = 0;
+    for (;;) {
+        int status = zap_io_status(pd, whole_deadline_ns);
+        if (status) {
+            free(buf);
+            zap_io_panic(status, "net: recvfrom_unix failed");
+            return NULL;
+        }
+        slen = (socklen_t)sizeof src;
+        ssize_t r =
+            (ssize_t)recvfrom(fd, buf, (size_t)n, 0, (struct sockaddr *)&src, &slen);
+        if (r >= 0) {
+            got = r;
+            have = 1;
+            break;
+        }
+        int e = ZAP_SOCK_ERR();
+        if (ZAP_SOCK_EINTR(e)) {
+            continue;
+        }
+        if (ZAP_SOCK_WOULDBLOCK(e)) {
+            int p = zap_sock_park2(fd, pd, ZAP_POLL_READ, timeout_ms, whole_deadline_ns);
+            if (p == -2 || p == -3) {
+                free(buf);
+                zap_io_panic(p, "net: recvfrom_unix failed");
+                return NULL;
+            }
+            if (p < 0) {
+                got = 0;
+                have = 0;
+                break;
+            }
+            continue;
+        }
+        free(buf);
+        zap_io_panic(-1, "net: recvfrom_unix failed");
+        return NULL;
+    }
+
+    /* The sender's pathname: present only when the address carries more than the
+     * family (a bound pathname socket); unbound/abstract senders give "". */
+    int64_t pathlen = 0;
+    if (have && (size_t)slen > offsetof(struct sockaddr_un, sun_path) &&
+        src.sun_path[0] != '\0') {
+        pathlen = (int64_t)strnlen(src.sun_path, sizeof src.sun_path);
+    }
+
+    ZapUnixDatagram *out = (ZapUnixDatagram *)zap_obj(&zap_desc_unixdgram);
+    out->data = NULL;
+    out->path = NULL;
+    out->data = (ZapStr *)zap_str_new(buf, (int64_t)got);
+    free(buf);
+    out->path = (ZapStr *)zap_str_new(src.sun_path, pathlen);
+    zap_check_cancel();
+    return out;
+}
+
+void *zap_net_unixdgram_data(void *d_) { return ((ZapUnixDatagram *)d_)->data; }
+void *zap_net_unixdgram_path(void *d_) { return ((ZapUnixDatagram *)d_)->path; }
+
+#else /* !ZAP_PLATFORM_POSIX: AF_UNIX is POSIX-only. */
+
+static void zap_unix_unsupported(void) {
+    zap_net_panic("net: Unix domain sockets are not supported on this platform");
+}
+void *zap_net_listen_unix(void *path_) {
+    (void)path_;
+    zap_unix_unsupported();
+    return NULL;
+}
+void *zap_net_connect_unix(void *path_) {
+    (void)path_;
+    zap_unix_unsupported();
+    return NULL;
+}
+void *zap_net_unixgram_socket(void) {
+    zap_unix_unsupported();
+    return NULL;
+}
+void zap_net_unixgram_bind(void *sock_, void *path_) {
+    (void)sock_;
+    (void)path_;
+    zap_unix_unsupported();
+}
+int64_t zap_net_sendto_unix(void *sock_, void *data_, void *path_) {
+    (void)sock_;
+    (void)data_;
+    (void)path_;
+    zap_unix_unsupported();
+    return 0;
+}
+void *zap_net_recvfrom_unix(void *sock_, int64_t n) {
+    (void)sock_;
+    (void)n;
+    zap_unix_unsupported();
+    return NULL;
+}
+void *zap_net_unixdgram_data(void *d_) {
+    (void)d_;
+    return NULL;
+}
+void *zap_net_unixdgram_path(void *d_) {
+    (void)d_;
+    return NULL;
+}
+
+#endif /* ZAP_PLATFORM_POSIX */
 

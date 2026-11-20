@@ -453,6 +453,26 @@ differs in a few places:
 - **No service-name resolution.** There is no `getaddrinfo(host, "http")`
   service→port form; ports are plain integers.
 
+### `net` Unix domain sockets (#993, decisions/stdlib/993-unix-domain-sockets.md)
+
+- **Two-step `socket()` + `bind`/`connect` is folded into combined
+  constructors.** CPython writes `socket(AF_UNIX, SOCK_STREAM); s.bind(path);
+  s.listen()`. Zap's `net.listen_unix(path)` does socket+bind+listen in one call
+  (and `net.connect_unix(path)` socket+connect), mirroring the TCP side; the
+  socket is the first argument everywhere else, as for all `net` functions.
+- **Pathname sockets only.** Linux abstract-namespace addresses (a leading-NUL
+  `sun_path`, which CPython spells as a leading `\0` in the path) are rejected as
+  an invalid path.
+- **`recvfrom_unix` returns `(data, path)`.** CPython's AF_UNIX `recvfrom`
+  returns `(bytes, address)` where `address` is the path string; Zap flattens to
+  a `(str, str)` tuple, and the payload is `str` (as elsewhere in `net`), not
+  `bytes`.
+- **No stale-path auto-unlink.** `net.listen_unix` fails if the path already
+  exists, like CPython `bind`; remove a stale socket file first.
+- **POSIX-only.** CPython exposes `AF_UNIX` only where the platform has it; Zap
+  likewise supports it on POSIX and raises a catchable "not supported" error on
+  Windows. Peer-credential access (`SO_PEERCRED`) is not yet exposed.
+
 ---
 
 ## Parity backlog

@@ -522,6 +522,13 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("net", "lookup_ipv4", &["name"]),
     ("net", "lookup_ipv6", &["name"]),
     ("net", "lookup_addr", &["ip"]),
+    // Unix domain sockets (#993, epic #985). The 0-arg unixgram_socket carries
+    // no params, so it needs no kwargs row.
+    ("net", "listen_unix", &["path"]),
+    ("net", "connect_unix", &["path"]),
+    ("net", "unixgram_bind", &["sock", "path"]),
+    ("net", "sendto_unix", &["sock", "data", "path"]),
+    ("net", "recvfrom_unix", &["sock", "n"]),
     // ---- linalg (tickets #926-#928): LAPACK-backed linear algebra (NumPy names) ----
     ("linalg", "solve", &["a", "b"]),
     ("linalg", "inv", &["a"]),

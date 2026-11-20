@@ -49,4 +49,22 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_net_lookup_ipv4", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_net_lookup_ipv6", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_net_lookup_addr", &[p.into()], Some(p.into()));
+
+    // ---- Unix domain sockets (ticket #993, epic #985) ----
+    cg.declare_rt("zap_net_listen_unix", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_net_connect_unix", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_net_unixgram_socket", &[], Some(p.into()));
+    cg.declare_rt("zap_net_unixgram_bind", &[p.into(), p.into()], None);
+    cg.declare_rt(
+        "zap_net_sendto_unix",
+        &[p.into(), p.into(), p.into()],
+        Some(i.into()),
+    );
+    cg.declare_rt(
+        "zap_net_recvfrom_unix",
+        &[p.into(), i.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt("zap_net_unixdgram_data", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_net_unixdgram_path", &[p.into()], Some(p.into()));
 }

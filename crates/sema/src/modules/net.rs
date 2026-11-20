@@ -6,9 +6,11 @@
 //! net.connect(...)` binds and flows through args/assign without new `Ty`
 //! machinery), exactly like the `crypto`/`sync` handle pattern. TLS lives in the
 //! `tls` module; UDP datagram sockets (`udp_socket`/`udp_bind`/`udp_connect`/
-//! `sendto`/`recvfrom`) were added in #991 and the DNS resolution surface
+//! `sendto`/`recvfrom`) were added in #991, the DNS resolution surface
 //! (`lookup_host`/`lookup_ipv4`/`lookup_ipv6`/`lookup_addr`, returning
-//! `list[str]`) in #992 (epic #985). `import net` is accepted but not required.
+//! `list[str]`) in #992, and Unix domain sockets (`listen_unix`/`connect_unix`
+//! stream + `unixgram_socket`/`unixgram_bind`/`sendto_unix`/`recvfrom_unix`
+//! datagram) in #993 (epic #985). `import net` is accepted but not required.
 
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
@@ -127,6 +129,37 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "lookup_addr" => {
             expect_argc(checker, "net", method, args, 1, span);
             Ty::List(Box::new(Ty::Str))
+        }
+
+        // ---- Unix domain sockets (ticket #993, epic #985) ----
+        // net.listen_unix(path) -> listener handle; net.connect_unix(path) ->
+        // connection handle. Both reuse net.accept/recv/send/close_* (opaque
+        // `bytes` handle, as the TCP side).
+        "listen_unix" | "connect_unix" => {
+            expect_argc(checker, "net", method, args, 1, span);
+            Ty::Bytes
+        }
+        // net.unixgram_socket() -> datagram socket handle (unbound AF_UNIX).
+        "unixgram_socket" => {
+            expect_argc(checker, "net", method, args, 0, span);
+            Ty::Bytes
+        }
+        // net.unixgram_bind(sock, path) -> unit.
+        "unixgram_bind" => {
+            expect_argc(checker, "net", method, args, 2, span);
+            Ty::Unit
+        }
+        // net.sendto_unix(sock, data, path) -> int64 (bytes sent in the one
+        // datagram): the AF_UNIX counterpart of net.sendto.
+        "sendto_unix" => {
+            expect_argc(checker, "net", method, args, 3, span);
+            Ty::Int64
+        }
+        // net.recvfrom_unix(sock, n) -> (data, path): the datagram payload and
+        // the sender's bound path ("" for an unbound sender).
+        "recvfrom_unix" => {
+            expect_argc(checker, "net", method, args, 2, span);
+            Ty::Tuple(vec![Ty::Str, Ty::Str])
         }
         _ => return None,
     })

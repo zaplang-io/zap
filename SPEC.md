@@ -2009,6 +2009,23 @@ deadline_ns)` directly, so pre-resolution + a bounded numeric dial compose
 without an opaque addrinfo handle. `net` remains **Experimental** (STABILITY.md
 §4.4).
 
+**`net` Unix domain sockets (#993, epic #985).** AF_UNIX local IPC over a
+filesystem socket path, matching Python's `socket` (`AF_UNIX`) and Go's `net`
+(`"unix"` / `"unixgram"`). *Stream:* `net.listen_unix(path) -> listener` binds +
+listens and `net.connect_unix(path) -> conn` dials an AF_UNIX `SOCK_STREAM`
+socket; both reuse the TCP `net.accept` / `net.recv` / `net.send` /
+`net.close_conn` / `net.close_listener` and the read deadlines unchanged.
+*Datagram:* `net.unixgram_socket()` creates an unbound AF_UNIX `SOCK_DGRAM`
+socket, `net.unixgram_bind(sock, path)` binds it to receive,
+`net.sendto_unix(sock, data, path) -> int64` sends one datagram, and
+`net.recvfrom_unix(sock, n) -> (data, path)` receives one with the sender's
+bound path (`""` for an unbound sender). All run non-blocking on the netpoller
+like the INET transports. Only filesystem pathnames are supported (Linux
+abstract-namespace names are rejected); `listen_unix` fails if `path` already
+exists (remove a stale socket file first, as in Python/Go). Unix sockets are
+**POSIX-only** — the Windows build raises a catchable "not supported" error.
+`net` remains **Experimental** (STABILITY.md §4.4).
+
 **`tls` client + server (#147, #488).** TLS over OpenSSL on the netpoller.
 *Client (#147):* `tls.connect(host, port)` verifies the certificate chain
 against the system trust store **and** the hostname (on by default);

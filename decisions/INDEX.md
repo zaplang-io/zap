@@ -24,6 +24,7 @@ listed here (see [`README.md`](README.md)).
 | [982](stdlib/982-fractions-exact-rational.md) | stdlib fractions — exact rational Fraction, software over bigint | Locked | 2026-11-19 |
 | [991](stdlib/991-udp-sockets.md) | net UDP datagram sockets — udp_socket / bind / connect / sendto / recvfrom | Locked | 2026-11-20 |
 | [992](stdlib/992-dns-resolution.md) | net DNS resolution surface — lookup_host / lookup_ipv4 / lookup_ipv6 / lookup_addr | Locked | 2026-11-20 |
+| [993](stdlib/993-unix-domain-sockets.md) | net Unix domain sockets — AF_UNIX stream (listen_unix/connect_unix) + datagram | Locked | 2026-11-20 |
 | [1083](stdlib/1083-dict-set-capacity.md) | dict / set initial-capacity hint on construction + reserve() | Locked | 2026-11-19 |
 | [1095](stdlib/1095-list-pop-and-methods.md) | list.pop plus index / reverse / copy — the remaining Python list methods | Locked | 2026-11-19 |
 | [1099](stdlib/1099-bytes-translate-maketrans.md) | Bulk byte-table translation — bytes.maketrans + bytes.translate | Locked | 2026-11-19 |
