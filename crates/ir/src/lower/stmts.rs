@@ -2512,6 +2512,17 @@ impl<'a> FnLower<'a> {
                 });
                 self.iterate_list(items, elem, body)
             }
+            // A `dict` iterates its keys (Python semantics, #299, #1154):
+            // materialize the key list via `zap_dict_keys_*` — exactly as the
+            // statement-`for` path does in `lower_for_dict` — and walk it with
+            // the list iterator. The element type is the key type `K`;
+            // iteration order is unspecified (#1066). This is what lets a
+            // comprehension (`[k for k in d]` / `{k for k in d}` / a genexpr)
+            // and the `set(...)`/`oset(...)` constructors accept a dict operand.
+            Ty::Dict(key, _val) => {
+                let keys = self.dict_keys(val, key);
+                self.iterate_list(keys, key, body)
+            }
             // A `str` (a pointer handle in ZIR) iterates its codepoints as
             // `char`s (D-0025), walking the UTF-8 buffer once — so comprehensions
             // and `set(...)`/`set[T](...)` accept a string operand.
@@ -3617,6 +3628,22 @@ impl<'a> FnLower<'a> {
         self.lower_for_list(target, items, elem, body)
     }
 
+    /// Materialize a dict's keys as a fresh `list[K]` via `zap_dict_keys_*` —
+    /// the shared key-snapshot primitive behind both statement `for k in d`
+    /// ([`Self::lower_for_dict`]) and dict comprehensions ([`Self::iterate`]).
+    /// Iterating a dict yields its keys (Python semantics, #299); the snapshot
+    /// list is a GC pointer that the list-iteration machinery then roots, and
+    /// its order is unspecified (#1066).
+    fn dict_keys(&mut self, dict_val: Value, key: Elem) -> Value {
+        let keys = self.new_value(Ty::List(key));
+        self.emit(Inst::Call {
+            dest: Some(keys),
+            func: format!("zap_dict_keys_{}", key.val_suffix()),
+            args: vec![dict_val],
+        });
+        keys
+    }
+
     /// `for k in d` where `d : dict[K, V]` (ticket #299). Snapshots the dict's
     /// keys into a fresh list (order unspecified — hash order) and iterates that
     /// list, exactly like `set`. `for k, v in d.items()` is the key/value form.
@@ -3627,12 +3654,7 @@ impl<'a> FnLower<'a> {
         key: Elem,
         body: &ast::Block,
     ) -> Result<(), LowerError> {
-        let keys = self.new_value(Ty::List(key));
-        self.emit(Inst::Call {
-            dest: Some(keys),
-            func: format!("zap_dict_keys_{}", key.val_suffix()),
-            args: vec![dict_val],
-        });
+        let keys = self.dict_keys(dict_val, key);
         self.lower_for_list(target, keys, key, body)
     }
 
