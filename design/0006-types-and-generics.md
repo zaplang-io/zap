@@ -389,9 +389,29 @@ unary (`__neg__`/`__pos__`/`__invert__`), `__eq__` (with `!=` derived),
 `__eq__`/`__cmp__`/`__hash__`/`__repr__` field-wise. Decisions made while
 implementing, consistent with D-0047:
 
-- **Dispatch is on the left operand only** — `a + b` is `a.__add__(b)`; there is
-  no reflected `__radd__`. `x in a` is the one exception (it dispatches on the
-  container `a`, as `a.__contains__(x)`).
+- **Dispatch prefers the left operand, with a reflected fallback on the right**
+  (reflected operators, I#1180 / epic I#1189, see
+  [lang/1180-reflected-operators](../decisions/lang/1180-reflected-operators.md)).
+  `a OP b` resolves statically as: (1) if the built-in rules type the operator,
+  or the **left** type is a struct that defines the forward dunder (`__add__` …)
+  **by name**, use it — `a.__add__(b)`, exactly as before; (2) otherwise, if the
+  **right** type is a struct whose reflected dunder (`__radd__` …) accepts the
+  left operand's type, use `b.__radd__(a)` (`self` is the right operand); (3)
+  otherwise `ZAP4071`. The left wins when both could apply, and a left type that
+  defines the forward dunder **commits** the operator to the left — a RHS its
+  parameter does not accept is an ordinary type error, **not** a reflected
+  reroute (Zap is statically typed and has no Python `NotImplemented` retry; the
+  param-aware fall-through would need overload resolution sema does not have for
+  generics). The reflected set mirrors the binary dunder table one-for-one:
+  `__radd__ __rsub__ __rmul__ __rtruediv__ __rfloordiv__ __rmod__ __rpow__`,
+  `__rand__ __ror__ __rxor__ __rlshift__ __rrshift__`, and `__rmatmul__`.
+  Conformance is **implicit/structural** (defining the dunder is satisfying the
+  capability, like every other operator interface). Reflected is purely additive
+  — it only occupies paths that errored before, so no previously-compiling
+  program changes meaning. Comparison (`__eq__`/`__cmp__`), the in-place
+  `__iOP__` family, and augmented assignment have **no** reflected form. `x in a`
+  remains the one operator that dispatches on the right/container `a`
+  (`a.__contains__(x)`); its scope is unchanged.
 - **`@derive(Hash)` supports integer/bool/str fields;** a float field is a clean
   "not supported yet" error, because bit-hashing a float would break the
   `a == b ⟹ hash(a) == hash(b)` invariant against `__eq__`'s value comparison.
