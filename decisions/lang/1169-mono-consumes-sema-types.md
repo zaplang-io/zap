@@ -75,6 +75,20 @@ optimization and removing them is pure churn with real risk.
 - **Pure augmentation.** A type the mono arms already produce, and the bare-`None`
   sink, are untouched, so no previously-inferring site changes; an argument sema
   also cannot type stays `Unknown` and is still rejected (fail-closed).
+- **Synthetic types are excluded from the bridge (#1190).** Sema types a bare
+  generator expression as the shared synthetic iterator `$genexpr`, a generator
+  function call as `$gen:<name>`, and carries interface fat-pointer layouts as
+  `$iface:<name>` — all `$`-prefixed, unspellable, deliberately element-erased
+  names (I#67/D-0048, #596). `Ty::to_ast_type` returns `None` for any `Named`
+  whose name begins with `$`, so these never flow into monomorphization: without
+  the guard the backfill minted a bogus `Optional$$genexpr` instance over the
+  synthetic type (an untested, likely-unsound struct/enum layout) instead of the
+  intended fail-closed `ZAP6001`. The guard is a narrow leading-`$` check, so a
+  mangled instance name such as `Optional$int64` (whose `$` is internal) still
+  bridges and the inference wins above are unaffected. Supporting a generator
+  *inside* a generic is a separate, unimplemented design decision (what would
+  `Optional[<generator>].unwrap()` yield, and is its layout sound?) and would
+  need its own RFC.
 - **Span-keyed.** The map is keyed by expression span. `with_prelude` preserves
   user-expression spans and the driver passes the same parsed module to sema and
   to lowering, so the keys line up. A span is only *locally* unique — multi-file

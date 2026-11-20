@@ -110,6 +110,49 @@ fn named_types_pass_through() {
     );
 }
 
+#[test]
+fn synthetic_sigil_names_are_none() {
+    // #1190: a `$`-prefixed `Named` is a compiler-synthesized, unspellable type
+    // (the generator-expression iterator `$genexpr`, a generator function's
+    // state `$gen:<name>`, an interface fat-pointer layout `$iface:<name>`).
+    // These must NOT bridge, so the sema-driven backfill never monomorphizes a
+    // bogus `Foo$$genexpr` instance over them — the argument stays `Unknown`
+    // and the generic is rejected with the normal `ZAP6001` (#1190).
+    assert!(Ty::Named("$genexpr".to_string()).to_ast_type().is_none());
+    assert!(Ty::Named("$gen:make".to_string()).to_ast_type().is_none());
+    assert!(Ty::Named("$iface:Display".to_string())
+        .to_ast_type()
+        .is_none());
+    // The guard is a narrow leading-`$` check, so a synthetic type nested inside
+    // a composite also makes the whole thing fail closed.
+    assert!(list(Ty::Named("$genexpr".to_string()))
+        .to_ast_type()
+        .is_none());
+    assert!(
+        Ty::Tuple(vec![Ty::Int64, Ty::Named("$genexpr".to_string())])
+            .to_ast_type()
+            .is_none()
+    );
+}
+
+#[test]
+fn ordinary_and_mangled_named_types_still_bridge() {
+    // Regression guard for the #1190 fix: only a *leading* `$` is synthetic.
+    // An ordinary user type, and a mangled generic instance whose `$` is in the
+    // middle (`Optional$int64`), must still bridge so #1167 inference is intact.
+    assert_eq!(bridged(Ty::Named("Box".to_string())), "Box");
+    assert_eq!(
+        bridged(Ty::Named("Optional$int64".to_string())),
+        "Optional$int64"
+    );
+    assert_eq!(
+        bridged(Ty::Named("Optional$$genexpr".to_string())),
+        "Optional$$genexpr",
+        "a mangled instance name is not itself a synthetic type — only a \
+         *leading* `$` is the synthetic sigil"
+    );
+}
+
 // ----- fail-closed: unbridgeable types and composites with an unbridgeable part
 
 #[test]
