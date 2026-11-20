@@ -22,6 +22,7 @@ listed here (see [`README.md`](README.md)).
 | [972](stdlib/972-collections-conveniences.md) | stdlib collections — Counter / defaultdict / OrderedDict as prelude generics | Locked | 2026-11-19 |
 | [981](stdlib/981-decimal-exact-base10.md) | stdlib decimal — exact base-10 Decimal, software over bigint | Locked | 2026-11-19 |
 | [982](stdlib/982-fractions-exact-rational.md) | stdlib fractions — exact rational Fraction, software over bigint | Locked | 2026-11-19 |
+| [991](stdlib/991-udp-sockets.md) | net UDP datagram sockets — udp_socket / bind / connect / sendto / recvfrom | Locked | 2026-11-20 |
 | [1083](stdlib/1083-dict-set-capacity.md) | dict / set initial-capacity hint on construction + reserve() | Locked | 2026-11-19 |
 | [1095](stdlib/1095-list-pop-and-methods.md) | list.pop plus index / reverse / copy — the remaining Python list methods | Locked | 2026-11-19 |
 | [1099](stdlib/1099-bytes-translate-maketrans.md) | Bulk byte-table translation — bytes.maketrans + bytes.translate | Locked | 2026-11-19 |

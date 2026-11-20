@@ -1969,6 +1969,28 @@ that keeps resetting the per-park clock is still cut off with a catchable
 per-park timeout and the whole-op deadline. `http` is **Experimental**
 (STABILITY.md §4.4).
 
+**`net` UDP datagram sockets (#991, epic #985).** Connectionless `SOCK_DGRAM`
+sockets over the same opaque handle and the same netpoller as the TCP streams,
+matching Python's `socket` (`SOCK_DGRAM`) / Go's `net`.
+`net.udp_socket() -> sock` creates an unbound IPv4 (`AF_INET`) datagram socket
+and `net.udp_socket6() -> sock` an IPv6 (`AF_INET6`) one (the family is fixed at
+construction — Zap exposes no `AF_*` constants). `net.udp_bind(sock, host, port)`
+binds a local address (`port 0` → OS-assigned ephemeral, read back with the
+shared `net.port(sock)`; an empty host is the wildcard). `net.sendto(sock, data,
+host, port) -> int64` sends one datagram and returns the bytes sent;
+`net.recvfrom(sock, n) -> (data, host, port)` receives one datagram (payload up
+to `n` bytes, any excess discarded) together with the numeric sender IP and
+port. `net.udp_connect(sock, host, port)` records a default peer so the ordinary
+`net.send` / `net.recv` work on the datagram socket (connected UDP). The shared
+`net.port`, `net.set_read_timeout`, `net.set_read_deadline`,
+`net.set_deadline_ns` and `net.close_conn` apply to a UDP socket unchanged — a
+bounded `net.recvfrom` with no datagram waiting raises `TimeoutError`, exactly as
+`net.recv` does, and a zero-length datagram is a valid empty payload (not EOF).
+A bind/send/connect whose address family does not match the socket's family
+raises a catchable error. The datagram payload is `str` (as `net.recv` /
+`net.send` already are), not Python `bytes`. `net` remains **Experimental**
+(STABILITY.md §4.4).
+
 **`tls` client + server (#147, #488).** TLS over OpenSSL on the netpoller.
 *Client (#147):* `tls.connect(host, port)` verifies the certificate chain
 against the system trust store **and** the hostname (on by default);

@@ -728,6 +728,49 @@ fn math_net_positional_unchanged() {
     assert_ok(&prog("    auto l = net.listen(\"0.0.0.0\", 8080)\n"));
 }
 
+#[test]
+fn net_udp_keyword_reorder_and_unknown() {
+    // udp_bind(sock, host, port): name-order reorder and swapped host/port.
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    net.udp_bind(sock=s, host=\"127.0.0.1\", port=0)\n",
+    ));
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    net.udp_bind(port=0, host=\"127.0.0.1\", sock=s)\n",
+    ));
+    // udp_connect mirrors udp_bind's (sock, host, port) shape.
+    assert_ok(&prog(
+        "    auto s = net.udp_socket6()\n    net.udp_connect(sock=s, host=\"::1\", port=9)\n",
+    ));
+    // sendto(sock, data, host, port) -> int64; reordered + the 4th slot named.
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    auto n = net.sendto(data=\"ping\", sock=s, port=9, host=\"127.0.0.1\")\n",
+    ));
+    // recvfrom(sock, n) -> (data, host, port): keyword form + tuple destructure.
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    auto d, h, p = net.recvfrom(n=1024, sock=s)\n",
+    ));
+    // An unknown keyword is rejected by the central binder (ZAP4023).
+    assert_code(
+        &prog(
+            "    auto s = net.udp_socket()\n    net.udp_bind(sock=s, host=\"127.0.0.1\", prt=0)\n",
+        ),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn net_udp_positional_unchanged() {
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    net.udp_bind(s, \"127.0.0.1\", 0)\n",
+    ));
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    auto n = net.sendto(s, \"x\", \"127.0.0.1\", 9)\n",
+    ));
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    auto d, h, p = net.recvfrom(s, 64)\n",
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // linalg — LAPACK-backed linear algebra; NumPy names (a / b / n / x / ord).
 // The check facet only infers + arity-checks (arrays type loosely), so these
