@@ -2024,7 +2024,13 @@ like the INET transports. Only filesystem pathnames are supported (Linux
 abstract-namespace names are rejected); `listen_unix` fails if `path` already
 exists (remove a stale socket file first, as in Python/Go). Unix sockets are
 **POSIX-only** — the Windows build raises a catchable "not supported" error.
-`net` remains **Experimental** (STABILITY.md §4.4).
+`net.peer_cred(sock) -> (uid, gid, pid)` (#1143) reads the connecting peer's
+user/group/process id off a connected Unix-domain socket (verified via
+`getsockname`, so it works on both a `connect_unix` client and an `accept`ed
+server connection); a non-Unix socket raises `ValueError`. It is **Linux-only**
+for now (via `SO_PEERCRED`) — macOS/BSD and Windows raise a catchable "not
+supported" error, with the macOS/BSD path (`getpeereid`/`LOCAL_PEERPID`) a
+follow-up. `net` remains **Experimental** (STABILITY.md §4.4).
 
 **`net` socket options (#994, epic #985).** Named setters/getters for the common
 socket options, in the same explicit-name style as the rest of `net` (no

@@ -1894,3 +1894,74 @@ void zap_net_set_multicast_loopback(void *sock_, int64_t on) {
         zap_net_mcast_value_error("net: multicast requires an IPv4/IPv6 UDP socket");
     }
 }
+
+/* ===========================================================================
+ * net: AF_UNIX peer credentials (ticket #1143, follow-up to #993). Read the
+ * connecting peer's uid / gid / pid off a connected Unix-domain stream socket —
+ * the authorization pattern a local daemon uses to check who is talking to it.
+ * `net.peer_cred(sock) -> (uid, gid, pid)`.
+ *
+ * The socket must be an AF_UNIX socket (checked via getsockname, so it works on
+ * both a connect_unix client and an accept()ed server conn regardless of the
+ * handle's cached family). Linux only for now, via SO_PEERCRED: glibc hides
+ * `struct ucred` without _GNU_SOURCE (which this runtime does not define), so we
+ * read into our own struct matching the kernel's {pid, uid, gid} ABI. macOS/BSD
+ * (getpeereid + LOCAL_PEERPID) and Windows have no equivalent here yet and raise
+ * a catchable "not supported" error.
+ * ========================================================================== */
+
+/* uid / gid / pid of the peer, read back into an (int64, int64, int64) tuple by
+ * the lowerer. Plain scalars, so an ATOMIC GC object (nothing to trace). */
+typedef struct {
+    int64_t uid;
+    int64_t gid;
+    int64_t pid;
+} ZapPeerCred;
+
+static const ZapTypeDesc zap_desc_peercred = {(int64_t)sizeof(ZapPeerCred), ZAP_TD_ATOMIC, 0,
+                                              NULL};
+
+void *zap_net_peer_cred(void *sock_) {
+#if defined(ZAP_PLATFORM_POSIX)
+    ZapSock *s = (ZapSock *)sock_;
+    struct sockaddr_storage ss;
+    socklen_t sl = (socklen_t)sizeof ss;
+    if (getsockname(s->fd, (struct sockaddr *)&ss, &sl) != 0 || ss.ss_family != AF_UNIX) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("net: peer_cred requires a Unix-domain socket",
+                                    sizeof("net: peer_cred requires a Unix-domain socket") - 1));
+        return NULL;
+    }
+#if defined(__linux__) && defined(SO_PEERCRED)
+    /* Kernel ABI of `struct ucred`; declared locally to avoid the _GNU_SOURCE
+     * requirement glibc puts on the real definition. */
+    struct zap_ucred {
+        pid_t pid;
+        uid_t uid;
+        gid_t gid;
+    } cr;
+    socklen_t cl = (socklen_t)sizeof cr;
+    if (getsockopt(s->fd, SOL_SOCKET, SO_PEERCRED, &cr, &cl) != 0) {
+        zap_net_panic("net: peer_cred failed");
+        return NULL;
+    }
+    ZapPeerCred *r = (ZapPeerCred *)zap_obj(&zap_desc_peercred);
+    r->uid = (int64_t)cr.uid;
+    r->gid = (int64_t)cr.gid;
+    r->pid = (int64_t)cr.pid;
+    return r;
+#else
+    (void)sock_;
+    zap_net_panic("net: peer_cred is not supported on this platform");
+    return NULL;
+#endif
+#else /* !ZAP_PLATFORM_POSIX */
+    (void)sock_;
+    zap_net_panic("net: peer_cred is not supported on this platform");
+    return NULL;
+#endif
+}
+
+int64_t zap_net_peer_cred_uid(void *c_) { return ((ZapPeerCred *)c_)->uid; }
+int64_t zap_net_peer_cred_gid(void *c_) { return ((ZapPeerCred *)c_)->gid; }
+int64_t zap_net_peer_cred_pid(void *c_) { return ((ZapPeerCred *)c_)->pid; }

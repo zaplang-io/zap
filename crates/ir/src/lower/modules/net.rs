@@ -110,6 +110,42 @@ fn unpack_unix_datagram_tuple(lowerer: &mut FnLower, h: Value) -> (Value, Ty) {
     (dest, Ty::Struct(sid))
 }
 
+/// Unpack a `ZapPeerCred` handle (from `zap_net_peer_cred`) into a
+/// `(int64, int64, int64)` tuple via the three infallible field getters.
+fn unpack_peer_cred_tuple(lowerer: &mut FnLower, h: Value) -> (Value, Ty) {
+    let getters = [
+        "zap_net_peer_cred_uid",
+        "zap_net_peer_cred_gid",
+        "zap_net_peer_cred_pid",
+    ];
+    let mut fields = Vec::with_capacity(3);
+    for g in getters {
+        let v = lowerer.new_value(Ty::I64);
+        lowerer.emit(Inst::Call {
+            dest: Some(v),
+            func: g.to_string(),
+            args: vec![h],
+        });
+        fields.push(v);
+    }
+    let sid = lowerer
+        .ctx
+        .tuples
+        .borrow_mut()
+        .intern(vec![Ty::I64, Ty::I64, Ty::I64]);
+    let dest = lowerer.new_value(Ty::Struct(sid));
+    lowerer.emit(Inst::StructNew { dest, sid });
+    for (idx, val) in fields.into_iter().enumerate() {
+        lowerer.emit(Inst::FieldSet {
+            base: dest,
+            sid,
+            idx: idx as u32,
+            val,
+        });
+    }
+    (dest, Ty::Struct(sid))
+}
+
 fn lower(
     lowerer: &mut FnLower,
     method: &str,
@@ -180,6 +216,13 @@ fn lower(
             let h = lowerer.new_value(Ty::Ptr);
             lowerer.throwing_call(Some(h), "zap_net_recvfrom_unix", a);
             unpack_unix_datagram_tuple(lowerer, h)
+        }
+        // peer_cred -> (uid, gid, pid): throwing call returns a ZapPeerCred
+        // handle, then three infallible getters unpack it into the int64 tuple.
+        "peer_cred" => {
+            let h = lowerer.new_value(Ty::Ptr);
+            lowerer.throwing_call(Some(h), "zap_net_peer_cred", a);
+            unpack_peer_cred_tuple(lowerer, h)
         }
 
         // ---- socket options (ticket #994, epic #985) ----

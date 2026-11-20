@@ -529,6 +529,7 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("net", "unixgram_bind", &["sock", "path"]),
     ("net", "sendto_unix", &["sock", "data", "path"]),
     ("net", "recvfrom_unix", &["sock", "n"]),
+    ("net", "peer_cred", &["sock"]),
     // Socket options (#994, epic #985).
     ("net", "set_reuseaddr", &["sock", "on"]),
     ("net", "set_reuseport", &["sock", "on"]),
