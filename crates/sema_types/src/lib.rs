@@ -507,6 +507,33 @@ pub fn inplace_op_dunder(op: BinOp) -> Option<&'static str> {
     })
 }
 
+/// The *reflected* binary-operator dunder for an operator (D-0047, #1180): when
+/// the left operand cannot handle `a OP b` itself, the RIGHT operand's reflected
+/// dunder is tried as a fallback (`a + b` -> `b.__radd__(a)`). Only the
+/// arithmetic / bitwise / shift / matmul operators — those with a
+/// [`binary_op_dunder`] — have a reflected form; comparison / membership /
+/// logical / send do not. The reflected method's `self` is the right operand and
+/// its first non-`self` parameter is the left operand's type.
+pub fn reflected_op_dunder(op: BinOp) -> Option<&'static str> {
+    use BinOp::*;
+    Some(match op {
+        Add => "__radd__",
+        Sub => "__rsub__",
+        Mul => "__rmul__",
+        Div => "__rtruediv__",
+        FloorDiv => "__rfloordiv__",
+        Mod => "__rmod__",
+        MatMul => "__rmatmul__",
+        Pow => "__rpow__",
+        BitAnd => "__rand__",
+        BitOr => "__ror__",
+        BitXor => "__rxor__",
+        Shl => "__rlshift__",
+        Shr => "__rrshift__",
+        Eq | Ne | Lt | Le | Gt | Ge | And | Or | In | NotIn | Is | IsNot | Send => return None,
+    })
+}
+
 /// The source symbol for an operator, for diagnostics.
 pub fn binop_symbol(op: BinOp) -> &'static str {
     use BinOp::*;
