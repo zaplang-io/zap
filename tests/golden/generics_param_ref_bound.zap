@@ -28,7 +28,7 @@ def scaled[T: Scaler[f64, T]](T x, f64 k) -> T:
 
 def main():
     Meters a = scaled(Meters(v=3.0), 4.0)
-    print(a.v)                                  # 12.0
+    print(a.v)  # 12.0
     # Nested: the inner call returns a Meters, which the outer call scales again.
     Meters b = scaled(scaled(Meters(v=1.0), 2.0), 5.0)
-    print(b.v)                                  # 10.0
+    print(b.v)  # 10.0
