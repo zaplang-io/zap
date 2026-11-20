@@ -14122,7 +14122,31 @@ impl<'a> FnLower<'a> {
         // same index — a matching `Ty::Func` is exactly `Ty::Func(to_idx)`, and
         // any other `Ty::Func(from_idx)` is a genuine structural mismatch.
         let Ty::Func(from_idx) = from else {
-            return Ok(());
+            // A source that is NOT a function value. Two cases are legitimate
+            // and must pass (#1104 must not over-reject):
+            //  * `Ty::Ptr` — a function value whose signature was erased (read
+            //    back from a collection element, a uniform reference word).
+            //    Re-attaching the expected call signature is the D-0067
+            //    round-trip, not a mismatch (see `container_roundtrip_accepted`).
+            //  * `Ty::Py` — a dynamically-typed value; stay permissive.
+            if matches!(from, Ty::Ptr | Ty::Py) {
+                return Ok(());
+            }
+            // Anything else (a scalar, a struct, a concrete collection, ...) is
+            // definitely not a function, so coercing it to a `fn(...)` slot would
+            // feed the wrong word kind into a closure-record pointer (e.g. an
+            // `iconst` into a `ptr`) — a silent miscompile (#1104). Reject it
+            // with the same code a normal argument/parameter mismatch uses, the
+            // sibling of the #465 signature-mismatch check.
+            let expected = self.ctx.fn_sigs.borrow().get(to_idx).clone();
+            let want = self.render_fn_sig(&expected);
+            return Err(LowerError {
+                code,
+                message: format!(
+                    "value of type `{}` is not a function, but `{want}` is expected",
+                    self.render_ty(from)
+                ),
+            });
         };
         if *from_idx == to_idx {
             return Ok(());
@@ -21516,6 +21540,42 @@ impl<'a> FnLower<'a> {
     /// `(value, type)` pairs starting with the receiver (`self`); each is coerced
     /// to the registered parameter type. A missing dunder is a clean error (sema
     /// normally catches it first, but the ir crate is exercised without sema).
+    /// Whether an argument of ZIR type `from` may be passed where parameter type
+    /// `to` is expected, at the representation level (#1103). Deliberately
+    /// conservative: it rejects only a value that crosses the scalar/pointer
+    /// boundary in a way [`coerce`](Self::coerce) cannot legitimately bridge —
+    /// the index/value type confusion the index-overload rewrite would otherwise
+    /// lower to a silent word reinterpret (an `iconst` into a pointer slot).
+    ///
+    /// Same-class conversions stay permissive, so the happy path and the D-0067
+    /// signature-less round-trip are never over-rejected: two scalars
+    /// (`int<->int`, a float widening), two pointers (`str`/struct/collection,
+    /// including a bare `ptr` read back from a collection element), and a
+    /// `struct -> interface` coercion all pass. This matches exactly the set of
+    /// conversions `coerce` performs without falling through to a bitwise
+    /// reinterpret — the one scalar->pointer case it *does* handle, a numeric
+    /// widened into a boxed `bigint`/`complex`, is admitted explicitly.
+    fn arg_repr_compatible(&self, from: Ty, to: Ty) -> bool {
+        if from == to {
+            return true;
+        }
+        // Dynamically-typed values stay permissive.
+        if matches!(from, Ty::Py) || matches!(to, Ty::Py) {
+            return true;
+        }
+        // The one scalar -> pointer conversion `coerce` performs: a numeric
+        // value widened into a boxed `bigint`/`complex`.
+        if matches!(to, Ty::Bigint | Ty::Complex) && (from.int_width().is_some() || from.is_float())
+        {
+            return true;
+        }
+        // Otherwise a value may only be passed when it stays on the same side of
+        // the scalar/pointer representation boundary. A scalar (`i64`, a `char`,
+        // an enum tag, a float) fed into a pointer parameter (a `str`, a struct,
+        // any collection) — or the reverse — is the #1103 confusion.
+        from.is_ptr() == to.is_ptr()
+    }
+
     fn call_dunder(
         &mut self,
         sid: u32,
@@ -21532,6 +21592,31 @@ impl<'a> FnLower<'a> {
         let mut argvals = Vec::with_capacity(args.len());
         for (i, (v, vt)) in args.into_iter().enumerate() {
             let target = *ptys.get(i).unwrap_or(&vt);
+            // The index-overload dunders (D-0047) are reached by the `a[i]` /
+            // `a[i] = v` rewrite, which — unlike a direct method call — has no
+            // sema argument check to lean on: a generic receiver's instantiation
+            // is erased in sema (`Box[str]` -> `Named("Box")`, the key variable
+            // `K` -> `Unknown`), so a wrong index/value type slips through to
+            // here (#1103). Verify the argument's representation is compatible
+            // with the declared parameter before forming the call, so a mismatch
+            // (e.g. an `i64` index fed into a `str`/pointer key slot) is a clean
+            // `ZAP4021` type error — the same code a normal argument/parameter
+            // mismatch produces — instead of a silent `coerce` word reinterpret.
+            if matches!(dunder, "__getitem__" | "__setitem__")
+                && !self.arg_repr_compatible(vt, target)
+            {
+                return Err(LowerError {
+                    code: zapc_diag::ErrorCode::ZAP4021,
+                    message: format!(
+                        "argument {i} to `{}.{dunder}` has type `{}`, which is not \
+                         compatible with the parameter type `{}` (the index/value \
+                         type does not match the overload's declared type; D-0047)",
+                        self.ctx.names[sid as usize],
+                        self.render_ty(&vt),
+                        self.render_ty(&target),
+                    ),
+                });
+            }
             argvals.push(self.coerce(v, vt, target));
         }
         let dest = if ret == Ty::Void {
