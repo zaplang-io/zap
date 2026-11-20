@@ -2066,6 +2066,61 @@ impl Mono<'_> {
         })
     }
 
+    /// The element type produced by *iterating* a value of best-effort type `c`
+    /// (a comprehension's `for v in ITER`), mirroring sema's `iterable_elem`
+    /// (#1131): `range` → `int64`; `list`/`set`/`heap`/`deque`/`oset` → their
+    /// element; `dict` → its key (iterating a dict yields keys, #299); `str` →
+    /// `char`. Anything else — a user struct's iterator protocol, an opaque or
+    /// untyped base — stays `Unknown`, so the loop variable's type is simply
+    /// unknown and inference falls back exactly as before.
+    fn iter_elem(&self, c: &CTy) -> CTy {
+        let CTy::Ty(Type::Named { name, args, .. }) = c else {
+            return CTy::Unknown;
+        };
+        match name.as_str() {
+            "range" => self.prim("int64"),
+            "str" => self.prim("char"),
+            // Iterating a dict yields its keys (`args[0]`).
+            "list" | "set" | "heap" | "deque" | "oset" | "dict" => {
+                args.first().map_or(CTy::Unknown, |t| CTy::Ty(t.clone()))
+            }
+            _ => CTy::Unknown,
+        }
+    }
+
+    /// The element/value type produced by *subscripting* a value of best-effort
+    /// type `base` (`base[i]`), mirroring sema's `Expr::Index` rules (#1131):
+    /// `list[T]`/`deque[T]` → `T`; `dict[K, V]` → `V`; `str` → `char`;
+    /// `bytes`/`range` → `int64`. A tuple needs a compile-time-constant index to
+    /// know the element statically, and a user `__getitem__` is not modelled
+    /// here, so both stay `Unknown` (fail-closed) — as does an opaque base.
+    fn index_elem(&self, base: &CTy) -> CTy {
+        let CTy::Ty(Type::Named { name, args, .. }) = base else {
+            return CTy::Unknown;
+        };
+        match name.as_str() {
+            "list" | "deque" => args.first().map_or(CTy::Unknown, |t| CTy::Ty(t.clone())),
+            "dict" => args.get(1).map_or(CTy::Unknown, |t| CTy::Ty(t.clone())),
+            "str" => self.prim("char"),
+            "bytes" | "range" => self.prim("int64"),
+            _ => CTy::Unknown,
+        }
+    }
+
+    /// The type produced by *slicing* a value of best-effort type `base`
+    /// (`base[lo:hi]`), mirroring sema's `Expr::Slice` rules (#1131): a
+    /// `list[T]` slice is a `list[T]` copy, a `str` slice is `str`, and a
+    /// `bytes` slice is `bytes` — the base's own type passes through. Any other
+    /// base (an opaque/loose array, a user type) stays `Unknown`.
+    fn slice_result(&self, base: &CTy) -> CTy {
+        if let CTy::Ty(Type::Named { name, .. }) = base {
+            if matches!(name.as_str(), "list" | "str" | "bytes") {
+                return base.clone();
+            }
+        }
+        CTy::Unknown
+    }
+
     /// Join two numeric families to the type their arithmetic yields, mirroring
     /// `sema_types::num_join`'s promotion order
     /// (`complex > float > unsigned > bigint > signed`). Signed/unsigned mixing
@@ -2315,15 +2370,23 @@ impl Mono<'_> {
                         }),
                     ));
                 }
-                let base = self.rw(base, env)?;
+                // An ordinary subscript carries the base container's
+                // element/value type into generic inference (#1131): without it
+                // `xs[0]` on a `list[int64]` stayed `Unknown`, so
+                // `Optional.Some(xs[0])` could not pin `T` (and an untyped
+                // `auto e = xs[0]` poisoned every later use). An opaque base, a
+                // tuple (needs a static index), or a user `__getitem__` keeps
+                // the result `Unknown`.
+                let (base_e, base_cty) = self.rewrite_expr(base, env, None)?;
                 let index = self.rw(index, env)?;
+                let cty = self.index_elem(&base_cty);
                 Ok((
                     Expr::Index {
-                        base: Box::new(base),
+                        base: Box::new(base_e),
                         index: Box::new(index),
                         span: *span,
                     },
-                    CTy::Unknown,
+                    cty,
                 ))
             }
             Expr::Unary { op, expr, span } => {
@@ -2395,7 +2458,28 @@ impl Mono<'_> {
                     self.prim("bool"),
                 ))
             }
-            Expr::Tuple(xs, span) => Ok((Expr::Tuple(self.rw_vec(xs, env)?, *span), CTy::Unknown)),
+            Expr::Tuple(xs, span) => {
+                // Infer a `tuple[...]` type from the elements (#1131), so a
+                // `tuple` argument can pin a type parameter. Mirror the
+                // list/set/dict literal arms, but a tuple is heterogeneous, so
+                // every element must be typed — any untyped element drops the
+                // whole tuple to `Unknown` (the empty tuple `()` too).
+                let mut out = Vec::with_capacity(xs.len());
+                let mut elems: Option<Vec<Type>> = Some(Vec::with_capacity(xs.len()));
+                for x in xs {
+                    let (v, cty) = self.rewrite_expr(x, env, None)?;
+                    match (&mut elems, cty) {
+                        (Some(acc), CTy::Ty(t)) => acc.push(t),
+                        (slot, _) => *slot = None,
+                    }
+                    out.push(v);
+                }
+                let cty = match elems {
+                    Some(elems) if !elems.is_empty() => CTy::Ty(Type::Tuple { elems, span: *span }),
+                    _ => CTy::Unknown,
+                };
+                Ok((Expr::Tuple(out, *span), cty))
+            }
             Expr::List(xs, span) => {
                 // Infer the element type from the first element (best-effort), so
                 // a `list[T]` parameter can be inferred from a list literal
@@ -2515,16 +2599,24 @@ impl Mono<'_> {
                 hi,
                 step,
                 span,
-            } => Ok((
-                Expr::Slice {
-                    base: Box::new(self.rw(base, env)?),
-                    lo: self.rw_opt(lo, env)?,
-                    hi: self.rw_opt(hi, env)?,
-                    step: self.rw_opt(step, env)?,
-                    span: *span,
-                },
-                CTy::Unknown,
-            )),
+            } => {
+                // A slice yields the base container's own type (#1131): slicing
+                // a `list[T]` gives a `list[T]`, a `str` gives `str`, `bytes`
+                // gives `bytes`. So `xs[0:2]` on a `list[int64]` pins a
+                // `list[int64]` parameter. An opaque/loose base stays `Unknown`.
+                let (base_e, base_cty) = self.rewrite_expr(base, env, None)?;
+                let cty = self.slice_result(&base_cty);
+                Ok((
+                    Expr::Slice {
+                        base: Box::new(base_e),
+                        lo: self.rw_opt(lo, env)?,
+                        hi: self.rw_opt(hi, env)?,
+                        step: self.rw_opt(step, env)?,
+                        span: *span,
+                    },
+                    cty,
+                ))
+            }
             Expr::SliceSpec { lo, hi, step, span } => Ok((
                 Expr::SliceSpec {
                     lo: self.rw_opt(lo, env)?,
@@ -2560,9 +2652,11 @@ impl Mono<'_> {
                 },
                 CTy::Unknown,
             )),
-            // Comprehensions, lambdas, regex, yield: rewrite nested exprs where
-            // they can carry generic references; bind the comprehension var as
-            // unknown. These are not generic-typed in the first vertical.
+            // Comprehensions (#1131): with the loop variable now typed from its
+            // iterable (see `rw_comp_clauses`), a list/set/dict comprehension
+            // infers `list`/`set`/`dict` of its element/key-value type, so it can
+            // pin a generic parameter. An untyped element keeps the result
+            // `Unknown`.
             Expr::ListComp {
                 elem,
                 clauses,
@@ -2570,15 +2664,23 @@ impl Mono<'_> {
             } => {
                 env.push();
                 let clauses = self.rw_comp_clauses(clauses, env)?;
-                let elem = Box::new(self.rw(elem, env)?);
+                let (elem_e, elem_cty) = self.rewrite_expr(elem, env, None)?;
                 env.pop();
+                let cty = match elem_cty {
+                    CTy::Ty(t) => CTy::Ty(Type::Named {
+                        name: "list".to_string(),
+                        args: vec![t],
+                        span: *span,
+                    }),
+                    _ => CTy::Unknown,
+                };
                 Ok((
                     Expr::ListComp {
-                        elem,
+                        elem: Box::new(elem_e),
                         clauses,
                         span: *span,
                     },
-                    CTy::Unknown,
+                    cty,
                 ))
             }
             Expr::SetComp {
@@ -2588,19 +2690,31 @@ impl Mono<'_> {
             } => {
                 env.push();
                 let clauses = self.rw_comp_clauses(clauses, env)?;
-                let elem = Box::new(self.rw(elem, env)?);
+                let (elem_e, elem_cty) = self.rewrite_expr(elem, env, None)?;
                 env.pop();
+                let cty = match elem_cty {
+                    CTy::Ty(t) => CTy::Ty(Type::Named {
+                        name: "set".to_string(),
+                        args: vec![t],
+                        span: *span,
+                    }),
+                    _ => CTy::Unknown,
+                };
                 Ok((
                     Expr::SetComp {
-                        elem,
+                        elem: Box::new(elem_e),
                         clauses,
                         span: *span,
                     },
-                    CTy::Unknown,
+                    cty,
                 ))
             }
             // Generator expression (#596): rewrite its nested exprs like a
-            // comprehension; it is not generic-typed in the first vertical.
+            // comprehension (the loop variable is typed for inference inside the
+            // body), but the result type stays `Unknown`. A generator's type is
+            // sema's internal `$genexpr` iterator — not a nominal type the
+            // inferer can name — so it is deliberately left unresolved (an
+            // explicit sink is not spellable for it either).
             Expr::GenExp {
                 elem,
                 clauses,
@@ -2627,17 +2741,25 @@ impl Mono<'_> {
             } => {
                 env.push();
                 let clauses = self.rw_comp_clauses(clauses, env)?;
-                let key = Box::new(self.rw(key, env)?);
-                let value = Box::new(self.rw(value, env)?);
+                let (key_e, kcty) = self.rewrite_expr(key, env, None)?;
+                let (value_e, vcty) = self.rewrite_expr(value, env, None)?;
                 env.pop();
+                let cty = match (kcty, vcty) {
+                    (CTy::Ty(kt), CTy::Ty(vt)) => CTy::Ty(Type::Named {
+                        name: "dict".to_string(),
+                        args: vec![kt, vt],
+                        span: *span,
+                    }),
+                    _ => CTy::Unknown,
+                };
                 Ok((
                     Expr::DictComp {
-                        key,
-                        value,
+                        key: Box::new(key_e),
+                        value: Box::new(value_e),
                         clauses,
                         span: *span,
                     },
-                    CTy::Unknown,
+                    cty,
                 ))
             }
             Expr::Lambda { params, body, span } => Ok((
@@ -2662,19 +2784,12 @@ impl Mono<'_> {
         }
     }
 
-    fn rw_vec(&mut self, xs: &[Expr], env: &mut Env) -> Result<Vec<Expr>, LowerError> {
-        let mut out = Vec::with_capacity(xs.len());
-        for x in xs {
-            out.push(self.rw(x, env)?);
-        }
-        Ok(out)
-    }
-
     /// Rewrite a comprehension clause list (#599). Each clause's iterable is
     /// rewritten with the previous clauses' variables in scope; its loop
-    /// variable is then declared (as `Unknown` — comprehensions are not
-    /// generic-typed in the first vertical) so later clauses and filters can
-    /// refer to it. The caller pushes and pops the surrounding scope.
+    /// variable is then declared with the iterable's element type (#1131; see
+    /// [`Mono::iter_elem`]), falling back to `Unknown` for a non-iterable or
+    /// opaque iterable, so later clauses and filters can refer to it. The caller
+    /// pushes and pops the surrounding scope.
     fn rw_comp_clauses(
         &mut self,
         clauses: &[CompClause],
@@ -2682,8 +2797,13 @@ impl Mono<'_> {
     ) -> Result<Vec<CompClause>, LowerError> {
         let mut out = Vec::with_capacity(clauses.len());
         for c in clauses {
-            let iter = Box::new(self.rw(&c.iter, env)?);
-            env.declare(&c.var, CTy::Unknown);
+            // Declare the loop variable with the iterable's element type (#1131)
+            // instead of `Unknown`, so a comprehension's element expression — and
+            // any generic call inside it — can be inferred. A non-iterable or
+            // opaque iterable leaves the variable `Unknown`, exactly as before.
+            let (iter_e, iter_cty) = self.rewrite_expr(&c.iter, env, None)?;
+            let iter = Box::new(iter_e);
+            env.declare(&c.var, self.iter_elem(&iter_cty));
             let mut ifs = Vec::with_capacity(c.ifs.len());
             for f in &c.ifs {
                 ifs.push(self.rw(f, env)?);
