@@ -1081,25 +1081,38 @@ impl Mono<'_> {
         generics: &[TypeParam],
         args: &[Type],
     ) -> Result<(), LowerError> {
+        // The instantiation's own substitution `param -> concrete arg` (#1206):
+        // a parametrized bound's arguments may reference the generic's own type
+        // parameters (`[T: RMul[f64, T]]`), so they are substituted to concrete
+        // types before the bound is checked — `RMul[f64, T]` with `T := Matrix`
+        // becomes `RMul[f64, Matrix]`.
+        let self_subst: HashMap<&str, &Type> = generics
+            .iter()
+            .map(|p| p.name.as_str())
+            .zip(args.iter())
+            .collect();
         for (p, arg) in generics.iter().zip(args.iter()) {
             let Some(bound) = &p.bound else { continue };
-            let Type::Named {
-                name: iface,
-                args: iface_args,
-                ..
-            } = bound
-            else {
+            let Type::Named { name: iface, .. } = bound else {
                 return Err(err(format!(
                     "type parameter '{}' of {what} has an invalid bound: a bound must name \
                      an interface",
                     p.name
                 )));
             };
+            // Substitute the generic's own parameters into the bound (its type
+            // arguments and, for the diagnostic, the whole bound) before the
+            // conformance check.
+            let bound = subst_type(bound, &self_subst);
+            let iface_args: &[Type] = match &bound {
+                Type::Named { args, .. } => args,
+                _ => &[],
+            };
             if let Err(reasons) = self.satisfies_bound(arg, iface, iface_args) {
-                // Name the bound with its type arguments (`Container[int64]`)
-                // when it is a generic-interface bound, so the diagnostic shows
-                // exactly what was required (#1205).
-                let bound_name = type_name(bound);
+                // Name the bound with its (substituted) type arguments
+                // (`Container[int64]` / `RMul[f64, Matrix]`) so the diagnostic
+                // shows exactly what was required (#1205/#1206).
+                let bound_name = type_name(&bound);
                 return Err(err(format!(
                     "type '{}' does not satisfy the bound '{}' on type parameter '{}' of \
                      {what}: {}",
@@ -4328,6 +4341,69 @@ mod tests {
         ));
         assert!(
             msg.contains("expects 1 type argument(s)") && msg.contains("supplies 2"),
+            "got: {msg}"
+        );
+    }
+
+    // ---- bounds referencing other type params (#1206) ---------------------
+    //
+    // A parametrized bound's argument may reference the generic's own type
+    // parameter: `[T: Scaler[f64, T]]`. At each instantiation the generic's
+    // parameter is substituted into the bound first (`T := Meters` makes the
+    // bound `Scaler[f64, Meters]`), then the interface's own parameters are
+    // substituted, and the structural match runs against the result.
+
+    const SCALER: &str = "interface Scaler[In, Out]:\n    def scale(self, In factor) -> Out\n\
+         struct Meters:\n    f64 v\n    def scale(self, f64 factor) -> Meters:\n        return Meters(v=self.v * factor)\n\
+         struct Bad:\n    f64 v\n    def scale(self, f64 factor) -> int64:\n        return 0\n";
+
+    #[test]
+    fn self_referential_bound_accepts_conformer() {
+        // T := Meters makes the bound Scaler[f64, Meters]; Meters.scale(f64) ->
+        // Meters conforms, so the instance is emitted.
+        let m = mono_ok(&format!(
+            "{SCALER}def use[T: Scaler[f64, T]](T x) -> int64:\n    return 0\n\
+             def main():\n    print(use(Meters(v=2.0)))\n"
+        ));
+        assert!(
+            fn_names(&m).iter().any(|n| n == "use$Meters"),
+            "conforming instance emitted: {:?}",
+            fn_names(&m)
+        );
+    }
+
+    #[test]
+    fn self_referential_bound_rejects_non_conformer() {
+        // T := Bad makes the bound Scaler[f64, Bad]; Bad.scale(f64) -> int64 does
+        // not conform (its result must be Bad). The diagnostic names the bound
+        // with the self-reference substituted to the concrete type.
+        let msg = mono_err(&format!(
+            "{SCALER}def use[T: Scaler[f64, T]](T x) -> int64:\n    return 0\n\
+             def main():\n    print(use(Bad(v=2.0)))\n"
+        ));
+        assert!(
+            msg.contains("does not satisfy the bound 'Scaler[float64, Bad]'")
+                && msg.contains("method 'scale' has a mismatched signature"),
+            "self-reference substituted in diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn self_referential_bound_on_a_type() {
+        // The self-referential bound is enforced on a generic type's parameter
+        // too: Pipe[Meters] conforms, Pipe[Bad] does not.
+        let m = mono_ok(&format!(
+            "{SCALER}struct Pipe[E: Scaler[f64, E]]:\n    E item\n\
+             def main():\n    Pipe[Meters] p = Pipe(Meters(v=1.0))\n    print(1)\n"
+        ));
+        assert!(struct_named(&m, "Pipe$Meters").is_some());
+        let msg = mono_err(&format!(
+            "{SCALER}struct Pipe[E: Scaler[f64, E]]:\n    E item\n\
+             def main():\n    Pipe[Bad] p = Pipe(Bad(v=1.0))\n    print(1)\n"
+        ));
+        assert!(
+            msg.contains("does not satisfy the bound 'Scaler[float64, Bad]'")
+                && msg.contains("of type 'Pipe'"),
             "got: {msg}"
         );
     }
