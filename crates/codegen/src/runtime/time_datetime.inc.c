@@ -950,7 +950,7 @@ void *zap_tz_zone_require(void *name) {
  * is either into `buf` or into the environment (copied immediately by the
  * caller). */
 static const char *zap_tz_local_name_lookup(char *buf, size_t cap) {
-    /* 1. TZ. */
+    /* 1. TZ — portable (all platforms). */
     const char *tz = getenv("TZ");
     if (tz && tz[0] != '\0') {
         if (tz[0] == ':') {
@@ -960,7 +960,9 @@ static const char *zap_tz_local_name_lookup(char *buf, size_t cap) {
             return tz;
         }
     }
-    /* 2. /etc/localtime symlink. */
+#ifndef _WIN32
+    /* 2. /etc/localtime symlink (POSIX: `readlink` is not available on Windows,
+     * which also has no zoneinfo symlink; there TZ above is the only source). */
     ssize_t rl = readlink("/etc/localtime", buf, cap - 1);
     if (rl > 0) {
         buf[rl] = '\0';
@@ -973,7 +975,7 @@ static const char *zap_tz_local_name_lookup(char *buf, size_t cap) {
             }
         }
     }
-    /* 3. /etc/timezone. */
+    /* 3. /etc/timezone (Debian/Ubuntu). */
     FILE *f = fopen("/etc/timezone", "r");
     if (f) {
         char line[128];
@@ -991,6 +993,10 @@ static const char *zap_tz_local_name_lookup(char *buf, size_t cap) {
             }
         }
     }
+#else
+    (void)buf;
+    (void)cap;
+#endif
     return NULL;
 }
 
