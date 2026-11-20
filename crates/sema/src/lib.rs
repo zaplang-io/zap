@@ -6065,17 +6065,33 @@ impl Checker {
     }
 
     /// Whether a value of type `t` can hold `None` — the operand rule for
-    /// `x is None` / `x is not None` (#611, D18). The two nullable categories
-    /// are a plain reference `struct` (D-0023; physically a pointer that may be
-    /// null) and `Optional[T]` (whose `None` is the empty variant).
-    /// `Unknown`/`Py` stay permissive. A value struct, an enum, and every
-    /// scalar / `str` / `bytes` / tuple can never be None.
+    /// `x is None` / `x is not None` (#611, D18) and `x == None` / `x != None`
+    /// (#374/B3, SPEC §5). A value is nullable exactly when it is a **reference
+    /// type** (D-0014): physically a pointer (or fat pointer / tagged box) that
+    /// `None` lowers to as the null pointer (D-0007/D-0075), so the null test is
+    /// a real runtime check rather than a folded constant.
+    ///
+    /// Covers (matching what `<ty> x = None` accepts at lowering):
+    /// - `str` and `bytes` — reference-represented, immutable (D-0023/D-0025);
+    ///   nullable even though they compare *by value* and carry no reference
+    ///   *identity* ([`is_identity_ty`]), which is why `a is b` on two strings
+    ///   is still ZAP4073;
+    /// - a declared structural **interface** (D-0016), a fat `{data, itable}`
+    ///   pointer whose `data` word may be null;
+    /// - every heap-identity reference type ([`is_identity_ty`]): a plain
+    ///   reference `struct` (D-0023), the GC collections
+    ///   (`list`/`dict`/`set`/`heap`/`deque`/`oset`/`AtomicArray`), a `channel`,
+    ///   and `Optional[T]` (whose `None` is the empty variant).
+    ///
+    /// `Unknown`/`Py` stay permissive. A **value struct**, an **enum**, and
+    /// every scalar (`int*`/`float*`/`bool`/`char`/`range`), a `tuple`, and the
+    /// borrowed views (`strview`/`bytesview`) can never be None — `is None` /
+    /// `== None` on them is rejected with ZAP4074.
     fn is_nullable_ty(&self, t: &Ty) -> bool {
         match t {
-            Ty::Unknown | Ty::Py => true,
-            _ if Self::is_optional_ty(t) => true,
-            Ty::Named(n) => self.structs.get(n).is_some_and(|s| !s.is_value),
-            _ => false,
+            Ty::Str | Ty::Bytes => true,
+            Ty::Named(n) if self.is_interface(n) => true,
+            _ => self.is_identity_ty(t),
         }
     }
 
@@ -15815,16 +15831,19 @@ def main():
 
     #[test]
     fn is_none_on_non_nullable_value_type_is_rejected() {
-        // A value that can never be None (scalars, `str`, `bytes`, `bool`,
-        // `char`, a tuple) makes `x is None` a constant — ZAP4074, directing to
-        // `==` / a pattern match.
+        // A value that can never be None — scalars (`int*`/`float*`/`bool`/
+        // `char`), an `enum`, a `value struct`, and a `tuple` — makes `x is None`
+        // a constant, so it is rejected with ZAP4074, directing to `==` / a
+        // pattern match. `str`/`bytes` are NOT here: they are reference types and
+        // nullable per D-0014 (see `null_check_on_nullable_reference_type_is_ok`).
         for src in [
             "def main():\n    int64 x = 1\n    bool r = x is None\n",
             "def main():\n    float64 x = 1.0\n    bool r = x is not None\n",
-            "def main():\n    str s = \"x\"\n    bool r = s is None\n",
-            "def main():\n    bytes b = b\"x\"\n    bool r = b is None\n",
             "def main():\n    bool t = True\n    bool r = t is None\n",
+            "def main():\n    char c = 'a'\n    bool r = c is None\n",
             "def main():\n    auto p = (1, 2)\n    bool r = p is None\n",
+            "value struct V:\n    int64 x\ndef main():\n    V v = V(x=1)\n    bool r = v is None\n",
+            "enum Color:\n    RED\n    BLUE\ndef main():\n    Color c = Color.RED\n    bool r = c is None\n",
         ] {
             let e = errors(src);
             assert!(
@@ -15832,6 +15851,103 @@ def main():
                 "expected ZAP4074 (value can never be None) for {src:?}, got {e:?}"
             );
         }
+    }
+
+    #[test]
+    fn eq_none_on_non_nullable_value_type_is_rejected() {
+        // `== None` / `!= None` (#374/B3, SPEC §5) is consistent with `is None`:
+        // a never-None value operand is rejected with ZAP4074 the same way,
+        // rather than passing sema and failing in lowering.
+        for src in [
+            "def main():\n    int64 x = 1\n    bool r = x == None\n",
+            "def main():\n    float64 x = 1.0\n    bool r = x != None\n",
+            "def main():\n    bool t = True\n    bool r = t == None\n",
+            "def main():\n    char c = 'a'\n    bool r = c != None\n",
+            "def main():\n    auto p = (1, 2)\n    bool r = p == None\n",
+            "value struct V:\n    int64 x\ndef main():\n    V v = V(x=1)\n    bool r = v == None\n",
+            "enum Color:\n    RED\n    BLUE\ndef main():\n    Color c = Color.RED\n    bool r = c != None\n",
+        ] {
+            let e = errors(src);
+            assert!(
+                e.iter().any(|x| x.code == ErrorCode::ZAP4074),
+                "expected ZAP4074 (value can never be None) for {src:?}, got {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn null_check_on_nullable_reference_type_is_ok() {
+        // D-0014 (#1179): every reference type can hold `None`, so `is None` /
+        // `is not None` and `== None` / `!= None` type-check on it — `str` and
+        // `bytes` (reference-represented, value-compared), a declared interface,
+        // a plain reference `struct`, and the GC collections. `Optional[T]`'s
+        // empty-variant check is covered elsewhere. None of these may be rejected
+        // with ZAP4074 (never-None) or ZAP4073 (`is` needs reference operands —
+        // a literal `None` operand is the null check, not identity).
+        ok(r#"
+def choose(str name = None) -> str:
+    if name is None:
+        return "local"
+    if name == None:
+        return "local"
+    return name
+
+def main():
+    str s = "x"
+    bool a = s is None
+    bool b = s is not None
+    bool c = s == None
+    bool d = s != None
+    bytes by = b"x"
+    bool e = by is None
+    bool f = by != None
+    list[int64] xs = [1]
+    bool g = xs is None
+    bool h = xs == None
+    dict[str, int64] m = {}
+    bool i = m is not None
+    set[int64] st = {1}
+    bool j = st == None
+    print(a)
+"#);
+        // A plain reference `struct` and a declared structural interface.
+        ok(r#"
+interface Greet:
+    def hi(self) -> str
+
+struct Person:
+    str name
+    def hi(self) -> str:
+        return self.name
+
+def main():
+    Person p = Person(name="a")
+    bool a = p is None
+    bool b = p == None
+    Greet g = p
+    bool c = g is None
+    bool d = g is not None
+    print(a)
+"#);
+    }
+
+    #[test]
+    fn nullable_str_null_check_distinguishes_none_from_empty() {
+        // The #1179 repro: a nullable `str` parameter distinguishes an omitted /
+        // explicit `None` argument from an empty or nonempty string. This must
+        // type-check cleanly (the native run in CI asserts local/local/""/UTC).
+        ok(r#"
+def choose(str name = None) -> str:
+    if name is None:
+        return "local"
+    return name
+
+def main():
+    print(choose())
+    print(choose(None))
+    print(choose(""))
+    print(choose("UTC"))
+"#);
     }
 
     #[test]
