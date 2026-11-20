@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 
 use zapc_syntax::ast::{
     self, Arg, Block, CompClause, DictItem, EnumDef, Expr, Function, InterfaceDef, Item, MethodSig,
-    Module, PatArg, Pattern, Stmt, StructDef, Type, TypeParam,
+    Module, PatArg, Pattern, Stmt, StructDef, Type, TypeParam, UnOp,
 };
 use zapc_syntax::span::Span;
 
@@ -2178,14 +2178,36 @@ impl Mono<'_> {
                     CTy::Unknown,
                 ))
             }
-            Expr::Unary { op, expr, span } => Ok((
-                Expr::Unary {
-                    op: *op,
-                    expr: Box::new(self.rw(expr, env)?),
-                    span: *span,
-                },
-                CTy::Unknown,
-            )),
+            Expr::Unary { op, expr, span } => {
+                // Infer the operand so a unary expression carries a type into
+                // generic argument unification (#1117). Without this a negative
+                // literal `-4` — which parses as `Neg` over `Int(4)` — stayed
+                // `Unknown` while the bare `4` was `int64`, so `Optional.Some(-4)`
+                // could not pin `T` though `Optional.Some(4)` could. The operand
+                // keeps the same expected-type context (`None`) the old
+                // `self.rw(expr, env)` call used, so the rewritten expression is
+                // byte-for-byte unchanged; only the inferred `CTy` is added.
+                let (inner, inner_cty) = self.rewrite_expr(expr, env, None)?;
+                let cty = match op {
+                    // `not x` is boolean regardless of the operand (Python
+                    // truthiness semantics).
+                    UnOp::Not => self.prim("bool"),
+                    // Arithmetic negation / unary plus / bitwise complement
+                    // preserve the operand's (numeric) type, so a negated,
+                    // unary-plus, or complemented literal infers exactly the type
+                    // its bare-literal counterpart does. An `Unknown` operand
+                    // stays `Unknown`, so no previously-inferring site changes.
+                    UnOp::Neg | UnOp::Pos | UnOp::BitNot => inner_cty,
+                };
+                Ok((
+                    Expr::Unary {
+                        op: *op,
+                        expr: Box::new(inner),
+                        span: *span,
+                    },
+                    cty,
+                ))
+            }
             Expr::Binary { op, lhs, rhs, span } => Ok((
                 Expr::Binary {
                     op: *op,
