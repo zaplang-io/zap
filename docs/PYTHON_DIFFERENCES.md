@@ -473,6 +473,21 @@ differs in a few places:
   likewise supports it on POSIX and raises a catchable "not supported" error on
   Windows. Peer-credential access (`SO_PEERCRED`) is not yet exposed.
 
+### `net` socket options (#994, decisions/stdlib/994-socket-options.md)
+
+- **Named options, not `setsockopt(level, optname, value)`.** CPython takes raw
+  integer `level`/`optname` constants (`socket.SOL_SOCKET`, `socket.TCP_NODELAY`,
+  …). Zap exposes no such constants: each option is its own named function
+  (`net.set_nodelay`, `net.set_keepalive`, `net.set_reuseaddr`,
+  `net.set_reuseport`, `net.set_recv_buffer`, `net.set_send_buffer`, and the
+  `get_*` twins), with `bool` or `int64` values.
+- **`SO_REUSEPORT` raises where the platform lacks it**, rather than failing to
+  resolve a constant.
+- **Keepalive on/off only; no interval tuning yet.** `set_keepalive` toggles
+  `SO_KEEPALIVE`; the per-platform idle/interval/count knobs
+  (`TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT` on Linux, `TCP_KEEPALIVE` on
+  macOS) and multicast membership are not yet exposed.
+
 ---
 
 ## Parity backlog

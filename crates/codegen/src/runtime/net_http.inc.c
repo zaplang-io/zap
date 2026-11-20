@@ -32,7 +32,8 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <sys/un.h> /* AF_UNIX / sockaddr_un (I#993) */
+#include <sys/un.h>      /* AF_UNIX / sockaddr_un (I#993) */
+#include <netinet/tcp.h> /* TCP_NODELAY (I#994) */
 #else
 /* Windows TCP sockets run on Winsock2 (<winsock2.h>/<ws2tcpip.h>, included at the
  * top under the platform seam). getaddrinfo/sockaddr_in/ntohs and the SOCKET type
@@ -1565,3 +1566,93 @@ void *zap_net_unixdgram_path(void *d_) {
 
 #endif /* ZAP_PLATFORM_POSIX */
 
+
+/* ===========================================================================
+ * net: socket options (ticket #994, epic #985). Named setters/getters over the
+ * common socket options, in the same explicit-name style as the rest of `net`
+ * (Zap exposes no SOL_SOCKET / SO_* / level constants): address reuse, Nagle
+ * (TCP_NODELAY), keepalive, and send/receive buffer sizes. setsockopt /
+ * getsockopt are portable (Winsock has the same SO_* / TCP_NODELAY), so these
+ * are not platform-guarded — except SO_REUSEPORT, which does not exist
+ * everywhere. A setsockopt/getsockopt failure (e.g. a TCP-only option on a
+ * non-TCP socket) raises a catchable error. Set address/reuse options on an
+ * unbound socket (e.g. net.udp_socket) before net.*_bind; buffer sizes and
+ * TCP_NODELAY apply to an established connection. The OS may round or double a
+ * requested buffer size, so a getter can report more than was set.
+ * ========================================================================== */
+
+static void zap_net_setopt_int(void *sock_, int level, int opt, int val, const char *what) {
+    ZapSock *s = (ZapSock *)sock_;
+    if (setsockopt(s->fd, level, opt, (const char *)&val, (socklen_t)sizeof val) != 0) {
+        zap_net_panic(what);
+    }
+}
+
+static int64_t zap_net_getopt_int(void *sock_, int level, int opt, const char *what) {
+    ZapSock *s = (ZapSock *)sock_;
+    int val = 0;
+    socklen_t sl = (socklen_t)sizeof val;
+    if (getsockopt(s->fd, level, opt, (char *)&val, &sl) != 0) {
+        zap_net_panic(what);
+        return 0;
+    }
+    return (int64_t)val;
+}
+
+/* net.set_reuseaddr(sock, on) — SO_REUSEADDR (prompt listener rebind). */
+void zap_net_set_reuseaddr(void *s, int64_t on) {
+    zap_net_setopt_int(s, SOL_SOCKET, SO_REUSEADDR, on != 0, "net: set_reuseaddr failed");
+}
+
+/* net.set_reuseport(sock, on) — SO_REUSEPORT (load-balance across listeners).
+ * Not available on every platform; raises there. */
+void zap_net_set_reuseport(void *s, int64_t on) {
+#ifdef SO_REUSEPORT
+    zap_net_setopt_int(s, SOL_SOCKET, SO_REUSEPORT, on != 0, "net: set_reuseport failed");
+#else
+    (void)s;
+    (void)on;
+    zap_net_panic("net: SO_REUSEPORT is not supported on this platform");
+#endif
+}
+
+/* net.set_nodelay(sock, on) — TCP_NODELAY (disable Nagle, low-latency). */
+void zap_net_set_nodelay(void *s, int64_t on) {
+    zap_net_setopt_int(s, IPPROTO_TCP, TCP_NODELAY, on != 0, "net: set_nodelay failed");
+}
+
+/* net.set_keepalive(sock, on) — SO_KEEPALIVE (idle-connection health probes). */
+void zap_net_set_keepalive(void *s, int64_t on) {
+    zap_net_setopt_int(s, SOL_SOCKET, SO_KEEPALIVE, on != 0, "net: set_keepalive failed");
+}
+
+/* net.set_recv_buffer(sock, nbytes) — SO_RCVBUF. */
+void zap_net_set_recv_buffer(void *s, int64_t n) {
+    zap_net_setopt_int(s, SOL_SOCKET, SO_RCVBUF, (int)n, "net: set_recv_buffer failed");
+}
+
+/* net.set_send_buffer(sock, nbytes) — SO_SNDBUF. */
+void zap_net_set_send_buffer(void *s, int64_t n) {
+    zap_net_setopt_int(s, SOL_SOCKET, SO_SNDBUF, (int)n, "net: set_send_buffer failed");
+}
+
+/* net.get_nodelay(sock) -> bool (TCP_NODELAY). */
+int64_t zap_net_get_nodelay(void *s) {
+    return zap_net_getopt_int(s, IPPROTO_TCP, TCP_NODELAY, "net: get_nodelay failed") != 0;
+}
+
+/* net.get_keepalive(sock) -> bool (SO_KEEPALIVE). */
+int64_t zap_net_get_keepalive(void *s) {
+    return zap_net_getopt_int(s, SOL_SOCKET, SO_KEEPALIVE, "net: get_keepalive failed") != 0;
+}
+
+/* net.get_recv_buffer(sock) -> int64 (SO_RCVBUF; the OS value, possibly rounded
+ * up or doubled from what was set). */
+int64_t zap_net_get_recv_buffer(void *s) {
+    return zap_net_getopt_int(s, SOL_SOCKET, SO_RCVBUF, "net: get_recv_buffer failed");
+}
+
+/* net.get_send_buffer(sock) -> int64 (SO_SNDBUF). */
+int64_t zap_net_get_send_buffer(void *s) {
+    return zap_net_getopt_int(s, SOL_SOCKET, SO_SNDBUF, "net: get_send_buffer failed");
+}

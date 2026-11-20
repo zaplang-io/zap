@@ -67,4 +67,16 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     );
     cg.declare_rt("zap_net_unixdgram_data", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_net_unixdgram_path", &[p.into()], Some(p.into()));
+
+    // ---- socket options (ticket #994, epic #985) ----
+    cg.declare_rt("zap_net_set_reuseaddr", &[p.into(), i.into()], None);
+    cg.declare_rt("zap_net_set_reuseport", &[p.into(), i.into()], None);
+    cg.declare_rt("zap_net_set_nodelay", &[p.into(), i.into()], None);
+    cg.declare_rt("zap_net_set_keepalive", &[p.into(), i.into()], None);
+    cg.declare_rt("zap_net_set_recv_buffer", &[p.into(), i.into()], None);
+    cg.declare_rt("zap_net_set_send_buffer", &[p.into(), i.into()], None);
+    cg.declare_rt("zap_net_get_nodelay", &[p.into()], Some(i.into()));
+    cg.declare_rt("zap_net_get_keepalive", &[p.into()], Some(i.into()));
+    cg.declare_rt("zap_net_get_recv_buffer", &[p.into()], Some(i.into()));
+    cg.declare_rt("zap_net_get_send_buffer", &[p.into()], Some(i.into()));
 }

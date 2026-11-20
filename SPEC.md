@@ -2026,6 +2026,25 @@ exists (remove a stale socket file first, as in Python/Go). Unix sockets are
 **POSIX-only** — the Windows build raises a catchable "not supported" error.
 `net` remains **Experimental** (STABILITY.md §4.4).
 
+**`net` socket options (#994, epic #985).** Named setters/getters for the common
+socket options, in the same explicit-name style as the rest of `net` (no
+`SO_*`/level constants, so no generic `setsockopt`); matches the intent of
+Python's `socket.setsockopt` and Go's `SetNoDelay`/`SetKeepAlive`/
+`SetReadBuffer`/`SetWriteBuffer`. *Setters* (the on/off ones take a `bool`, the
+buffers an `int64` byte count): `net.set_reuseaddr(sock, on)` (`SO_REUSEADDR`),
+`net.set_reuseport(sock, on)` (`SO_REUSEPORT`, raising where the platform lacks
+it), `net.set_nodelay(sock, on)` (`TCP_NODELAY`, disable Nagle),
+`net.set_keepalive(sock, on)` (`SO_KEEPALIVE`), `net.set_recv_buffer(sock,
+nbytes)` (`SO_RCVBUF`), `net.set_send_buffer(sock, nbytes)` (`SO_SNDBUF`).
+*Getters:* `net.get_nodelay(sock)` / `net.get_keepalive(sock)` return `bool`;
+`net.get_recv_buffer(sock)` / `net.get_send_buffer(sock)` return `int64` (the OS
+value, which may be rounded up or doubled from what was set). A setsockopt/
+getsockopt failure (for example a TCP-level option on a non-TCP socket) raises a
+catchable error. Set address-reuse options on an unbound socket (e.g.
+`net.udp_socket`) before the matching bind; `TCP_NODELAY` and the buffer sizes
+apply to an established connection. Keepalive-interval tuning and multicast
+membership are follow-ups. `net` remains **Experimental** (STABILITY.md §4.4).
+
 **`tls` client + server (#147, #488).** TLS over OpenSSL on the netpoller.
 *Client (#147):* `tls.connect(host, port)` verifies the certificate chain
 against the system trust store **and** the hostname (on by default);
