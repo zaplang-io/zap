@@ -162,6 +162,7 @@ value struct DateTime:
     int64 offset
     bool is_aware
     int64 zone_id
+    int64 nanosecond
 
 value struct TimeZone:
     str name
