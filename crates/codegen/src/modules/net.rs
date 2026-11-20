@@ -20,6 +20,11 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
         &[p.into(), i.into(), i.into()],
         Some(p.into()),
     );
+    cg.declare_rt(
+        "zap_net_connect_deadline",
+        &[p.into(), i.into(), i.into()],
+        Some(p.into()),
+    );
     cg.declare_rt("zap_net_set_deadline_ns", &[p.into(), i.into()], None);
     cg.declare_rt("zap_net_accept", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_net_recv", &[p.into(), i.into()], Some(p.into()));

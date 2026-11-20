@@ -2177,6 +2177,17 @@ DNS resolution is a separate prerequisite and is not covered by these APIs.
 Existing named connects retain synchronous resolution. A zero dial deadline
 is unbounded, a negative deadline or invalid numeric IP/port is ValueError.
 
+`net.connect_deadline(host, port, deadline_ns)` (#1138) is the **hostname-aware**
+bounded TCP dial: unlike `connect_ip_deadline`, it accepts a DNS name, and the
+one absolute monotonic-ns `deadline_ns` covers the whole operation — name
+resolution and every resolved-address attempt — so a caller can bound a
+lookup-plus-dial under a single budget. Expiry raises `TimeoutError`, distinct
+from a DNS-resolve failure, a connect failure, and `Cancelled`; a zero deadline
+is unbounded, a negative one is `ValueError`. `getaddrinfo` has no portable
+mid-call cancellation, so resolution is bounded at its boundary (a hung resolver
+is observed when it returns); the deadline is otherwise enforced before
+resolution and per address attempt.
+
 Scoped cancellation wakes parked TCP/TLS I/O and raises Cancelled after native
 operation scratch and partial connections are cleaned. A scope waits for its
 children's finally cleanup. Existing established connections/listeners remain

@@ -130,6 +130,7 @@ fn lower(
         "connect_ip_deadline" => {
             call_ret(lowerer, "zap_net_connect_ip_deadline", a, Ty::Bytes, true)
         }
+        "connect_deadline" => call_ret(lowerer, "zap_net_connect_deadline", a, Ty::Bytes, true),
         "set_deadline_ns" => call_void(lowerer, "zap_net_set_deadline_ns", a, true),
         "accept" => call_ret(lowerer, "zap_net_accept", a, Ty::Bytes, true),
         "recv" => call_ret(lowerer, "zap_net_recv", a, Ty::Ptr, true),
