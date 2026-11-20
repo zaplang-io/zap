@@ -408,10 +408,15 @@ implementing, consistent with D-0047:
   Conformance is **implicit/structural** (defining the dunder is satisfying the
   capability, like every other operator interface). Reflected is purely additive
   — it only occupies paths that errored before, so no previously-compiling
-  program changes meaning. Comparison (`__eq__`/`__cmp__`), the in-place
-  `__iOP__` family, and augmented assignment have **no** reflected form. `x in a`
-  remains the one operator that dispatches on the right/container `a`
-  (`a.__contains__(x)`); its scope is unchanged.
+  program changes meaning. **Comparison reflects too** (I#1198, see
+  [lang/1198-reflected-comparison](../decisions/lang/1198-reflected-comparison.md)):
+  `==`/`!=` fall back to the right operand's `__req__(self, L) -> bool`
+  (symmetric), and `< <= > >=` to `__rcmp__(self, L) -> int`, which returns the
+  sign of `left <=> self` so the four relationals derive exactly as from the
+  forward `__cmp__`; the same left-wins-by-name precedence and additivity apply.
+  The in-place `__iOP__` family and augmented assignment have **no** reflected
+  form. `x in a` remains the one operator that dispatches on the right/container
+  `a` (`a.__contains__(x)`); its scope is unchanged.
 - **`@derive(Hash)` supports integer/bool/str fields;** a float field is a clean
   "not supported yet" error, because bit-hashing a float would break the
   `a == b ⟹ hash(a) == hash(b)` invariant against `__eq__`'s value comparison.

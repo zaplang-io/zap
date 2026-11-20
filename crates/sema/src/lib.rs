@@ -6059,25 +6059,50 @@ impl Checker {
             //    right: defer to the built-in arithmetic rules.
             return None;
         }
-        // Every other operator (comparison / logical / membership / send)
-        // dispatches on the left operand only — no reflected form.
+        // Equality / relational (D-0047). The result is always `bool`, but the
+        // operator is reflected the same way as arithmetic (#1198): the left
+        // operand owns it by name; otherwise the RIGHT operand's reflected
+        // comparison dunder handles it — `__req__` for `==`/`!=` (symmetric),
+        // `__rcmp__` for `< <= > >=`. `__rcmp__(self, L left) -> int` returns the
+        // sign of `left <=> self`, so the four relationals derive identically to
+        // the forward `__cmp__`. Reflected is a fallback: it only occupies paths
+        // that errored before, so no resolving comparison changes meaning.
+        if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
+            let (fwd, rfl, iface) = if matches!(op, Eq | Ne) {
+                ("__eq__", "__req__", "Eq")
+            } else {
+                ("__cmp__", "__rcmp__", "Ord")
+            };
+            let left_is_struct = self.struct_info(l).is_some();
+            // Left wins: a struct left that defines the forward dunder by name.
+            if left_is_struct && self.lookup_dunder(l, fwd).is_some() {
+                return Some(Ty::Bool);
+            }
+            // Reflected fallback: the right operand is a struct whose reflected
+            // comparison dunder accepts the left operand's type.
+            if self.struct_info(r).is_some() {
+                if let Some(sig) = self.lookup_dunder(r, rfl) {
+                    if self.reflected_accepts(&sig, l) {
+                        return Some(Ty::Bool);
+                    }
+                }
+            }
+            // A struct left with neither a forward dunder nor a reflected handler
+            // on the right: the original "operator not supported" error.
+            if left_is_struct {
+                self.require_dunder(l, fwd, iface, binop_symbol(op), span);
+                return Some(Ty::Bool);
+            }
+            // A built-in left with no reflected handler: built-in comparison
+            // rules apply.
+            return None;
+        }
+        // Logical / send (and any remaining operator) dispatch on the left
+        // operand only — no reflected form.
         self.struct_info(l)?;
         match op {
-            Eq | Ne => {
-                self.require_dunder(l, "__eq__", "Eq", binop_symbol(op), span);
-                Some(Ty::Bool)
-            }
-            Lt | Le | Gt | Ge => {
-                // The four relational operators derive from a single `__cmp__`.
-                self.require_dunder(l, "__cmp__", "Ord", binop_symbol(op), span);
-                Some(Ty::Bool)
-            }
             And | Or => Some(Ty::Bool),
-            Send => None,
-            _ => {
-                let (dunder, iface) = binary_op_dunder(op)?;
-                Some(self.op_result(l, dunder, iface, binop_symbol(op), span))
-            }
+            _ => None,
         }
     }
 
@@ -14133,19 +14158,72 @@ def main():
     }
 
     #[test]
-    fn reflected_does_not_apply_to_comparison_or_builtins() {
-        // Reflected dispatch is scoped to arithmetic/bitwise/shift/matmul:
-        // a right-operand `__radd__`-style handler is NOT consulted for `<`
-        // (comparison dispatches on the left `__cmp__` only).
+    fn reflected_arithmetic_leaves_builtins_unaffected() {
+        // The arithmetic/bitwise/shift/matmul reflected set does not perturb
+        // ordinary scalar arithmetic between two built-ins.
+        ok("def main():\n    int64 x = 2 + 3\n    float64 y = 1.5 * 2.0\n    print(x)\n    print(str(y))\n");
+    }
+
+    // --- reflected comparison (#1198) ------------------------------------------
+
+    #[test]
+    fn reflected_comparison_via_right_rcmp_and_req() {
+        // The left `DT` defines no `__cmp__`/`__eq__`; the right `Rel` supplies
+        // `__rcmp__` (relationals) and `__req__` (equality). Both resolve, each
+        // yielding bool.
+        ok("value struct DT:\n    int64 month\n\n\
+            struct Rel:\n    int64 months\n\n    \
+            def __rcmp__(self, DT dt) -> int64:\n        return 0\n\n    \
+            def __req__(self, DT dt) -> bool:\n        return True\n\n\
+            def main():\n    auto dt = DT(month=1)\n    auto rd = Rel(months=1)\n    \
+            if dt < rd:\n        print(1)\n    if dt >= rd:\n        print(2)\n    \
+            if dt == rd:\n        print(3)\n    if dt != rd:\n        print(4)\n");
+    }
+
+    #[test]
+    fn reflected_comparison_builtin_left() {
+        // A built-in left (`int64`) with a struct right that defines the
+        // reflected comparison dunders: `3 < v` / `3 == v`.
+        ok("struct Money:\n    int64 cents\n\n    \
+            def __rcmp__(self, int64 n) -> int64:\n        return 0\n\n    \
+            def __req__(self, int64 n) -> bool:\n        return False\n\n\
+            def main():\n    auto m = Money(cents=100)\n    if 3 < m:\n        print(1)\n    \
+            if 3 == m:\n        print(2)\n");
+    }
+
+    #[test]
+    fn reflected_comparison_left_cmp_wins() {
+        // When the left type defines `__cmp__`, it owns the comparison even if the
+        // right defines `__rcmp__`; a right with a non-matching nature is ignored.
+        ok("value struct V:\n    int64 x\n\n    \
+            def __cmp__(self, V other) -> int64:\n        return self.x - other.x\n\n\
+            def main():\n    auto a = V(x=1)\n    auto b = V(x=2)\n    if a < b:\n        print(1)\n");
+    }
+
+    #[test]
+    fn reflected_comparison_absent_still_errors() {
+        // A struct left with no `__cmp__` and a right without `__rcmp__` is still
+        // the original ZAP4071 naming `__cmp__`/`Ord`.
+        let e = errors(
+            "value struct DT:\n    int64 month\n\n\
+             struct Rel:\n    int64 months\n\n\
+             def main():\n    auto dt = DT(month=1)\n    if dt < Rel(months=1):\n        print(1)\n",
+        );
+        assert!(!e.is_empty(), "no reflected comparison handler: {e:?}");
+        assert!(e.iter().any(|x| x.message.contains("__cmp__")), "{e:?}");
+    }
+
+    #[test]
+    fn reflected_comparison_requires_param_to_accept_left() {
+        // A `__rcmp__` whose parameter does not accept the left operand's type
+        // does not resolve the comparison — it falls through to the error.
         let e = errors(
             "value struct DT:\n    int64 month\n\n\
              struct Rel:\n    int64 months\n\n    \
-             def __rcmp__(self, DT dt) -> int64:\n        return 0\n\n\
+             def __rcmp__(self, str s) -> int64:\n        return 0\n\n\
              def main():\n    auto dt = DT(month=1)\n    if dt < Rel(months=1):\n        print(1)\n",
         );
-        assert!(!e.is_empty(), "comparison has no reflected form: {e:?}");
-        // And built-in arithmetic between two scalars is completely unaffected.
-        ok("def main():\n    int64 x = 2 + 3\n    float64 y = 1.5 * 2.0\n    print(x)\n    print(str(y))\n");
+        assert!(!e.is_empty(), "rcmp param must accept the left type: {e:?}");
     }
 
     #[test]
