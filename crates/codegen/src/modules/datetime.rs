@@ -87,6 +87,59 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
         &[p.into(), i.into(), i.into(), i.into()],
         Some(i.into()),
     );
+    // Named-zone retention + civil resolution (#1149).
+    // (name: ZapStr*, is_fixed) -> zone_id handle (-1 for fixed/none).
+    cg.declare_rt("zap_tz_zone_id", &[p.into(), i.into()], Some(i.into()));
+    // (zone_id, instant, fixed_off) -> offset at the instant.
+    cg.declare_rt(
+        "zap_tz_offset_at_id",
+        &[i.into(), i.into(), i.into()],
+        Some(i.into()),
+    );
+    // (zone_id, y,mo,d,h,mi,s) -> civil kind: 0 unique / 1 gap / 2 overlap.
+    let id_and_six = [
+        i.into(),
+        i.into(),
+        i.into(),
+        i.into(),
+        i.into(),
+        i.into(),
+        i.into(),
+    ];
+    cg.declare_rt("zap_tz_civil_kind", &id_and_six, Some(i.into()));
+    // (zone_id, y,mo,d,h,mi,s, fold, fixed_off) -> resolved offset for the wall
+    // clock (fold selects the overlap instant / gap side).
+    cg.declare_rt(
+        "zap_tz_resolve_local",
+        &[
+            i.into(),
+            i.into(),
+            i.into(),
+            i.into(),
+            i.into(),
+            i.into(),
+            i.into(),
+            i.into(),
+            i.into(),
+        ],
+        Some(i.into()),
+    );
+    // (zone_id, y,mo,d,h,mi,s, fixed_off) -> canonical real instant for
+    // resolve_imaginary.
+    cg.declare_rt(
+        "zap_tz_imaginary_instant",
+        &[
+            i.into(),
+            i.into(),
+            i.into(),
+            i.into(),
+            i.into(),
+            i.into(),
+            i.into(),
+            i.into(),
+        ],
+        Some(i.into()),
+    );
 
     // Separate date / time-of-day renderers (#1046, D-0226).
     // (year, month, day) -> "YYYY-MM-DD"; (hour, minute, second) -> "HH:MM:SS".

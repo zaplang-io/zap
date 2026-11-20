@@ -47,6 +47,12 @@ const GETTERS: [&str; 6] = [
 const F_OFFSET: u32 = 6;
 /// `DateTime` field index for the aware flag (bool), #1045.
 const F_AWARE: u32 = 7;
+/// `DateTime` field index for the named-zone handle (#1149): `-1` for a naive or
+/// fixed-offset value, else an index into the bundled name-sorted zone table.
+/// Keeps `DateTime` a non-GC-traced POD (a plain integer, not a zone pointer).
+const F_ZONE_ID: u32 = 8;
+/// The zone handle for a value with no retained IANA zone (naive / fixed-offset).
+const ZONE_NONE: i64 = -1;
 
 /// `TimeZone` field indices (name / offset-seconds / fixed-flag), #1045.
 const TZ_NAME: u32 = 0;
@@ -99,6 +105,7 @@ fn build_datetime(
     is_local: i64,
     offset: Value,
     aware: Value,
+    zone_id: Value,
 ) -> Result<(Value, Ty), LowerError> {
     let sid = datetime_sid(lowerer)?;
     let local = lowerer.iconst(Ty::I64, is_local);
@@ -130,7 +137,33 @@ fn build_datetime(
         idx: F_AWARE,
         val: aware,
     });
+    lowerer.emit(Inst::FieldSet {
+        base: dest,
+        sid,
+        idx: F_ZONE_ID,
+        val: zone_id,
+    });
     Ok((dest, Ty::Struct(sid)))
+}
+
+/// A `zone_id` constant for a value carrying no retained IANA zone.
+fn zone_none(lowerer: &mut FnLower) -> Value {
+    lowerer.iconst(Ty::I64, ZONE_NONE)
+}
+
+/// `build_datetime` for a value with no retained IANA zone (`zone_id == -1`):
+/// every naive constructor, the host-`*_local` ones, `combine`, and the
+/// fixed-offset / offset-parsed paths. Only `astimezone` (a named zone) and
+/// `add` (zone preserved) pass an explicit `zone_id` to `build_datetime`.
+fn build_datetime_naive(
+    lowerer: &mut FnLower,
+    getter_ts: Value,
+    is_local: i64,
+    offset: Value,
+    aware: Value,
+) -> Result<(Value, Ty), LowerError> {
+    let zid = zone_none(lowerer);
+    build_datetime(lowerer, getter_ts, is_local, offset, aware, zid)
 }
 
 /// Read the six civil `DateTime` fields of an already-lowered base value.
@@ -159,7 +192,10 @@ fn components_of(lowerer: &mut FnLower, arg: &ast::Arg) -> Result<Vec<Value>, Lo
 /// arithmetic and comparisons (#974, D-0221; offset-aware since #1045): for a
 /// naive value (`offset == 0`) the instant is exactly `zap_datetime_to_unix` of
 /// the civil fields, so the behaviour reduces to the pre-#1045 UTC math.
-fn instant_of(lowerer: &mut FnLower, arg: &ast::Arg) -> Result<(Value, Value, Value), LowerError> {
+fn instant_of(
+    lowerer: &mut FnLower,
+    arg: &ast::Arg,
+) -> Result<(Value, Value, Value, Value), LowerError> {
     let sid = datetime_sid(lowerer)?;
     let (base, _) = lowerer.expr(&arg.value)?;
     let comps = civil_fields(lowerer, base, sid);
@@ -171,6 +207,7 @@ fn instant_of(lowerer: &mut FnLower, arg: &ast::Arg) -> Result<(Value, Value, Va
     });
     let off = lowerer.field_get(base, sid, F_OFFSET, Ty::I64);
     let aware = lowerer.field_get(base, sid, F_AWARE, Ty::I1);
+    let zone_id = lowerer.field_get(base, sid, F_ZONE_ID, Ty::I64);
     let inst = lowerer.new_value(Ty::I64);
     lowerer.emit(Inst::Bin {
         dest: inst,
@@ -178,7 +215,7 @@ fn instant_of(lowerer: &mut FnLower, arg: &ast::Arg) -> Result<(Value, Value, Va
         lhs: local_ts,
         rhs: off,
     });
-    Ok((inst, off, aware))
+    Ok((inst, off, aware, zone_id))
 }
 
 /// Lower a `(DateTime, fmt)` custom-format call: read the six civil fields plus
@@ -316,7 +353,7 @@ fn lower(
             if method == "from_timestamp" {
                 let off = lowerer.iconst(Ty::I64, 0);
                 let aware = lowerer.bconst(false);
-                build_datetime(lowerer, ts, 0, off, aware)?
+                build_datetime_naive(lowerer, ts, 0, off, aware)?
             } else {
                 let off = lowerer.new_value(Ty::I64);
                 lowerer.emit(Inst::Call {
@@ -325,7 +362,7 @@ fn lower(
                     args: vec![ts],
                 });
                 let aware = lowerer.bconst(true);
-                build_datetime(lowerer, ts, 1, off, aware)?
+                build_datetime_naive(lowerer, ts, 1, off, aware)?
             }
         }
         "now" | "now_local" => {
@@ -338,7 +375,7 @@ fn lower(
             if method == "now" {
                 let off = lowerer.iconst(Ty::I64, 0);
                 let aware = lowerer.bconst(false);
-                build_datetime(lowerer, ts, 0, off, aware)?
+                build_datetime_naive(lowerer, ts, 0, off, aware)?
             } else {
                 let off = lowerer.new_value(Ty::I64);
                 lowerer.emit(Inst::Call {
@@ -347,7 +384,7 @@ fn lower(
                     args: vec![ts],
                 });
                 let aware = lowerer.bconst(true);
-                build_datetime(lowerer, ts, 1, off, aware)?
+                build_datetime_naive(lowerer, ts, 1, off, aware)?
             }
         }
         "parse" => {
@@ -360,7 +397,7 @@ fn lower(
             });
             let off = lowerer.iconst(Ty::I64, 0);
             let aware = lowerer.bconst(false);
-            build_datetime(lowerer, ts, 0, off, aware)?
+            build_datetime_naive(lowerer, ts, 0, off, aware)?
         }
         // (str, strftime format) -> UTC Unix timestamp -> naive DateTime (#338).
         "strptime" => {
@@ -374,10 +411,10 @@ fn lower(
             });
             let off = lowerer.iconst(Ty::I64, 0);
             let aware = lowerer.bconst(false);
-            build_datetime(lowerer, ts, 0, off, aware)?
+            build_datetime_naive(lowerer, ts, 0, off, aware)?
         }
         "to_timestamp" => {
-            let (inst, _off, _aware) = instant_of(lowerer, &args[0])?;
+            let (inst, _off, _aware, _zid) = instant_of(lowerer, &args[0])?;
             (inst, Ty::I64)
         }
         // One arg: ISO-8601. Two args: strftime-style custom format (#286).
@@ -411,12 +448,32 @@ fn lower(
                 args: vec![s],
             });
             let aware = lowerer.bconst(true);
-            build_datetime(lowerer, local_ts, 0, off, aware)?
+            // An offset-parsed value carries a fixed numeric offset, no IANA zone.
+            build_datetime_naive(lowerer, local_ts, 0, off, aware)?
         }
-        // Date arithmetic + comparisons over the true UTC instant (#974,
-        // D-0221; offset-aware since #1045). `add` keeps the source zone.
+        // add(dt, delta) -> DateTime: pure-Python WALL-CLOCK arithmetic (#974,
+        // D-0221; zone-aware since #1149, §4). The Duration advances the NAIVE
+        // wall-clock fields (days and sub-day units alike — in Python
+        // `timedelta(days=1) == timedelta(seconds=86400)`, both naive-field
+        // additions), then the offset is RE-RESOLVED at the new naive wall time
+        // (fold = 0). For a naive / fixed-offset value (`zone_id == -1`) the
+        // re-resolve returns the stored offset unchanged, and advancing the naive
+        // wall clock equals the old instant-plus-delta math, so those results are
+        // byte-for-byte identical to pre-#1149.
         "add" => {
-            let (inst, off, aware) = instant_of(lowerer, &args[0])?;
+            let sid = datetime_sid(lowerer)?;
+            let (base, _) = lowerer.expr(&args[0].value)?;
+            let civil = civil_fields(lowerer, base, sid);
+            let old_off = lowerer.field_get(base, sid, F_OFFSET, Ty::I64);
+            let aware = lowerer.field_get(base, sid, F_AWARE, Ty::I1);
+            let zone_id = lowerer.field_get(base, sid, F_ZONE_ID, Ty::I64);
+            // The naive wall clock as an epoch (timegm of the civil fields).
+            let wall0 = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(wall0),
+                func: "zap_datetime_to_unix".to_string(),
+                args: civil,
+            });
             // delta is a Duration (ns); DateTime is whole-second, so use
             // nanos / 1_000_000_000 (truncating any sub-second part) (#1047).
             let dur_sid = struct_sid(lowerer, "Duration")?;
@@ -430,26 +487,75 @@ fn lower(
                 lhs: nanos,
                 rhs: billion,
             });
-            let inst2 = lowerer.new_value(Ty::I64);
+            // Advance the NAIVE wall clock by the delta (not the UTC instant).
+            let wall1 = lowerer.new_value(Ty::I64);
             lowerer.emit(Inst::Bin {
-                dest: inst2,
+                dest: wall1,
                 op: BinOp::Add,
-                lhs: inst,
+                lhs: wall0,
                 rhs: sec,
             });
-            // Rebuild the wall clock in the same offset: getter_ts = inst2 + off.
-            let local_ts2 = lowerer.new_value(Ty::I64);
-            lowerer.emit(Inst::Bin {
-                dest: local_ts2,
-                op: BinOp::Add,
-                lhs: inst2,
-                rhs: off,
+            // Recompose the new civil fields from the advanced wall clock
+            // (is_local = 0: the wall epoch is decomposed as UTC civil fields).
+            let utc = lowerer.iconst(Ty::I64, 0);
+            let mut new_civil: Vec<Value> = Vec::with_capacity(6);
+            for func in GETTERS {
+                let v = lowerer.new_value(Ty::I64);
+                lowerer.emit(Inst::Call {
+                    dest: Some(v),
+                    func: func.to_string(),
+                    args: vec![wall1, utc],
+                });
+                new_civil.push(v);
+            }
+            // Re-resolve the offset at the new naive wall time (fold = 0); a
+            // naive / fixed value (zone_id == -1) returns `old_off` unchanged.
+            let fold = lowerer.iconst(Ty::I64, 0);
+            let mut rl = Vec::with_capacity(9);
+            rl.push(zone_id);
+            rl.extend_from_slice(&new_civil);
+            rl.push(fold);
+            rl.push(old_off);
+            let off2 = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(off2),
+                func: "zap_tz_resolve_local".to_string(),
+                args: rl,
             });
-            build_datetime(lowerer, local_ts2, 0, off, aware)?
+            // Build with the advanced civil fields verbatim + the resolved offset.
+            let dest = lowerer.new_value(Ty::Struct(sid));
+            lowerer.emit(Inst::StructNew { dest, sid });
+            for (idx, v) in new_civil.into_iter().enumerate() {
+                lowerer.emit(Inst::FieldSet {
+                    base: dest,
+                    sid,
+                    idx: idx as u32,
+                    val: v,
+                });
+            }
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: F_OFFSET,
+                val: off2,
+            });
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: F_AWARE,
+                val: aware,
+            });
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: F_ZONE_ID,
+                val: zone_id,
+            });
+            (dest, Ty::Struct(sid))
         }
         "diff" => {
-            let (a, _, _) = instant_of(lowerer, &args[0])?;
-            let (b, _, _) = instant_of(lowerer, &args[1])?;
+            let (a, _, _, _) = instant_of(lowerer, &args[0])?;
+            let (b, _, _, _) = instant_of(lowerer, &args[1])?;
             let secs = lowerer.new_value(Ty::I64);
             lowerer.emit(Inst::Bin {
                 dest: secs,
@@ -478,8 +584,8 @@ fn lower(
             (dest, Ty::Struct(dur_sid))
         }
         "before" | "after" | "equal" => {
-            let (a, _, _) = instant_of(lowerer, &args[0])?;
-            let (b, _, _) = instant_of(lowerer, &args[1])?;
+            let (a, _, _, _) = instant_of(lowerer, &args[0])?;
+            let (b, _, _, _) = instant_of(lowerer, &args[1])?;
             let pred = match method {
                 "before" => CmpPred::Lt,
                 "after" => CmpPred::Gt,
@@ -558,7 +664,7 @@ fn lower(
             build_timezone(lowerer, empty, off, fixed)?
         }
         "astimezone" => {
-            let (inst, _off, _aware) = instant_of(lowerer, &args[0])?;
+            let (inst, _off, _aware, _zid) = instant_of(lowerer, &args[0])?;
             let tzsid = timezone_sid(lowerer)?;
             let (tzbase, _) = lowerer.expr(&args[1].value)?;
             let zname = lowerer.field_get(tzbase, tzsid, TZ_NAME, Ty::Ptr);
@@ -570,6 +676,16 @@ fn lower(
             // catchable error for an unknown name).
             let off = lowerer.new_value(Ty::I64);
             lowerer.throwing_call(Some(off), "zap_tz_resolve", vec![zname, zoff, zfixed, inst]);
+            // Retain the zone identity on the value (#1149): a named zone stores
+            // its bundled-table index so later wall-clock ops re-apply its rules;
+            // a fixed zone stores -1 (its constant offset is already in `off`).
+            // Non-throwing — the name was validated by `zone()`.
+            let zid = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(zid),
+                func: "zap_tz_zone_id".to_string(),
+                args: vec![zname, zfixed],
+            });
             let local_ts = lowerer.new_value(Ty::I64);
             lowerer.emit(Inst::Bin {
                 dest: local_ts,
@@ -578,18 +694,22 @@ fn lower(
                 rhs: off,
             });
             let aware = lowerer.bconst(true);
-            build_datetime(lowerer, local_ts, 0, off, aware)?
+            build_datetime(lowerer, local_ts, 0, off, aware, zid)?
         }
-        // replace(dt, field=val, ...) -> DateTime (#1046, D-0226): copy the
-        // civil fields, override the supplied ones, keep the zone (offset /
-        // is_aware). A pure civil-field substitution — no instant round-trip and
-        // no range validation (matching the lenient `parse` family).
+        // replace(dt, field=val, ...) -> DateTime (#1046, D-0226; zone-aware
+        // since #1149): copy the civil fields, override the supplied ones, carry
+        // the zone (is_aware / zone_id). For a NAMED-zone value (zone_id >= 0)
+        // the offset is RE-RESOLVED against the new wall clock (fold = 0), so
+        // e.g. local noon Mar 9 replaced to day=10 moves -05:00 → -04:00. A
+        // naive / fixed value (zone_id == -1) keeps its stored offset, matching
+        // the pre-#1149 pure-civil-substitution behaviour.
         "replace" => {
             let sid = datetime_sid(lowerer)?;
             let (base, _) = lowerer.expr(&args[0].value)?;
             let mut civil = civil_fields(lowerer, base, sid);
-            let off = lowerer.field_get(base, sid, F_OFFSET, Ty::I64);
+            let old_off = lowerer.field_get(base, sid, F_OFFSET, Ty::I64);
             let aware = lowerer.field_get(base, sid, F_AWARE, Ty::I1);
+            let zone_id = lowerer.field_get(base, sid, F_ZONE_ID, Ty::I64);
             for a in &args[1..] {
                 let name = a
                     .name
@@ -602,6 +722,21 @@ fn lower(
                 let (v, vt) = lowerer.expr(&a.value)?;
                 civil[idx] = lowerer.coerce(v, vt, Ty::I64);
             }
+            // Re-resolve the offset at the new wall clock for a named zone;
+            // `zap_tz_resolve_local` returns `old_off` unchanged for zone_id < 0.
+            // fold = 0 (the earlier instant on an overlap, PEP 495 default).
+            let fold = lowerer.iconst(Ty::I64, 0);
+            let mut rl_args = Vec::with_capacity(9);
+            rl_args.push(zone_id);
+            rl_args.extend_from_slice(&civil);
+            rl_args.push(fold);
+            rl_args.push(old_off);
+            let off = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(off),
+                func: "zap_tz_resolve_local".to_string(),
+                args: rl_args,
+            });
             let dest = lowerer.new_value(Ty::Struct(sid));
             lowerer.emit(Inst::StructNew { dest, sid });
             for (idx, v) in civil.into_iter().enumerate() {
@@ -623,6 +758,12 @@ fn lower(
                 sid,
                 idx: F_AWARE,
                 val: aware,
+            });
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: F_ZONE_ID,
+                val: zone_id,
             });
             (dest, Ty::Struct(sid))
         }
@@ -692,6 +833,13 @@ fn lower(
                 sid: dtsid,
                 idx: F_AWARE,
                 val: naive,
+            });
+            let zid = zone_none(lowerer);
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid: dtsid,
+                idx: F_ZONE_ID,
+                val: zid,
             });
             (dest, Ty::Struct(dtsid))
         }
@@ -775,7 +923,154 @@ fn lower(
                 (w, Ty::I64)
             }
         }
+        // resolve(tz, year, month, day, hour, minute, second, fold=0) -> DateTime
+        // (#1149): localize a wall clock into `tz`, picking the `fold` instant on
+        // an overlap and PEP-495-resolving a gap. The civil fields are stored
+        // verbatim; only the offset is zone-resolved (the UTC instant is derived
+        // on demand as timegm(civil) − offset, as everywhere else).
+        "resolve" => {
+            let sid = datetime_sid(lowerer)?;
+            let tzsid = timezone_sid(lowerer)?;
+            let (tzbase, _) = lowerer.expr(&args[0].value)?;
+            let zname = lowerer.field_get(tzbase, tzsid, TZ_NAME, Ty::Ptr);
+            let zoff = lowerer.field_get(tzbase, tzsid, TZ_OFFSET, Ty::I64);
+            let zfixed_i1 = lowerer.field_get(tzbase, tzsid, TZ_FIXED, Ty::I1);
+            let zfixed = lowerer.coerce(zfixed_i1, Ty::I1, Ty::I64);
+            let zone_id = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(zone_id),
+                func: "zap_tz_zone_id".to_string(),
+                args: vec![zname, zfixed],
+            });
+            // Six civil components (positional, after `tz`).
+            let mut civil: Vec<Value> = Vec::with_capacity(6);
+            for a in args.iter().skip(1).take(6) {
+                let (v, vt) = lowerer.expr(&a.value)?;
+                civil.push(lowerer.coerce(v, vt, Ty::I64));
+            }
+            let fold = resolve_fold(lowerer, args)?;
+            // Offset for the wall clock in the zone; a fixed zone (zone_id == -1)
+            // returns its constant `zoff`.
+            let mut rl = Vec::with_capacity(9);
+            rl.push(zone_id);
+            rl.extend_from_slice(&civil);
+            rl.push(fold);
+            rl.push(zoff);
+            let off = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(off),
+                func: "zap_tz_resolve_local".to_string(),
+                args: rl,
+            });
+            let aware = lowerer.bconst(true);
+            let dest = lowerer.new_value(Ty::Struct(sid));
+            lowerer.emit(Inst::StructNew { dest, sid });
+            for (idx, v) in civil.into_iter().enumerate() {
+                lowerer.emit(Inst::FieldSet {
+                    base: dest,
+                    sid,
+                    idx: idx as u32,
+                    val: v,
+                });
+            }
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: F_OFFSET,
+                val: off,
+            });
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: F_AWARE,
+                val: aware,
+            });
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: F_ZONE_ID,
+                val: zone_id,
+            });
+            (dest, Ty::Struct(sid))
+        }
+        // is_ambiguous(dt) / is_imaginary(dt) -> bool (#1149): classify dt's wall
+        // clock against its retained zone. A naive / fixed value (zone_id == -1)
+        // is always unique (kind 0), so both are false.
+        "is_ambiguous" | "is_imaginary" => {
+            let sid = datetime_sid(lowerer)?;
+            let (base, _) = lowerer.expr(&args[0].value)?;
+            let zone_id = lowerer.field_get(base, sid, F_ZONE_ID, Ty::I64);
+            let mut ck = Vec::with_capacity(7);
+            ck.push(zone_id);
+            ck.extend(civil_fields(lowerer, base, sid));
+            let kind = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(kind),
+                func: "zap_tz_civil_kind".to_string(),
+                args: ck,
+            });
+            let want = lowerer.iconst(Ty::I64, if method == "is_ambiguous" { 2 } else { 1 });
+            let d = lowerer.new_value(Ty::I1);
+            lowerer.emit(Inst::ICmp {
+                dest: d,
+                pred: CmpPred::Eq,
+                lhs: kind,
+                rhs: want,
+            });
+            (d, Ty::I1)
+        }
+        // resolve_imaginary(dt) -> DateTime (#1149): if dt's wall clock falls in a
+        // spring-forward gap, shift it forward by the gap length onto the real
+        // post-transition time; otherwise return dt unchanged. Computed via the
+        // canonical real instant + its offset, so a non-gap value rebuilds to the
+        // same wall clock.
+        "resolve_imaginary" => {
+            let sid = datetime_sid(lowerer)?;
+            let (base, _) = lowerer.expr(&args[0].value)?;
+            let zone_id = lowerer.field_get(base, sid, F_ZONE_ID, Ty::I64);
+            let old_off = lowerer.field_get(base, sid, F_OFFSET, Ty::I64);
+            let aware = lowerer.field_get(base, sid, F_AWARE, Ty::I1);
+            let mut ia = Vec::with_capacity(8);
+            ia.push(zone_id);
+            ia.extend(civil_fields(lowerer, base, sid));
+            ia.push(old_off);
+            let inst = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(inst),
+                func: "zap_tz_imaginary_instant".to_string(),
+                args: ia,
+            });
+            let off = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(off),
+                func: "zap_tz_offset_at_id".to_string(),
+                args: vec![zone_id, inst, old_off],
+            });
+            let local_ts = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Bin {
+                dest: local_ts,
+                op: BinOp::Add,
+                lhs: inst,
+                rhs: off,
+            });
+            build_datetime(lowerer, local_ts, 0, off, aware, zone_id)?
+        }
         _ => return Ok(None),
     };
     Ok(Some(r))
+}
+
+/// Extract the optional `fold` selector for `resolve` (#1149): a trailing
+/// `fold=` keyword wins; otherwise a positional 8th argument; otherwise `0`
+/// (the earlier instant on an overlap, PEP 495 default).
+fn resolve_fold(lowerer: &mut FnLower, args: &[ast::Arg]) -> Result<Value, LowerError> {
+    if let Some(a) = args.iter().find(|a| a.name.as_deref() == Some("fold")) {
+        let (v, vt) = lowerer.expr(&a.value)?;
+        return Ok(lowerer.coerce(v, vt, Ty::I64));
+    }
+    if args.len() > 7 && args[7].name.is_none() {
+        let (v, vt) = lowerer.expr(&args[7].value)?;
+        return Ok(lowerer.coerce(v, vt, Ty::I64));
+    }
+    Ok(lowerer.iconst(Ty::I64, 0))
 }

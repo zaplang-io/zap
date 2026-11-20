@@ -823,6 +823,185 @@ void *zap_tz_zone_require(void *name) {
     return name;
 }
 
+/* ===========================================================================
+ * Named-zone retention + civil-time resolution (#1149).
+ *
+ * A `DateTime` retains its IANA zone as an `int64 zone_id`: `-1` for a naive or
+ * fixed-offset value, else an index into the name-sorted `ZAP_TZ_ZONES[]`. The
+ * resolution helpers derive gap / unique / overlap entirely from the already
+ * bundled `(at, off)` intervals (no separate DST flag, no table regeneration):
+ * a wall time `w = timegm(civil)` is realised by interval `i` iff
+ * `trans[i].at <= w - trans[i].off < trans[i+1].at`. Counting the matches gives
+ * 0 = gap (imaginary), 1 = unique, 2 = overlap (ambiguous); the two overlap
+ * instants are `w - off` for each match. Tables are small, so a linear scan is
+ * used for exactness (this is not a hot path).
+ * ===========================================================================*/
+
+/* The bundled zone at index `id`, or NULL if out of range (id < 0 = none). */
+static const zap_tz_zone *zap_tz_zone_at(int64_t id) {
+    if (id < 0 || id >= ZAP_TZ_NZONES) {
+        return NULL;
+    }
+    return &ZAP_TZ_ZONES[id];
+}
+
+/* The `zone_id` handle for a `TimeZone`: a fixed zone (or an empty/unknown name)
+ * is -1; a bundled named zone is its index in the sorted table. Non-raising —
+ * the name was validated by `zone()`; an unexpected miss simply yields -1. */
+int64_t zap_tz_zone_id(void *name, int64_t is_fixed) {
+    if (is_fixed) {
+        return -1;
+    }
+    char buf[128];
+    zap_tz_name_cstr(name, buf, sizeof buf);
+    if (buf[0] == '\0') {
+        return -1;
+    }
+    int lo = 0, hi = ZAP_TZ_NZONES - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        int c = strcmp(buf, ZAP_TZ_ZONES[mid].name);
+        if (c == 0) {
+            return (int64_t)mid;
+        }
+        if (c < 0) {
+            hi = mid - 1;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return -1;
+}
+
+/* A zone's offset at UTC instant `inst` by zone id. A naive / fixed value
+ * (id < 0) returns `fixed_off` unchanged — so instant arithmetic on such values
+ * is byte-for-byte the pre-#1149 math. */
+int64_t zap_tz_offset_at_id(int64_t zone_id, int64_t inst, int64_t fixed_off) {
+    const zap_tz_zone *z = zap_tz_zone_at(zone_id);
+    if (!z) {
+        return fixed_off;
+    }
+    return zap_tz_offset_for(z, inst);
+}
+
+/* Count the intervals that realise wall time `w`, recording the first match's
+ * offset in `*off0` (the earlier instant / larger offset) and a second, if any,
+ * in `*off1` (the later instant / smaller offset). Returns 0, 1 or 2. */
+static int zap_tz_wall_candidates(const zap_tz_zone *z, int64_t w, int64_t *off0,
+                                  int64_t *off1) {
+    int count = 0;
+    for (int i = 0; i < z->n; i++) {
+        int64_t lo = z->trans[i].at;
+        int64_t hi = (i + 1 < z->n) ? z->trans[i + 1].at : INT64_MAX;
+        int64_t off = z->trans[i].off;
+        int64_t inst = w - off;
+        if (inst >= lo && inst < hi) {
+            if (count == 0) {
+                *off0 = off;
+            } else {
+                *off1 = off;
+            }
+            count++;
+            if (count == 2) {
+                break;
+            }
+        }
+    }
+    return count;
+}
+
+/* For a wall time `w` with no matching interval (a spring-forward gap), find the
+ * surrounding offsets: `*ob` just before the transition, `*oa` just after
+ * (`oa > ob`). Returns 1 on success, 0 if `w` is not actually in a gap. */
+static int zap_tz_gap_offsets(const zap_tz_zone *z, int64_t w, int64_t *ob,
+                              int64_t *oa) {
+    for (int i = 1; i < z->n; i++) {
+        int64_t t = z->trans[i].at;
+        int64_t b = z->trans[i - 1].off;
+        int64_t a = z->trans[i].off;
+        if (a > b && w >= t + b && w < t + a) {
+            *ob = b;
+            *oa = a;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Classify a civil wall clock in a zone: 0 unique, 1 gap (imaginary), 2 overlap
+ * (ambiguous). A naive / fixed value (zone_id < 0) is always unique. */
+int64_t zap_tz_civil_kind(int64_t zone_id, int64_t y, int64_t mo, int64_t d,
+                          int64_t h, int64_t mi, int64_t s) {
+    const zap_tz_zone *z = zap_tz_zone_at(zone_id);
+    if (!z) {
+        return 0;
+    }
+    int64_t w = zap_datetime_to_unix(y, mo, d, h, mi, s);
+    int64_t a = 0, b = 0;
+    int c = zap_tz_wall_candidates(z, w, &a, &b);
+    if (c == 0) {
+        return 1;
+    }
+    if (c >= 2) {
+        return 2;
+    }
+    return 0;
+}
+
+/* Resolve the UTC offset for a wall clock in a zone, with `fold` selecting the
+ * instant on an overlap (0 = earlier, 1 = later) and the pre/post offset in a
+ * gap (0 = pre, 1 = post, PEP 495). A naive / fixed value (zone_id < 0) returns
+ * `fixed_off` unchanged. */
+int64_t zap_tz_resolve_local(int64_t zone_id, int64_t y, int64_t mo, int64_t d,
+                             int64_t h, int64_t mi, int64_t s, int64_t fold,
+                             int64_t fixed_off) {
+    const zap_tz_zone *z = zap_tz_zone_at(zone_id);
+    if (!z) {
+        return fixed_off;
+    }
+    int64_t w = zap_datetime_to_unix(y, mo, d, h, mi, s);
+    int64_t off0 = 0, off1 = 0;
+    int c = zap_tz_wall_candidates(z, w, &off0, &off1);
+    if (c == 1) {
+        return off0;
+    }
+    if (c >= 2) {
+        return fold ? off1 : off0;
+    }
+    int64_t ob = 0, oa = 0;
+    if (zap_tz_gap_offsets(z, w, &ob, &oa)) {
+        return fold ? oa : ob;
+    }
+    /* No match and not a classic gap (should not occur): fall back to the
+     * instant-based lookup so a value is always produced. */
+    return zap_tz_offset_for(z, w);
+}
+
+/* The canonical real UTC instant for a wall clock in a zone, used by
+ * `resolve_imaginary`: a unique / overlap time maps to its (earlier) real
+ * instant, so the value rebuilds unchanged; a gap time maps just past the
+ * transition, so rebuilding shifts the wall clock forward by the gap length
+ * onto the real post-transition time (dateutil `resolve_imaginary`). */
+int64_t zap_tz_imaginary_instant(int64_t zone_id, int64_t y, int64_t mo,
+                                 int64_t d, int64_t h, int64_t mi, int64_t s,
+                                 int64_t fixed_off) {
+    int64_t w = zap_datetime_to_unix(y, mo, d, h, mi, s);
+    const zap_tz_zone *z = zap_tz_zone_at(zone_id);
+    if (!z) {
+        return w - fixed_off;
+    }
+    int64_t off0 = 0, off1 = 0;
+    int c = zap_tz_wall_candidates(z, w, &off0, &off1);
+    if (c >= 1) {
+        return w - off0;
+    }
+    int64_t ob = 0, oa = 0;
+    if (zap_tz_gap_offsets(z, w, &ob, &oa)) {
+        return w - ob;
+    }
+    return w - zap_tz_offset_for(z, w);
+}
+
 /* Separate date / time-of-day renderers (#1046, D-0226). `Date` -> "YYYY-MM-DD",
  * `Time` -> "HH:MM:SS" (zero-padded, no zone — these types carry none). */
 void *zap_date_isoformat(int64_t y, int64_t mo, int64_t d) {
