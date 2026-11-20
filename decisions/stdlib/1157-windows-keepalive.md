@@ -45,12 +45,17 @@ setsockopt options, #1141).
 - **Count / getters raise.** Honest about what the platform lacks, consistent
   with the "unsupported knob raises" pattern #1141 shipped. A non-positive value
   remains a `ValueError`.
-- **Verified by the A4 CI leg.** The `windows-runtime` job (I#198) `gcc`-compiles
-  `zaprt.c` (and thus this branch) on MinGW-w64 under both collectors; the A4
-  integration harness (`zap_win_a4_test.c`) is extended to connect a loopback
-  socket inside a coroutine and set the idle/interval, exercising the ioctl at
-  runtime on a real Windows runner. So, unlike the macOS peer-cred follow-up
-  (#1156), this is CI-verifiable today.
+- **Compile-verified by the A4 CI leg.** The `windows-runtime` job (I#198)
+  `gcc`-compiles `zaprt.c` (and thus this `SIO_KEEPALIVE_VALS` branch, the
+  `<mstcpip.h>` include, the `struct tcp_keepalive` / `WSAIoctl` usage) on
+  MinGW-w64 under both collectors — so a type/API error here is caught in the
+  merge queue, unlike the macOS peer-cred follow-up (#1156). A runtime exercise
+  of the ioctl was attempted in the A4 harness but removed: it needs a *connected*
+  socket, and a Windows non-blocking connect parks on the netpoller, which
+  deadlocks the harness's single-threaded main (blocked on a channel) — so
+  on-Windows *runtime* coverage of the keepalive ioctl is a follow-up (it needs a
+  harness that pumps the netpoller while a coroutine parks). The behaviour is
+  otherwise pinned by the Linux keepalive goldens (#1141).
 
 ## Consequences
 
