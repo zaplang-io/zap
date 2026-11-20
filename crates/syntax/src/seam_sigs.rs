@@ -547,6 +547,11 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("net", "get_keepalive_idle", &["sock"]),
     ("net", "get_keepalive_interval", &["sock"]),
     ("net", "get_keepalive_count", &["sock"]),
+    // UDP multicast (#1142, follow-up to #991/#994).
+    ("net", "join_multicast", &["sock", "group"]),
+    ("net", "leave_multicast", &["sock", "group"]),
+    ("net", "set_multicast_ttl", &["sock", "hops"]),
+    ("net", "set_multicast_loopback", &["sock", "on"]),
     // ---- linalg (tickets #926-#928): LAPACK-backed linear algebra (NumPy names) ----
     ("linalg", "solve", &["a", "b"]),
     ("linalg", "inv", &["a"]),

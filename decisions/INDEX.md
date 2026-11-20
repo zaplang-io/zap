@@ -31,6 +31,7 @@ listed here (see [`README.md`](README.md)).
 | [1099](stdlib/1099-bytes-translate-maketrans.md) | Bulk byte-table translation — bytes.maketrans + bytes.translate | Locked | 2026-11-19 |
 | [1138](stdlib/1138-connect-deadline-hostname.md) | net.connect_deadline — hostname-aware bounded TCP dial | Locked | 2026-11-20 |
 | [1141](stdlib/1141-keepalive-interval.md) | net TCP keepalive interval tuning — idle / interval / count | Locked | 2026-11-20 |
+| [1142](stdlib/1142-multicast.md) | net UDP multicast — join/leave + TTL/loopback, family-dispatched | Locked | 2026-11-20 |
 
 ## runtime
 

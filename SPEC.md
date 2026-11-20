@@ -2042,8 +2042,17 @@ value, which may be rounded up or doubled from what was set). A setsockopt/
 getsockopt failure (for example a TCP-level option on a non-TCP socket) raises a
 catchable error. Set address-reuse options on an unbound socket (e.g.
 `net.udp_socket`) before the matching bind; `TCP_NODELAY` and the buffer sizes
-apply to an established connection. Multicast membership is a follow-up. `net`
-remains **Experimental** (STABILITY.md §4.4).
+apply to an established connection. `net` remains **Experimental** (STABILITY.md
+§4.4).
+
+UDP multicast (#1142) is joined with `net.join_multicast(sock, group)` and left
+with `net.leave_multicast(sock, group)` (default interface), and the senders'
+`net.set_multicast_ttl(sock, hops)` (0..255) and `net.set_multicast_loopback(sock,
+on)` control how far outgoing multicast propagates and whether this host receives
+its own. All four dispatch on the socket's family (IPv4 via `udp_socket`, IPv6 via
+`udp_socket6`), and the group literal must parse in that family; a malformed group
+or an out-of-range TTL is a `ValueError`. An explicit-interface selector is a
+follow-up.
 
 Keepalive *timing* (#1141) is tuned with `net.set_keepalive_idle(sock, seconds)`
 (idle before the first probe), `net.set_keepalive_interval(sock, seconds)`
