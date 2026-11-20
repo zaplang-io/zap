@@ -823,6 +823,13 @@ fn net_unix_keyword_and_positional() {
         &prog("    auto l = net.listen_unix(file=\"/tmp/x.sock\")\n"),
         "ZAP4023",
     );
+    // peer_cred(sock) -> (uid, gid, pid): keyword + positional destructure.
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    auto u, g, p = net.peer_cred(sock=s)\n",
+    ));
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    auto u, g, p = net.peer_cred(s)\n",
+    ));
 }
 
 #[test]

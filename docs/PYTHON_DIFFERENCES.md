@@ -471,7 +471,11 @@ differs in a few places:
   exists, like CPython `bind`; remove a stale socket file first.
 - **POSIX-only.** CPython exposes `AF_UNIX` only where the platform has it; Zap
   likewise supports it on POSIX and raises a catchable "not supported" error on
-  Windows. Peer-credential access (`SO_PEERCRED`) is not yet exposed.
+  Windows. Peer-credential access is `net.peer_cred(sock) -> (uid, gid, pid)`
+  (#1143): CPython spells this `sock.getsockopt(SOL_SOCKET, SO_PEERCRED, ...)` and
+  unpacks the `struct ucred` by hand; Zap returns the flat `(int64, int64, int64)`
+  tuple directly, with no `SO_*` constant. It is Linux-only for now (macOS/BSD and
+  Windows raise "not supported"); a non-Unix socket raises `ValueError`.
 
 ### `net` socket options (#994, decisions/stdlib/994-socket-options.md)
 

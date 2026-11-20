@@ -73,6 +73,12 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_net_unixdgram_data", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_net_unixdgram_path", &[p.into()], Some(p.into()));
 
+    // ---- AF_UNIX peer credentials (ticket #1143, follow-up to #993) ----
+    cg.declare_rt("zap_net_peer_cred", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_net_peer_cred_uid", &[p.into()], Some(i.into()));
+    cg.declare_rt("zap_net_peer_cred_gid", &[p.into()], Some(i.into()));
+    cg.declare_rt("zap_net_peer_cred_pid", &[p.into()], Some(i.into()));
+
     // ---- socket options (ticket #994, epic #985) ----
     cg.declare_rt("zap_net_set_reuseaddr", &[p.into(), i.into()], None);
     cg.declare_rt("zap_net_set_reuseport", &[p.into(), i.into()], None);

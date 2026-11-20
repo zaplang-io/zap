@@ -170,6 +170,13 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "net", method, args, 2, span);
             Ty::Tuple(vec![Ty::Str, Ty::Str])
         }
+        // net.peer_cred(sock) -> (uid, gid, pid): the connecting peer's
+        // credentials on a connected Unix-domain socket (#1143). Non-AF_UNIX
+        // raises; Linux-only for now (raises elsewhere).
+        "peer_cred" => {
+            expect_argc(checker, "net", method, args, 1, span);
+            Ty::Tuple(vec![Ty::Int64, Ty::Int64, Ty::Int64])
+        }
 
         // ---- socket options (ticket #994, epic #985) ----
         // Setters take (sock, value); the on/off ones a bool, the buffer ones an
