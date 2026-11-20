@@ -1159,8 +1159,22 @@ impl<'a> FnLower<'a> {
         cond_src: &str,
     ) -> Result<(), LowerError> {
         // Decompose a comparison so both operand values can be reported.
+        //
+        // A `== None` / `!= None` comparison (#1184) is NOT decomposed: a bare
+        // `None` operand has no standalone lowering (it only exists as the
+        // null/empty-variant check intercepted in the `Expr::Binary` expr
+        // lowerer), so evaluating it here with `self.expr` would bail with
+        // ZAP6001. It falls through to the whole-expression path below, which
+        // lowers the null check (`lower_is_none` → a real `IsNull` test) and
+        // takes its truthiness — exactly as `assert x is None` already does.
+        // The power-assert operand values ("left/right") are dropped for a null
+        // check, where "right: None" would carry no information anyway.
         let decomposed = match cond {
-            Expr::Binary { op, lhs, rhs, .. } if is_power_comparison(*op) => {
+            Expr::Binary { op, lhs, rhs, .. }
+                if is_power_comparison(*op)
+                    && !matches!(lhs.as_ref(), Expr::None(_))
+                    && !matches!(rhs.as_ref(), Expr::None(_)) =>
+            {
                 let (lv, lt) = self.expr(lhs)?;
                 let (rv, rt) = self.expr(rhs)?;
                 let (bit, _) = self.binop(*op, lv, lt, rv, rt)?;

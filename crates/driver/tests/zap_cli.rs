@@ -486,6 +486,44 @@ fn test_reports_power_assert_on_failure() {
     assert!(stdout.contains("1 failed"), "stdout:\n{stdout}");
 }
 
+/// `assert` on a nullable reference struct field compared with `None` — the
+/// #1184 reproducer — runs green under `zap test`, both while the field holds
+/// its default `None` and after it is assigned a struct. Pins the test-mode
+/// path (the issue reproduced under `zap test … --json`), complementing the
+/// `assert_none_field` `zap run` golden.
+#[cfg(feature = "codegen")]
+#[test]
+fn test_assert_nullable_field_vs_none_1184() {
+    let dir = scratch("test_assert_none_1184");
+    write_file(
+        &dir,
+        "tests/reader_test.zap",
+        "struct Reader:\n    bytes pending\n\n\
+         struct Client:\n    Reader reader = None\n\n\
+         @test\ndef test_empty_reader_is_none():\n    auto c = Client()\n    assert c.reader == None\n\n\
+         @test\ndef test_assigned_reader_is_not_none():\n    auto c = Client()\n\
+         \x20   c.reader = Reader(pending=b\"x\")\n    assert c.reader != None\n",
+    );
+
+    let out = zap().arg("test").current_dir(&dir).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "zap test should pass; exit {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        out.status.code()
+    );
+    assert!(
+        stdout.contains("[PASS] test_empty_reader_is_none"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[PASS] test_assigned_reader_is_not_none"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("0 failed"), "stdout:\n{stdout}");
+}
+
 // --- `zap mcp` end-to-end (issue #72, D-0055) ---------------------------------
 
 /// Drive the real `zap mcp` server over stdio: spawn it rooted at `root`, feed

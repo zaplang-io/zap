@@ -1,0 +1,3 @@
+empty: reader is None
+assigned: reader is not None
+done
