@@ -797,6 +797,34 @@ fn net_dns_keyword_and_positional() {
     );
 }
 
+#[test]
+fn net_unix_keyword_and_positional() {
+    // Stream: listen_unix / connect_unix take a single `path`.
+    assert_ok(&prog(
+        "    auto l = net.listen_unix(path=\"/tmp/x.sock\")\n",
+    ));
+    assert_ok(&prog("    auto c = net.connect_unix(\"/tmp/x.sock\")\n"));
+    // Datagram: unixgram_bind / sendto_unix / recvfrom_unix, keyword-reordered.
+    assert_ok(&prog(
+        "    auto s = net.unixgram_socket()\n    net.unixgram_bind(path=\"/tmp/d.sock\", sock=s)\n",
+    ));
+    assert_ok(&prog(
+        "    auto s = net.unixgram_socket()\n    auto n = net.sendto_unix(data=\"x\", sock=s, path=\"/tmp/d.sock\")\n",
+    ));
+    assert_ok(&prog(
+        "    auto s = net.unixgram_socket()\n    auto d, p = net.recvfrom_unix(sock=s, n=64)\n",
+    ));
+    // recvfrom_unix yields a (str, str) tuple — positional destructure too.
+    assert_ok(&prog(
+        "    auto s = net.unixgram_socket()\n    auto d, p = net.recvfrom_unix(s, 64)\n",
+    ));
+    // An unknown keyword is rejected by the central binder (ZAP4023).
+    assert_code(
+        &prog("    auto l = net.listen_unix(file=\"/tmp/x.sock\")\n"),
+        "ZAP4023",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // linalg — LAPACK-backed linear algebra; NumPy names (a / b / n / x / ord).
 // The check facet only infers + arity-checks (arrays type loosely), so these

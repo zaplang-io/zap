@@ -58,6 +58,41 @@ fn unpack_datagram_tuple(lowerer: &mut FnLower, h: Value) -> (Value, Ty) {
     (dest, Ty::Struct(sid))
 }
 
+/// Unpack a `ZapUnixDatagram` handle (from `zap_net_recvfrom_unix`) into a
+/// `(str, str)` tuple — the AF_UNIX datagram counterpart of
+/// [`unpack_datagram_tuple`], with the sender's path in place of host/port.
+fn unpack_unix_datagram_tuple(lowerer: &mut FnLower, h: Value) -> (Value, Ty) {
+    let data = lowerer.new_value(Ty::Ptr);
+    lowerer.emit(Inst::Call {
+        dest: Some(data),
+        func: "zap_net_unixdgram_data".to_string(),
+        args: vec![h],
+    });
+    let path = lowerer.new_value(Ty::Ptr);
+    lowerer.emit(Inst::Call {
+        dest: Some(path),
+        func: "zap_net_unixdgram_path".to_string(),
+        args: vec![h],
+    });
+
+    let sid = lowerer
+        .ctx
+        .tuples
+        .borrow_mut()
+        .intern(vec![Ty::Ptr, Ty::Ptr]);
+    let dest = lowerer.new_value(Ty::Struct(sid));
+    lowerer.emit(Inst::StructNew { dest, sid });
+    for (idx, val) in [data, path].into_iter().enumerate() {
+        lowerer.emit(Inst::FieldSet {
+            base: dest,
+            sid,
+            idx: idx as u32,
+            val,
+        });
+    }
+    (dest, Ty::Struct(sid))
+}
+
 fn lower(
     lowerer: &mut FnLower,
     method: &str,
@@ -114,6 +149,20 @@ fn lower(
         "lookup_ipv4" => call_ret(lowerer, "zap_net_lookup_ipv4", a, Ty::List(Elem::Ptr), true),
         "lookup_ipv6" => call_ret(lowerer, "zap_net_lookup_ipv6", a, Ty::List(Elem::Ptr), true),
         "lookup_addr" => call_ret(lowerer, "zap_net_lookup_addr", a, Ty::List(Elem::Ptr), true),
+
+        // ---- Unix domain sockets (ticket #993, epic #985) ----
+        "listen_unix" => call_ret(lowerer, "zap_net_listen_unix", a, Ty::Bytes, true),
+        "connect_unix" => call_ret(lowerer, "zap_net_connect_unix", a, Ty::Bytes, true),
+        "unixgram_socket" => call_ret(lowerer, "zap_net_unixgram_socket", a, Ty::Bytes, true),
+        "unixgram_bind" => call_void(lowerer, "zap_net_unixgram_bind", a, true),
+        "sendto_unix" => call_ret(lowerer, "zap_net_sendto_unix", a, Ty::I64, true),
+        // recvfrom_unix -> (data, path): throwing call returns a ZapUnixDatagram
+        // handle, then two infallible getters unpack it into the (str, str) tuple.
+        "recvfrom_unix" => {
+            let h = lowerer.new_value(Ty::Ptr);
+            lowerer.throwing_call(Some(h), "zap_net_recvfrom_unix", a);
+            unpack_unix_datagram_tuple(lowerer, h)
+        }
         _ => return Ok(None),
     }))
 }
