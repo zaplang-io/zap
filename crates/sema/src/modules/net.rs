@@ -38,6 +38,13 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "net", method, args, 3, span);
             Ty::Bytes
         }
+        // net.connect_deadline(host, port, deadline_ns) -> conn (#1138): a
+        // hostname-aware bounded dial; the absolute monotonic-ns deadline covers
+        // resolution + every address attempt. Positional like connect_ip_deadline.
+        "connect_deadline" => {
+            expect_argc(checker, "net", method, args, 3, span);
+            Ty::Bytes
+        }
         "set_deadline_ns" => {
             expect_argc(checker, "net", method, args, 2, span);
             Ty::Unit

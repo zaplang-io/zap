@@ -452,6 +452,21 @@ void *zap_net_connect_ip_deadline(void *ip_, int64_t port, int64_t deadline_ns) 
     return zap_net_connect_impl(ip_, port, deadline_ns, 1);
 }
 
+/* net.connect_deadline(host, port, deadline_ns) -> conn (I#1138). A HOSTNAME-aware
+ * bounded TCP dial: unlike connect_ip_deadline (numeric IP only), it resolves a
+ * DNS name, and the ONE absolute CLOCK_MONOTONIC-ns `deadline_ns` covers the whole
+ * operation — resolution and every address attempt — through the same bounded
+ * path net.connect_ip_deadline uses (numeric=0 here). Expiry raises a catchable
+ * TimeoutError, distinct from a resolve failure, a connect failure, and
+ * cancellation. The deadline is checked before resolution (expiry-before-work),
+ * and at the first address attempt after resolution (expiry-during/after a DNS
+ * lookup), then per-attempt during dialing; getaddrinfo itself has no portable
+ * mid-call cancellation, so a hung resolver is caught when it returns. A zero
+ * deadline is unbounded (like net.connect); a negative one raises ValueError. */
+void *zap_net_connect_deadline(void *host_, int64_t port, int64_t deadline_ns) {
+    return zap_net_connect_impl(host_, port, deadline_ns, 0);
+}
+
 /* net.accept(listener) -> connection handle. Parks on readability until a peer
  * connects. */
 void *zap_net_accept(void *l_) {
