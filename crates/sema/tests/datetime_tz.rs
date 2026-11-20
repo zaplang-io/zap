@@ -227,6 +227,74 @@ fn replace_rejects_bad_calls() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #1148 — subsecond precision: replace(microsecond=/nanosecond=) + local_zone.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn replace_accepts_fractional_fields() {
+    // microsecond= and nanosecond= are optional, int, any-subset keywords, and
+    // may combine with the civil fields (any order), like the other fields.
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    DateTime r = datetime.replace(t, microsecond=1)\n",
+    ));
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    DateTime r = datetime.replace(t, nanosecond=1)\n",
+    ));
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    \
+         DateTime r = datetime.replace(t, day=2, microsecond=250000)\n",
+    ));
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    \
+         DateTime r = datetime.replace(t, nanosecond=123456789, year=2020)\n",
+    ));
+}
+
+#[test]
+fn replace_rejects_bad_fractional_fields() {
+    // A non-int fractional value.
+    assert_code(
+        &prog("    auto t = datetime.from_timestamp(0)\n    auto r = datetime.replace(t, microsecond=\"x\")\n"),
+        "ZAP4024",
+    );
+    assert_code(
+        &prog("    auto t = datetime.from_timestamp(0)\n    auto r = datetime.replace(t, nanosecond=1.5)\n"),
+        "ZAP4024",
+    );
+    // A repeated fractional field.
+    assert_code(
+        &prog("    auto t = datetime.from_timestamp(0)\n    auto r = datetime.replace(t, microsecond=1, microsecond=2)\n"),
+        "ZAP4023",
+    );
+    // microsecond= and nanosecond= both set the single stored fraction — at most
+    // one per call.
+    assert_code(
+        &prog("    auto t = datetime.from_timestamp(0)\n    auto r = datetime.replace(t, microsecond=1, nanosecond=2)\n"),
+        "ZAP4023",
+    );
+    assert_code(
+        &prog("    auto t = datetime.from_timestamp(0)\n    auto r = datetime.replace(t, nanosecond=2, microsecond=1)\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn local_zone_returns_timezone_zero_arg() {
+    // #1171 — no arguments, returns a TimeZone usable in astimezone/resolve.
+    assert_ok(&prog("    TimeZone z = datetime.local_zone()\n"));
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    \
+         auto z = datetime.local_zone()\n    \
+         DateTime a = datetime.astimezone(t, z)\n",
+    ));
+    // Arity: no positional / keyword arguments.
+    assert_code(
+        &prog("    auto z = datetime.local_zone(\"UTC\")\n"),
+        "ZAP4025",
+    );
+}
+
 #[test]
 fn date_time_constructors_and_accessors() {
     assert_ok(&prog("    Date d = datetime.date(2020, 2, 29)\n"));

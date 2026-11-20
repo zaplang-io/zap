@@ -1639,6 +1639,34 @@ fn datetime_zone_resolution_keyword_and_positional() {
 }
 
 #[test]
+fn datetime_subsecond_keyword_and_positional() {
+    // #1148 — replace()'s new fractional keywords. Bespoke binder (not a seam
+    // row, like the civil fields): microsecond= / nanosecond= are optional,
+    // any-subset, any-order keywords alongside the civil fields.
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    auto r = datetime.replace(t, microsecond=5)\n",
+    ));
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    auto r = datetime.replace(t, nanosecond=5)\n",
+    ));
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    auto r = datetime.replace(t, hour=1, microsecond=250000)\n",
+    ));
+    // microsecond= and nanosecond= both set the one stored fraction -> at most one.
+    assert_code(
+        &prog("    auto t = datetime.from_timestamp(0)\n    auto r = datetime.replace(t, microsecond=1, nanosecond=2)\n"),
+        "ZAP4023",
+    );
+
+    // #1171 — local_zone() binds as a 0-arg call (no seam row, like now()).
+    assert_ok(&prog("    auto z = datetime.local_zone()\n"));
+    assert_code(
+        &prog("    auto z = datetime.local_zone(\"UTC\")\n"),
+        "ZAP4025",
+    );
+}
+
+#[test]
 fn datetime_time_refinements_keyword_and_positional() {
     // #1055 refinements: keyword binding for the new 1-arg helpers.
     assert_ok(&prog(

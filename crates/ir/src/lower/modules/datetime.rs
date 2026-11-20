@@ -51,6 +51,10 @@ const F_AWARE: u32 = 7;
 /// fixed-offset value, else an index into the bundled name-sorted zone table.
 /// Keeps `DateTime` a non-GC-traced POD (a plain integer, not a zone pointer).
 const F_ZONE_ID: u32 = 8;
+/// `DateTime` field index for the fractional second (#1148): nanoseconds-of-
+/// second, `0..=999_999_999`. A plain integer, so `DateTime` stays a non-GC-
+/// traced POD; `StructNew` zero-inits it, so whole-second values default to 0.
+const F_NANOSECOND: u32 = 9;
 /// The zone handle for a value with no retained IANA zone (naive / fixed-offset).
 const ZONE_NONE: i64 = -1;
 
@@ -106,6 +110,7 @@ fn build_datetime(
     offset: Value,
     aware: Value,
     zone_id: Value,
+    nanos: Value,
 ) -> Result<(Value, Ty), LowerError> {
     let sid = datetime_sid(lowerer)?;
     let local = lowerer.iconst(Ty::I64, is_local);
@@ -143,6 +148,12 @@ fn build_datetime(
         idx: F_ZONE_ID,
         val: zone_id,
     });
+    lowerer.emit(Inst::FieldSet {
+        base: dest,
+        sid,
+        idx: F_NANOSECOND,
+        val: nanos,
+    });
     Ok((dest, Ty::Struct(sid)))
 }
 
@@ -163,7 +174,22 @@ fn build_datetime_naive(
     aware: Value,
 ) -> Result<(Value, Ty), LowerError> {
     let zid = zone_none(lowerer);
-    build_datetime(lowerer, getter_ts, is_local, offset, aware, zid)
+    let nanos = lowerer.iconst(Ty::I64, 0);
+    build_datetime(lowerer, getter_ts, is_local, offset, aware, zid, nanos)
+}
+
+/// `build_datetime` for a value with no retained IANA zone but a fractional
+/// second (#1148): the ISO / RFC-3339 parsers, which read a `.fff…` component.
+fn build_datetime_naive_frac(
+    lowerer: &mut FnLower,
+    getter_ts: Value,
+    is_local: i64,
+    offset: Value,
+    aware: Value,
+    nanos: Value,
+) -> Result<(Value, Ty), LowerError> {
+    let zid = zone_none(lowerer);
+    build_datetime(lowerer, getter_ts, is_local, offset, aware, zid, nanos)
 }
 
 /// Read the six civil `DateTime` fields of an already-lowered base value.
@@ -195,7 +221,7 @@ fn components_of(lowerer: &mut FnLower, arg: &ast::Arg) -> Result<Vec<Value>, Lo
 fn instant_of(
     lowerer: &mut FnLower,
     arg: &ast::Arg,
-) -> Result<(Value, Value, Value, Value), LowerError> {
+) -> Result<(Value, Value, Value, Value, Value), LowerError> {
     let sid = datetime_sid(lowerer)?;
     let (base, _) = lowerer.expr(&arg.value)?;
     let comps = civil_fields(lowerer, base, sid);
@@ -208,6 +234,7 @@ fn instant_of(
     let off = lowerer.field_get(base, sid, F_OFFSET, Ty::I64);
     let aware = lowerer.field_get(base, sid, F_AWARE, Ty::I1);
     let zone_id = lowerer.field_get(base, sid, F_ZONE_ID, Ty::I64);
+    let nanos = lowerer.field_get(base, sid, F_NANOSECOND, Ty::I64);
     let inst = lowerer.new_value(Ty::I64);
     lowerer.emit(Inst::Bin {
         dest: inst,
@@ -215,7 +242,7 @@ fn instant_of(
         lhs: local_ts,
         rhs: off,
     });
-    Ok((inst, off, aware, zone_id))
+    Ok((inst, off, aware, zone_id, nanos))
 }
 
 /// Lower a `(DateTime, fmt)` custom-format call: read the six civil fields plus
@@ -266,14 +293,16 @@ fn isoformat(lowerer: &mut FnLower, arg: &ast::Arg) -> Result<(Value, Ty), Lower
                 .collect(),
         ),
         _ => {
-            // DateTime: six civil fields + offset + is_aware.
+            // DateTime: six civil fields + offset + is_aware + nanosecond (#1148).
             let sid = datetime_sid(lowerer)?;
             let mut call_args = civil_fields(lowerer, base, sid);
             let off = lowerer.field_get(base, sid, F_OFFSET, Ty::I64);
             let aware_i1 = lowerer.field_get(base, sid, F_AWARE, Ty::I1);
             let aware_i64 = lowerer.coerce(aware_i1, Ty::I1, Ty::I64);
+            let nanos = lowerer.field_get(base, sid, F_NANOSECOND, Ty::I64);
             call_args.push(off);
             call_args.push(aware_i64);
+            call_args.push(nanos);
             ("zap_datetime_isoformat", call_args)
         }
     };
@@ -395,9 +424,16 @@ fn lower(
                 func: "zap_datetime_parse_iso".to_string(),
                 args: vec![s],
             });
+            // Fractional second (#1148): nanoseconds-of-second, 0 when absent.
+            let nanos = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(nanos),
+                func: "zap_datetime_parse_nanos".to_string(),
+                args: vec![s],
+            });
             let off = lowerer.iconst(Ty::I64, 0);
             let aware = lowerer.bconst(false);
-            build_datetime_naive(lowerer, ts, 0, off, aware)?
+            build_datetime_naive_frac(lowerer, ts, 0, off, aware, nanos)?
         }
         // (str, strftime format) -> UTC Unix timestamp -> naive DateTime (#338).
         "strptime" => {
@@ -414,7 +450,7 @@ fn lower(
             build_datetime_naive(lowerer, ts, 0, off, aware)?
         }
         "to_timestamp" => {
-            let (inst, _off, _aware, _zid) = instant_of(lowerer, &args[0])?;
+            let (inst, _off, _aware, _zid, _ns) = instant_of(lowerer, &args[0])?;
             (inst, Ty::I64)
         }
         // One arg: ISO-8601. Two args: strftime-style custom format (#286).
@@ -447,9 +483,16 @@ fn lower(
                 func: "zap_datetime_rfc3339_offset".to_string(),
                 args: vec![s],
             });
+            // Fractional second (#1148): nanoseconds-of-second, 0 when absent.
+            let nanos = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(nanos),
+                func: "zap_datetime_parse_nanos".to_string(),
+                args: vec![s],
+            });
             let aware = lowerer.bconst(true);
             // An offset-parsed value carries a fixed numeric offset, no IANA zone.
-            build_datetime_naive(lowerer, local_ts, 0, off, aware)?
+            build_datetime_naive_frac(lowerer, local_ts, 0, off, aware, nanos)?
         }
         // add(dt, delta) -> DateTime: pure-Python WALL-CLOCK arithmetic (#974,
         // D-0221; zone-aware since #1149, §4). The Duration advances the NAIVE
@@ -467,6 +510,7 @@ fn lower(
             let old_off = lowerer.field_get(base, sid, F_OFFSET, Ty::I64);
             let aware = lowerer.field_get(base, sid, F_AWARE, Ty::I1);
             let zone_id = lowerer.field_get(base, sid, F_ZONE_ID, Ty::I64);
+            let old_nanos = lowerer.field_get(base, sid, F_NANOSECOND, Ty::I64);
             // The naive wall clock as an epoch (timegm of the civil fields).
             let wall0 = lowerer.new_value(Ty::I64);
             lowerer.emit(Inst::Call {
@@ -474,26 +518,34 @@ fn lower(
                 func: "zap_datetime_to_unix".to_string(),
                 args: civil,
             });
-            // delta is a Duration (ns); DateTime is whole-second, so use
-            // nanos / 1_000_000_000 (truncating any sub-second part) (#1047).
+            // delta is a Duration (ns, #1047). Combine it with the base's
+            // nanoseconds-of-second and split FLOORED into a whole-second carry
+            // and the new fractional second (#1148), so a ±1µs delta is preserved
+            // and borrows correctly across a second (and thus day/month/year)
+            // boundary — no more truncating the Duration to whole seconds.
             let dur_sid = struct_sid(lowerer, "Duration")?;
             let (dbase, _) = lowerer.expr(&args[1].value)?;
-            let nanos = lowerer.field_get(dbase, dur_sid, 0, Ty::I64);
-            let billion = lowerer.iconst(Ty::I64, 1_000_000_000);
-            let sec = lowerer.new_value(Ty::I64);
-            lowerer.emit(Inst::Bin {
-                dest: sec,
-                op: BinOp::Div,
-                lhs: nanos,
-                rhs: billion,
+            let delta = lowerer.field_get(dbase, dur_sid, 0, Ty::I64);
+            let carry = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(carry),
+                func: "zap_datetime_nanos_carry".to_string(),
+                args: vec![old_nanos, delta],
             });
-            // Advance the NAIVE wall clock by the delta (not the UTC instant).
+            let new_nanos = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(new_nanos),
+                func: "zap_datetime_nanos_of_second".to_string(),
+                args: vec![old_nanos, delta],
+            });
+            // Advance the NAIVE wall clock by the whole-second carry (not the UTC
+            // instant); the fractional remainder rides in `new_nanos`.
             let wall1 = lowerer.new_value(Ty::I64);
             lowerer.emit(Inst::Bin {
                 dest: wall1,
                 op: BinOp::Add,
                 lhs: wall0,
-                rhs: sec,
+                rhs: carry,
             });
             // Recompose the new civil fields from the advanced wall clock
             // (is_local = 0: the wall epoch is decomposed as UTC civil fields).
@@ -551,11 +603,17 @@ fn lower(
                 idx: F_ZONE_ID,
                 val: zone_id,
             });
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: F_NANOSECOND,
+                val: new_nanos,
+            });
             (dest, Ty::Struct(sid))
         }
         "diff" => {
-            let (a, _, _, _) = instant_of(lowerer, &args[0])?;
-            let (b, _, _, _) = instant_of(lowerer, &args[1])?;
+            let (a, _, _, _, a_ns) = instant_of(lowerer, &args[0])?;
+            let (b, _, _, _, b_ns) = instant_of(lowerer, &args[1])?;
             let secs = lowerer.new_value(Ty::I64);
             lowerer.emit(Inst::Bin {
                 dest: secs,
@@ -563,15 +621,32 @@ fn lower(
                 lhs: a,
                 rhs: b,
             });
-            // -> Duration (whole-second datetimes, so ns = seconds × 1e9) (#1047).
+            // -> Duration (ns). The whole-second difference × 1e9 plus the
+            // sub-second difference (#1148), so a microsecond-scale delta is
+            // observed. (Within ±292 years the product fits int64, the Duration
+            // range, D-0227.)
             let dur_sid = struct_sid(lowerer, "Duration")?;
             let billion = lowerer.iconst(Ty::I64, 1_000_000_000);
-            let nanos = lowerer.new_value(Ty::I64);
+            let sec_ns = lowerer.new_value(Ty::I64);
             lowerer.emit(Inst::Bin {
-                dest: nanos,
+                dest: sec_ns,
                 op: BinOp::Mul,
                 lhs: secs,
                 rhs: billion,
+            });
+            let frac = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Bin {
+                dest: frac,
+                op: BinOp::Sub,
+                lhs: a_ns,
+                rhs: b_ns,
+            });
+            let nanos = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Bin {
+                dest: nanos,
+                op: BinOp::Add,
+                lhs: sec_ns,
+                rhs: frac,
             });
             let dest = lowerer.new_value(Ty::Struct(dur_sid));
             lowerer.emit(Inst::StructNew { dest, sid: dur_sid });
@@ -584,20 +659,73 @@ fn lower(
             (dest, Ty::Struct(dur_sid))
         }
         "before" | "after" | "equal" => {
-            let (a, _, _, _) = instant_of(lowerer, &args[0])?;
-            let (b, _, _, _) = instant_of(lowerer, &args[1])?;
-            let pred = match method {
-                "before" => CmpPred::Lt,
-                "after" => CmpPred::Gt,
-                _ => CmpPred::Eq,
-            };
-            let d = lowerer.new_value(Ty::I1);
+            let (a, _, _, _, a_ns) = instant_of(lowerer, &args[0])?;
+            let (b, _, _, _, b_ns) = instant_of(lowerer, &args[1])?;
+            // Compare (instant, nanosecond) LEXICOGRAPHICALLY (#1148): the
+            // sub-second fraction is observed without narrowing the date range a
+            // single `instant·1e9 + nanos` int64 would (overflows outside
+            // ≈1678–2262). `equal` = both equal; `before`/`after` = instant
+            // ordered, or equal instants with the fraction ordered.
+            let inst_eq = lowerer.new_value(Ty::I1);
             lowerer.emit(Inst::ICmp {
-                dest: d,
-                pred,
+                dest: inst_eq,
+                pred: CmpPred::Eq,
                 lhs: a,
                 rhs: b,
             });
+            let d = if method == "equal" {
+                let ns_eq = lowerer.new_value(Ty::I1);
+                lowerer.emit(Inst::ICmp {
+                    dest: ns_eq,
+                    pred: CmpPred::Eq,
+                    lhs: a_ns,
+                    rhs: b_ns,
+                });
+                let d = lowerer.new_value(Ty::I1);
+                lowerer.emit(Inst::Bin {
+                    dest: d,
+                    op: BinOp::And,
+                    lhs: inst_eq,
+                    rhs: ns_eq,
+                });
+                d
+            } else {
+                let pred = if method == "before" {
+                    CmpPred::Lt
+                } else {
+                    CmpPred::Gt
+                };
+                let inst_ord = lowerer.new_value(Ty::I1);
+                lowerer.emit(Inst::ICmp {
+                    dest: inst_ord,
+                    pred,
+                    lhs: a,
+                    rhs: b,
+                });
+                let ns_ord = lowerer.new_value(Ty::I1);
+                lowerer.emit(Inst::ICmp {
+                    dest: ns_ord,
+                    pred,
+                    lhs: a_ns,
+                    rhs: b_ns,
+                });
+                // inst_ord | (inst_eq & ns_ord)
+                let tie = lowerer.new_value(Ty::I1);
+                lowerer.emit(Inst::Bin {
+                    dest: tie,
+                    op: BinOp::And,
+                    lhs: inst_eq,
+                    rhs: ns_ord,
+                });
+                let d = lowerer.new_value(Ty::I1);
+                lowerer.emit(Inst::Bin {
+                    dest: d,
+                    op: BinOp::Or,
+                    lhs: inst_ord,
+                    rhs: tie,
+                });
+                d
+            };
             (d, Ty::I1)
         }
         "weekday" | "day_of_year" => {
@@ -644,6 +772,17 @@ fn lower(
             let fixed = lowerer.bconst(false);
             build_timezone(lowerer, valid, off, fixed)?
         }
+        // local_zone() -> TimeZone (#1171): the host system's configured zone as
+        // a NAMED handle (a bundled IANA name), so it re-resolves across DST in
+        // astimezone/resolve just like zone(name). Raises (throwing) when the
+        // host zone cannot be resolved to a bundled key.
+        "local_zone" => {
+            let name = lowerer.new_value(Ty::Ptr);
+            lowerer.throwing_call(Some(name), "zap_datetime_local_zone_name", vec![]);
+            let off = lowerer.iconst(Ty::I64, 0);
+            let fixed = lowerer.bconst(false);
+            build_timezone(lowerer, name, off, fixed)?
+        }
         "fixed_offset" => {
             let (mv, mt) = lowerer.expr(&args[0].value)?;
             let mins = lowerer.coerce(mv, mt, Ty::I64);
@@ -664,7 +803,7 @@ fn lower(
             build_timezone(lowerer, empty, off, fixed)?
         }
         "astimezone" => {
-            let (inst, _off, _aware, _zid) = instant_of(lowerer, &args[0])?;
+            let (inst, _off, _aware, _zid, src_ns) = instant_of(lowerer, &args[0])?;
             let tzsid = timezone_sid(lowerer)?;
             let (tzbase, _) = lowerer.expr(&args[1].value)?;
             let zname = lowerer.field_get(tzbase, tzsid, TZ_NAME, Ty::Ptr);
@@ -694,7 +833,8 @@ fn lower(
                 rhs: off,
             });
             let aware = lowerer.bconst(true);
-            build_datetime(lowerer, local_ts, 0, off, aware, zid)?
+            // The sub-second fraction is independent of the zone — carry it (#1148).
+            build_datetime(lowerer, local_ts, 0, off, aware, zid, src_ns)?
         }
         // replace(dt, field=val, ...) -> DateTime (#1046, D-0226; zone-aware
         // since #1149): copy the civil fields, override the supplied ones, carry
@@ -710,17 +850,39 @@ fn lower(
             let old_off = lowerer.field_get(base, sid, F_OFFSET, Ty::I64);
             let aware = lowerer.field_get(base, sid, F_AWARE, Ty::I1);
             let zone_id = lowerer.field_get(base, sid, F_ZONE_ID, Ty::I64);
+            // The fractional second rides through unchanged unless `microsecond=`
+            // / `nanosecond=` overrides it (#1148); sema rejects both at once.
+            let mut nanos = lowerer.field_get(base, sid, F_NANOSECOND, Ty::I64);
             for a in &args[1..] {
                 let name = a
                     .name
                     .as_deref()
                     .ok_or_else(|| err("datetime.replace() field must be a keyword argument"))?;
-                let idx = REPLACE_FIELDS
-                    .iter()
-                    .position(|f| *f == name)
-                    .ok_or_else(|| err("datetime.replace() unknown field"))?;
                 let (v, vt) = lowerer.expr(&a.value)?;
-                civil[idx] = lowerer.coerce(v, vt, Ty::I64);
+                let iv = lowerer.coerce(v, vt, Ty::I64);
+                match name {
+                    "microsecond" => {
+                        let thousand = lowerer.iconst(Ty::I64, 1000);
+                        let n = lowerer.new_value(Ty::I64);
+                        lowerer.emit(Inst::Bin {
+                            dest: n,
+                            op: BinOp::Mul,
+                            lhs: iv,
+                            rhs: thousand,
+                        });
+                        nanos = n;
+                    }
+                    "nanosecond" => {
+                        nanos = iv;
+                    }
+                    _ => {
+                        let idx = REPLACE_FIELDS
+                            .iter()
+                            .position(|f| *f == name)
+                            .ok_or_else(|| err("datetime.replace() unknown field"))?;
+                        civil[idx] = iv;
+                    }
+                }
             }
             // Re-resolve the offset at the new wall clock for a named zone;
             // `zap_tz_resolve_local` returns `old_off` unchanged for zone_id < 0.
@@ -764,6 +926,12 @@ fn lower(
                 sid,
                 idx: F_ZONE_ID,
                 val: zone_id,
+            });
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: F_NANOSECOND,
+                val: nanos,
             });
             (dest, Ty::Struct(sid))
         }
@@ -840,6 +1008,14 @@ fn lower(
                 sid: dtsid,
                 idx: F_ZONE_ID,
                 val: zid,
+            });
+            // Date + Time carry no fraction (#1148).
+            let zero_ns = lowerer.iconst(Ty::I64, 0);
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid: dtsid,
+                idx: F_NANOSECOND,
+                val: zero_ns,
             });
             (dest, Ty::Struct(dtsid))
         }
@@ -991,6 +1167,14 @@ fn lower(
                 idx: F_ZONE_ID,
                 val: zone_id,
             });
+            // A localized wall clock carries no sub-second fraction (#1148).
+            let zero_ns = lowerer.iconst(Ty::I64, 0);
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: F_NANOSECOND,
+                val: zero_ns,
+            });
             (dest, Ty::Struct(sid))
         }
         // is_ambiguous(dt) / is_imaginary(dt) -> bool (#1149): classify dt's wall
@@ -1030,6 +1214,8 @@ fn lower(
             let zone_id = lowerer.field_get(base, sid, F_ZONE_ID, Ty::I64);
             let old_off = lowerer.field_get(base, sid, F_OFFSET, Ty::I64);
             let aware = lowerer.field_get(base, sid, F_AWARE, Ty::I1);
+            // The gap shift is whole seconds, so the fraction rides through (#1148).
+            let src_ns = lowerer.field_get(base, sid, F_NANOSECOND, Ty::I64);
             let mut ia = Vec::with_capacity(8);
             ia.push(zone_id);
             ia.extend(civil_fields(lowerer, base, sid));
@@ -1053,7 +1239,7 @@ fn lower(
                 lhs: inst,
                 rhs: off,
             });
-            build_datetime(lowerer, local_ts, 0, off, aware, zone_id)?
+            build_datetime(lowerer, local_ts, 0, off, aware, zone_id, src_ns)?
         }
         _ => return Ok(None),
     };

@@ -139,6 +139,31 @@ int64_t zap_datetime_to_unix(int64_t y, int64_t mo, int64_t d, int64_t h,
     return (int64_t)timegm(&tm);
 }
 
+/* --- subsecond carry/borrow (#1148) ---
+ * Combine a `DateTime`'s nanoseconds-of-second (`base_nanos`, always in
+ * [0,1e9)) with a signed nanosecond delta (a `Duration`, D-0227) into a whole-
+ * second carry and a normalized nanoseconds-of-second. The split is FLOORED, so
+ * a negative delta borrows correctly (e.g. -1000 ns at .000000000 -> carry -1,
+ * nanos 999_999_000); C's `/` and `%` truncate toward zero, which would borrow
+ * wrongly, so the floor adjustment is explicit. These are the reason the `add`
+ * lowering no longer divides the Duration to whole seconds. */
+int64_t zap_datetime_nanos_carry(int64_t base_nanos, int64_t delta_nanos) {
+    int64_t total = base_nanos + delta_nanos;
+    int64_t q = total / 1000000000LL;
+    int64_t r = total % 1000000000LL;
+    if (r < 0) {
+        q -= 1; /* floor toward negative infinity */
+    }
+    return q;
+}
+int64_t zap_datetime_nanos_of_second(int64_t base_nanos, int64_t delta_nanos) {
+    int64_t r = (base_nanos + delta_nanos) % 1000000000LL;
+    if (r < 0) {
+        r += 1000000000LL;
+    }
+    return r;
+}
+
 /* Day-of-week for a civil date (#974, D-0221): Python's `weekday()`, Monday=0 …
  * Sunday=6. The date is recomposed in UTC (`timegm` then `gmtime_r`, the same
  * path `strftime` uses for `%A`/`%j`); C's `tm_wday` is Sunday=0, shifted to
@@ -410,6 +435,60 @@ int64_t zap_datetime_parse_iso(void *s) {
     return zap_datetime_to_unix(y, mo, d, h, mi, sec);
 }
 
+/* The fractional-second component of an ISO/RFC-3339 string, in nanoseconds-of-
+ * second (#1148). Scans the time portion (after the `T`/space separator) for a
+ * `.` or `,` fraction that follows the seconds, before any offset. Accepts a
+ * GENERAL variable-length fraction of 1-9 digits, right-padded to nanoseconds
+ * (`.5` -> 500_000_000, `.000001` -> 1000); digits past the 9th are consumed but
+ * truncated. 0 when no fraction is present. Lenient, matching `parse`'s v1
+ * contract. The companion to `zap_datetime_parse_iso` (whole seconds). */
+int64_t zap_datetime_parse_nanos(void *s) {
+    ZapStr *z = (ZapStr *)s;
+    int64_t len = z->len < 0 ? 0 : z->len;
+    const char *p = z->data;
+    int64_t start = 0;
+    for (int64_t i = 0; i < len; i++) {
+        char c = p[i];
+        if (c == 'T' || c == 't' || c == ' ') {
+            start = i + 1;
+            break;
+        }
+    }
+    int64_t i = start;
+    int found = 0;
+    for (; i < len; i++) {
+        char c = p[i];
+        if (c == '.' || c == ',') {
+            i++;
+            found = 1;
+            break;
+        }
+        /* An offset sign or `Z` before any `.`/`,` means no fraction. */
+        if (c == 'Z' || c == 'z' || c == '+' || c == '-') {
+            return 0;
+        }
+    }
+    if (!found || i >= len) {
+        return 0;
+    }
+    int64_t v = 0;
+    int count = 0;
+    while (i < len && p[i] >= '0' && p[i] <= '9') {
+        if (count < 9) {
+            v = v * 10 + (p[i] - '0');
+            count++;
+        }
+        i++;
+    }
+    if (count == 0) {
+        return 0;
+    }
+    for (int k = count; k < 9; k++) {
+        v *= 10;
+    }
+    return v;
+}
+
 /* --- strptime support (#338) ---
  * Read up to `maxw` consecutive ASCII digits from `p[*pos..plen]`, advancing
  * `*pos`; returns the parsed value (0 if none). Bounding the width lets packed
@@ -664,14 +743,32 @@ int64_t zap_datetime_local_offset(int64_t ts) {
  * (a historical LMT) render to whole minutes. */
 void *zap_datetime_isoformat(int64_t y, int64_t mo, int64_t d, int64_t h,
                              int64_t mi, int64_t s, int64_t offset,
-                             int64_t is_aware) {
-    char buf[48];
+                             int64_t is_aware, int64_t nanos) {
+    char buf[64];
     int n = snprintf(buf, sizeof buf,
                      "%04lld-%02lld-%02lldT%02lld:%02lld:%02lld", (long long)y,
                      (long long)mo, (long long)d, (long long)h, (long long)mi,
                      (long long)s);
     if (n < 0) {
         n = 0;
+    }
+    /* Fractional second (#1148), before the offset suffix. Policy: emitted iff
+     * non-zero; a whole number of microseconds renders as 6 digits (exactly
+     * Python `isoformat`, trailing zeros included — `.250000`, `.000001`), finer
+     * nanosecond precision renders as 9 digits (`.123456789`). A zero fraction is
+     * omitted (Python). RFC-3339 accepts this variable-length fraction. */
+    if (nanos > 0 && nanos < 1000000000LL) {
+        int m;
+        if (nanos % 1000 == 0) {
+            m = snprintf(buf + n, sizeof buf - (size_t)n, ".%06lld",
+                         (long long)(nanos / 1000));
+        } else {
+            m = snprintf(buf + n, sizeof buf - (size_t)n, ".%09lld",
+                         (long long)nanos);
+        }
+        if (m > 0) {
+            n += m;
+        }
     }
     if (is_aware) {
         long long a = offset < 0 ? -offset : offset;
@@ -773,28 +870,45 @@ static int64_t zap_tz_offset_for(const zap_tz_zone *z, int64_t inst) {
     return (int64_t)z->trans[ans].off;
 }
 
-/* Copy a `ZapStr*` zone name into a NUL-terminated C buffer (bounded). */
-static void zap_tz_name_cstr(void *name, char *buf, size_t cap) {
+/* Copy a `ZapStr*` zone name into a NUL-terminated C buffer, validating the
+ * WHOLE length-delimited string (#1172). Returns 1 when the name is usable as a
+ * bundled-zone key, 0 when it is not: an embedded NUL (which would let the
+ * downstream `strcmp` silently match only the truncated prefix) or a length that
+ * overflows the buffer (which would truncate to a possibly-valid zone). A real
+ * IANA key carries no NUL and is far shorter than `cap`, so a rejected name is
+ * never a bundled zone — callers treat 0 as "unknown zone". `buf` is still
+ * filled with a bounded, best-effort copy for the diagnostic message. */
+static int zap_tz_name_cstr(void *name, char *buf, size_t cap) {
     ZapStr *z = (ZapStr *)name;
     int64_t len = z->len < 0 ? 0 : z->len;
+    int ok = 1;
     if ((size_t)len > cap - 1) {
         len = (int64_t)(cap - 1);
+        ok = 0; /* overlong: must not truncate to a valid zone */
+    }
+    for (int64_t i = 0; i < len; i++) {
+        if (z->data[i] == '\0') {
+            ok = 0; /* embedded NUL: the full string is not a bundled key */
+            break;
+        }
     }
     memcpy(buf, z->data, (size_t)len);
     buf[len] = '\0';
+    return ok;
 }
 
 /* Resolve a zone's offset at `inst`. A fixed zone returns its constant offset;
  * a named zone looks the instant up in the bundled table. An unknown named zone
- * raises a catchable error (Python `ZoneInfoNotFoundError`). */
+ * — including one with an embedded NUL or an overlong name (#1172) — raises a
+ * catchable error (Python `ZoneInfoNotFoundError`). */
 int64_t zap_tz_resolve(void *name, int64_t fixed_off, int64_t is_fixed,
                        int64_t inst) {
     if (is_fixed) {
         return fixed_off;
     }
     char buf[128];
-    zap_tz_name_cstr(name, buf, sizeof buf);
-    const zap_tz_zone *zn = zap_tz_find_zone(buf);
+    int ok = zap_tz_name_cstr(name, buf, sizeof buf);
+    const zap_tz_zone *zn = ok ? zap_tz_find_zone(buf) : NULL;
     if (!zn) {
         char msg[192];
         int m = snprintf(msg, sizeof msg, "unknown time zone: %s", buf);
@@ -808,11 +922,12 @@ int64_t zap_tz_resolve(void *name, int64_t fixed_off, int64_t is_fixed,
 }
 
 /* Validate a named zone against the bundled index, returning the name back so
- * `zone(name)` can both check and carry it; raises for an unknown zone. */
+ * `zone(name)` can both check and carry it; raises for an unknown zone,
+ * including an embedded-NUL or overlong name (#1172). */
 void *zap_tz_zone_require(void *name) {
     char buf[128];
-    zap_tz_name_cstr(name, buf, sizeof buf);
-    if (!zap_tz_find_zone(buf)) {
+    int ok = zap_tz_name_cstr(name, buf, sizeof buf);
+    if (!ok || !zap_tz_find_zone(buf)) {
         char msg[192];
         int m = snprintf(msg, sizeof msg, "unknown time zone: %s", buf);
         if (m < 0) {
@@ -821,6 +936,76 @@ void *zap_tz_zone_require(void *name) {
         zap_panic(zap_str_new(msg, (int64_t)m));
     }
     return name;
+}
+
+/* The host system's configured local zone as a bundled IANA name (#1171), or
+ * NULL if it cannot be resolved to a bundled key. Unix sources, tried in order:
+ *   1. the `TZ` environment variable (a leading ':' stripped);
+ *   2. the `/etc/localtime` symlink target (the suffix after the last
+ *      "zoneinfo/");
+ *   3. `/etc/timezone`'s first trimmed line (Debian/Ubuntu).
+ * Each candidate must be present in the bundled table, so a POSIX rule string
+ * (e.g. "EST5EDT") or a non-bundled zone falls through. On a match the name is
+ * copied into `buf` (stable storage the caller can read); the returned pointer
+ * is either into `buf` or into the environment (copied immediately by the
+ * caller). */
+static const char *zap_tz_local_name_lookup(char *buf, size_t cap) {
+    /* 1. TZ. */
+    const char *tz = getenv("TZ");
+    if (tz && tz[0] != '\0') {
+        if (tz[0] == ':') {
+            tz++;
+        }
+        if (tz[0] != '\0' && zap_tz_find_zone(tz)) {
+            return tz;
+        }
+    }
+    /* 2. /etc/localtime symlink. */
+    ssize_t rl = readlink("/etc/localtime", buf, cap - 1);
+    if (rl > 0) {
+        buf[rl] = '\0';
+        const char *marker = "zoneinfo/";
+        char *z = strstr(buf, marker);
+        if (z) {
+            const char *name = z + strlen(marker);
+            if (name[0] != '\0' && zap_tz_find_zone(name)) {
+                return name;
+            }
+        }
+    }
+    /* 3. /etc/timezone. */
+    FILE *f = fopen("/etc/timezone", "r");
+    if (f) {
+        char line[128];
+        char *got = fgets(line, sizeof line, f);
+        fclose(f);
+        if (got) {
+            size_t l = strlen(line);
+            while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r' ||
+                             line[l - 1] == ' ' || line[l - 1] == '\t')) {
+                line[--l] = '\0';
+            }
+            if (l > 0 && l < cap && zap_tz_find_zone(line)) {
+                memcpy(buf, line, l + 1);
+                return buf;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* `datetime.local_zone()` backing (#1171): the host local zone's bundled IANA
+ * name as a fresh ZapStr*, raising the same catchable error family as an unknown
+ * `zone()` when the host zone cannot be resolved to a bundled key. */
+void *zap_datetime_local_zone_name(void) {
+    char buf[256];
+    const char *name = zap_tz_local_name_lookup(buf, sizeof buf);
+    if (!name) {
+        const char *msg = "cannot determine system local zone";
+        zap_panic(zap_str_new(msg, (int64_t)strlen(msg)));
+        return NULL; /* unreachable: zap_panic does not return */
+    }
+    return zap_str_new(name, (int64_t)strlen(name));
 }
 
 /* ===========================================================================
@@ -853,7 +1038,10 @@ int64_t zap_tz_zone_id(void *name, int64_t is_fixed) {
         return -1;
     }
     char buf[128];
-    zap_tz_name_cstr(name, buf, sizeof buf);
+    /* An embedded-NUL / overlong name is not a bundled key (#1172) -> none. */
+    if (!zap_tz_name_cstr(name, buf, sizeof buf)) {
+        return -1;
+    }
     if (buf[0] == '\0') {
         return -1;
     }

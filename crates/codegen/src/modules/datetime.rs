@@ -51,6 +51,20 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     ];
     cg.declare_rt("zap_datetime_strftime", &six_fmt_tz, Some(p.into()));
     cg.declare_rt("zap_datetime_parse_iso", &[p.into()], Some(i.into()));
+    // Fractional-second (nanoseconds-of-second) of an ISO/RFC-3339 string (#1148).
+    cg.declare_rt("zap_datetime_parse_nanos", &[p.into()], Some(i.into()));
+    // Subsecond carry/borrow (#1148): (base_nanos, delta_nanos) -> floored
+    // whole-second carry / normalized nanoseconds-of-second.
+    cg.declare_rt(
+        "zap_datetime_nanos_carry",
+        &[i.into(), i.into()],
+        Some(i.into()),
+    );
+    cg.declare_rt(
+        "zap_datetime_nanos_of_second",
+        &[i.into(), i.into()],
+        Some(i.into()),
+    );
     // (str: ZapStr*, fmt: ZapStr*) -> unix seconds (#338)
     cg.declare_rt(
         "zap_datetime_strptime",
@@ -61,9 +75,14 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     // Timezone database (#1045, D-0225).
     // Host UTC offset (seconds) at a given instant — for the `*_local` paths.
     cg.declare_rt("zap_datetime_local_offset", &[i.into()], Some(i.into()));
-    // (y,mo,d,h,mi,s, offset, is_aware) -> RFC-3339 ZapStr* (offset suffix when
-    // aware, bare civil ISO when naive).
-    let six_and_tz = [
+    // The host system's configured local zone as a bundled IANA name (#1171),
+    // raising when it cannot be resolved (throwing).
+    cg.declare_rt("zap_datetime_local_zone_name", &[], Some(p.into()));
+    // (y,mo,d,h,mi,s, offset, is_aware, nanos) -> RFC-3339 ZapStr* (offset suffix
+    // when aware, fractional second when non-zero #1148, bare civil ISO when
+    // naive + whole-second).
+    let six_and_tz_frac = [
+        i.into(),
         i.into(),
         i.into(),
         i.into(),
@@ -73,7 +92,7 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
         i.into(),
         i.into(),
     ];
-    cg.declare_rt("zap_datetime_isoformat", &six_and_tz, Some(p.into()));
+    cg.declare_rt("zap_datetime_isoformat", &six_and_tz_frac, Some(p.into()));
     // RFC-3339 trailing offset (`Z`/`±HH:MM`) of a string, in seconds (0 if none).
     cg.declare_rt("zap_datetime_rfc3339_offset", &[p.into()], Some(i.into()));
     // Validate a named zone against the bundled IANA index; returns the name

@@ -42,6 +42,12 @@ const DURATION: &str = "Duration";
 /// The `DateTime` civil fields that `replace` may override, in field order.
 const REPLACE_FIELDS: [&str; 6] = ["year", "month", "day", "hour", "minute", "second"];
 
+/// The fractional-second fields `replace` may override (#1148, D-0226):
+/// `microsecond=` (Python-faithful, scaled ×1000 to the stored nanoseconds) and
+/// `nanosecond=` (full precision). At most ONE may appear in a call — they both
+/// set the single stored fraction.
+const REPLACE_FRACTION_FIELDS: [&str; 2] = ["microsecond", "nanosecond"];
+
 /// Require exactly one argument of the named kind, inferring it so it is still
 /// type-checked. `want` is a human description for the diagnostic; `ok` decides
 /// whether the inferred type is acceptable.
@@ -254,8 +260,9 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         }
         // Date arithmetic + comparisons + field helpers (#974, D-0221; the
         // duration is now a `Duration`, #1047/D-0227).
-        // add(dt, delta: Duration) -> DateTime (whole-second instant math; the
-        // Duration's sub-second nanos truncate).
+        // add(dt, delta: Duration) -> DateTime. Wall-clock arithmetic (#1149);
+        // the Duration's sub-second nanos are carried into the fractional second,
+        // not truncated (#1148).
         "add" => {
             if args.len() != 2 {
                 checker.error(
@@ -337,6 +344,13 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect1(checker, method, args, span, "a str zone name", |t| {
                 matches!(t, Ty::Str)
             });
+            Some(Ty::Named(TIMEZONE.to_string()))
+        }
+        // local_zone() -> TimeZone (#1171): the host system's configured zone as
+        // a named handle. No arguments; raises at runtime if the host zone cannot
+        // be resolved to a bundled IANA key.
+        "local_zone" => {
+            expect_argc(checker, "datetime", method, args, 0, span);
             Some(Ty::Named(TIMEZONE.to_string()))
         }
         // fixed_offset(minutes) -> TimeZone: a constant-offset zone.
@@ -446,12 +460,15 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
                         None => checker.error(
                             ErrorCode::ZAP4023,
                             "datetime.replace() fields must be keyword arguments \
-                             (year=, month=, day=, hour=, minute=, second=)"
+                             (year=, month=, day=, hour=, minute=, second=, \
+                             microsecond=, nanosecond=)"
                                 .to_string(),
                             a.span,
                         ),
                         Some(name) => {
-                            if !REPLACE_FIELDS.contains(&name.as_str()) {
+                            let is_civil = REPLACE_FIELDS.contains(&name.as_str());
+                            let is_fraction = REPLACE_FRACTION_FIELDS.contains(&name.as_str());
+                            if !is_civil && !is_fraction {
                                 checker.error(
                                     ErrorCode::ZAP4023,
                                     format!("datetime.replace() has no field named '{name}'"),
@@ -463,6 +480,18 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
                                     format!(
                                         "datetime.replace() got multiple values for field '{name}'"
                                     ),
+                                    a.span,
+                                );
+                            } else if is_fraction
+                                && seen.iter().any(|s| REPLACE_FRACTION_FIELDS.contains(s))
+                            {
+                                // microsecond= and nanosecond= both set the one
+                                // stored fraction — at most one per call (#1148).
+                                checker.error(
+                                    ErrorCode::ZAP4023,
+                                    "datetime.replace() got multiple values for the fractional \
+                                     second (pass only one of microsecond= / nanosecond=)"
+                                        .to_string(),
                                     a.span,
                                 );
                             } else {
