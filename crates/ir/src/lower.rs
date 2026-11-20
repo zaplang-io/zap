@@ -946,6 +946,30 @@ fn inplace_op_dunder(op: AstBin) -> Option<&'static str> {
     })
 }
 
+/// The *reflected* binary-operator dunder for an operator (D-0047, #1180): `a OP
+/// b` falls back to `b.__rOP__(a)` when the left operand cannot handle the
+/// operator itself. Mirrors sema's `reflected_op_dunder`; only the arithmetic /
+/// bitwise / shift / matmul operators have a reflected form.
+fn reflected_op_dunder(op: AstBin) -> Option<&'static str> {
+    use AstBin::*;
+    Some(match op {
+        Add => "__radd__",
+        Sub => "__rsub__",
+        Mul => "__rmul__",
+        Div => "__rtruediv__",
+        FloorDiv => "__rfloordiv__",
+        Mod => "__rmod__",
+        Pow => "__rpow__",
+        MatMul => "__rmatmul__",
+        BitAnd => "__rand__",
+        BitOr => "__ror__",
+        BitXor => "__rxor__",
+        Shl => "__rlshift__",
+        Shr => "__rrshift__",
+        _ => return None,
+    })
+}
+
 pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     // The default path lowers WITHOUT race instrumentation, so existing callers
     // and goldens are byte-for-byte unchanged (#677, epic #665): `--race` opts in
@@ -17374,6 +17398,7 @@ impl<'a> FnLower<'a> {
                     FloorDiv => "__floordiv__",
                     Mod => "__mod__",
                     Pow => "__pow__",
+                    MatMul => "__matmul__",
                     BitAnd => "__and__",
                     BitOr => "__or__",
                     BitXor => "__xor__",
@@ -17381,9 +17406,31 @@ impl<'a> FnLower<'a> {
                     Shr => "__rshift__",
                     _ => unreachable!(),
                 };
+                // Left wins when it defines the forward dunder by name (D-0047).
+                if self.struct_has_dunder(sid, dunder) {
+                    return self.call_dunder(sid, dunder, vec![(l, lt), (r, rt)]);
+                }
+                // Reflected fallback (#1180): the right operand's reflected
+                // dunder (`a + b` -> `b.__radd__(a)`), when the left struct has
+                // no forward dunder. `self` is the right operand.
+                if let (Some(rdunder), Ty::Struct(rsid)) = (reflected_op_dunder(op), rt) {
+                    if self.struct_has_dunder(rsid, rdunder) {
+                        return self.call_dunder(rsid, rdunder, vec![(r, rt), (l, lt)]);
+                    }
+                }
+                // Neither side handles it: preserve the original clean
+                // "missing forward dunder" error from `call_dunder`.
                 self.call_dunder(sid, dunder, vec![(l, lt), (r, rt)])
             }
         }
+    }
+
+    /// Whether struct `sid` defines dunder method `dunder` (a registered,
+    /// possibly monomorphized, signature exists). Used to decide operator
+    /// dispatch — forward on the left, reflected on the right (#1180).
+    fn struct_has_dunder(&self, sid: u32, dunder: &str) -> bool {
+        let mangled = format!("{}__{}", self.ctx.names[sid as usize], dunder);
+        self.sigs.contains_key(&mangled)
     }
 
     /// Lower `x is None` / `x is not None` (#611, D18). Exactly one operand is a
@@ -17746,6 +17793,15 @@ impl<'a> FnLower<'a> {
         // other operator dispatches on the left.
         if let (Ty::Struct(sid), false) = (lt, matches!(op, In)) {
             return self.struct_binop(op, sid, l, r, rt);
+        }
+        // Reflected fallback when the LEFT is a built-in (non-struct) and the
+        // RIGHT is a user struct defining the reflected dunder (#1180): e.g.
+        // `3.0 * v` -> `v.__rmul__(3.0)`. Mirrors sema's built-in-left reflected
+        // path; the left-struct case is handled by `struct_binop` above.
+        if let (Some(rdunder), Ty::Struct(rsid)) = (reflected_op_dunder(op), rt) {
+            if self.struct_has_dunder(rsid, rdunder) {
+                return self.call_dunder(rsid, rdunder, vec![(r, rt), (l, lt)]);
+            }
         }
         if matches!(op, In) {
             if let Ty::Struct(sid) = rt {
