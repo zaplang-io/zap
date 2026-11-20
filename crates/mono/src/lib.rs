@@ -28,8 +28,8 @@
 use std::collections::{HashMap, HashSet};
 
 use zapc_syntax::ast::{
-    self, Arg, Block, CompClause, DictItem, EnumDef, Expr, Function, InterfaceDef, Item, MethodSig,
-    Module, PatArg, Pattern, Stmt, StructDef, Type, TypeParam, UnOp,
+    self, Arg, BinOp, Block, CompClause, DictItem, EnumDef, Expr, Function, InterfaceDef, Item,
+    MethodSig, Module, PatArg, Pattern, Stmt, StructDef, Type, TypeParam, UnOp,
 };
 use zapc_syntax::span::Span;
 
@@ -60,6 +60,71 @@ enum CTy {
     Ty(Type),
     NoneLit,
     Unknown,
+}
+
+/// The numeric family of a best-effort scalar type, for inferring the result
+/// type of an arithmetic binary expression (#1128). It mirrors the distinctions
+/// `sema_types::num_join` draws, whose promotion order is
+/// `complex > float > unsigned > bigint > signed`. Re-derived here (by scalar
+/// name) because `mono`/`ir` do not depend on `sema` — they re-derive types (see
+/// the module docs).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Num {
+    Signed,
+    Unsigned,
+    Bigint,
+    Float,
+    Complex,
+}
+
+/// The numeric family of a best-effort type, or `None` when it is not a scalar
+/// number the inferer models (`Unknown`, a sequence/collection, a tuple, a
+/// function type, or a user type). Only a bare `Named` scalar qualifies.
+fn num_kind(c: &CTy) -> Option<Num> {
+    let CTy::Ty(Type::Named { name, args, .. }) = c else {
+        return None;
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    Some(match name.as_str() {
+        // `int` is the untyped-int literal's name; it joins like `int64`.
+        "int" | "int32" | "int64" => Num::Signed,
+        "uint8" | "uint16" | "uint32" | "uint64" | "usize" => Num::Unsigned,
+        "bigint" => Num::Bigint,
+        // `float` is the untyped-float literal's name; it joins like `float64`.
+        "float" | "float32" | "float64" => Num::Float,
+        "complex" => Num::Complex,
+        _ => return None,
+    })
+}
+
+/// Whether a type is a fixed-width/`usize`/untyped integer eligible for the
+/// bitwise and shift operators — and, if so, whether it is unsigned. `bigint`
+/// is excluded (sema rejects bitwise ops on it); floats and complex are not
+/// integers.
+fn int_unsigned(c: &CTy) -> Option<bool> {
+    match num_kind(c) {
+        Some(Num::Signed) => Some(false),
+        Some(Num::Unsigned) => Some(true),
+        _ => None,
+    }
+}
+
+/// `+` on two identical sequence types concatenates to that type, mirroring
+/// sema: `str + str` → `str`, `bytes + bytes` → `bytes`, and
+/// `list[T] + list[U]` → the left list's type. Anything else is not a
+/// concatenation the inferer models, so it stays `Unknown`.
+fn same_sequence(l: &CTy, r: &CTy) -> CTy {
+    if let (CTy::Ty(Type::Named { name: ln, .. }), CTy::Ty(Type::Named { name: rn, .. })) = (l, r) {
+        if matches!(
+            (ln.as_str(), rn.as_str()),
+            ("str", "str") | ("bytes", "bytes") | ("list", "list")
+        ) {
+            return l.clone();
+        }
+    }
+    CTy::Unknown
 }
 
 struct Mono<'a> {
@@ -2001,6 +2066,89 @@ impl Mono<'_> {
         })
     }
 
+    /// Join two numeric families to the type their arithmetic yields, mirroring
+    /// `sema_types::num_join`'s promotion order
+    /// (`complex > float > unsigned > bigint > signed`). Signed/unsigned mixing
+    /// is a sema error (ZAP4015) caught before this matters, so the join is only
+    /// ever consulted for a program that also type-checks.
+    fn num_join(&self, l: Num, r: Num) -> CTy {
+        let name = if l == Num::Complex || r == Num::Complex {
+            "complex"
+        } else if l == Num::Float || r == Num::Float {
+            "float64"
+        } else if l == Num::Unsigned || r == Num::Unsigned {
+            "uint64"
+        } else if l == Num::Bigint || r == Num::Bigint {
+            "bigint"
+        } else {
+            "int64"
+        };
+        self.prim(name)
+    }
+
+    /// The best-effort result type of a binary expression `l OP r`, mirroring
+    /// sema's binary result-type rules (`arith_result`). The inferer uses this
+    /// so a binary expression carries a type into generic-argument unification
+    /// (#1128). An operand it cannot type leaves the result `Unknown`, so no
+    /// previously-inferring site changes behaviour and a genuinely unresolvable
+    /// parameter is still rejected.
+    fn binary_result(&self, op: BinOp, l: &CTy, r: &CTy) -> CTy {
+        use BinOp::*;
+        match op {
+            // Logical, membership and identity operators are always `bool`,
+            // whatever the operands (sema: `And|Or`, `In|NotIn`, `Is|IsNot`).
+            And | Or | In | NotIn | Is | IsNot => self.prim("bool"),
+            // A comparison is `bool` once both operands are typed; a loose
+            // (array-mask, #510) operand keeps it `Unknown`, matching sema.
+            // Comparison *chains* parse as `Expr::Compare`; this arm covers a
+            // `BinOp` comparison and keeps the match exhaustive.
+            Eq | Ne | Lt | Le | Gt | Ge => {
+                if matches!(l, CTy::Ty(_)) && matches!(r, CTy::Ty(_)) {
+                    self.prim("bool")
+                } else {
+                    CTy::Unknown
+                }
+            }
+            // True division (D-0024) always yields a float — never the integer
+            // operand type — and `complex` if either operand is complex.
+            Div => match (num_kind(l), num_kind(r)) {
+                (Some(a), Some(b)) => {
+                    if a == Num::Complex || b == Num::Complex {
+                        self.prim("complex")
+                    } else {
+                        self.prim("float64")
+                    }
+                }
+                _ => CTy::Unknown,
+            },
+            // `+` promotes two numbers, or concatenates two equal sequence
+            // types (`str`/`bytes`/`list`).
+            Add => match (num_kind(l), num_kind(r)) {
+                (Some(a), Some(b)) => self.num_join(a, b),
+                _ => same_sequence(l, r),
+            },
+            // The remaining arithmetic operators require numbers; `//` and `%`
+            // additionally reject complex (sema).
+            Sub | Mul | Pow => match (num_kind(l), num_kind(r)) {
+                (Some(a), Some(b)) => self.num_join(a, b),
+                _ => CTy::Unknown,
+            },
+            FloorDiv | Mod => match (num_kind(l), num_kind(r)) {
+                (Some(a), Some(b)) if a != Num::Complex && b != Num::Complex => self.num_join(a, b),
+                _ => CTy::Unknown,
+            },
+            // Bitwise/shift need (non-bigint) integer operands and yield
+            // `int64`, or `uint64` if either operand is unsigned (#552).
+            BitAnd | BitOr | BitXor | Shl | Shr => match (int_unsigned(l), int_unsigned(r)) {
+                (Some(lu), Some(ru)) => self.prim(if lu || ru { "uint64" } else { "int64" }),
+                _ => CTy::Unknown,
+            },
+            // `@` (matrix multiply, arrays/loose) and `<-` (channel send, unit)
+            // carry no useful inference type.
+            MatMul | Send => CTy::Unknown,
+        }
+    }
+
     /// A read-only best-effort type for an lvalue/name (no rewriting).
     fn infer(&self, e: &Expr, env: &Env) -> CTy {
         match e {
@@ -2208,15 +2356,30 @@ impl Mono<'_> {
                     cty,
                 ))
             }
-            Expr::Binary { op, lhs, rhs, span } => Ok((
-                Expr::Binary {
-                    op: *op,
-                    lhs: Box::new(self.rw(lhs, env)?),
-                    rhs: Box::new(self.rw(rhs, env)?),
-                    span: *span,
-                },
-                CTy::Unknown,
-            )),
+            Expr::Binary { op, lhs, rhs, span } => {
+                // Infer the operands so a binary expression carries a type into
+                // generic-argument unification (#1128), mirroring sema's binary
+                // result-type rules (`arith_result`). Without this an integer
+                // subtraction `2 - 5` stayed `Unknown` while the bare `2` was
+                // `int64`, so `Optional.Some(2 - 5)` could not pin `T`; an
+                // untyped `auto count = 2 - 5` binding then carried that
+                // `Unknown` into every later use. The operands keep the same
+                // expected-type context (`None`) the old `self.rw(lhs, env)` /
+                // `self.rw(rhs, env)` calls used, so the rewritten expression is
+                // byte-for-byte unchanged; only the inferred `CTy` is added.
+                let (lhs_e, lcty) = self.rewrite_expr(lhs, env, None)?;
+                let (rhs_e, rcty) = self.rewrite_expr(rhs, env, None)?;
+                let cty = self.binary_result(*op, &lcty, &rcty);
+                Ok((
+                    Expr::Binary {
+                        op: *op,
+                        lhs: Box::new(lhs_e),
+                        rhs: Box::new(rhs_e),
+                        span: *span,
+                    },
+                    cty,
+                ))
+            }
             Expr::Compare { first, rest, span } => {
                 let first = Box::new(self.rw(first, env)?);
                 let mut new_rest = Vec::with_capacity(rest.len());
