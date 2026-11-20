@@ -21,9 +21,22 @@
 //! generic *functions*/methods with their own type parameters (I#161), and
 //! interface *bounds* on type parameters (`[T: Iface]`, I#164). A bound is
 //! enforced at each concrete instantiation by the I#84 structural-conformance
-//! rule (re-derived here at the AST level, since ir does not depend on sema);
-//! the bound's methods then resolve statically per instance through ordinary
-//! type substitution — no fat pointer / vtable is emitted (design/0012 slice 5).
+//! rule (re-derived here at the AST level, since ir does not depend on the sema
+//! *checker*); the bound's methods then resolve statically per instance through
+//! ordinary type substitution — no fat pointer / vtable is emitted (design/0012
+//! slice 5).
+//!
+//! Type-argument inference (I#1169, ADR decisions/lang/1169): a generic
+//! constructor / call pins its type parameters by typing each argument
+//! expression (`rewrite_expr`) and unifying. That inferer is best-effort and
+//! re-derives types at the AST level; where it comes up `Unknown`, it backfills
+//! from the type **sema already inferred**, read from a span-keyed `TypeMap`
+//! (`zapc_sema_types`, bridged via `Ty::to_ast_type`). This is a **data-only**
+//! dependency on the shared type model — not on the sema checker — so ir still
+//! owns its lowering/codegen logic (the GC-correctness-as-a-theorem property is
+//! unaffected: layout is independent of how a type argument was inferred). The
+//! `TypeMap` is supplied by the driver (`zapc_sema::analyze_types`); callers
+//! that pass none (the REPL/JIT, most tests) get the re-derivation alone.
 
 use std::collections::{HashMap, HashSet};
 
@@ -85,7 +98,7 @@ enum CTy {
 /// type of an arithmetic binary expression (#1128). It mirrors the distinctions
 /// `sema_types::num_join` draws, whose promotion order is
 /// `complex > float > unsigned > bigint > signed`. Re-derived here (by scalar
-/// name) because `mono`/`ir` do not depend on `sema` — they re-derive types (see
+/// name) because `mono`/`ir` do not depend on the `sema` checker — they re-derive types (see
 /// the module docs).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Num {
@@ -207,7 +220,7 @@ struct Mono<'a> {
     /// Every interface declaration, for static type-parameter bound satisfaction
     /// checks (I#164, slice 5): a bound `[T: Iface]` is enforced by the same
     /// structural-conformance rule as I#84, re-derived here at the AST level
-    /// (ir does not depend on sema; it re-derives types — see module docs).
+    /// (ir does not depend on the sema checker; it re-derives types — see module docs).
     interfaces: HashMap<String, &'a InterfaceDef>,
     /// Free-function return types, for inference of `f(...)` results.
     func_ret: HashMap<String, Option<Type>>,
