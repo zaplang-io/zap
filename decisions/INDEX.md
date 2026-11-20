@@ -18,6 +18,7 @@ listed here (see [`README.md`](README.md)).
 | [1180](lang/1180-reflected-operators.md) | Reflected binary operators — right-operand fallback dispatch (capability-based) | Accepted | 2026-11-20 |
 | [1198](lang/1198-reflected-comparison.md) | Reflected comparison operators — __req__ / __rcmp__ on the right operand | Accepted | 2026-11-20 |
 | [1199](lang/1199-operator-capability-interfaces.md) | Operator capabilities are declared prelude generic interfaces (forward + reflected) | Accepted | 2026-11-20 |
+| [1205](lang/1205-generic-interface-conformance.md) | Generic-interface conformance — substitute the interface's type parameters | Accepted | 2026-11-20 |
 
 ## stdlib
 

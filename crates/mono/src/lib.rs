@@ -42,7 +42,7 @@ use std::collections::{HashMap, HashSet};
 
 use zapc_syntax::ast::{
     self, Arg, BinOp, Block, CompClause, DictItem, EnumDef, Expr, Function, InterfaceDef, Item,
-    MethodSig, Module, PatArg, Pattern, Stmt, StructDef, Type, TypeParam, UnOp,
+    MethodSig, Module, Param, PatArg, Pattern, Stmt, StructDef, Type, TypeParam, UnOp,
 };
 use zapc_syntax::span::Span;
 
@@ -352,6 +352,27 @@ fn subst_type(t: &Type, subst: &HashMap<&str, &Type>) -> Type {
             ret: ret.as_ref().map(|r| Box::new(subst_type(r, subst))),
             span: *span,
         },
+    }
+}
+
+/// Substitute generic type-parameter names in an interface method signature
+/// (#1205, generic-interface conformance): each parameter type and the return
+/// type has `subst_type` applied, so `def get(self) -> T` in `interface
+/// Container[T]` becomes `def get(self) -> int64` when matched against a
+/// conformer at `Container[int64]`. Parameter names/flags are preserved.
+fn subst_method_sig(m: &MethodSig, subst: &HashMap<&str, &Type>) -> MethodSig {
+    MethodSig {
+        name: m.name.clone(),
+        params: m
+            .params
+            .iter()
+            .map(|p| Param {
+                ty: p.ty.as_ref().map(|t| subst_type(t, subst)),
+                ..p.clone()
+            })
+            .collect(),
+        ret: m.ret.as_ref().map(|t| subst_type(t, subst)),
+        span: m.span,
     }
 }
 
@@ -1062,19 +1083,28 @@ impl Mono<'_> {
     ) -> Result<(), LowerError> {
         for (p, arg) in generics.iter().zip(args.iter()) {
             let Some(bound) = &p.bound else { continue };
-            let Type::Named { name: iface, .. } = bound else {
+            let Type::Named {
+                name: iface,
+                args: iface_args,
+                ..
+            } = bound
+            else {
                 return Err(err(format!(
                     "type parameter '{}' of {what} has an invalid bound: a bound must name \
                      an interface",
                     p.name
                 )));
             };
-            if let Err(reasons) = self.satisfies_bound(arg, iface) {
+            if let Err(reasons) = self.satisfies_bound(arg, iface, iface_args) {
+                // Name the bound with its type arguments (`Container[int64]`)
+                // when it is a generic-interface bound, so the diagnostic shows
+                // exactly what was required (#1205).
+                let bound_name = type_name(bound);
                 return Err(err(format!(
                     "type '{}' does not satisfy the bound '{}' on type parameter '{}' of \
                      {what}: {}",
                     type_name(arg),
-                    iface,
+                    bound_name,
                     p.name,
                     reasons.join("; ")
                 )));
@@ -1102,14 +1132,39 @@ impl Mono<'_> {
     ///
     /// Returns the human-readable reasons on failure (each a clause the
     /// [`Self::check_bounds`] caller joins after "does not satisfy the bound").
-    fn satisfies_bound(&self, arg: &Type, iface: &str) -> Result<(), Vec<String>> {
+    fn satisfies_bound(
+        &self,
+        arg: &Type,
+        iface: &str,
+        iface_args: &[Type],
+    ) -> Result<(), Vec<String>> {
         if let Some(cap) = Capability::from_iface(iface) {
             let mut visited = HashSet::new();
             return self.type_has_capability(arg, cap, &mut visited);
         }
-        if !self.interfaces.contains_key(iface) {
+        let Some(idef) = self.interfaces.get(iface) else {
             return Err(vec![format!("'{iface}' is not an interface")]);
+        };
+        // Generic-interface conformance (#1205): the interface's own type
+        // parameters are substituted (`T := iface_args[i]`) in each of its
+        // declared method signatures before the structural match, so a concrete
+        // type conforms to `Container[int64]` iff it provides `Container`'s
+        // methods with `T` replaced by `int64`. A non-generic bound carries no
+        // arguments and this map stays empty (the pre-#1205 behavior). An arity
+        // mismatch is reported here, at the instantiation that supplied them.
+        if !iface_args.is_empty() && iface_args.len() != idef.generics.len() {
+            return Err(vec![format!(
+                "interface '{iface}' expects {} type argument(s), but the bound supplies {}",
+                idef.generics.len(),
+                iface_args.len()
+            )]);
         }
+        let iface_subst: HashMap<&str, &Type> = idef
+            .generics
+            .iter()
+            .map(|g| g.name.as_str())
+            .zip(iface_args.iter())
+            .collect();
         let mut reasons = Vec::new();
         // The interface itself plus every refined supertype, transitively
         // (D-0139/#806): a `[T: C]` bound where `interface C: A` requires A's
@@ -1148,7 +1203,17 @@ impl Mono<'_> {
                 ));
                 continue;
             };
+            // Only the direct interface's method signatures are instantiated at
+            // `iface_args` (#1205); a refined supertype carries its own, so its
+            // signatures are matched verbatim (generic supertypes are deferred).
+            let subst_here = origin == iface && !iface_subst.is_empty();
             for im in &idef.methods {
+                let want = if subst_here {
+                    subst_method_sig(im, &iface_subst)
+                } else {
+                    im.clone()
+                };
+                let im = &want;
                 match methods.iter().find(|m| m.name == im.name) {
                     None => reasons.push(format!("missing method '{}'{attr}", im.name)),
                     Some(cm) if !method_sig_matches(cm, im) => reasons.push(format!(
@@ -4148,6 +4213,122 @@ mod tests {
         assert!(
             msg.contains("method 'show' has a mismatched signature"),
             "signature mismatch is reported, got: {msg}"
+        );
+    }
+
+    // ---- generic-interface bounds (#1205) ---------------------------------
+    //
+    // A bound may name a *generic* interface with concrete type arguments,
+    // `[T: Container[int64]]`. At each instantiation the interface's own type
+    // parameters are substituted (`E := int64`) before the structural match, so
+    // a conformer at that argument is accepted and a non-conformer rejected with
+    // the substituted requirement named in the diagnostic.
+
+    const CONTAINER: &str = "interface Container[E]:\n    def get(self) -> E\n\
+         struct IntBox:\n    int64 v\n    def get(self) -> int64:\n        return self.v\n\
+         struct StrBox:\n    str s\n    def get(self) -> str:\n        return self.s\n";
+
+    #[test]
+    fn generic_interface_bound_accepts_substituted_conformer() {
+        // IntBox.get -> int64 satisfies Container[int64] (E := int64): the
+        // conforming instance is emitted.
+        let m = mono_ok(&format!(
+            "{CONTAINER}def use[T: Container[int64]](T c) -> int64:\n    return 0\n\
+             def main():\n    print(use(IntBox(v=1)))\n"
+        ));
+        assert!(
+            fn_names(&m).iter().any(|n| n == "use$IntBox"),
+            "the conforming instance use$IntBox is emitted: {:?}",
+            fn_names(&m)
+        );
+    }
+
+    #[test]
+    fn generic_interface_bound_rejects_wrong_argument() {
+        // StrBox.get -> str does not satisfy Container[int64]; the diagnostic
+        // names the bound with its argument and the mismatched method.
+        let msg = mono_err(&format!(
+            "{CONTAINER}def use[T: Container[int64]](T c) -> int64:\n    return 0\n\
+             def main():\n    print(use(StrBox(s=\"x\")))\n"
+        ));
+        assert!(
+            msg.contains("does not satisfy the bound 'Container[int64]'")
+                && msg.contains("method 'get' has a mismatched signature"),
+            "substituted bound diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn generic_interface_bound_is_per_argument() {
+        // The same interface with a different argument flips which type conforms:
+        // StrBox satisfies Container[str], IntBox does not.
+        let m = mono_ok(&format!(
+            "{CONTAINER}def use[T: Container[str]](T c) -> int64:\n    return 0\n\
+             def main():\n    print(use(StrBox(s=\"x\")))\n"
+        ));
+        assert!(fn_names(&m).iter().any(|n| n == "use$StrBox"));
+        let msg = mono_err(&format!(
+            "{CONTAINER}def use[T: Container[str]](T c) -> int64:\n    return 0\n\
+             def main():\n    print(use(IntBox(v=1)))\n"
+        ));
+        assert!(
+            msg.contains("does not satisfy the bound 'Container[str]'"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn generic_interface_bound_on_a_type_is_checked() {
+        // The bound is enforced on a generic *type*'s parameter too, not only a
+        // function's — a non-conformer at the type's instantiation is rejected.
+        let msg = mono_err(&format!(
+            "{CONTAINER}struct Holder[T: Container[int64]]:\n    T item\n\
+             def main():\n    Holder[StrBox] h = Holder(StrBox(s=\"x\"))\n    print(1)\n"
+        ));
+        assert!(
+            msg.contains("does not satisfy the bound 'Container[int64]'")
+                && msg.contains("of type 'Holder'"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn two_parameter_generic_interface_bound() {
+        // A two-parameter interface substitutes each argument independently (the
+        // `[L, Out]` shape the operator-capability interfaces use, modeled with
+        // plain methods to stay generics-only).
+        let pairish =
+            "interface Pairish[A, B]:\n    def first(self) -> A\n    def second(self) -> B\n\
+             struct IS:\n    int64 i\n    str s\n\
+             \x20   def first(self) -> int64:\n        return self.i\n\
+             \x20   def second(self) -> str:\n        return self.s\n";
+        let m = mono_ok(&format!(
+            "{pairish}def take[T: Pairish[int64, str]](T p) -> int64:\n    return 0\n\
+             def main():\n    print(take(IS(i=1, s=\"a\")))\n"
+        ));
+        assert!(fn_names(&m).iter().any(|n| n == "take$IS"));
+        // Swapped arguments: `first` must now be str — IS no longer conforms.
+        let msg = mono_err(&format!(
+            "{pairish}def take[T: Pairish[str, int64]](T p) -> int64:\n    return 0\n\
+             def main():\n    print(take(IS(i=1, s=\"a\")))\n"
+        ));
+        assert!(
+            msg.contains("does not satisfy the bound 'Pairish[str, int64]'"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn generic_interface_bound_arity_mismatch_is_rejected() {
+        // Supplying the wrong number of type arguments to a generic-interface
+        // bound is reported at the instantiation.
+        let msg = mono_err(&format!(
+            "{CONTAINER}def use[T: Container[int64, str]](T c) -> int64:\n    return 0\n\
+             def main():\n    print(use(IntBox(v=1)))\n"
+        ));
+        assert!(
+            msg.contains("expects 1 type argument(s)") && msg.contains("supplies 2"),
+            "got: {msg}"
         );
     }
 
