@@ -30,8 +30,8 @@ use inkwell::{
 };
 
 use zapc_ir::{
-    self as zir, lower_module_opts, AtomicOrd, AtomicRmwOp, CastKind, CmpPred, Func, Inst, Owner,
-    Term, Ty,
+    self as zir, lower_module_opts_with_types, AtomicOrd, AtomicRmwOp, CastKind, CmpPred, Func,
+    Inst, Owner, Term, Ty, TypeMap,
 };
 use zapc_syntax::ast::Module as AstModule;
 
@@ -59,6 +59,7 @@ pub trait Backend {
     fn compile_object(
         &self,
         module: &AstModule,
+        types: &TypeMap,
         obj_path: &Path,
         race: bool,
         fp: zir::FpPolicy,
@@ -72,13 +73,14 @@ impl Backend for LlvmBackend {
     fn compile_object(
         &self,
         module: &AstModule,
+        types: &TypeMap,
         obj_path: &Path,
         race: bool,
         fp: zir::FpPolicy,
     ) -> Result<(), String> {
         let ctx = Context::create();
         let builder = ctx.create_builder();
-        let (llmod, tm) = build_llvm_module(&ctx, &builder, module, "zap", false, race, fp)?;
+        let (llmod, tm) = build_llvm_module(&ctx, &builder, module, types, "zap", false, race, fp)?;
         // Run the LLVM middle-end optimization pipeline BEFORE object emission
         // (I#857, D-0152). `write_to_file` is `llc`-equivalent — it runs the
         // backend (isel/regalloc/sched) but NOT the IR transform passes
@@ -206,13 +208,15 @@ impl LlvmBackend {
     fn compile_bitcode(
         &self,
         module: &AstModule,
+        types: &TypeMap,
         bc_path: &Path,
         race: bool,
         fp: zir::FpPolicy,
     ) -> Result<(), String> {
         let ctx = Context::create();
         let builder = ctx.create_builder();
-        let (llmod, _tm) = build_llvm_module(&ctx, &builder, module, "zap", false, race, fp)?;
+        let (llmod, _tm) =
+            build_llvm_module(&ctx, &builder, module, types, "zap", false, race, fp)?;
         // `write_bitcode_to_path` returns false on an I/O failure (it has no
         // richer error channel); surface the path so a build failure is legible.
         if llmod.write_bitcode_to_path(bc_path) {
@@ -655,16 +659,18 @@ fn native_runtime_object(
 /// offsets (ticket #48). The `builder` must outlive the returned module's
 /// construction; it is unused afterwards. `jit` selects the REPL JIT code path
 /// (shadow-head access via a runtime helper; see [`Cg::gc_head`]).
+#[allow(clippy::too_many_arguments)] // +`types` for sema-driven inference (#1167)
 pub(crate) fn build_llvm_module<'ctx>(
     ctx: &'ctx Context,
     builder: &Builder<'ctx>,
     module: &AstModule,
+    types: &TypeMap,
     name: &str,
     jit: bool,
     race: bool,
     fp: zir::FpPolicy,
 ) -> Result<(LlvmModule<'ctx>, TargetMachine), String> {
-    let (zir_module, errs) = lower_module_opts(module, race);
+    let (zir_module, errs) = lower_module_opts_with_types(module, race, types);
     if !errs.is_empty() {
         return Err(errs
             .iter()
@@ -910,8 +916,8 @@ const SELF_CONTAINED_CRYPTO: &[&str] = &[
 /// Scan the lowered program for the optional-backend seam symbols it references
 /// (#853). Lowers the module once for the scan; the backend lowers again for
 /// codegen, but lowering is deterministic, so both see the same symbol set.
-pub(crate) fn program_backend_use(module: &AstModule, race: bool) -> BackendUse {
-    let (zir, _errs) = lower_module_opts(module, race);
+pub(crate) fn program_backend_use(module: &AstModule, types: &TypeMap, race: bool) -> BackendUse {
+    let (zir, _errs) = lower_module_opts_with_types(module, race, types);
     let mut u = BackendUse::default();
     for f in &zir.funcs {
         for b in &f.blocks {
@@ -1067,6 +1073,7 @@ fn blas_build_flags() -> Option<(Vec<String>, Vec<String>)> {
 /// `ZAP_LTO`.
 pub fn build_executable(
     module: &AstModule,
+    types: &TypeMap,
     out_path: &Path,
     portable: bool,
     race: bool,
@@ -1110,7 +1117,7 @@ pub fn build_executable(
     // default path, LLVM bitcode under LTO so the cross-module inliner sees it.
     let prog_path = out_path.with_extension(if lto { "bc" } else { "o" });
     if lto {
-        LlvmBackend.compile_bitcode(module, &prog_path, race, fp)?;
+        LlvmBackend.compile_bitcode(module, types, &prog_path, race, fp)?;
         // Clear any inline-blocking target/FP attributes from the (small) program
         // module up front. It carries none today, but stripping it here — plus
         // stripping the cached runtime bitcode once (below) — means the merged
@@ -1119,7 +1126,7 @@ pub fn build_executable(
         // (I#841). Cheap: the program module is small.
         strip_target_attrs_bitcode(&prog_path)?;
     } else {
-        LlvmBackend.compile_object(module, &prog_path, race, fp)?;
+        LlvmBackend.compile_object(module, types, &prog_path, race, fp)?;
     }
 
     // Write the runtime into a per-build temp dir and let cc compile + link it
@@ -1180,7 +1187,7 @@ pub fn build_executable(
     // http client) is `#if !defined(ZAP_NO_OPENSSL)`-compiled out. No stubs are
     // needed, unlike CPython: a program that reaches no OpenSSL seam references
     // none of those symbols, so the compiled-out functions are simply absent.
-    let backends = program_backend_use(module, race);
+    let backends = program_backend_use(module, types, race);
     let no_regex = !backends.regex;
     let no_zlib = !backends.zlib;
     let no_openssl = !backends.openssl;

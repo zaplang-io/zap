@@ -168,7 +168,7 @@ fn front_end_program(
     entry: &str,
     target: &Target,
     warnings_as_errors: bool,
-) -> Result<Module, ExitCode> {
+) -> Result<(Module, zapc_sema::TypeMap), ExitCode> {
     let mut module = match modlink::load_program(entry, target) {
         Ok(m) => m,
         Err(diags) => {
@@ -205,7 +205,12 @@ fn front_end_program(
         report(sema_reports(entry, beh_diags));
         return Err(ExitCode::from(1));
     }
-    let (errs, warns) = zapc_sema::analyze(&module);
+    // Analysis mode (#1167): same diagnostics as `analyze`, plus the inferred
+    // type of every expression (a `TypeMap`), which lowering hands to the
+    // monomorphizer so a generic argument whose type mono's own inferer cannot
+    // derive is pinned from sema's type instead (#1132/#1162). `zapc_ir` cannot
+    // compute this — it does not depend on the sema checker — so the driver does.
+    let (errs, warns, types) = zapc_sema::analyze_types(&module);
     // Per-site suppression (#664, D-0113): drop warnings whose source line
     // carries a `# noqa` pragma. The spans are byte offsets into the entry
     // file's source (sema diagnostics are attributed to `entry`), so the entry
@@ -236,7 +241,7 @@ fn front_end_program(
         report(sema_reports(entry, errs));
         return Err(ExitCode::from(1));
     }
-    Ok(module)
+    Ok((module, types))
 }
 
 /// Front-end + AST→ZIR lowering. Host-safe (no LLVM needed). Used by both
@@ -254,16 +259,20 @@ pub fn emit_ir_for(
     warnings_as_errors: bool,
     race: bool,
 ) -> ExitCode {
-    let mut module = match front_end_program(file, &build_target(features), warnings_as_errors) {
-        Ok(m) => m,
-        Err(code) => return code,
-    };
+    let (mut module, types) =
+        match front_end_program(file, &build_target(features), warnings_as_errors) {
+            Ok(mt) => mt,
+            Err(code) => return code,
+        };
     // `@test` functions are compiled only under `zap test`, never into a normal
-    // build or diagnostic (D-0054).
+    // build or diagnostic (D-0054). Removing items does not shift the remaining
+    // expressions' spans, so `types` still keys into them.
     testing::strip_test_items(&mut module);
     // `--race` (#677, epic #665): emit the shared-access instrumentation hooks so
     // `zap ir --race` shows them. Off → identical ZIR to today (golden-safe).
-    let (zir, errs) = zapc_ir::lower_module_opts(&module, race);
+    // `types` lets the monomorphizer pin generic arguments from sema's inferred
+    // types (#1167).
+    let (zir, errs) = zapc_ir::lower_module_opts_with_types(&module, race, &types);
     if !errs.is_empty() {
         // Lowering errors carry no span, so they render as the location-free
         // header (unchanged), but still through the one shared path (#571).
@@ -330,11 +339,14 @@ pub fn compile_for(
     debug: bool,
     fp: FpPolicy,
 ) -> ExitCode {
-    let mut module = match front_end_program(file, &build_target(features), warnings_as_errors) {
-        Ok(m) => m,
-        Err(code) => return code,
-    };
-    // `@test` functions are excluded from release binaries (D-0054).
+    let (mut module, types) =
+        match front_end_program(file, &build_target(features), warnings_as_errors) {
+            Ok(mt) => mt,
+            Err(code) => return code,
+        };
+    // `@test` functions are excluded from release binaries (D-0054). Removing
+    // items does not shift the remaining expressions' spans, so `types` still
+    // keys into them.
     testing::strip_test_items(&mut module);
     // `--fp=fast` enables reduction reassociation (unbounded error, width-
     // dependent bits). Warn in the compiler log as the model mandates (#946,
@@ -345,7 +357,9 @@ pub fn compile_for(
              results are width-dependent and NOT reproducible across targets (#946)"
         );
     }
-    backend(&module, file, out, run_after, portable, race, debug, fp)
+    backend(
+        &module, &types, file, out, run_after, portable, race, debug, fp,
+    )
 }
 
 /// Default output path for a compile when `-o` is not given.
@@ -392,6 +406,7 @@ fn unique_run_dir() -> PathBuf {
 #[allow(clippy::too_many_arguments)]
 fn backend(
     module: &Module,
+    types: &zapc_sema::TypeMap,
     file: &str,
     out: Option<String>,
     run_after: bool,
@@ -433,7 +448,7 @@ fn backend(
         }
     };
 
-    if let Err(e) = zapc_codegen::build_executable(module, &exe, portable, race, debug, fp) {
+    if let Err(e) = zapc_codegen::build_executable(module, types, &exe, portable, race, debug, fp) {
         eprintln!("{file}: codegen error: {e}");
         cleanup();
         return ExitCode::from(1);
@@ -459,6 +474,7 @@ fn backend(
 #[allow(clippy::too_many_arguments)]
 fn backend(
     _module: &Module,
+    _types: &zapc_sema::TypeMap,
     file: &str,
     _out: Option<String>,
     _run_after: bool,

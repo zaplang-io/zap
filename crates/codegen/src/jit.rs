@@ -141,10 +141,14 @@ impl ReplJit {
         let name = format!("zap_repl_{}", self.gen);
         let builder = self.ctx.create_builder();
         // The REPL JIT has no `--race` surface, so race instrumentation is off.
+        // It also has no sema `TypeMap` (each line is evaluated incrementally),
+        // so generic inference uses the monomorphizer's own inferer as before
+        // (#1167): an empty map makes the sema backfill a no-op here.
         let (module, _tm) = crate::build_llvm_module(
             self.ctx,
             &builder,
             ast,
+            &zapc_ir::TypeMap::default(),
             &name,
             true,
             false,

@@ -238,6 +238,11 @@ mod run_impl {
         // not `--debug` — since it is executed, not iterated on (I#867/D-0157).
         if let Err(e) = zapc_codegen::build_executable(
             &harness_module,
+            // The `@test` harness is a transformed module, not the one sema
+            // typed, so its spans would not key into the original `TypeMap`; the
+            // harness build keeps the monomorphizer's own inference (#1167),
+            // unchanged, via an empty map.
+            &zapc_ir::TypeMap::default(),
             &exe,
             false,
             race,
