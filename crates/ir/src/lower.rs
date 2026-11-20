@@ -15930,6 +15930,152 @@ impl<'a> FnLower<'a> {
         cur
     }
 
+    /// Validate one axis index of a full integer index against that axis's
+    /// length (`zap_array_ckidx`, #894) and return the validated value, so the
+    /// flat-offset Horner can thread it in. Preserves the per-axis out-of-range
+    /// abort the former `zap_array_row` fold performed, without allocating a
+    /// view: e.g. `m[0, 5]` on a `(3, 3)` array still raises rather than
+    /// silently reading flat slot 5.
+    fn array_ckidx(&mut self, arr: Value, axis: usize, i: Value) -> Value {
+        let ax = self.iconst(Ty::I64, axis as i64);
+        let v = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(v),
+            func: "zap_array_ckidx".to_string(),
+            args: vec![arr, ax, i],
+        });
+        v
+    }
+
+    /// Compute the whole-shape row-major flat element index of a FULL integer
+    /// index `m[i0, i1, ..., i_{n-1}]` inline (#894), bounds-checking each axis
+    /// (`array_ckidx`) and folding the dims with Horner's rule
+    /// (`flat = (..(i0 * d1 + i1) * d2 + i2) ..`, the trailing-axis dims read via
+    /// `zap_array_dim`). No `zap_array_row` view is allocated; the single
+    /// `zap_array_get/set_<dtype>` that consumes the result addresses storage
+    /// through `zap_array_phys_nd`, so this composes with strided views.
+    /// `idxs.len()` must equal `ndim` (>= 2 — rank 1 is already a direct get).
+    fn array_full_flat_index(&mut self, arr: Value, ndim: u8, idxs: &[Value]) -> Value {
+        let n = ndim as usize;
+        debug_assert_eq!(idxs.len(), n);
+        let mut flat = self.array_ckidx(arr, 0, idxs[0]);
+        for (k, &idx) in idxs.iter().enumerate().skip(1) {
+            let axis = self.iconst(Ty::I64, k as i64);
+            let dk = self.new_value(Ty::I64);
+            self.emit(Inst::Call {
+                dest: Some(dk),
+                func: "zap_array_dim".to_string(),
+                args: vec![arr, axis],
+            });
+            let ik = self.array_ckidx(arr, k, idx);
+            let scaled = self.new_value(Ty::I64);
+            self.emit(Inst::Bin {
+                dest: scaled,
+                op: BinOp::Mul,
+                lhs: flat,
+                rhs: dk,
+            });
+            let next = self.new_value(Ty::I64);
+            self.emit(Inst::Bin {
+                dest: next,
+                op: BinOp::Add,
+                lhs: scaled,
+                rhs: ik,
+            });
+            flat = next;
+        }
+        flat
+    }
+
+    /// Is `e` a pure, side-effect-free scalar index safe to lower
+    /// speculatively while probing a chain (#894 part 2)? Conservative: a bare
+    /// name or an integer literal — the hot `m[i][j]` loop-index / constant
+    /// forms. Because such an expression has no side effect and cannot raise,
+    /// abandoning a non-matching chain leaves only dead, re-executable IR, so
+    /// the fall-through per-step lowering stays correct. Anything else
+    /// (arithmetic, a call, a nested index that could raise) is not fused.
+    fn is_pure_scalar_index(e: &Expr) -> bool {
+        matches!(e, Expr::Name(..) | Expr::Int(..))
+    }
+
+    /// #894 part 2: fuse a chained FULL integer index `root[i0][i1]…[i_{n-1}]`
+    /// into a single flat scalar get — identical to the comma form
+    /// `root[i0, …, i_{n-1}]` (Increment 19). Each `root[i0]…[i_k]` prefix would
+    /// otherwise materialize a rank-reduced **row view** (one `zap_array_row`
+    /// allocation per link) only to index it again; when every link is a pure
+    /// scalar index those intermediates are dead, single-use temporaries that
+    /// provably cannot escape or alias, so the whole chain lowers to the inline
+    /// flat offset with no allocation.
+    ///
+    /// Returns `None` (fall through to the per-step lowering, unchanged
+    /// behavior) unless: every link is a pure scalar index, the root is a bare
+    /// name that lowers to an `array[T]`, and the chain indexes ALL `ndim` axes
+    /// (a partial chain still yields a bindable view per step; a slice / tuple /
+    /// fancy-array index is not a plain integer chain). The pure-index guard also
+    /// keeps the `None` paths sound: any IR emitted before bailing is
+    /// side-effect-free and the caller re-lowers the chain per step.
+    fn try_fuse_full_index_chain(
+        &mut self,
+        base: &Expr,
+        index: &Expr,
+    ) -> Result<Option<(Value, Ty)>, LowerError> {
+        if !Self::is_pure_scalar_index(index) {
+            return Ok(None);
+        }
+        // Collect the chain, outer index first, walking inward through nested
+        // `Expr::Index` bases until the first non-index root.
+        let mut rev_idx: Vec<&Expr> = vec![index];
+        let mut root = base;
+        while let Expr::Index {
+            base: inner,
+            index: idx,
+            ..
+        } = root
+        {
+            if !Self::is_pure_scalar_index(idx) {
+                return Ok(None);
+            }
+            rev_idx.push(idx);
+            root = inner;
+        }
+        // A lone `m[i]` is not a chain; and the root must be a bare name so that
+        // re-lowering it on the fall-through path is a harmless repeated load.
+        if rev_idx.len() < 2 || !matches!(root, Expr::Name(..)) {
+            return Ok(None);
+        }
+        let (rv, rty) = self.expr(root)?;
+        let (d, ndim) = match rty {
+            Ty::Array(d, n) => (d, n),
+            _ => return Ok(None),
+        };
+        // Only a FULL chain (one index per axis) fuses to a scalar; a partial
+        // chain still produces a bindable rank-reduced view per step.
+        if rev_idx.len() != ndim as usize {
+            return Ok(None);
+        }
+        // Source order is root-most first, so reverse the outer-first list and
+        // evaluate each index exactly once in that order (matching the per-step
+        // order: the base `m[i]` — hence `i` — before the outer index `j`).
+        let mut idxs: Vec<Value> = Vec::with_capacity(rev_idx.len());
+        for ie in rev_idx.iter().rev() {
+            let (iv, it) = self.expr(ie)?;
+            if it.int_width().is_none() {
+                // An array-typed index is advanced indexing (#510), not a plain
+                // integer chain — do not fuse.
+                return Ok(None);
+            }
+            idxs.push(self.coerce_index(iv, it));
+        }
+        let flat = self.array_full_flat_index(rv, ndim, &idxs);
+        let dest = self.new_value(d.ty());
+        self.emit(Inst::Call {
+            dest: Some(dest),
+            func: format!("zap_array_get_{}", d.suffix()),
+            args: vec![rv, flat],
+        });
+        Ok(Some((dest, d.ty())))
+    }
+
     /// Lower an N-D array subscript **get** `m[i, j, ...]`. A full index (one per
     /// axis) names a scalar element; a partial index (fewer than `ndim`) yields a
     /// rank-reduced **view** (#500). Too many indices is an error.
@@ -16083,13 +16229,19 @@ impl<'a> FnLower<'a> {
             .collect();
         let k = idxs.len();
         if k == n {
-            let view = self.array_fold_rows(arr, d, ndim, &idxs[..k - 1]);
-            let last = idxs[k - 1];
+            // Full integer index -> a single scalar get. Rank 1 is already a
+            // direct get on the array; rank >= 2 computes the flat offset inline
+            // (#894) instead of folding through an allocated rank-1 row view.
+            let flat = if n == 1 {
+                idxs[0]
+            } else {
+                self.array_full_flat_index(arr, ndim, &idxs)
+            };
             let dest = self.new_value(d.ty());
             self.emit(Inst::Call {
                 dest: Some(dest),
                 func: format!("zap_array_get_{}", d.suffix()),
-                args: vec![view, last],
+                args: vec![arr, flat],
             });
             Ok((dest, d.ty()))
         } else {
@@ -16409,14 +16561,17 @@ impl<'a> FnLower<'a> {
         }
     }
 
-    /// Resolve an N-D array subscript to the (rank-1 view, final index) naming a
-    /// single scalar slot, for `m[i, j] = v` / augmented assignment. The index is
-    /// evaluated exactly once. Only a full index names a slot; assigning a partial
-    /// index (a whole-row store) is a documented follow-up (#501/#511).
+    /// Resolve an N-D array subscript to the `(array, flat element index)` naming
+    /// a single scalar slot, for `m[i, j] = v` / augmented assignment — read or
+    /// written by the caller through `zap_array_get/set_<dtype>` (which address
+    /// storage via `zap_array_phys_nd`). The index is evaluated exactly once.
+    /// Only a full index names a slot; assigning a partial index (a whole-row
+    /// store) is a documented follow-up (#501/#511). Rank 1 is the element
+    /// index directly; rank >= 2 computes the flat offset inline (#894) instead
+    /// of folding through an allocated rank-1 row view.
     fn array_scalar_slot(
         &mut self,
         arr: Value,
-        d: Dtype,
         ndim: u8,
         index: &Expr,
     ) -> Result<(Value, Value), LowerError> {
@@ -16434,8 +16589,12 @@ impl<'a> FnLower<'a> {
                  is not supported yet; index all {n} axes"
             )));
         }
-        let view = self.array_fold_rows(arr, d, ndim, &idxs[..k - 1]);
-        Ok((view, idxs[k - 1]))
+        let flat = if n == 1 {
+            idxs[0]
+        } else {
+            self.array_full_flat_index(arr, ndim, &idxs)
+        };
+        Ok((arr, flat))
     }
 
     /// Lower an array attribute read (#500): `a.ndim` (the static rank, a
@@ -18800,6 +18959,13 @@ impl<'a> FnLower<'a> {
         index: &Expr,
         span: Span,
     ) -> Result<(Value, Ty), LowerError> {
+        // #894 part 2: fuse a chained full integer index `m[i][j]…` into the
+        // same flat scalar access as the comma form `m[i, j]`, dropping the
+        // dead intermediate row-view allocations. Falls through for anything
+        // that is not a pure all-axes integer chain into an array.
+        if let Some(res) = self.try_fuse_full_index_chain(base, index)? {
+            return Ok(res);
+        }
         let (bv, bty) = self.expr(base)?;
         // Tuple element access `t[k]` (D-0049): `k` must be a compile-time
         // constant (a tuple is heterogeneous), and the result is that field.
@@ -19214,7 +19380,7 @@ impl<'a> FnLower<'a> {
                     });
                     return Ok(());
                 }
-                let (view, last) = self.array_scalar_slot(bv, d, ndim, index)?;
+                let (view, last) = self.array_scalar_slot(bv, ndim, index)?;
                 let (v, vt) = self.expr(value)?;
                 if vt.int_width().is_none() && !vt.is_float() {
                     return Err(err("array element assignment requires a numeric scalar"));
@@ -19342,7 +19508,7 @@ impl<'a> FnLower<'a> {
             Ty::Array(d, ndim) => {
                 // The index (and any row folds) is resolved once to a scalar
                 // slot, then read-modified-written through that rank-1 view.
-                let (view, last) = self.array_scalar_slot(bv, d, ndim, index)?;
+                let (view, last) = self.array_scalar_slot(bv, ndim, index)?;
                 let cur = self.new_value(d.ty());
                 self.emit(Inst::Call {
                     dest: Some(cur),
@@ -19559,7 +19725,7 @@ impl<'a> FnLower<'a> {
                 Ok(())
             }
             Ty::Array(d, ndim) => {
-                let (view, last) = self.array_scalar_slot(bv, d, ndim, index)?;
+                let (view, last) = self.array_scalar_slot(bv, ndim, index)?;
                 if vt.int_width().is_none() && !vt.is_float() {
                     return Err(err("array element assignment requires a numeric scalar"));
                 }
@@ -26355,12 +26521,147 @@ mod nd_array_tests {
     // --- indexing ---
 
     #[test]
-    fn full_index_folds_rows_then_gets() {
-        // m[i, j] on a rank-2 array -> one row fold + a 1-D get (scalar).
+    fn full_index_takes_the_flat_fast_path() {
+        // #894: a FULL multi-axis integer index `m[i, j]` must NOT allocate an
+        // intermediate rank-1 row view. It lowers to an inline flat offset
+        // (one `zap_array_ckidx` per axis + one trailing-axis `zap_array_dim`
+        // for the Horner multiply) feeding a single scalar `zap_array_get_i64`.
         let src = "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    print(m[1, 0])\n";
         lowers_ok(src);
-        assert_eq!(count(src, "zap_array_row"), 1);
+        assert_eq!(
+            count(src, "zap_array_row"),
+            0,
+            "no row-view allocation on a full index"
+        );
         assert_eq!(count(src, "zap_array_get_i64"), 1);
+        assert_eq!(
+            count(src, "zap_array_ckidx"),
+            2,
+            "one per-axis bounds check"
+        );
+        // Only the trailing axis (axis 1) contributes a Horner multiplier.
+        assert_eq!(count(src, "zap_array_dim"), 1);
+    }
+
+    #[test]
+    fn full_index_rank3_fast_path() {
+        // Rank 3: still no row fold; three axis checks and two Horner dims.
+        let src = "def main():\n    \
+                   auto m = array[f64]([[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]])\n    \
+                   print(m[1, 0, 1])\n";
+        lowers_ok(src);
+        assert_eq!(count(src, "zap_array_row"), 0);
+        assert_eq!(count(src, "zap_array_get_f64"), 1);
+        assert_eq!(count(src, "zap_array_ckidx"), 3);
+        assert_eq!(count(src, "zap_array_dim"), 2);
+    }
+
+    #[test]
+    fn full_index_store_takes_the_flat_fast_path() {
+        // #894: `m[i, j] = v` and `m[i, j] += v` write through the same inline
+        // flat offset — no row-view allocation on the store path either.
+        let store = "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    m[0, 1] = 9\n";
+        lowers_ok(store);
+        assert_eq!(count(store, "zap_array_row"), 0);
+        assert_eq!(count(store, "zap_array_set_i64"), 5); // 4 construction fills + 1 store
+        assert_eq!(count(store, "zap_array_ckidx"), 2);
+
+        let aug = "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    m[1, 1] += 5\n";
+        lowers_ok(aug);
+        assert_eq!(count(aug, "zap_array_row"), 0);
+        // read-modify-write: one get + one set on the same flat slot (plus the
+        // four construction fills), one ckidx pair reused for the slot.
+        assert_eq!(count(aug, "zap_array_get_i64"), 1);
+        assert_eq!(count(aug, "zap_array_set_i64"), 5);
+        assert_eq!(count(aug, "zap_array_ckidx"), 2);
+    }
+
+    #[test]
+    fn chained_full_index_fuses_like_comma_index() {
+        // #894 part 2: `m[i][j]` on a rank-2 array fuses to the SAME flat scalar
+        // access as `m[i, j]` — the dead intermediate row view is not allocated.
+        let src = "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    \
+                   auto i = 1\n    auto j = 0\n    print(m[i][j])\n";
+        lowers_ok(src);
+        assert_eq!(
+            count(src, "zap_array_row"),
+            0,
+            "chained full index must not allocate a row view"
+        );
+        assert_eq!(count(src, "zap_array_get_i64"), 1);
+        assert_eq!(count(src, "zap_array_ckidx"), 2);
+        assert_eq!(count(src, "zap_array_dim"), 1);
+    }
+
+    #[test]
+    fn chained_full_index_rank3_fuses() {
+        // Rank-3 `m[i][j][k]` with all axes indexed also fuses to one flat get.
+        let src = "def main():\n    \
+                   auto m = array[f64]([[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]])\n    \
+                   print(m[1][0][1])\n";
+        lowers_ok(src);
+        assert_eq!(count(src, "zap_array_row"), 0);
+        assert_eq!(count(src, "zap_array_get_f64"), 1);
+        assert_eq!(count(src, "zap_array_ckidx"), 3);
+    }
+
+    #[test]
+    fn chained_partial_index_still_views() {
+        // A PARTIAL chain (fewer indices than axes) is not a full access, so it
+        // keeps the per-step row views — `m[i][j]` on a rank-3 array yields a
+        // rank-1 view via two row folds and is not fused.
+        let src = "def main():\n    \
+                   auto m = array[i64]([[[1, 2], [3, 4]], [[5, 6], [7, 8]]])\n    \
+                   auto r = m[0][1]\n    print(r[0], sum(r))\n";
+        lowers_ok(src);
+        assert_eq!(
+            count(src, "zap_array_row"),
+            2,
+            "partial chain keeps row folds"
+        );
+        assert_eq!(count(src, "zap_array_ckidx"), 0);
+    }
+
+    #[test]
+    fn bound_row_view_is_not_fused() {
+        // A row view bound to a name is a first-class value: `row = m[i]` still
+        // allocates it, and the later `row[j]` is a plain 1-D get (no chain).
+        let src = "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    \
+                   auto row = m[1]\n    print(row[0], row[1])\n";
+        lowers_ok(src);
+        assert_eq!(count(src, "zap_array_row"), 1, "bound view is materialized");
+        assert_eq!(count(src, "zap_array_ckidx"), 0);
+    }
+
+    #[test]
+    fn impure_chain_index_is_not_fused() {
+        // A non-pure link index (`i + 1`) is not lowered speculatively, so the
+        // chain is not fused — it falls back to the per-step row view (unchanged
+        // behavior), still correct.
+        let src = "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    \
+                   auto i = 0\n    auto j = 1\n    print(m[i + 1][j])\n";
+        lowers_ok(src);
+        assert_eq!(
+            count(src, "zap_array_row"),
+            1,
+            "impure chain keeps the row fold"
+        );
+        assert_eq!(count(src, "zap_array_ckidx"), 0);
+    }
+
+    #[test]
+    fn fancy_index_chain_is_not_fused() {
+        // `m[idx][j]` with an integer index ARRAY is advanced indexing (#510),
+        // not a plain integer chain: it must not be fused (the gather copy is a
+        // real value), so no per-axis ckidx is emitted.
+        let src = "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    \
+                   auto idx = array[i64]([0, 1])\n    print(m[idx][0])\n";
+        lowers_ok(src);
+        assert_eq!(
+            count(src, "zap_array_ckidx"),
+            0,
+            "fancy chain is not a flat index"
+        );
     }
 
     #[test]

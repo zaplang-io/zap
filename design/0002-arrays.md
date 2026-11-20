@@ -425,6 +425,32 @@ BLAS gemm. Completes epic #914 Phase 2 (the consumer that wires the #912 seam +
   large float `@` matches the own kernel within fp tolerance (NumPy-like);
   integers stay exact. Floor is tunable (#904 benchmarking), not an API promise.
 
+**Increment 19 (shipped, #894, decisions/runtime/894-full-index-flat-offset.md):**
+full-index flat-offset fast path — perf follow-up to #500. Both halves of #894:
+the comma form `m[i, j]` and the chained form `m[i][j]`.
+
+- A FULL integer index `m[i0, …, i_{n-1}]` (one index per axis, read *or* store/
+  `+=`) previously folded through one `zap_array_row` call per leading axis, each
+  allocating a rank-1 view header + a copied `dims` buffer — one GC allocation per
+  element access, exactly the overhead a dense array should avoid. It now computes
+  the whole-shape row-major flat offset **inline** (Horner over the axis dims,
+  `flat = (..(i0·d1 + i1)·d2 + i2)..`) and issues a single scalar
+  `zap_array_get/set_<dtype>`, with **no** intermediate view object.
+- The typed get/set now address storage through the general `zap_array_phys_nd`
+  (fast-pathed for the contiguous and rank-1-strided cases, so no existing access
+  regresses), so the fast path composes with strided/transposed views (#502).
+- Per-axis bounds are preserved exactly: each index is validated against its own
+  axis length by `zap_array_ckidx` before flattening, so `m[0, 5]` on a `(3, 3)`
+  array still raises rather than silently reading flat slot 5 — no surface or
+  semantic change, `m[i, j]` and `m[i][j]` keep their current results.
+- The **chained** form `m[i][j]…` (part 2) fuses to the same flat access at
+  lowering when every link is a pure scalar index and the chain indexes all axes
+  of an array: the intermediate row views are dead, single-use temporaries that
+  provably cannot escape, so none is allocated. A row view that is *bound*
+  (`row = m[i]`) or indexed through a non-pure/partial chain is unchanged — it is
+  a first-class bindable value and is still materialized. IR regressions assert no
+  `zap_array_row` is emitted for either full-index form.
+
 **Deferred (clean follow-ups, noted so they are not silently missing):**
 
 - Integer-array (non-mask) bitwise element-wise ops (`&`/`|`/`^`/`~` on numeric
@@ -436,6 +462,11 @@ BLAS gemm. Completes epic #914 Phase 2 (the consumer that wires the #912 seam +
   tuning follow-ups: a register-tiled + packed own micro-kernel targeting ~70–90%
   of single-thread BLAS, and refining the hardcoded BLAS floor after the
   1/4/32-core ±container benchmarking (#904; RFC = discussion #906).
+- Fusing a *bound* dead row view (`row = m[i]; … row[j]` where `row` never
+  escapes) or a non-pure chained index (`m[i + 1][j]`) — the chained fast path
+  (Increment 19) fuses only a pure, unbound, all-axes `m[i][j]` chain, where the
+  intermediate is a single-use temporary; the general case needs the #839/#850
+  escape pass to prove the bound view dead.
 - Broadcasting in assignment / partial-index (whole-row) stores `m[i] = row`
   (#501 follow-up / #511). (Inner-axis SIMD for the broadcast path shipped in
   Increment 15, #896 / D-0178.)

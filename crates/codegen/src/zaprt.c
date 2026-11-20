@@ -4082,7 +4082,9 @@ static int64_t zap_array_stride_of(const ZapArray *a, int64_t axis) {
 /* Map a flat logical index into a rank-1 array/view to its physical element
  * offset into `data` (#502). A rank-1 strided view steps by `strides[0]`; every
  * other case (a contiguous array of any rank, including the flat fill during N-D
- * construction) is dense, so the flat index is the offset past `off`. */
+ * construction) is dense, so the flat index is the offset past `off`. Still used
+ * by the accel RNG shuffle (`runtime/accel/random.inc.c`), which walks a rank-1
+ * target; scalar get/set now go through `zap_array_phys_nd` (#894). */
 static int64_t zap_array_phys(const ZapArray *a, int64_t i) {
     if (a->strides && a->ndim == 1) {
         return a->off + i * a->strides[0];
@@ -4092,12 +4094,27 @@ static int64_t zap_array_phys(const ZapArray *a, int64_t i) {
 
 /* Map a row-major flat logical index over the WHOLE N-D shape to its physical
  * element offset into `data`, honoring per-axis strides for a view of any rank
- * (#510). Dense (`strides == NULL`) is the flat index past `off`. Used by
- * in-place advanced-index assignment, which writes into the real storage (a may
- * itself be a strided view) and so cannot compact first. */
+ * (#502/#510). This is the single element-addressing primitive for scalar
+ * get/set: they call it with the whole-shape flat index that a full integer
+ * index `m[i, j, ...]` lowers to (Horner over the axis dims, #894), and in-place
+ * advanced-index assignment calls it while writing into real storage that may
+ * itself be a strided view (so it cannot compact first).
+ *
+ * The fast paths keep it exactly as cheap as the rank-1-only `zap_array_phys`
+ * for every shape a scalar get/set actually lands on:
+ *   - contiguous (`strides == NULL`), ANY rank  -> `off + flat` (the common
+ *     case: every constructed array, and every full index into one);
+ *   - a rank-1 strided view -> `off + flat * strides[0]` (a single multiply, no
+ *     modulo — so hot element access through `a[::2]` does NOT regress).
+ * Only a strided view of rank >= 2 (e.g. a transposed array indexed in full)
+ * takes the general per-axis decode loop, which still allocates nothing — the
+ * #894 win is that it never folds through an allocated rank-1 row view. */
 static int64_t zap_array_phys_nd(const ZapArray *a, int64_t flat) {
     if (!a->strides) {
         return a->off + flat;
+    }
+    if (a->ndim == 1) {
+        return a->off + flat * a->strides[0];
     }
     int64_t off = a->off, rem = flat;
     for (int64_t k = a->ndim - 1; k >= 0; k--) {
@@ -4106,6 +4123,26 @@ static int64_t zap_array_phys_nd(const ZapArray *a, int64_t flat) {
         off += c * a->strides[k];
     }
     return off;
+}
+
+/* Per-axis bounds check for a full integer index `m[i0, i1, ...]` (#894). The
+ * fast path computes the whole-shape flat offset inline (Horner over the dims)
+ * rather than folding through an allocated rank-1 row view, so each axis index
+ * is validated here against THAT axis's own length — exactly the per-axis check
+ * the former `zap_array_row` / `zap_array_index_axis` fold performed (so e.g.
+ * `m[0, 5]` on a (3, 3) array still raises, instead of silently reading the flat
+ * slot 5). Out-of-range aborts, matching 1-D `a[i]` (catchable index exceptions
+ * are a documented follow-up). Returns the validated index so the lowering can
+ * thread it straight into the offset arithmetic. */
+int64_t zap_array_ckidx(void *ap, int64_t axis, int64_t i) {
+    ZapArray *a = (ZapArray *)ap;
+    int64_t dim = a->dims[axis];
+    if (i < 0 || i >= dim) {
+        fprintf(stderr, "zap: array index %lld out of range (len %lld)\n",
+                (long long)i, (long long)dim);
+        abort();
+    }
+    return i;
 }
 
 /* Compact a possibly-strided array to a contiguous one (#502): returns `a`
@@ -4589,7 +4626,7 @@ static void zap_array_empty_reduce(void) {
     ZAP_MINMAXFN(zap_minc_##suffix, ctype, ctype, <)                           \
     ZAP_MINMAXFN(zap_maxc_##suffix, ctype, ctype, >)
 
-/* get/set are stride-aware (`zap_array_phys`) so a write through a strided view
+/* get/set are stride-aware (`zap_array_phys_nd`) so a write through a strided view
  * aliases the parent; the reducers compact a strided view first
  * (`zap_array_contig`, a no-op when contiguous) so their inner loop stays a
  * dense `data + off` walk (#502). */
@@ -4597,12 +4634,12 @@ static void zap_array_empty_reduce(void) {
     int64_t zap_array_get_##suffix(void *ap, int64_t i) {                      \
         ZapArray *a = (ZapArray *)ap;                                          \
         zap_array_bounds(a, i);                                                \
-        return (int64_t)((const ctype *)a->data)[zap_array_phys(a, i)];        \
+        return (int64_t)((const ctype *)a->data)[zap_array_phys_nd(a, i)];        \
     }                                                                          \
     void zap_array_set_##suffix(void *ap, int64_t i, int64_t v) {             \
         ZapArray *a = (ZapArray *)ap;                                          \
         zap_array_bounds(a, i);                                               \
-        ((ctype *)a->data)[zap_array_phys(a, i)] = (ctype)v;                  \
+        ((ctype *)a->data)[zap_array_phys_nd(a, i)] = (ctype)v;                  \
     }                                                                          \
     /* Whole-array integer sum widens to int64 (no per-width wrap), unlike the  \
      * axis= sum which keeps the element width. */                            \
@@ -4651,12 +4688,12 @@ static void zap_array_empty_reduce(void) {
     double zap_array_get_##suffix(void *ap, int64_t i) {                       \
         ZapArray *a = (ZapArray *)ap;                                          \
         zap_array_bounds(a, i);                                                \
-        return (double)((const ctype *)a->data)[zap_array_phys(a, i)];        \
+        return (double)((const ctype *)a->data)[zap_array_phys_nd(a, i)];        \
     }                                                                          \
     void zap_array_set_##suffix(void *ap, int64_t i, double v) {              \
         ZapArray *a = (ZapArray *)ap;                                         \
         zap_array_bounds(a, i);                                               \
-        ((ctype *)a->data)[zap_array_phys(a, i)] = (ctype)v;                  \
+        ((ctype *)a->data)[zap_array_phys_nd(a, i)] = (ctype)v;                  \
     }                                                                          \
     /* Float reductions accumulate in double (so an f32 sum does not lose      \
      * precision), returning f64; the lowering narrows to f32 for an f32       \
@@ -4727,12 +4764,12 @@ ZAP_ARRAY_INT_ACCESS(u64, uint64_t)
 int64_t zap_array_get_bool(void *ap, int64_t i) {
     ZapArray *a = (ZapArray *)ap;
     zap_array_bounds(a, i);
-    return ((const uint8_t *)a->data)[zap_array_phys(a, i)] ? 1 : 0;
+    return ((const uint8_t *)a->data)[zap_array_phys_nd(a, i)] ? 1 : 0;
 }
 void zap_array_set_bool(void *ap, int64_t i, int64_t v) {
     ZapArray *a = (ZapArray *)ap;
     zap_array_bounds(a, i);
-    ((uint8_t *)a->data)[zap_array_phys(a, i)] = v ? 1 : 0;
+    ((uint8_t *)a->data)[zap_array_phys_nd(a, i)] = v ? 1 : 0;
 }
 int64_t zap_array_sum_bool(void *ap) {
     ZapArray *a = (ZapArray *)zap_array_contig(ap);
@@ -4756,19 +4793,19 @@ static void arr_store_f(ZapArray *a, int64_t i, double v);
  * scalar dtypes, a complex element is not a single SIMD lane, so the lowering
  * routes EVERY complex-array operation here rather than through the inline
  * element-wise kernel. get/set are stride-aware (the physical element index from
- * `zap_array_phys` selects a 2-double slot); `a[i]` materialises a heap
+ * `zap_array_phys_nd` selects a 2-double slot); `a[i]` materialises a heap
  * `ZapComplex`. */
 void *zap_array_get_complex(void *ap, int64_t i) {
     ZapArray *a = (ZapArray *)ap;
     zap_array_bounds(a, i);
-    int64_t p = zap_array_phys(a, i);
+    int64_t p = zap_array_phys_nd(a, i);
     const double *d = (const double *)a->data;
     return zap_complex_new(d[2 * p], d[2 * p + 1]);
 }
 void zap_array_set_complex(void *ap, int64_t i, void *zp) {
     ZapArray *a = (ZapArray *)ap;
     zap_array_bounds(a, i);
-    int64_t p = zap_array_phys(a, i);
+    int64_t p = zap_array_phys_nd(a, i);
     const ZapComplex *z = (const ZapComplex *)zp;
     double *d = (double *)a->data;
     d[2 * p] = z->re;

@@ -3098,6 +3098,15 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             ],
             Some(p.into()),
         );
+        // Per-axis bounds check for the full-index fast path (#894): validates
+        // one axis index against that axis's length and returns it, so a full
+        // integer index `m[i, j, ...]` can compute its flat offset inline
+        // (Horner over the dims) without folding through an allocated row view.
+        self.declare_rt(
+            "zap_array_ckidx",
+            &[p.into(), i.into(), i.into()],
+            Some(i.into()),
+        );
         self.declare_rt("zap_array_get_f64", &[p.into(), i.into()], Some(f.into()));
         self.declare_rt("zap_array_set_f64", &[p.into(), i.into(), f.into()], None);
         self.declare_rt("zap_array_get_i64", &[p.into(), i.into()], Some(i.into()));
