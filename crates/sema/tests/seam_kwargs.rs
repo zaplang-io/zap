@@ -854,6 +854,29 @@ fn net_sockopt_keyword_and_positional() {
     );
 }
 
+#[test]
+fn net_keepalive_interval_keyword_and_positional() {
+    // Setters take (sock, seconds|count), reorderable by name.
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    net.set_keepalive_idle(seconds=60, sock=s)\n",
+    ));
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    net.set_keepalive_interval(s, 10)\n",
+    ));
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    net.set_keepalive_count(count=5, sock=s)\n",
+    ));
+    // Getters -> int64 feed arithmetic.
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    auto n = net.get_keepalive_idle(s) + net.get_keepalive_count(sock=s)\n",
+    ));
+    // An unknown keyword is rejected by the central binder (ZAP4023).
+    assert_code(
+        &prog("    auto s = net.udp_socket()\n    net.set_keepalive_idle(sock=s, secs=60)\n"),
+        "ZAP4023",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // linalg — LAPACK-backed linear algebra; NumPy names (a / b / n / x / ord).
 // The check facet only infers + arity-checks (arrays type loosely), so these

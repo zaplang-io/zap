@@ -198,6 +198,16 @@ fn lower(
         // Buffer-size getters -> int64.
         "get_recv_buffer" => call_ret(lowerer, "zap_net_get_recv_buffer", a, Ty::I64, true),
         "get_send_buffer" => call_ret(lowerer, "zap_net_get_send_buffer", a, Ty::I64, true),
+
+        // ---- TCP keepalive interval tuning (ticket #1141, follow-up to #994) ----
+        "set_keepalive_idle" => call_void(lowerer, "zap_net_set_keepalive_idle", a, true),
+        "set_keepalive_interval" => call_void(lowerer, "zap_net_set_keepalive_interval", a, true),
+        "set_keepalive_count" => call_void(lowerer, "zap_net_set_keepalive_count", a, true),
+        "get_keepalive_idle" => call_ret(lowerer, "zap_net_get_keepalive_idle", a, Ty::I64, true),
+        "get_keepalive_interval" => {
+            call_ret(lowerer, "zap_net_get_keepalive_interval", a, Ty::I64, true)
+        }
+        "get_keepalive_count" => call_ret(lowerer, "zap_net_get_keepalive_count", a, Ty::I64, true),
         _ => return Ok(None),
     }))
 }

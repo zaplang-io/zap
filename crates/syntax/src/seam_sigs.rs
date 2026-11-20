@@ -540,6 +540,13 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("net", "get_keepalive", &["sock"]),
     ("net", "get_recv_buffer", &["sock"]),
     ("net", "get_send_buffer", &["sock"]),
+    // TCP keepalive interval tuning (#1141, follow-up to #994).
+    ("net", "set_keepalive_idle", &["sock", "seconds"]),
+    ("net", "set_keepalive_interval", &["sock", "seconds"]),
+    ("net", "set_keepalive_count", &["sock", "count"]),
+    ("net", "get_keepalive_idle", &["sock"]),
+    ("net", "get_keepalive_interval", &["sock"]),
+    ("net", "get_keepalive_count", &["sock"]),
     // ---- linalg (tickets #926-#928): LAPACK-backed linear algebra (NumPy names) ----
     ("linalg", "solve", &["a", "b"]),
     ("linalg", "inv", &["a"]),

@@ -84,4 +84,20 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_net_get_keepalive", &[p.into()], Some(i.into()));
     cg.declare_rt("zap_net_get_recv_buffer", &[p.into()], Some(i.into()));
     cg.declare_rt("zap_net_get_send_buffer", &[p.into()], Some(i.into()));
+
+    // ---- TCP keepalive interval tuning (ticket #1141, follow-up to #994) ----
+    cg.declare_rt("zap_net_set_keepalive_idle", &[p.into(), i.into()], None);
+    cg.declare_rt(
+        "zap_net_set_keepalive_interval",
+        &[p.into(), i.into()],
+        None,
+    );
+    cg.declare_rt("zap_net_set_keepalive_count", &[p.into(), i.into()], None);
+    cg.declare_rt("zap_net_get_keepalive_idle", &[p.into()], Some(i.into()));
+    cg.declare_rt(
+        "zap_net_get_keepalive_interval",
+        &[p.into()],
+        Some(i.into()),
+    );
+    cg.declare_rt("zap_net_get_keepalive_count", &[p.into()], Some(i.into()));
 }

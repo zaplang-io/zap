@@ -190,6 +190,19 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "net", method, args, 1, span);
             Ty::Int64
         }
+
+        // ---- TCP keepalive interval tuning (ticket #1141, follow-up to #994) ----
+        // Setters take (sock, seconds|count); a non-positive value raises
+        // ValueError, an unsupported knob raises at runtime.
+        "set_keepalive_idle" | "set_keepalive_interval" | "set_keepalive_count" => {
+            expect_argc(checker, "net", method, args, 2, span);
+            Ty::Unit
+        }
+        // Getters -> int64 (seconds / count).
+        "get_keepalive_idle" | "get_keepalive_interval" | "get_keepalive_count" => {
+            expect_argc(checker, "net", method, args, 1, span);
+            Ty::Int64
+        }
         _ => return None,
     })
 }
