@@ -511,6 +511,12 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("net", "set_read_deadline", &["conn", "ms"]),
     ("net", "close_conn", &["conn"]),
     ("net", "close_listener", &["listener"]),
+    // UDP datagram sockets (#991, epic #985). The 0-arg constructors
+    // (udp_socket / udp_socket6) carry no params, so they need no kwargs row.
+    ("net", "udp_bind", &["sock", "host", "port"]),
+    ("net", "udp_connect", &["sock", "host", "port"]),
+    ("net", "sendto", &["sock", "data", "host", "port"]),
+    ("net", "recvfrom", &["sock", "n"]),
     // ---- linalg (tickets #926-#928): LAPACK-backed linear algebra (NumPy names) ----
     ("linalg", "solve", &["a", "b"]),
     ("linalg", "inv", &["a"]),

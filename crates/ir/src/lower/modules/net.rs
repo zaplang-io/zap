@@ -14,6 +14,50 @@ use crate::lower::{FnLower, LowerError};
 
 pub(super) const MODULE: ModuleLower = ModuleLower { name: "net", lower };
 
+/// Unpack a `ZapDatagram` handle (from `zap_udp_recvfrom`) into a
+/// `(str, str, int64)` tuple via the three infallible field getters and the
+/// tuple aggregate path (intern + StructNew + FieldSet) — the same shape
+/// `process.run` uses for its `ZapProc` -> `(int64, str, str)`. The handle is
+/// GC-rooted (the throwing-call dest), and no park occurs between the getters,
+/// so the two `str` fields stay live while the tuple is built.
+fn unpack_datagram_tuple(lowerer: &mut FnLower, h: Value) -> (Value, Ty) {
+    let data = lowerer.new_value(Ty::Ptr);
+    lowerer.emit(Inst::Call {
+        dest: Some(data),
+        func: "zap_udp_dgram_data".to_string(),
+        args: vec![h],
+    });
+    let host = lowerer.new_value(Ty::Ptr);
+    lowerer.emit(Inst::Call {
+        dest: Some(host),
+        func: "zap_udp_dgram_host".to_string(),
+        args: vec![h],
+    });
+    let port = lowerer.new_value(Ty::I64);
+    lowerer.emit(Inst::Call {
+        dest: Some(port),
+        func: "zap_udp_dgram_port".to_string(),
+        args: vec![h],
+    });
+
+    let sid = lowerer
+        .ctx
+        .tuples
+        .borrow_mut()
+        .intern(vec![Ty::Ptr, Ty::Ptr, Ty::I64]);
+    let dest = lowerer.new_value(Ty::Struct(sid));
+    lowerer.emit(Inst::StructNew { dest, sid });
+    for (idx, val) in [data, host, port].into_iter().enumerate() {
+        lowerer.emit(Inst::FieldSet {
+            base: dest,
+            sid,
+            idx: idx as u32,
+            val,
+        });
+    }
+    (dest, Ty::Struct(sid))
+}
+
 fn lower(
     lowerer: &mut FnLower,
     method: &str,
@@ -44,6 +88,24 @@ fn lower(
         // Throwing: a negative deadline raises ValueError (checked in the runtime).
         "set_read_deadline" => call_void(lowerer, "zap_net_set_read_deadline", a, true),
         "close_conn" | "close_listener" => call_void(lowerer, "zap_net_close", a, false),
+
+        // ---- UDP datagram sockets (ticket #991, epic #985) ----
+        // Constructors: socket() can fail (fd exhaustion), so throwing.
+        "udp_socket" => call_ret(lowerer, "zap_udp_socket", a, Ty::Bytes, true),
+        "udp_socket6" => call_ret(lowerer, "zap_udp_socket6", a, Ty::Bytes, true),
+        // bind / connect may raise (bad address, family mismatch, in-use port).
+        "udp_bind" => call_void(lowerer, "zap_udp_bind", a, true),
+        "udp_connect" => call_void(lowerer, "zap_udp_connect", a, true),
+        // sendto -> int64 bytes sent; may raise (resolve/send failure, timeout).
+        "sendto" => call_ret(lowerer, "zap_udp_sendto", a, Ty::I64, true),
+        // recvfrom -> (data, host, port). The throwing call returns a ZapDatagram
+        // handle (GC pointer, rooted as the call dest); the three infallible
+        // getters then unpack it into the (str, str, int64) tuple.
+        "recvfrom" => {
+            let h = lowerer.new_value(Ty::Ptr);
+            lowerer.throwing_call(Some(h), "zap_udp_recvfrom", a);
+            unpack_datagram_tuple(lowerer, h)
+        }
         _ => return Ok(None),
     }))
 }

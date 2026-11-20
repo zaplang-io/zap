@@ -173,6 +173,13 @@ typedef struct {
      * the per-park clock forever. The two compose: each park waits the nearer of
      * the per-park timeout and this whole-op deadline. */
     int64_t read_deadline_ms;
+    /* Address family of a UDP socket (AF_INET / AF_INET6), set by the datagram
+     * constructors (I#991) so `udp_bind` / `udp_connect` / `sendto` resolve the
+     * target constrained to the socket's family. AF_UNSPEC (0) for the TCP
+     * stream sockets, which never consult it. Appended at the tail so the
+     * aliased leading `kind` and the `read_timeout_ms` / `read_deadline_ms`
+     * offsets the TLS seam reads are unchanged. */
+    int family;
 } ZapSock;
 
 static const ZapTypeDesc zap_desc_sock = {(int64_t)sizeof(ZapSock), ZAP_TD_ATOMIC, 0, NULL};
@@ -188,6 +195,7 @@ static ZapSock *zap_sock_wrap(zap_fd_t fd) {
     s->pd = pd;
     s->read_timeout_ms = 0;  /* ATOMIC objects are not zeroed; init explicitly. */
     s->read_deadline_ms = 0; /* ATOMIC objects are not zeroed; init explicitly. */
+    s->family = AF_UNSPEC;   /* ATOMIC objects are not zeroed; init explicitly. */
     return s;
 }
 
@@ -421,6 +429,7 @@ static void *zap_net_connect_impl(void *host_, int64_t port, int64_t deadline_ns
             ZapSock *s = (ZapSock *)zap_obj(&zap_desc_sock);
             s->kind = ZAP_CONN_PLAIN; s->fd = fd; s->pd = pd;
             s->read_timeout_ms = 0; s->read_deadline_ms = 0;
+            s->family = AF_UNSPEC;
             return s;
         }
         if (pd) zap_netpoll_close(pd);
@@ -660,4 +669,384 @@ void zap_net_set_read_deadline(void *s_, int64_t ms) {
     }
     zap_conn_set_read_deadline(s_, ms);
 }
+
+/* ===========================================================================
+ * net: UDP datagram sockets (ticket #991, epic #985). A connectionless
+ * SOCK_DGRAM socket on the same netpoller as the TCP side: every send/recv is
+ * non-blocking and PARKS on a would-block (freeing the worker M), identical in
+ * shape to the stream paths above. The handle is the same `ZapSock` (so
+ * `net.port`, `net.set_read_timeout`, `net.set_read_deadline`,
+ * `net.set_deadline_ns` and `net.close_conn` all apply unchanged); its `family`
+ * field records AF_INET / AF_INET6 so `udp_bind` / `udp_connect` / `sendto`
+ * resolve a target constrained to the socket's family (no accidental v4/v6
+ * cross-wiring — a mismatch raises, exactly as Python's `socket` does).
+ *
+ * GC discipline (precise Immix), identical to the stream section: a payload is
+ * copied into malloc scratch BEFORE any park, all I/O uses that scratch, and the
+ * GC result objects (the ZapStr payload, the ZapDatagram below) are built only
+ * at the very end with no park after.
+ * ========================================================================== */
+
+/* The result of net.recvfrom: one datagram's payload plus the numeric sender
+ * address. A precise GC object (two leading pointer fields traced; the trailing
+ * `port` scalar is not) whose three fields the lowerer reads back into a
+ * `(str, str, int64)` tuple — the same aggregate path `process.run` uses for its
+ * `ZapProc` -> `(int64, str, str)`. */
+typedef struct {
+    ZapStr *data;
+    ZapStr *host;
+    int64_t port;
+} ZapDatagram;
+
+static const int32_t zap_off_dgram[] = {
+    (int32_t)offsetof(ZapDatagram, data),
+    (int32_t)offsetof(ZapDatagram, host),
+};
+static const ZapTypeDesc zap_desc_dgram = {(int64_t)sizeof(ZapDatagram), ZAP_TD_PRECISE,
+                                           2, zap_off_dgram};
+
+/* Resolve host:port into an addrinfo list for a DATAGRAM socket, constrained to
+ * `family` (AF_INET / AF_INET6; AF_UNSPEC lets getaddrinfo pick). `passive` adds
+ * AI_PASSIVE (the bind side; an empty host then means the wildcard address).
+ * getaddrinfo can block on real DNS, so it is bracketed by enter/leave_blocking;
+ * numeric hosts resolve without I/O. Raises a Zap exception on failure. Caller
+ * freeaddrinfo()s the result. */
+static struct addrinfo *zap_udp_resolve(const ZapStr *host, int64_t port, int family,
+                                        int passive) {
+    char *hz = zap_net_dupz(host);
+    if (!hz) {
+        zap_net_panic("net: out of memory");
+        return NULL;
+    }
+    char portbuf[16];
+    snprintf(portbuf, sizeof portbuf, "%ld", (long)port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = family;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+    if (passive) hints.ai_flags |= AI_PASSIVE;
+    const char *node = (host->len == 0 && passive) ? NULL : hz;
+    struct addrinfo *res = NULL;
+    zap_enter_blocking();
+    int rc = getaddrinfo(node, portbuf, &hints, &res);
+    zap_leave_blocking();
+    free(hz);
+    if (rc != 0) {
+        char msg[256];
+        snprintf(msg, sizeof msg, "net: resolve failed: %s", gai_strerror(rc));
+        zap_net_panic(msg);
+        return NULL;
+    }
+    if (g_is_cancelled()) {
+        freeaddrinfo(res);
+        zap_raise(cancelled_exc());
+        return NULL;
+    }
+    return res;
+}
+
+/* Non-raising DGRAM resolve used by net.sendto, which has already copied its
+ * payload into malloc scratch before this point: it must be able to FREE that
+ * scratch before raising, so this variant reports failure via `*rc_out` /
+ * `*cancelled` instead of longjmping. `*rc_out` is a getaddrinfo code (0 ok),
+ * `*cancelled` is set when a scope cancellation was observed. Returns the
+ * addrinfo list (caller freeaddrinfo()s) or NULL. */
+static struct addrinfo *zap_udp_getaddr(const ZapStr *host, int64_t port, int family,
+                                        int *rc_out, int *cancelled) {
+    *rc_out = 0;
+    *cancelled = 0;
+    char *hz = zap_net_dupz(host);
+    if (!hz) {
+        *rc_out = EAI_MEMORY;
+        return NULL;
+    }
+    char portbuf[16];
+    snprintf(portbuf, sizeof portbuf, "%ld", (long)port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = family;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+    struct addrinfo *res = NULL;
+    zap_enter_blocking();
+    int rc = getaddrinfo(hz, portbuf, &hints, &res);
+    zap_leave_blocking();
+    free(hz);
+    if (rc != 0) {
+        *rc_out = rc;
+        return NULL;
+    }
+    if (g_is_cancelled()) {
+        freeaddrinfo(res);
+        *cancelled = 1;
+        return NULL;
+    }
+    return res;
+}
+
+/* Create an unbound UDP socket of `family`, register it with the netpoller, and
+ * return the GC handle. Shared by net.udp_socket (AF_INET) and net.udp_socket6
+ * (AF_INET6). No park happens here, so building the GC object is safe. */
+static void *zap_udp_socket_family(int family, const char *what) {
+    zap_net_startup();
+    zap_fd_t fd = socket(family, SOCK_DGRAM, IPPROTO_UDP);
+    if (!ZAP_FD_VALID(fd)) {
+        zap_net_panic(what);
+        return NULL;
+    }
+    ZapSock *s = zap_sock_wrap(fd);
+    s->family = family;
+    return s;
+}
+
+/* net.udp_socket() -> sock. An unbound IPv4 (AF_INET) datagram socket. */
+void *zap_udp_socket(void) {
+    return zap_udp_socket_family(AF_INET, "net: udp_socket failed");
+}
+
+/* net.udp_socket6() -> sock. An unbound IPv6 (AF_INET6) datagram socket. */
+void *zap_udp_socket6(void) {
+    return zap_udp_socket_family(AF_INET6, "net: udp_socket6 failed");
+}
+
+/* net.udp_bind(sock, host, port). Bind a datagram socket to a local address so
+ * it can receive. Port 0 asks the OS for an ephemeral port (read back with
+ * net.port). An empty host is the wildcard address. SO_REUSEADDR so a rebind on
+ * an ephemeral port is prompt across test runs, mirroring net.listen. Resolves
+ * constrained to the socket's family, so binding an IPv6 literal on an IPv4
+ * socket (or vice versa) raises rather than silently misbehaving. */
+void zap_udp_bind(void *sock_, void *host_, int64_t port) {
+    ZapSock *s = (ZapSock *)sock_;
+    struct addrinfo *res = zap_udp_resolve((const ZapStr *)host_, port, s->family, 1);
+    int bound = 0;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        int one = 1;
+        setsockopt(s->fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
+        if (bind(s->fd, ai->ai_addr, (socklen_t)ai->ai_addrlen) == 0) {
+            bound = 1;
+            break;
+        }
+    }
+    freeaddrinfo(res);
+    if (!bound) {
+        zap_net_panic("net: udp_bind failed");
+    }
+}
+
+/* net.udp_connect(sock, host, port). Set the datagram socket's default peer so
+ * net.send / net.recv (and the shared deadlines) work on it — Python's
+ * `s.connect` for a SOCK_DGRAM. A UDP connect only records the peer (no
+ * handshake, no network round-trip), so it does not park. Resolves constrained
+ * to the socket's family. */
+void zap_udp_connect(void *sock_, void *host_, int64_t port) {
+    ZapSock *s = (ZapSock *)sock_;
+    struct addrinfo *res = zap_udp_resolve((const ZapStr *)host_, port, s->family, 0);
+    int ok = 0;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        if (connect(s->fd, ai->ai_addr, (socklen_t)ai->ai_addrlen) == 0) {
+            ok = 1;
+            break;
+        }
+    }
+    freeaddrinfo(res);
+    if (!ok) {
+        zap_net_panic("net: udp_connect failed");
+    }
+}
+
+/* net.sendto(sock, data, host, port) -> int64 bytes sent. Send ONE datagram to
+ * host:port. The payload is copied to malloc scratch up front so no GC pointer
+ * is held across the resolve/send parks. Resolves constrained to the socket's
+ * family; parks for writability on a would-block. A datagram is sent whole, so a
+ * short sendto is a hard error, not a partial write to retry. */
+int64_t zap_udp_sendto(void *sock_, void *data_, void *host_, int64_t port) {
+    ZapSock *s = (ZapSock *)sock_;
+    zap_fd_t fd = s->fd;
+    void *pd = s->pd;
+    const ZapStr *data = (const ZapStr *)data_;
+    size_t len = (size_t)(data->len < 0 ? 0 : data->len);
+    char *scratch = (char *)malloc(len + 1);
+    if (!scratch) {
+        zap_net_panic("net: out of memory");
+        return 0;
+    }
+    if (len > 0) {
+        memcpy(scratch, data->data, len);
+    }
+    /* Resolve after the payload is safely in malloc scratch (no GC pointer held
+     * across getaddrinfo's blocking window). The non-raising variant lets us free
+     * scratch before raising on a resolve failure. */
+    int rc = 0, cancelled = 0;
+    struct addrinfo *res = zap_udp_getaddr((const ZapStr *)host_, port, s->family, &rc, &cancelled);
+    if (!res) {
+        free(scratch);
+        if (cancelled) {
+            zap_raise(cancelled_exc());
+            return 0;
+        }
+        char msg[256];
+        snprintf(msg, sizeof msg, "net: resolve failed: %s", gai_strerror(rc));
+        zap_net_panic(msg);
+        return 0;
+    }
+    int initial = zap_io_status(pd, 0);
+    if (initial) {
+        free(scratch);
+        freeaddrinfo(res);
+        zap_io_panic(initial, "net: sendto failed");
+        return 0;
+    }
+    ssize_t sent = -1;
+    int hard_err = 0;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        for (;;) {
+            int status = zap_io_status(pd, 0);
+            if (status) {
+                free(scratch);
+                freeaddrinfo(res);
+                zap_io_panic(status, "net: sendto failed");
+                return 0;
+            }
+            ssize_t w = (ssize_t)sendto(fd, scratch, len, MSG_NOSIGNAL, ai->ai_addr,
+                                        (socklen_t)ai->ai_addrlen);
+            if (w >= 0) {
+                sent = w;
+                break;
+            }
+            int e = ZAP_SOCK_ERR();
+            if (ZAP_SOCK_EINTR(e)) {
+                continue;
+            }
+            if (ZAP_SOCK_WOULDBLOCK(e)) {
+                int p = zap_sock_park(fd, pd, ZAP_POLL_WRITE, 0);
+                if (p < 0) {
+                    free(scratch);
+                    freeaddrinfo(res);
+                    zap_io_panic(p, "net: sendto failed");
+                    return 0;
+                }
+                continue;
+            }
+            hard_err = 1; /* this address family/route failed; try the next ai */
+            break;
+        }
+        if (sent >= 0) {
+            break;
+        }
+    }
+    free(scratch);
+    freeaddrinfo(res);
+    if (sent < 0) {
+        zap_net_panic(hard_err ? "net: sendto failed" : "net: sendto: unresolved address");
+        return 0;
+    }
+    return (int64_t)sent;
+}
+
+/* net.recvfrom(sock, n) -> (data, host, port). Receive ONE datagram (up to `n`
+ * bytes; any excess is discarded, standard SOCK_DGRAM truncation) and report the
+ * numeric sender address. Honors net.set_read_timeout / net.set_read_deadline
+ * exactly as net.recv (same park path). A zero-length datagram is a valid empty
+ * payload (not EOF); a socket closed under a parked recvfrom yields an empty
+ * datagram with an empty host, mirroring net.recv's EOF. The scratch buffer is
+ * malloc (lives across the park); the ZapStr payload, the numeric host and the
+ * ZapDatagram are built only at the end with no park after. */
+void *zap_udp_recvfrom(void *sock_, int64_t n) {
+    ZapSock *s = (ZapSock *)sock_;
+    zap_fd_t fd = s->fd;
+    void *pd = s->pd;
+    int64_t timeout_ms = s->read_timeout_ms;
+    int64_t whole_deadline_ns =
+        (s->read_deadline_ms > 0) ? zap_deadline_after_ms(s->read_deadline_ms) : 0;
+    if (n < 0) {
+        n = 0;
+    }
+    int initial = zap_io_status(pd, whole_deadline_ns);
+    if (initial) {
+        zap_io_panic(initial, "net: recvfrom failed");
+        return NULL;
+    }
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (!buf) {
+        zap_net_panic("net: out of memory");
+        return NULL;
+    }
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof ss);
+    ssize_t got = 0;
+    int have = 0; /* 0 until a datagram (possibly empty) is received */
+    for (;;) {
+        int status = zap_io_status(pd, whole_deadline_ns);
+        if (status) {
+            free(buf);
+            zap_io_panic(status, "net: recvfrom failed");
+            return NULL;
+        }
+        socklen_t slen = sizeof ss;
+        ssize_t r = (ssize_t)recvfrom(fd, buf, (size_t)n, 0, (struct sockaddr *)&ss, &slen);
+        if (r >= 0) {
+            got = r;
+            have = 1;
+            break;
+        }
+        int e = ZAP_SOCK_ERR();
+        if (ZAP_SOCK_EINTR(e)) {
+            continue;
+        }
+        if (ZAP_SOCK_WOULDBLOCK(e)) {
+            int p = zap_sock_park2(fd, pd, ZAP_POLL_READ, timeout_ms, whole_deadline_ns);
+            if (p == -2 || p == -3) {
+                free(buf);
+                zap_io_panic(p, "net: recvfrom failed");
+                return NULL;
+            }
+            if (p < 0) {
+                got = 0;
+                have = 0; /* closed under us -> empty datagram, empty host */
+                break;
+            }
+            continue;
+        }
+        free(buf);
+        zap_io_panic(-1, "net: recvfrom failed");
+        return NULL;
+    }
+
+    /* Format the numeric sender address into a stack buffer (no allocation, no
+     * park). getaddrinfo is not needed on the receive side. */
+    char hostbuf[INET6_ADDRSTRLEN];
+    hostbuf[0] = '\0';
+    int64_t sport = 0;
+    if (have) {
+        if (ss.ss_family == AF_INET6) {
+            struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&ss;
+            inet_ntop(AF_INET6, &a6->sin6_addr, hostbuf, sizeof hostbuf);
+            sport = (int64_t)ntohs(a6->sin6_port);
+        } else if (ss.ss_family == AF_INET) {
+            struct sockaddr_in *a4 = (struct sockaddr_in *)&ss;
+            inet_ntop(AF_INET, &a4->sin_addr, hostbuf, sizeof hostbuf);
+            sport = (int64_t)ntohs(a4->sin_port);
+        }
+    }
+
+    /* Build the GC results last, no park after (precise-Immix discipline): the
+     * container first, then each field is filled from a fresh allocation and
+     * stored immediately — the same order process.run uses for ZapProc. */
+    ZapDatagram *out = (ZapDatagram *)zap_obj(&zap_desc_dgram);
+    out->data = NULL;
+    out->host = NULL;
+    out->port = sport;
+    out->data = (ZapStr *)zap_str_new(buf, (int64_t)got);
+    free(buf);
+    out->host = (ZapStr *)zap_str_new(hostbuf, (int64_t)strlen(hostbuf));
+    zap_check_cancel();
+    return out;
+}
+
+/* net.recvfrom field getters (infallible), unpacked into the (str, str, int64)
+ * tuple by the lowerer. */
+void *zap_udp_dgram_data(void *d_) { return ((ZapDatagram *)d_)->data; }
+void *zap_udp_dgram_host(void *d_) { return ((ZapDatagram *)d_)->host; }
+int64_t zap_udp_dgram_port(void *d_) { return ((ZapDatagram *)d_)->port; }
 

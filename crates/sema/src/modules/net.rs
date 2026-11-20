@@ -4,9 +4,10 @@
 //! loop, and `recv`/`send` over opaque socket handles. A socket handle (listener
 //! or connection) is an opaque GC object typed as `bytes` here (so `auto c =
 //! net.connect(...)` binds and flows through args/assign without new `Ty`
-//! machinery), exactly like the `crypto`/`sync` handle pattern. TLS and UDP are
-//! out of scope for v1 (plaintext TCP only); `import net` is accepted but not
-//! required.
+//! machinery), exactly like the `crypto`/`sync` handle pattern. TLS lives in the
+//! `tls` module; UDP datagram sockets (`udp_socket`/`udp_bind`/`udp_connect`/
+//! `sendto`/`recvfrom`) were added in #991 (epic #985) over the same opaque
+//! handle. `import net` is accepted but not required.
 
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
@@ -78,6 +79,39 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "close_conn" | "close_listener" => {
             expect_argc(checker, "net", method, args, 1, span);
             Ty::Unit
+        }
+
+        // ---- UDP datagram sockets (ticket #991, epic #985) ----
+        // net.udp_socket() -> sock handle (AF_INET). net.udp_socket6() -> AF_INET6.
+        // An unbound datagram socket; typed `bytes` like every other net handle.
+        "udp_socket" | "udp_socket6" => {
+            expect_argc(checker, "net", method, args, 0, span);
+            Ty::Bytes
+        }
+        // net.udp_bind(sock, host, port) -> unit. Bind a datagram socket to a
+        // local address (port 0 = OS-assigned ephemeral, read back via net.port).
+        "udp_bind" => {
+            expect_argc(checker, "net", method, args, 3, span);
+            Ty::Unit
+        }
+        // net.udp_connect(sock, host, port) -> unit. Record the default peer so
+        // net.send / net.recv work on the datagram socket (connected UDP).
+        "udp_connect" => {
+            expect_argc(checker, "net", method, args, 3, span);
+            Ty::Unit
+        }
+        // net.sendto(sock, data, host, port) -> int64 (bytes sent in the one
+        // datagram). The connectionless counterpart of net.send.
+        "sendto" => {
+            expect_argc(checker, "net", method, args, 4, span);
+            Ty::Int64
+        }
+        // net.recvfrom(sock, n) -> (data, host, port): the datagram payload (up
+        // to `n` bytes), the numeric sender IP, and the sender port. The
+        // connectionless counterpart of net.recv.
+        "recvfrom" => {
+            expect_argc(checker, "net", method, args, 2, span);
+            Ty::Tuple(vec![Ty::Str, Ty::Str, Ty::Int64])
         }
         _ => return None,
     })

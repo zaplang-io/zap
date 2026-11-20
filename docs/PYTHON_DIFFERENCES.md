@@ -411,6 +411,29 @@ differs in a few places:
   lock-free integer counter (D-0078). They are distinct types (backed by distinct
   prelude structs) and do not collide.
 
+### `net` UDP sockets (#991, decisions/stdlib/991-udp-sockets.md)
+
+- **Datagram payloads are `str`, not `bytes`.** CPython's `sendto` takes `bytes`
+  and `recvfrom` returns `bytes`. Zap's `net.sendto` takes a `str` and
+  `net.recvfrom` returns the payload as `str`, exactly as the existing
+  `net.send` / `net.recv` already do — UDP stays consistent with the module it
+  joins. (A `str`'s bytes are its UTF-8 encoding, so arbitrary binary content
+  still round-trips byte-for-byte.)
+- **The address family is chosen by the constructor, not an `AF_*` constant.**
+  CPython writes `socket.socket(socket.AF_INET, socket.SOCK_DGRAM)` /
+  `AF_INET6`. Zap exposes no `AF_*` constants: `net.udp_socket()` is the IPv4
+  socket and `net.udp_socket6()` the IPv6 one. A bind/send/connect whose target
+  address family does not match the socket's raises, rather than silently
+  cross-wiring.
+- **`recvfrom` returns a flat `(data, host, port)` triple.** CPython returns
+  `(bytes, address)` where `address` is itself a `(host, port)` (and a 4-tuple
+  for IPv6). Zap flattens it to `(str, str, int64)`; `host` is the numeric IP
+  string.
+- **The socket is the first argument.** Zap `net` functions are module functions,
+  not methods on a socket object, so e.g. `net.sendto(sock, data, host, port)` /
+  `net.recvfrom(sock, n)` take the socket explicitly (as every other `net`
+  function does).
+
 ---
 
 ## Parity backlog

@@ -28,4 +28,19 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_net_set_read_timeout", &[p.into(), i.into()], None);
     cg.declare_rt("zap_net_set_read_deadline", &[p.into(), i.into()], None);
     cg.declare_rt("zap_net_close", &[p.into()], None);
+
+    // ---- UDP datagram sockets (ticket #991, epic #985) ----
+    cg.declare_rt("zap_udp_socket", &[], Some(p.into()));
+    cg.declare_rt("zap_udp_socket6", &[], Some(p.into()));
+    cg.declare_rt("zap_udp_bind", &[p.into(), p.into(), i.into()], None);
+    cg.declare_rt("zap_udp_connect", &[p.into(), p.into(), i.into()], None);
+    cg.declare_rt(
+        "zap_udp_sendto",
+        &[p.into(), p.into(), p.into(), i.into()],
+        Some(i.into()),
+    );
+    cg.declare_rt("zap_udp_recvfrom", &[p.into(), i.into()], Some(p.into()));
+    cg.declare_rt("zap_udp_dgram_data", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_udp_dgram_host", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_udp_dgram_port", &[p.into()], Some(i.into()));
 }
