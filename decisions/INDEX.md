@@ -30,6 +30,7 @@ listed here (see [`README.md`](README.md)).
 
 | # | Title | Status | Date |
 |---|-------|--------|------|
+| [894](runtime/894-full-index-flat-offset.md) | Full-index flat-offset fast path — single scalar get/set for m[i, j] and m[i][j], no row-view allocation | Locked | 2026-11-20 |
 | [1081](runtime/1081-stack-promote-transients.md) | Stack-promote non-escaping transient heap values — pointer-bearing structs and length-bounded strings | Locked | 2026-11-19 |
 | [1084](runtime/1084-bigint-division-algorithm.md) | Native bigint division uses word-wise long division (Knuth Algorithm D) | Locked | 2026-11-19 |
 | [1100](runtime/1100-channel-element-type.md) | A typed channel's element keeps its precise type on receive | Locked | 2026-11-19 |
