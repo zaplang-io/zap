@@ -1774,3 +1774,123 @@ int64_t zap_net_get_keepalive_count(void *s) {
     return 0;
 #endif
 }
+
+/* ===========================================================================
+ * net: UDP multicast (ticket #1142, follow-up to #991/#994). Join/leave a
+ * multicast group and the senders' TTL / loopback options, family-dispatched on
+ * the socket's AF_INET / AF_INET6 (the #991 explicit-family model): the group
+ * literal must parse in the socket's family. The default interface is used
+ * (an explicit-interface argument is a follow-up). A malformed group or an
+ * out-of-range TTL is a ValueError; a setsockopt failure (e.g. no multicast
+ * route) is a catchable error.
+ *
+ * Membership uses the structured ip_mreq / ipv6_mreq options. The IPv4 TTL /
+ * loopback scalars want a u_char on POSIX (BSD/macOS require it; Linux accepts
+ * it) and a DWORD on Windows; the IPv6 hops / loopback want an int everywhere.
+ * ========================================================================== */
+
+static void zap_net_mcast_value_error(const char *msg) {
+    zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(msg, (int64_t)strlen(msg)));
+}
+
+/* Join (opt4=IP_ADD_MEMBERSHIP / opt6=IPV6_JOIN_GROUP) or leave
+ * (IP_DROP_MEMBERSHIP / IPV6_LEAVE_GROUP) a group on the default interface. */
+static void zap_net_mcast_membership(void *sock_, void *group_, int opt4, int opt6,
+                                     const char *what) {
+    ZapSock *s = (ZapSock *)sock_;
+    char *gz = zap_net_dupz((const ZapStr *)group_);
+    if (!gz) {
+        zap_net_panic("net: out of memory");
+        return;
+    }
+    int rc;
+    if (s->family == AF_INET) {
+        struct ip_mreq mreq;
+        memset(&mreq, 0, sizeof mreq);
+        if (inet_pton(AF_INET, gz, &mreq.imr_multiaddr) != 1) {
+            free(gz);
+            zap_net_mcast_value_error("net: invalid IPv4 multicast group");
+            return;
+        }
+        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+        rc = setsockopt(s->fd, IPPROTO_IP, opt4, (const char *)&mreq, (socklen_t)sizeof mreq);
+    } else if (s->family == AF_INET6) {
+        struct ipv6_mreq mreq;
+        memset(&mreq, 0, sizeof mreq);
+        if (inet_pton(AF_INET6, gz, &mreq.ipv6mr_multiaddr) != 1) {
+            free(gz);
+            zap_net_mcast_value_error("net: invalid IPv6 multicast group");
+            return;
+        }
+        mreq.ipv6mr_interface = 0; /* default interface */
+        rc = setsockopt(s->fd, IPPROTO_IPV6, opt6, (const char *)&mreq, (socklen_t)sizeof mreq);
+    } else {
+        free(gz);
+        zap_net_mcast_value_error("net: multicast requires an IPv4/IPv6 UDP socket");
+        return;
+    }
+    free(gz);
+    if (rc != 0) {
+        zap_net_panic(what);
+    }
+}
+
+/* net.join_multicast(sock, group). */
+void zap_net_join_multicast(void *s, void *g) {
+    zap_net_mcast_membership(s, g, IP_ADD_MEMBERSHIP, IPV6_JOIN_GROUP,
+                             "net: join_multicast failed");
+}
+
+/* net.leave_multicast(sock, group). */
+void zap_net_leave_multicast(void *s, void *g) {
+    zap_net_mcast_membership(s, g, IP_DROP_MEMBERSHIP, IPV6_LEAVE_GROUP,
+                             "net: leave_multicast failed");
+}
+
+/* Set an IPv4 multicast scalar option with the platform-correct optval width
+ * (u_char on POSIX, DWORD on Windows). */
+static int zap_net_mcast_set4(zap_fd_t fd, int opt, int val) {
+#if defined(ZAP_PLATFORM_WINDOWS)
+    DWORD v = (DWORD)val;
+    return setsockopt(fd, IPPROTO_IP, opt, (const char *)&v, (socklen_t)sizeof v);
+#else
+    unsigned char v = (unsigned char)val;
+    return setsockopt(fd, IPPROTO_IP, opt, &v, (socklen_t)sizeof v);
+#endif
+}
+
+/* net.set_multicast_ttl(sock, hops) — IP_MULTICAST_TTL / IPV6_MULTICAST_HOPS
+ * (0..255). Controls how far outgoing multicast datagrams propagate. */
+void zap_net_set_multicast_ttl(void *sock_, int64_t hops) {
+    ZapSock *s = (ZapSock *)sock_;
+    if (hops < 0 || hops > 255) {
+        zap_net_mcast_value_error("net: multicast TTL must be 0..255");
+        return;
+    }
+    if (s->family == AF_INET) {
+        if (zap_net_mcast_set4(s->fd, IP_MULTICAST_TTL, (int)hops) != 0) {
+            zap_net_panic("net: set_multicast_ttl failed");
+        }
+    } else if (s->family == AF_INET6) {
+        zap_net_setopt_int(s, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, (int)hops,
+                           "net: set_multicast_ttl failed");
+    } else {
+        zap_net_mcast_value_error("net: multicast requires an IPv4/IPv6 UDP socket");
+    }
+}
+
+/* net.set_multicast_loopback(sock, on) — IP_MULTICAST_LOOP / IPV6_MULTICAST_LOOP.
+ * Whether this host also receives its own outgoing multicast. */
+void zap_net_set_multicast_loopback(void *sock_, int64_t on) {
+    ZapSock *s = (ZapSock *)sock_;
+    if (s->family == AF_INET) {
+        if (zap_net_mcast_set4(s->fd, IP_MULTICAST_LOOP, on != 0) != 0) {
+            zap_net_panic("net: set_multicast_loopback failed");
+        }
+    } else if (s->family == AF_INET6) {
+        zap_net_setopt_int(s, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, on != 0,
+                           "net: set_multicast_loopback failed");
+    } else {
+        zap_net_mcast_value_error("net: multicast requires an IPv4/IPv6 UDP socket");
+    }
+}

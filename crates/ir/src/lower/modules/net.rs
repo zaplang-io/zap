@@ -208,6 +208,12 @@ fn lower(
             call_ret(lowerer, "zap_net_get_keepalive_interval", a, Ty::I64, true)
         }
         "get_keepalive_count" => call_ret(lowerer, "zap_net_get_keepalive_count", a, Ty::I64, true),
+
+        // ---- UDP multicast (ticket #1142, follow-up to #991/#994) ----
+        "join_multicast" => call_void(lowerer, "zap_net_join_multicast", a, true),
+        "leave_multicast" => call_void(lowerer, "zap_net_leave_multicast", a, true),
+        "set_multicast_ttl" => call_void(lowerer, "zap_net_set_multicast_ttl", a, true),
+        "set_multicast_loopback" => call_void(lowerer, "zap_net_set_multicast_loopback", a, true),
         _ => return Ok(None),
     }))
 }

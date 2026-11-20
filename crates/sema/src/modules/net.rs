@@ -203,6 +203,25 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "net", method, args, 1, span);
             Ty::Int64
         }
+
+        // ---- UDP multicast (ticket #1142, follow-up to #991/#994) ----
+        // join/leave a group (sock, group); the group literal must parse in the
+        // socket's family. A malformed group is a ValueError.
+        "join_multicast" | "leave_multicast" => {
+            expect_argc(checker, "net", method, args, 2, span);
+            Ty::Unit
+        }
+        // set_multicast_ttl(sock, hops): 0..255 (ValueError otherwise).
+        "set_multicast_ttl" => {
+            expect_argc(checker, "net", method, args, 2, span);
+            Ty::Unit
+        }
+        // set_multicast_loopback(sock, on): whether this host receives its own
+        // outgoing multicast.
+        "set_multicast_loopback" => {
+            expect_argc(checker, "net", method, args, 2, span);
+            Ty::Unit
+        }
         _ => return None,
     })
 }

@@ -877,6 +877,31 @@ fn net_keepalive_interval_keyword_and_positional() {
     );
 }
 
+#[test]
+fn net_multicast_keyword_and_positional() {
+    // join/leave take (sock, group); reorderable by name.
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    net.join_multicast(group=\"239.1.2.3\", sock=s)\n",
+    ));
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    net.leave_multicast(s, \"239.1.2.3\")\n",
+    ));
+    // sender options: ttl (hops) and loopback (bool).
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    net.set_multicast_ttl(sock=s, hops=1)\n",
+    ));
+    assert_ok(&prog(
+        "    auto s = net.udp_socket()\n    net.set_multicast_loopback(s, True)\n",
+    ));
+    // An unknown keyword is rejected by the central binder (ZAP4023).
+    assert_code(
+        &prog(
+            "    auto s = net.udp_socket()\n    net.join_multicast(sock=s, addr=\"239.1.2.3\")\n",
+        ),
+        "ZAP4023",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // linalg — LAPACK-backed linear algebra; NumPy names (a / b / n / x / ord).
 // The check facet only infers + arity-checks (arrays type loosely), so these

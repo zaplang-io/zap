@@ -100,4 +100,14 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
         Some(i.into()),
     );
     cg.declare_rt("zap_net_get_keepalive_count", &[p.into()], Some(i.into()));
+
+    // ---- UDP multicast (ticket #1142, follow-up to #991/#994) ----
+    cg.declare_rt("zap_net_join_multicast", &[p.into(), p.into()], None);
+    cg.declare_rt("zap_net_leave_multicast", &[p.into(), p.into()], None);
+    cg.declare_rt("zap_net_set_multicast_ttl", &[p.into(), i.into()], None);
+    cg.declare_rt(
+        "zap_net_set_multicast_loopback",
+        &[p.into(), i.into()],
+        None,
+    );
 }
