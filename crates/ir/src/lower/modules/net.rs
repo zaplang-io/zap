@@ -3,7 +3,8 @@
 //! Each call lowers to a backing `zap_net_*` runtime entry point over
 //! `str`/`int64`/handle (`ptr`) words. Socket operations may raise (connection
 //! refused, reset, resolve failure) so they are emitted with `throwing_call`
-//! (catchable inside `try`); the infallible `port` query is a plain call.
+//! (catchable inside `try`). `port` is also throwing since #1159 — it raises
+//! ValueError on a Unix-domain socket (which has no port).
 
 use zapc_syntax::ast;
 
@@ -171,7 +172,9 @@ fn lower(
         "accept" => call_ret(lowerer, "zap_net_accept", a, Ty::Bytes, true),
         "recv" => call_ret(lowerer, "zap_net_recv", a, Ty::Ptr, true),
         "send" => call_ret(lowerer, "zap_net_send", a, Ty::I64, true),
-        "port" => call_ret(lowerer, "zap_net_port", a, Ty::I64, false),
+        // Throwing since #1159: net.port on a Unix-domain socket raises ValueError
+        // (it has no port), so the call must be an invoke to be catchable.
+        "port" => call_ret(lowerer, "zap_net_port", a, Ty::I64, true),
         // Throwing: a negative timeout raises ValueError (checked in the runtime).
         "set_read_timeout" => call_void(lowerer, "zap_net_set_read_timeout", a, true),
         // Throwing: a negative deadline raises ValueError (checked in the runtime).

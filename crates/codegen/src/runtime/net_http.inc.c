@@ -613,7 +613,9 @@ int64_t zap_net_send(void *c_, void *data_) {
 }
 
 /* net.port(listener) -> int64. The locally bound port (host byte order), so an
- * ephemeral `net.listen(host, 0)` can be discovered and dialed. */
+ * ephemeral `net.listen(host, 0)` can be discovered and dialed. A Unix-domain
+ * socket has no port, so it raises a catchable ValueError rather than reading an
+ * unrelated byte of the sockaddr_un (I#1159); other families return the port. */
 int64_t zap_net_port(void *s_) {
     ZapSock *s = (ZapSock *)s_;
     struct sockaddr_storage ss;
@@ -624,7 +626,13 @@ int64_t zap_net_port(void *s_) {
     if (ss.ss_family == AF_INET6) {
         return (int64_t)ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
     }
-    return (int64_t)ntohs(((struct sockaddr_in *)&ss)->sin_port);
+    if (ss.ss_family == AF_INET) {
+        return (int64_t)ntohs(((struct sockaddr_in *)&ss)->sin_port);
+    }
+    zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                    zap_str_new("net: port is undefined for a Unix-domain socket",
+                                sizeof("net: port is undefined for a Unix-domain socket") - 1));
+    return 0;
 }
 
 /* Close a raw fd + netpoller descriptor. Used both by net.close and by the HTTP

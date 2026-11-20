@@ -2022,7 +2022,8 @@ socket, `net.unixgram_bind(sock, path)` binds it to receive,
 bound path (`""` for an unbound sender). All run non-blocking on the netpoller
 like the INET transports. Only filesystem pathnames are supported (Linux
 abstract-namespace names are rejected); `listen_unix` fails if `path` already
-exists (remove a stale socket file first, as in Python/Go). Unix sockets are
+exists (remove a stale socket file first, as in Python/Go). `net.port` on a
+Unix-domain socket raises `ValueError` — it has no port (#1159). Unix sockets are
 **POSIX-only** — the Windows build raises a catchable "not supported" error.
 `net.peer_cred(sock) -> (uid, gid, pid)` (#1143) reads the connecting peer's
 user/group/process id off a connected Unix-domain socket (verified via
