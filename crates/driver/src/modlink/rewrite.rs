@@ -111,9 +111,32 @@ impl Rewriter<'_> {
         }
     }
 
+    /// Rewrite the interface name inside each type parameter's bound (#1222).
+    ///
+    /// A bound like `C: Codec[T]` names an interface (`Codec`) that is one of
+    /// the declaring module's own top-level symbols, so it is mangled with the
+    /// module prefix exactly as the interface *declaration* and every ordinary
+    /// type reference is. Without this, an imported generic's declaration and
+    /// its concrete argument are mangled while the bound's interface name stays
+    /// unqualified, and the monomorphizer cannot resolve the bound to the
+    /// (mangled) imported interface — it reports `'Codec' is not an interface`.
+    ///
+    /// The bound's own type arguments are the surrounding type parameters
+    /// (`T` in `Codec[T]`), which are kept in `tl` and so are left untouched;
+    /// a built-in capability bound (`Comparable`, `Add`, …) is not a module
+    /// symbol, so `mangle_own` leaves it untouched as well.
+    fn bounds(&mut self, generics: &mut [TypeParam], tl: &HashSet<String>) {
+        for g in generics {
+            if let Some(b) = &mut g.bound {
+                self.ty(b, tl);
+            }
+        }
+    }
+
     fn function(&mut self, f: &mut Function, extra_tlocals: &HashSet<String>) {
         self.rename_decl(&mut f.name);
         let tl = generics_set(&f.generics, extra_tlocals);
+        self.bounds(&mut f.generics, &tl);
         let locals = collect_bindings_fn(f);
         for p in &mut f.params {
             if let Some(t) = &mut p.ty {
@@ -132,6 +155,7 @@ impl Rewriter<'_> {
     fn struct_def(&mut self, s: &mut StructDef) {
         self.rename_decl(&mut s.name);
         let tl = generics_set(&s.generics, &HashSet::new());
+        self.bounds(&mut s.generics, &tl);
         for field in &mut s.fields {
             self.ty(&mut field.ty, &tl);
             if let Some(d) = &mut field.default {
@@ -146,6 +170,7 @@ impl Rewriter<'_> {
     fn enum_def(&mut self, e: &mut EnumDef) {
         self.rename_decl(&mut e.name);
         let tl = generics_set(&e.generics, &HashSet::new());
+        self.bounds(&mut e.generics, &tl);
         for v in &mut e.variants {
             for vf in &mut v.fields {
                 self.ty(&mut vf.ty, &tl);
@@ -162,12 +187,14 @@ impl Rewriter<'_> {
     fn type_alias(&mut self, a: &mut TypeAliasDef) {
         self.rename_decl(&mut a.name);
         let tl = generics_set(&a.generics, &HashSet::new());
+        self.bounds(&mut a.generics, &tl);
         self.ty(&mut a.target, &tl);
     }
 
     fn interface_def(&mut self, i: &mut InterfaceDef) {
         self.rename_decl(&mut i.name);
         let tl = generics_set(&i.generics, &HashSet::new());
+        self.bounds(&mut i.generics, &tl);
         for sig in &mut i.methods {
             for p in &mut sig.params {
                 if let Some(t) = &mut p.ty {

@@ -583,6 +583,131 @@ fn arch_aarch64_import_ok_on_target() {
 }
 
 #[test]
+fn imported_generic_bound_interface_name_is_mangled() {
+    // #1222: a generic struct `Wrapper[T, C: Codec[T]]` declared in an imported
+    // module. Before the fix the struct name, the interface declaration, and the
+    // concrete argument were all mangled with the module prefix, but the
+    // interface name *inside the type-parameter bound* stayed unqualified, so
+    // the monomorphizer could not resolve it and reported "'Codec' is not an
+    // interface". The bound's interface name must be mangled exactly like the
+    // interface declaration, while the bound's own type argument `T` (a sibling
+    // type parameter) stays bare.
+    let p = Project::new("imported_bound");
+    p.write(
+        "src/codec.zap",
+        "interface Codec[T]:\n\
+         \x20   def decode(self, bytes raw) -> T\n\
+         \n\
+         struct TextCodec:\n\
+         \x20   def decode(self, bytes raw) -> str:\n\
+         \x20       return str(raw)\n\
+         \n\
+         struct Wrapper[T, C: Codec[T]]:\n\
+         \x20   C codec\n\
+         \n\
+         \x20   def decode(self, bytes raw) -> T:\n\
+         \x20       return self.codec.decode(raw)\n",
+    );
+    p.write(
+        "src/main.zap",
+        "import codec\n\n\
+         def main():\n\
+         \x20   auto w = codec.Wrapper[str, codec.TextCodec](codec.TextCodec())\n\
+         \x20   print(w.decode(b\"hi\"))\n",
+    );
+    let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
+
+    // The interface declaration is mangled to some `<prefix>Codec`.
+    let iface_name = m
+        .items
+        .iter()
+        .find_map(|it| match it {
+            Item::Interface(i) if i.name.ends_with("Codec") => Some(i.name.clone()),
+            _ => None,
+        })
+        .expect("Codec interface present in merged module");
+    assert_ne!(iface_name, "Codec", "imported interface must be mangled");
+
+    // The `Wrapper` struct's `C` bound must name that same mangled interface,
+    // and the bound's type argument must still be the bare sibling param `T`.
+    let wrapper = m
+        .items
+        .iter()
+        .find_map(|it| match it {
+            Item::Struct(s) if s.name.ends_with("Wrapper") => Some(s),
+            _ => None,
+        })
+        .expect("Wrapper struct present in merged module");
+    let c_param = wrapper
+        .generics
+        .iter()
+        .find(|g| g.name == "C")
+        .expect("Wrapper has a `C` type parameter");
+    let bound = c_param.bound.as_ref().expect("`C` carries a bound");
+    match bound {
+        zapc_syntax::ast::Type::Named { name, args, .. } => {
+            assert_eq!(
+                name, &iface_name,
+                "bound interface name must match the mangled interface declaration, got {name:?}"
+            );
+            assert_ne!(
+                name, "Codec",
+                "bound interface name must not stay unqualified"
+            );
+            match args.as_slice() {
+                [zapc_syntax::ast::Type::Named { name: arg, .. }] => assert_eq!(
+                    arg, "T",
+                    "the bound's type argument is the sibling param `T`, unmangled, got {arg:?}"
+                ),
+                other => panic!("expected a single `T` bound argument, got {other:?}"),
+            }
+        }
+        other => panic!("bound must be a named interface type, got {other:?}"),
+    }
+}
+
+#[test]
+fn imported_generic_bound_capability_name_is_not_mangled() {
+    // The bound rewrite (#1222) must only touch module-own interface symbols: a
+    // built-in capability bound (`Comparable`) is not a module member, so it
+    // keeps its bare name across the import boundary and is still resolved
+    // intrinsically by the monomorphizer.
+    let p = Project::new("imported_cap_bound");
+    p.write(
+        "src/ds.zap",
+        "struct Holder[K: Comparable]:\n\
+         \x20   K key\n",
+    );
+    p.write(
+        "src/main.zap",
+        "import ds\n\n\
+         def main():\n\
+         \x20   auto h = ds.Holder[int64](3)\n\
+         \x20   print(h.key)\n",
+    );
+    let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
+    let holder = m
+        .items
+        .iter()
+        .find_map(|it| match it {
+            Item::Struct(s) if s.name.ends_with("Holder") => Some(s),
+            _ => None,
+        })
+        .expect("Holder struct present");
+    let bound = holder.generics[0]
+        .bound
+        .as_ref()
+        .expect("K carries a bound");
+    match bound {
+        zapc_syntax::ast::Type::Named { name, .. } => assert_eq!(
+            name, "Comparable",
+            "a built-in capability bound must keep its bare name, got {name:?}"
+        ),
+        other => panic!("bound must be a named type, got {other:?}"),
+    }
+}
+
+#[test]
 fn arch_import_guarded_by_cfg_compiles_on_both_targets() {
     // The intended portable pattern: a `when target.arch` guard keeps only the
     // matching arm, so one source carries both arch paths and the off-target
