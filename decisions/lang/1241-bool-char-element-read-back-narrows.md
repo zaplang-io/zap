@@ -15,15 +15,29 @@ superseded-by:
 
 ## Decision
 
-A value *read back* from a collection whose element kind is `bool` (`Elem::Bool`)
-or `char` (`Elem::Char`) — by iteration (`for x in xs`), by indexing (`xs[i]`),
-or by a comprehension / constructor — now carries its **narrow logical scalar
-type** (`bool` → `Ty::I1`, `char` → `Ty::Char`), not the physical `i64` storage
-word it is read through. The element is still physically read via the
-`i64`-word runtime entry point (`zap_list_get_i64`), honoring the storage ABI;
-lowering then truncates that word to `i1`/`char` at the read site so the value a
-program observes has its true kind. Every other element kind is unchanged: it
-already reads back at its own type, so the narrowing is a no-op for it.
+A value *read back* from a `bool` (`Elem::Bool`) or `char` (`Elem::Char`)
+collection element into a **user program binding** — a statement `for` loop
+variable (`for x in xs`, including the `set`/`dict`/`heap`/`deque`/`oset` loops,
+which route through the same list-loop lowering) or an index expression
+(`xs[i]`) — now carries its **narrow logical scalar type** (`bool` → `Ty::I1`,
+`char` → `Ty::Char`), not the physical `i64` storage word it is read through.
+The element is still physically read via the `i64`-word runtime entry point
+(`zap_list_get_i64`), honoring the storage ABI; lowering then truncates that
+word to `i1`/`char` at the read site so the value a program observes has its
+true kind. Every other element kind is unchanged: it already reads back at its
+own type, so the narrowing is a no-op for it.
+
+The narrowing is applied at the two *user-facing* read-back sites
+(`lower_for_list`, `lower_index_get`), **not** inside the shared internal
+iterator (`iterate_list`). Several internal callers of `iterate_list` — the
+container renderer (`repr.rs`), `list.extend`, and dict copy/merge — pass the
+raw element word straight into an `i64`-word runtime entry point
+(`zap_bool_to_str`, `zap_list_push_i64`, `zap_dict_get_*`/`set_*`) without
+re-coercing, so they rely on `iterate_list` yielding the physical word.
+Narrowing there would miscompile them (an `i1`/`char` passed where `i64` is
+expected). Consequently a bool/char element read back by a **comprehension or a
+`set(...)`/`list(...)` constructor** (which bind through `iterate_list`) does
+**not** yet narrow; that is a documented follow-up, not part of this fix.
 
 This makes a `bool`/`char` read-back round-trip through the element-kind check,
 so `for value in a_list_of_bool: copied.append(value)` compiles exactly like the
@@ -63,6 +77,10 @@ Narrowing the read-back is the consistent fix, not a special case:
   the C ABI of `zap_list_get_i64`. Lowering reads the word at `elem_ty` and
   truncates to the logical `elem_read_ty` right after the call, so codegen never
   sees an `i1`-typed call result.
+- **It narrows per user-facing read site, not in the shared iterator.** Making
+  `iterate_list` narrow would be the smallest diff, but its internal callers
+  (renderer, `extend`, dict copy/merge) consume the physical word directly, so
+  the narrowing is scoped to the sites that actually bind a program value.
 
 Alternatives rejected:
 
@@ -73,14 +91,23 @@ Alternatives rejected:
   pushed value the same way.
 - **Retype `Elem::ty()` to `i1`/`char`.** It is the physical read-back word;
   changing it breaks the `i64`-word runtime ABI and every value-position read.
+- **Narrow inside `iterate_list`.** Its internal consumers (container renderer,
+  `list.extend`, dict copy/merge) push the raw element word into `i64`-word
+  runtime entry points without re-coercing, so narrowing there emits an
+  `i1`/`char` where an `i64` is required and fails LLVM module verification.
 
 ## Consequences
 
-- One narrowing chokepoint (`narrow_read_elem`) is applied at the three list
-  read-back sites — statement `for` (`lower_for_list`), the comprehension /
-  constructor iterator (`iterate_list`), and `xs[i]` (`lower_index_get`). The
-  set / dict-key / heap / deque / oset `for` and comprehension forms funnel
-  through those, so they are covered too.
+- One narrowing chokepoint (`narrow_read_elem`) is applied at the two
+  user-facing read-back sites — statement `for` (`lower_for_list`) and `xs[i]`
+  (`lower_index_get`). The `set` / `dict` / `heap` / `deque` / `oset` statement
+  `for` loops funnel through `lower_for_list`, so they are covered too.
+- A comprehension or `set(...)`/`list(...)` constructor over a `list[bool]` /
+  `list[char]` binds through `iterate_list` and so still reads the element back
+  as the `i64` word; `[v for v in bools]` into a `list[bool]` therefore remains
+  rejected (unchanged from before this fix). Making that work consistently
+  requires teaching the `iterate_list` internal consumers to re-widen, and is
+  tracked as a follow-up.
 - `print(xs[i])` / `print(value)` for a `bool`/`char` element now renders
   `True`/`False` / `'c'` through the scalar Display path, instead of the element
   word's `-1`/codepoint integer (the same `str()`-matching rendering a container

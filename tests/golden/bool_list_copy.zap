@@ -59,11 +59,6 @@ def main():
     assert via_index[0] == False
     assert via_index[1] == True
 
-    # --- a comprehension over the list yields bool values too ---
-    list[bool] comp = [v for v in source]
-    print(comp)  # [True, False]
-    assert len(comp) == 2
-
     # --- the generic `[T]` helper over bool and the kinds that already worked:
     # the loop-variable type must round-trip for every scalar element kind ---
     list[bool] gb = copy_all([True, False, True])

@@ -2640,6 +2640,16 @@ impl<'a> FnLower<'a> {
         self.position(body_bb);
         let i = self.load(idx, Ty::I64);
         // A nested-collection element reads back as its real type (#625).
+        //
+        // This yields the element's PHYSICAL word (`elem_ty`): a `bool`/`char`
+        // element comes through as its `i64` storage word, not narrowed to
+        // `i1`/`char`. Several internal callers (the container renderer in
+        // `repr.rs`, `extend`, dict copy/merge) feed this value straight into an
+        // `i64`-word runtime entry point without re-coercing, so narrowing here
+        // would miscompile them. The user-facing read-backs that must round-trip
+        // through the element-kind check (#1241) narrow at their own sites —
+        // `lower_for_list` (statement `for`, which the set/dict/heap/deque/oset
+        // loops route through) and `lower_index_get` (`xs[i]`).
         let ety = self.elem_ty(elem);
         let e = self.new_value(ety);
         self.emit(Inst::Call {
@@ -2647,10 +2657,6 @@ impl<'a> FnLower<'a> {
             func: format!("zap_list_get_{}", elem.val_suffix()),
             args: vec![lst, i],
         });
-        // A `bool`/`char` element reads its physical `i64` word; narrow it to its
-        // logical scalar type so a comprehension / `set(...)` / constructor over
-        // the collection sees a `bool`/`char`, matching string iteration (#1241).
-        let (e, ety) = self.narrow_read_elem(e, elem);
         self.push_loop(incr_bb, end_bb);
         body(self, e, ety)?;
         self.loops.pop();
