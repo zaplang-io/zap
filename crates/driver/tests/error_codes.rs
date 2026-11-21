@@ -73,6 +73,15 @@ fn type_codes() {
         "def f() -> int32:\n    return \"x\"\n\ndef main():\n    pass\n",
         "ZAP4003",
     );
+    // Calling a module `const` whose type does not define `__call__` (#1228):
+    // the callable sugar requires the `Call` operator interface, so a
+    // non-conformer is a clean "operator '()'" error, not an "unknown function".
+    assert_code(
+        "struct Plain:\n    int64 x\n\
+         const Plain P = Plain(1)\n\
+         def main():\n    auto r = P(5)\n",
+        "ZAP4071",
+    );
 }
 
 #[test]
