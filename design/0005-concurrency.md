@@ -794,9 +794,21 @@ parks its G and frees its M.
   guard-page stacks. Initial stack size and free-list size classes to be tuned.
 - **`MAXPROCS`.** RESOLVED (ticket #172): env var `MAXPROCS` + runtime call
   `runtime.maxprocs()`; name finalized (no `ZAP_` prefix, no GOMAXPROCS analogy).
-- **Coroutine-local storage.**
-  Whether to provide a coroutine-local (not thread-local) storage facility, and
-  how it interacts with `scope:` inheritance.
+- **Coroutine-local storage.** RESOLVED (#1237,
+  decisions/lang/1237-coroutine-local-context.md, PROVISIONAL): a
+  coroutine-local execution context — Zap's `contextvars` — via two built-in
+  reference types, `ContextVar[T]` and `ContextToken`. `cv.set(v)` binds a value
+  on the *current* coroutine and returns a token; `cv.get()` reads it from any
+  deep callee; `cv.reset(token)` restores the context to the point of that `set`.
+  The binding lives on the coroutine `G` (not a thread-local), so it follows the
+  coroutine across park/resume and worker migration, and interleaved coroutines
+  on one worker are isolated. **`spawn` inheritance:** a child inherits a
+  *snapshot* of the parent's context at spawn time (Python `copy_context`); the
+  child's own `set` never leaks back. **`scope:` inheritance:** a `scope:` body
+  runs in the current coroutine and mutates its own context directly; its spawned
+  children snapshot at spawn; restoring an outer value on scope exit — normal or
+  exceptional — is done with a token in a `finally`/`with`, which Zap runs on
+  both paths.
 - **Formal memory-model spec** (D-0034) and the **race-detector** tool
   (both already tracked in OPEN-QUESTIONS).
 - **General timer API** — concrete `after()` and `sleep()` surfaces; scope

@@ -107,6 +107,19 @@ pub enum Ty {
     /// field-based `Atomic[T]` (D-0066) cannot express. A GC-managed reference
     /// type; `@shareable` so it may back a mutable module global (D-0113).
     AtomicArray(Box<Ty>),
+    /// A coroutine-local execution-context variable `ContextVar[T]` (#1237,
+    /// PROVISIONAL): a key under which a typed value is bound for the *current*
+    /// coroutine and read by deep callees across suspension/resumption and
+    /// worker migration. Isolated per coroutine; a `spawn`ed child inherits a
+    /// snapshot of the parent's bindings. A GC-managed reference type (the object
+    /// identity is the lookup key); `@shareable` so one `ContextVar` can be a
+    /// module global shared across coroutines (D-0113). Zap's `contextvars`.
+    ContextVar(Box<Ty>),
+    /// The opaque token returned by `ContextVar.set(v)` and consumed by
+    /// `reset(token)` to restore the context to the state just before that `set`
+    /// (#1237, PROVISIONAL). A GC-managed reference, deliberately non-generic and
+    /// opaque so it cannot be forged or inspected.
+    CtxToken,
     /// A user-defined type (struct/enum), treated opaquely for now.
     Named(String),
     /// A regex match object (result of `subject =~ m/.../`, D-0010). Truthy on
@@ -234,6 +247,8 @@ impl Ty {
             }
             Ty::Chan(t) => format!("channel[{}]", t.display()),
             Ty::AtomicArray(t) => format!("AtomicArray[{}]", t.display()),
+            Ty::ContextVar(t) => format!("ContextVar[{}]", t.display()),
+            Ty::CtxToken => "ContextToken".into(),
             Ty::Named(n) => n.clone(),
             Ty::Match => "Match".into(),
             Ty::Py => "py".into(),
@@ -289,6 +304,8 @@ impl Ty {
             Ty::OSet(e) => named("oset", vec![e.to_ast_type()?]),
             Ty::Chan(e) => named("channel", vec![e.to_ast_type()?]),
             Ty::AtomicArray(e) => named("AtomicArray", vec![e.to_ast_type()?]),
+            Ty::ContextVar(e) => named("ContextVar", vec![e.to_ast_type()?]),
+            Ty::CtxToken => named("ContextToken", vec![]),
             Ty::Dict(k, v) => named("dict", vec![k.to_ast_type()?, v.to_ast_type()?]),
             Ty::Tuple(elems) => {
                 let mut out = Vec::with_capacity(elems.len());

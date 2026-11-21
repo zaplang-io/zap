@@ -3553,6 +3553,17 @@ impl Parser {
         if self.is_kw(Keyword::None) {
             self.bump();
             "None".to_string()
+        } else if let TokenKind::Keyword(k) = self.peek() {
+            // A built-in nominal type name (`set`, `list`, `str`, …) is a hard
+            // keyword in type position but unambiguous as a `.name` member, so it
+            // is accepted here as a member/method name (#1237: `ContextVar.set`).
+            if k.is_nominal_type() {
+                let name = k.as_str().to_string();
+                self.bump();
+                name
+            } else {
+                self.ident(what)
+            }
         } else {
             self.ident(what)
         }

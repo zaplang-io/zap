@@ -481,6 +481,15 @@ pub enum Ty {
     /// lowering boundary, like the field-based [`Inst::AtomicCas`]) and whether the
     /// collector traces the slots. Maps to `ptr` in codegen, like [`Ty::Chan`].
     AtomicArray(Elem),
+    /// A pointer to a runtime `ContextVar[T]` object (#1237): a coroutine-local
+    /// execution-context key. The object identity IS the lookup key; its value
+    /// for the current coroutine lives in the coroutine `G`'s context chain, not
+    /// in this object. The element kind selects the typed get/set runtime entry
+    /// point (`zap_ctxvar_get_i64` vs `_ptr`), like [`Ty::Chan`]. Maps to `ptr`.
+    ContextVar(Elem),
+    /// A pointer to a runtime `ContextToken` object (#1237) returned by
+    /// `ContextVar.set` and consumed by `reset`. Opaque; maps to `ptr`.
+    CtxToken,
     /// A pointer to an immutable `bytes` object (ticket #337): physically the
     /// same `ZapStr {len, data}` length-prefixed byte buffer as `str`, so it maps
     /// to `ptr` in codegen and coerces to/from `Ptr` as a no-op bitcast. Kept
@@ -1431,6 +1440,8 @@ impl fmt::Display for Ty {
             }
             Ty::Chan(e) => return write!(f, "chan[{}]", e.val_suffix()),
             Ty::AtomicArray(e) => return write!(f, "AtomicArray[{}]", e.val_suffix()),
+            Ty::ContextVar(e) => return write!(f, "ContextVar[{}]", e.val_suffix()),
+            Ty::CtxToken => return write!(f, "ContextToken"),
             Ty::Func(idx) => return write!(f, "fn#{idx}"),
         };
         f.write_str(s)
