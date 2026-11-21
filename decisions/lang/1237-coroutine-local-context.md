@@ -50,8 +50,9 @@ cv.reset(tok)                            # restore the context to the point of t
   immutable tail, and its own `set` swaps only its head, so later mutations never
   leak between parent, child, or siblings. Done in one chokepoint — `galloc` —
   so `spawn`, `spawn detached`, and `spawn` inside a `scope:` all inherit
-  uniformly. Spawned from a native thread (`main`, no current `G`), the child
-  starts empty.
+  uniformly. Spawned directly from `main`'s native thread, the child inherits the
+  main-thread context chain, so a top-level `cv.set` before `spawn` is visible to
+  the child (the snapshot source mirrors `get`/`set`, not a special-cased empty).
 - **`scope:` does not itself push or pop context.** A `scope:` body runs in the
   current coroutine and sees/mutates its own context directly; its spawned
   children snapshot at spawn. Restoring an outer value on scope exit —

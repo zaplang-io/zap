@@ -6231,6 +6231,12 @@ void zap_race_wg_acquire(void *wg);
 void zap_race_once_release(void *once);
 void zap_race_once_acquire(void *once);
 
+/* Context head for code running on `main`'s native thread (no coroutine `G`):
+ * a single process-wide chain (#1237). Declared here so `galloc` can snapshot it
+ * into a coroutine spawned directly from `main`; defined (and GC-rooted) with the
+ * other context code below. */
+static void *zap_main_coctx;
+
 static G *galloc(void *fn, void *arg) {
     size_t ss = zap_stack_size();
     G *g = NULL;
@@ -6260,13 +6266,15 @@ static G *galloc(void *fn, void *arg) {
     g->shadow_head = NULL; /* precise GC (#48): a fresh G has an empty chain */
     g->race_gid = -1;      /* unassigned until the race engine first sees it */
     /* Coroutine-local context (#1237): a spawned child inherits a SNAPSHOT of
-     * the spawning coroutine's current context (Python `copy_context`); spawned
-     * from a native thread (no current G), it starts empty. Every spawn form
-     * (root / scoped / detached) funnels through here, so this is the one place
-     * the parent->child context edge is made. The list is immutable, so sharing
-     * the head pointer is a safe snapshot — the child's own `set` prepends a new
-     * head without mutating the shared tail. */
-    g->coctx = (cur_m && cur_m->current) ? cur_m->current->coctx : NULL;
+     * the spawning context's current head (Python `copy_context`). Spawned from a
+     * coroutine, that is the parent G's head; spawned from `main`'s native thread
+     * (no current G), it is the main-thread chain (`zap_main_coctx`) — so a
+     * top-level `cv.set` before `spawn` is visible to the child. This mirrors
+     * `zap_ctx_head`. Every spawn form (root / scoped / detached) funnels through
+     * here, so this is the one place the parent->child context edge is made. The
+     * list is immutable, so sharing the head pointer is a safe snapshot — the
+     * child's own `set` prepends a new head without mutating the shared tail. */
+    g->coctx = (cur_m && cur_m->current) ? cur_m->current->coctx : zap_main_coctx;
     zap_ctx_make(&g->ctx, g->stack, g->stack_size, g_bootstrap);
     all_add(g);
     return g;
@@ -7374,11 +7382,10 @@ void zap_spawn_scoped(void *fn_, void *arg, void *scope_, const char *name) {
  * always kept alive and forwarded — the D-0078 §4.4 invariant, without boxing.
  * ======================================================================== */
 
-/* Context head for code running on `main`'s native thread (no coroutine `G`):
- * a single process-wide chain. Registered as a precise-GC root in
- * `zap_gc_register_statics` so its nodes are traced; under Boehm the static data
- * segment is scanned conservatively anyway. */
-static void *zap_main_coctx;
+/* `zap_main_coctx` (the main-thread context head) is declared above `galloc`
+ * so a spawn from `main` can snapshot it; it is registered as a precise-GC root
+ * in `zap_gc_register_statics` so its nodes are traced (under Boehm the static
+ * data segment is scanned conservatively anyway). */
 
 typedef struct ZapCtxVar {
     void *name;         /* ZapStr* — the variable's name (diagnostics)          */
