@@ -12860,6 +12860,25 @@ def main():
                 .iter()
                 .any(|e| e.code == ErrorCode::ZAP5122)
         );
+
+        // A method call is a non-free-function callee, so a `*`-spread into a
+        // variadic STRUCT METHOD is still rejected in this version (#597). The
+        // #1218 fix makes the *positional* variadic method call collect its
+        // arguments correctly; enabling the spread form on methods is a separate
+        // language-surface decision (it would relax this gate), so the current
+        // contract is pinned here as intent documentation.
+        assert!(errors(
+            "struct C:\n    \
+             int64 k\n\n    \
+             def count(self, int64... args) -> int64:\n        \
+             return len(args)\n\n\
+             def main():\n    \
+             auto c = C(0)\n    \
+             auto xs = [1, 2]\n    \
+             auto n = c.count(*xs)\n"
+        )
+        .iter()
+        .any(|e| e.code == ErrorCode::ZAP5122));
     }
 
     #[test]
