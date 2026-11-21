@@ -275,6 +275,13 @@ struct Mono<'a> {
     /// Type-parameter substitution for the declaration currently being rewritten
     /// (empty for non-generic top-level code).
     cur_subst: HashMap<String, Type>,
+    /// Associated-type projections for the declaration currently being rewritten
+    /// (#1207): `"T.Out" -> <concrete binding>` for each bounded type parameter
+    /// whose generic-interface bound declares an associated type, resolved to the
+    /// concrete argument's producing-method return. Consulted by [`apply_subst`]
+    /// so a `T.Out` annotation in a specialized signature becomes the concrete
+    /// type before codegen. Empty when no bound contributes a projection.
+    cur_proj: HashMap<String, Type>,
     /// The enclosing generic instance (its name + concrete args), used to resolve
     /// a bare `Self.Variant` (`Optional.Some`/`Optional.None`) inside a generic
     /// method body to the current instantiation.
@@ -474,16 +481,53 @@ fn optional_payload_ty(expected: Option<&Type>) -> Option<Type> {
 /// receiver (`self`, parameter 0) is ignored — it is the differing
 /// concrete/interface type — so the remaining parameter types are compared
 /// pairwise and the return type is compared, by structural type identity
-/// (primitive aliases canonicalized).
-fn method_sig_matches(have: &Function, want: &MethodSig) -> bool {
+/// (primitive aliases canonicalized). The interface's associated types are
+/// treated as **free variables** the conformer binds (#1207): a `want` position
+/// typed as a bare associated-type name (listed in `assoc`) matches any concrete
+/// `have` type, and repeated occurrences must bind consistently. With `assoc`
+/// empty this is plain structural equality.
+fn method_conforms(have: &Function, want: &MethodSig, assoc: &[&str]) -> bool {
     let hp = have.params.get(1..).unwrap_or(&[]);
     let wp = want.params.get(1..).unwrap_or(&[]);
-    hp.len() == wp.len()
-        && hp
-            .iter()
-            .zip(wp.iter())
-            .all(|(a, b)| opt_type_eq(a.ty.as_ref(), b.ty.as_ref()))
-        && opt_type_eq(have.ret.as_ref(), want.ret.as_ref())
+    if hp.len() != wp.len() {
+        return false;
+    }
+    let mut binds: HashMap<&str, &Type> = HashMap::new();
+    for (a, b) in hp.iter().zip(wp.iter()) {
+        if !ty_opt_conforms(a.ty.as_ref(), b.ty.as_ref(), assoc, &mut binds) {
+            return false;
+        }
+    }
+    ty_opt_conforms(have.ret.as_ref(), want.ret.as_ref(), assoc, &mut binds)
+}
+
+/// Structural match of a concrete type `have` against a `want` that may name an
+/// associated type (#1207). A bare `want` named in `assoc` binds to `have`
+/// (consistency-checked across occurrences); everything else is `type_eq`.
+fn ty_opt_conforms<'t>(
+    have: Option<&'t Type>,
+    want: Option<&'t Type>,
+    assoc: &[&str],
+    binds: &mut HashMap<&'t str, &'t Type>,
+) -> bool {
+    match (have, want) {
+        (None, None) => true,
+        (Some(h), Some(w)) => {
+            if let Type::Named { name, args, .. } = w {
+                if args.is_empty() && assoc.contains(&name.as_str()) {
+                    return match binds.get(name.as_str()) {
+                        Some(prev) => type_eq(prev, h),
+                        None => {
+                            binds.insert(name.as_str(), h);
+                            true
+                        }
+                    };
+                }
+            }
+            type_eq(h, w)
+        }
+        _ => false,
+    }
 }
 
 /// A compiler-known **capability interface** (D-0139): the adjectival vocabulary
@@ -626,6 +670,7 @@ impl<'a> Mono<'a> {
             src_items: module.items.clone(),
             span: module.span,
             cur_subst: HashMap::new(),
+            cur_proj: HashMap::new(),
             cur_self: None,
             cur_ret: None,
         };
@@ -907,6 +952,12 @@ impl Mono<'_> {
                 // renaming both key on the bare prelude name.
                 let name = zapc_syntax::seam::seam_generic_bare_type(name).unwrap_or(name.as_str());
                 if args.is_empty() {
+                    // An associated-type projection `T.Out` (#1207) resolves to
+                    // the concrete binding computed for this instance, before the
+                    // plain type-parameter substitution (so `T` alone still maps).
+                    if let Some(bound) = self.cur_proj.get(name) {
+                        return bound.clone();
+                    }
                     if let Some(concrete) = self.cur_subst.get(name) {
                         return concrete.clone();
                     }
@@ -1220,6 +1271,15 @@ impl Mono<'_> {
             // `iface_args` (#1205); a refined supertype carries its own, so its
             // signatures are matched verbatim (generic supertypes are deferred).
             let subst_here = origin == iface && !iface_subst.is_empty();
+            // The direct interface's associated types are free variables the
+            // conformer *binds* structurally (#1207): a method position typed as
+            // one matches any concrete type (consistently). A supertype carries
+            // none in the MVP.
+            let assoc: Vec<&str> = if origin == iface {
+                idef.assoc_types.iter().map(|a| a.name.as_str()).collect()
+            } else {
+                Vec::new()
+            };
             for im in &idef.methods {
                 let want = if subst_here {
                     subst_method_sig(im, &iface_subst)
@@ -1229,7 +1289,7 @@ impl Mono<'_> {
                 let im = &want;
                 match methods.iter().find(|m| m.name == im.name) {
                     None => reasons.push(format!("missing method '{}'{attr}", im.name)),
-                    Some(cm) if !method_sig_matches(cm, im) => reasons.push(format!(
+                    Some(cm) if !method_conforms(cm, im, &assoc) => reasons.push(format!(
                         "method '{}' has a mismatched signature{attr}",
                         im.name
                     )),
@@ -1531,6 +1591,17 @@ impl Mono<'_> {
         }
         let mangled = self.mangle_name(generic, args);
         let subst = self.subst_map(generic, args);
+        // Associated-type projections from the type's own bounded parameters
+        // (#1207), so a `T.Out` in a field/method signature resolves.
+        let type_generics: &[TypeParam] = if let Some(s) = self.gstructs.get(generic) {
+            &s.generics
+        } else if let Some(e) = self.genums.get(generic) {
+            &e.generics
+        } else {
+            &[]
+        };
+        let proj = self.build_proj(type_generics, args);
+        let saved_proj = std::mem::replace(&mut self.cur_proj, proj);
         // The receiver type used for inference is the *generic form*
         // (`Optional[int64]`), so method/variant/pattern lookups resolve against
         // the generic declaration and re-derive the instance; the specialized
@@ -1603,6 +1674,7 @@ impl Mono<'_> {
 
         self.cur_subst = saved_subst;
         self.cur_self = saved_self;
+        self.cur_proj = saved_proj;
         Ok(())
     }
 
@@ -1815,6 +1887,44 @@ impl Mono<'_> {
 // ---------------------------------------------------------------------------
 
 impl<'a> Mono<'a> {
+    /// The associated-type projections contributed by `generics`/`args` at an
+    /// instantiation (#1207): for each type parameter bounded on a generic
+    /// interface that declares associated types, map `"<param>.<assoc>"` to the
+    /// concrete argument's binding. Empty when no bound contributes.
+    fn build_proj(&self, generics: &[TypeParam], args: &[Type]) -> HashMap<String, Type> {
+        let mut proj = HashMap::new();
+        for (p, arg) in generics.iter().zip(args.iter()) {
+            let Some(Type::Named { name: iface, .. }) = &p.bound else {
+                continue;
+            };
+            let Some(idef) = self.interfaces.get(iface.as_str()) else {
+                continue;
+            };
+            for at in &idef.assoc_types {
+                if let Some(binding) = self.assoc_binding(idef, &at.name, arg) {
+                    proj.insert(format!("{}.{}", p.name, at.name), binding);
+                }
+            }
+        }
+        proj
+    }
+
+    /// The concrete binding of associated type `assoc` of interface `idef` on the
+    /// concrete type `arg` (#1207): find the interface's *producer* method — the
+    /// one whose declared return type is exactly `assoc` — and read the concrete
+    /// type's method of that name's return type. `None` when the interface has no
+    /// such producer method or the concrete type does not provide it (the
+    /// non-conformance is reported separately by the bound check).
+    fn assoc_binding(&self, idef: &InterfaceDef, assoc: &str, arg: &Type) -> Option<Type> {
+        let producer = idef.methods.iter().find(|m| {
+            matches!(&m.ret, Some(Type::Named { name, args, .. }) if name == assoc && args.is_empty())
+        })?;
+        let Type::Named { name: cname, .. } = arg else {
+            return None;
+        };
+        self.find_method(cname, &producer.name)?.ret.clone()
+    }
+
     /// Find a method named `name` declared on the type `owner` (generic or not).
     fn find_method(&self, owner: &str, name: &str) -> Option<&'a Function> {
         if let Some(s) = self.structs.get(owner) {
@@ -1846,10 +1956,13 @@ impl<'a> Mono<'a> {
         for (p, a) in f.generics.iter().zip(args.iter()) {
             subst.insert(p.name.clone(), a.clone());
         }
+        let proj = self.build_proj(&f.generics, args);
         let saved_subst = std::mem::replace(&mut self.cur_subst, subst);
+        let saved_proj = std::mem::replace(&mut self.cur_proj, proj);
         let saved_self = self.cur_self.take();
         let spec = self.rewrite_fn_inner(f, None, Some(mangled));
         self.cur_subst = saved_subst;
+        self.cur_proj = saved_proj;
         self.cur_self = saved_self;
         self.spec_funcs.push(spec?);
         Ok(())
@@ -1886,12 +1999,25 @@ impl<'a> Mono<'a> {
             args: mi.owner_args.clone(),
             span: self.span,
         };
+        // Associated-type projections from the owner's bounded parameters and the
+        // method's own (#1207).
+        let owner_generics: &[TypeParam] = if let Some(s) = self.gstructs.get(mi.owner.as_str()) {
+            &s.generics
+        } else if let Some(e) = self.genums.get(mi.owner.as_str()) {
+            &e.generics
+        } else {
+            &[]
+        };
+        let mut proj = self.build_proj(owner_generics, &mi.owner_args);
+        proj.extend(self.build_proj(&method.generics, &mi.targs));
         let saved_subst = std::mem::replace(&mut self.cur_subst, subst);
+        let saved_proj = std::mem::replace(&mut self.cur_proj, proj);
         let saved_self = self
             .cur_self
             .replace((mi.owner.clone(), mi.owner_args.clone()));
         let spec = self.rewrite_fn_inner(method, Some(self_ty), Some(method_spec));
         self.cur_subst = saved_subst;
+        self.cur_proj = saved_proj;
         self.cur_self = saved_self;
         let owner_mangled = self.instance_name(&mi.owner, &mi.owner_args);
         self.spec_methods
@@ -4404,6 +4530,66 @@ mod tests {
         assert!(
             msg.contains("does not satisfy the bound 'Scaler[float64, Bad]'")
                 && msg.contains("of type 'Pipe'"),
+            "got: {msg}"
+        );
+    }
+
+    // ---- associated / output types (#1207) --------------------------------
+    //
+    // An interface may declare `type Out`; a conformer binds it structurally (by
+    // the return of the method the interface declares as its producer). At each
+    // instantiation the projection `T.Out` in a specialized signature resolves to
+    // that concrete binding, before codegen sees it.
+
+    const PRODUCER: &str = "interface Producer[In]:\n    type Out\n    def make(self, In seed) -> Out\n\
+         struct Widget:\n    int64 n\n\
+         struct Factory:\n    int64 base\n    def make(self, f64 seed) -> Widget:\n        return Widget(n=self.base)\n\
+         struct Mute:\n    int64 n\n";
+
+    #[test]
+    fn associated_type_projection_resolves_to_concrete_binding() {
+        // `build[Factory]`: the return `T.Out` resolves to Factory's `make`
+        // return — Widget — in the emitted signature (so codegen sees Widget).
+        let m = mono_ok(&format!(
+            "{PRODUCER}def build[T: Producer[f64]](T f, f64 s) -> T.Out:\n    return f.make(s)\n\
+             def main():\n    Widget w = build(Factory(base=1), 2.0)\n    print(w.n)\n"
+        ));
+        let f = m
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Function(f) if f.name == "build$Factory" => Some(f),
+                _ => None,
+            })
+            .expect("build$Factory emitted");
+        assert_eq!(
+            type_name(f.ret.as_ref().expect("a declared return")),
+            "Widget",
+            "the T.Out projection resolves to the concrete binding"
+        );
+    }
+
+    #[test]
+    fn associated_type_conformer_accepted() {
+        // Factory provides `make(self, f64) -> Widget`, binding Out := Widget, so
+        // it satisfies `Producer[f64]`.
+        let m = mono_ok(&format!(
+            "{PRODUCER}def use[T: Producer[f64]](T f) -> int64:\n    return 0\n\
+             def main():\n    print(use(Factory(base=1)))\n"
+        ));
+        assert!(fn_names(&m).iter().any(|n| n == "use$Factory"));
+    }
+
+    #[test]
+    fn associated_type_non_conformer_rejected() {
+        // Mute lacks `make`, so it does not satisfy `Producer[f64]`.
+        let msg = mono_err(&format!(
+            "{PRODUCER}def use[T: Producer[f64]](T f) -> int64:\n    return 0\n\
+             def main():\n    print(use(Mute(n=1)))\n"
+        ));
+        assert!(
+            msg.contains("does not satisfy the bound 'Producer[float64]'")
+                && msg.contains("missing method 'make'"),
             "got: {msg}"
         );
     }

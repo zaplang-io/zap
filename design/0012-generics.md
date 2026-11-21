@@ -324,10 +324,18 @@ def max_of[T: Ord](list[T] xs) -> T:    # body may call __cmp__; nothing else
   typed by the interface's substituted signature (result `T`), and at each
   instantiation the parameter is substituted into the bound before the #1205
   conformance check. A wrong argument count is `ZAP4084` at the definition.
-- **Deferred:** multiple bounds per param (`[T: Add + Ord]`), where-clauses, and
-  associated / output types (`type Out`, #1207). Single interface bound per
-  param (generic or not, and now parameter-referencing) is the v1-of-bounds
-  surface.
+- **Associated / output types (#1207, realized).** An interface may declare an
+  associated type with `type Out` and name it in its method signatures; a
+  conformer binds it structurally (by the producing method's return), and
+  bounded generic code names it as the dotted type projection `T.Out`
+  (`def build[T: Producer[f64]](T f, f64 s) -> T.Out`). At monomorphization the
+  projection resolves to the concrete binding. Deferred within this: an
+  associated type produced by more than one method (consistency check), a
+  declared default/bound on it, and migrating the prelude operator capabilities
+  to the `RMul[L]` + `type Out` form.
+- **Deferred:** multiple bounds per param (`[T: Add + Ord]`) and where-clauses.
+  Single interface bound per param (generic, parameter-referencing, or with an
+  associated output type) is the v1-of-bounds surface.
 
 ### Fork X — Interaction with existing machinery
 

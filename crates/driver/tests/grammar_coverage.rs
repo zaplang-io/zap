@@ -260,6 +260,10 @@ def f():
     cov("method_sig",        Compiles , r#"interface I:
     def m(self) -> int64
 "#),
+    cov("assoc_type",        Compiles , r#"interface P[In]:
+    type Out
+    def make(self, In seed) -> Out
+"#),
     cov("enum_def",          Compiles , r#"enum Color:
     Red
     Green

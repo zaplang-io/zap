@@ -1752,6 +1752,7 @@ impl Checker {
                 InterfaceInfo {
                     // The built-in capability interfaces are not generic.
                     generics: Vec::new(),
+                    assoc_types: Vec::new(),
                     methods: method
                         .into_iter()
                         .map(|(n, s)| (n.to_string(), s))
@@ -1791,13 +1792,20 @@ impl Checker {
         // as a `Ty::Named(param)` type variable (substitutable at conformance),
         // rather than resolving to the opaque `Ty::Unknown` of an unknown name.
         let generics: Vec<String> = i.generics.iter().map(|g| g.name.clone()).collect();
+        let assoc_types: Vec<String> = i.assoc_types.iter().map(|a| a.name.clone()).collect();
+        // Both the type parameters and the associated types are type variables
+        // inside the interface's own method signatures (#1205/#1207): `-> Out`
+        // keeps `Out` as `Ty::Named("Out")` so conformance can bind it and
+        // bounded code can project it.
+        let mut in_scope = generics.clone();
+        in_scope.extend(assoc_types.iter().cloned());
         let methods = i
             .methods
             .iter()
             .map(|m| {
                 (
                     m.name.clone(),
-                    self.sig_of_method_sig(m, &i.name, &generics),
+                    self.sig_of_method_sig(m, &i.name, &in_scope),
                 )
             })
             .collect();
@@ -1815,6 +1823,7 @@ impl Checker {
             .collect();
         InterfaceInfo {
             generics,
+            assoc_types,
             methods,
             supertypes,
         }
@@ -2162,18 +2171,38 @@ impl Checker {
     /// `args` (a non-generic interface, or a bare bound) returns `sig` unchanged.
     /// A supertype method's signature contains none of `iname`'s own parameter
     /// names, so substituting across it is a safe no-op.
-    fn subst_iface_sig(&self, iname: &str, args: &[Ty], sig: &FnSig) -> FnSig {
-        let subst: HashMap<&str, &Ty> = self
-            .interfaces
-            .get(iname)
-            .map(|info| {
-                info.generics
-                    .iter()
-                    .map(|s| s.as_str())
-                    .zip(args.iter())
-                    .collect()
-            })
-            .unwrap_or_default();
+    /// `receiver` (the bounded parameter's name, e.g. `"T"`) additionally
+    /// projects each of the interface's associated types to `Ty::Named("T.Out")`
+    /// (#1207), so a call through the parameter whose interface method returns an
+    /// associated type is typed as that projection. `None` (an interface value)
+    /// leaves associated types unprojected.
+    fn subst_iface_sig(
+        &self,
+        iname: &str,
+        args: &[Ty],
+        receiver: Option<&str>,
+        sig: &FnSig,
+    ) -> FnSig {
+        let Some(info) = self.interfaces.get(iname) else {
+            return sig.clone();
+        };
+        // Owned projection types, so the borrowed `&Ty` substitution map below
+        // can reference them alongside the bound arguments.
+        let projections: Vec<(String, Ty)> = match receiver {
+            Some(recv) => info
+                .assoc_types
+                .iter()
+                .map(|a| (a.clone(), Ty::Named(format!("{recv}.{a}"))))
+                .collect(),
+            None => Vec::new(),
+        };
+        let mut subst: HashMap<&str, &Ty> = HashMap::new();
+        for (p, a) in info.generics.iter().zip(args.iter()) {
+            subst.insert(p.as_str(), a);
+        }
+        for (name, ty) in &projections {
+            subst.insert(name.as_str(), ty);
+        }
         if subst.is_empty() {
             sig.clone()
         } else {
@@ -2960,10 +2989,28 @@ impl Checker {
                         return self.resolve_type(&expanded);
                     }
                     if self.user_types.contains(other) {
-                        Ty::Named(other.to_string())
-                    } else {
-                        Ty::Unknown
+                        return Ty::Named(other.to_string());
                     }
+                    // An associated-type projection `T.Out` (#1207): a bounded
+                    // type parameter `T` in scope whose bound interface declares
+                    // the associated type `Out`. Kept as the `Ty::Named("T.Out")`
+                    // projection variable (mono resolves it to the concrete
+                    // binding at instantiation). Any other dotted/unknown name
+                    // stays `Unknown` as before.
+                    if args.is_empty() {
+                        if let Some((base, proj)) = other.split_once('.') {
+                            if let Some(b) = self.tyvar_bounds.get(base) {
+                                if self
+                                    .interfaces
+                                    .get(&b.iface)
+                                    .is_some_and(|i| i.assoc_types.iter().any(|a| a == proj))
+                                {
+                                    return Ty::Named(other.to_string());
+                                }
+                            }
+                        }
+                    }
+                    Ty::Unknown
                 }
             },
             Type::Tuple { elems, .. } => {
@@ -4017,12 +4064,6 @@ impl Checker {
         }
         self.check_param_shape(&f.params);
         self.push_scope();
-        let new_ret = f
-            .ret
-            .as_ref()
-            .map(|t| self.resolve_type(t))
-            .unwrap_or(Ty::Unit);
-        let saved = std::mem::replace(&mut self.ret_ty, new_ret);
         // Interface bounds on this declaration's own type parameters (I#164,
         // slice 5): record `T -> Iface` for each `T: Iface` whose bound names a
         // known interface, so that inside the body a method call on a value of a
@@ -4056,6 +4097,15 @@ impl Checker {
         for (name, bound) in own_bounds {
             self.tyvar_bounds.insert(name, bound);
         }
+        // Resolve the declared return type now that the bounds are in scope, so a
+        // `-> T.Out` associated-type projection (#1207) resolves to its type
+        // variable rather than the opaque `Unknown` of an unknown name.
+        let new_ret = f
+            .ret
+            .as_ref()
+            .map(|t| self.resolve_type(t))
+            .unwrap_or(Ty::Unit);
+        let saved = std::mem::replace(&mut self.ret_ty, new_ret);
         // Generator validation (I#67, D-0026/D-0048): a `def` whose body contains
         // `yield` is a generator and returns an `Iterator`. Free functions,
         // struct methods, and tier-3 (data-carrying) enum methods may be
@@ -7982,8 +8032,15 @@ impl Checker {
                         // parametrized bound, substitute the interface's type
                         // parameters by the bound's arguments (#1206) so the
                         // call's result is typed precisely (e.g. `Out := T`).
+                        // For a bounded type parameter, an interface method that
+                        // returns an associated type projects to `T.Out` (#1207);
+                        // an interface value has no projection receiver.
+                        let receiver = if is_iface { None } else { Some(tn.as_str()) };
                         let ret = match self.iface_method(&iname, name) {
-                            Some(sig) => self.subst_iface_sig(&iname, &bound_args, &sig).ret,
+                            Some(sig) => {
+                                self.subst_iface_sig(&iname, &bound_args, receiver, &sig)
+                                    .ret
+                            }
                             None => {
                                 let what = if is_iface {
                                     format!("interface '{tn}' has no method '{name}'")
@@ -15625,6 +15682,76 @@ def main():
         ok(&format!(
             "{DISPLAY_IFACE}def announce[T: Display](T x) -> str:\n    return x.show()\n\n\
              def main():\n    print(announce(Greeter(msg=\"hi\")))\n"
+        ));
+    }
+
+    // --- associated / output types (#1207) ----------------------------------
+    //
+    // An interface may declare an associated type `type Out`; a conformer binds
+    // it structurally (by the producing method's return), and bounded generic
+    // code names it as the projection `T.Out`. The instantiation-time binding
+    // resolution lives in mono (mono unit tests + a golden); these host tests
+    // pin the sema surface.
+
+    const PRODUCER_IFACE: &str =
+        "interface Producer[In]:\n    type Out\n    def make(self, In seed) -> Out\n\n\
+        struct Widget:\n    int64 n\n\n\
+        struct Factory:\n    int64 base\n\
+        \x20   def make(self, f64 seed) -> Widget:\n        return Widget(n=self.base)\n\n";
+
+    #[test]
+    fn interface_records_associated_types() {
+        // `type Out` is recorded on the interface, and the method that returns it
+        // keeps `Out` as a type variable (not erased to Unknown).
+        let c = checker_with_types(PRODUCER_IFACE);
+        let info = c.interfaces.get("Producer").expect("Producer registered");
+        assert_eq!(info.assoc_types, vec!["Out".to_string()]);
+        let (_, make) = info.methods.iter().find(|(n, _)| n == "make").unwrap();
+        assert_eq!(make.ret, Ty::Named("Out".to_string()));
+    }
+
+    #[test]
+    fn associated_type_projection_return_type_checks() {
+        // `-> T.Out` and the body `return f.make(s)` agree: the call through the
+        // bounded parameter projects the associated type to `T.Out`, which is
+        // exactly the declared return.
+        ok(&format!(
+            "{PRODUCER_IFACE}def build[T: Producer[f64]](T f, f64 s) -> T.Out:\n    return f.make(s)\n\n\
+             def main():\n    print(1)\n"
+        ));
+    }
+
+    #[test]
+    fn associated_type_projection_is_a_real_type_not_unknown() {
+        // The projected call result is `T.Out`, not `Unknown`: declaring a `f64`
+        // return but returning `f.make(s)` (type `T.Out`) is a type error. This
+        // distinguishes #1207 from the call typing loosely.
+        let m = msgs(&format!(
+            "{PRODUCER_IFACE}def build[T: Producer[f64]](T f, f64 s) -> f64:\n    return f.make(s)\n\n\
+             def main():\n    print(1)\n"
+        ));
+        assert!(
+            !m.is_empty(),
+            "returning a T.Out where f64 is declared must error"
+        );
+    }
+
+    #[test]
+    fn associated_type_used_only_inside_the_interface() {
+        // An interface may declare and use an associated type purely in its own
+        // signatures; this registers and type-checks at definition.
+        ok("interface Seq:\n    type Elem\n    def head(self) -> Elem\n    def tail(self) -> Elem\n\n\
+            def main():\n    print(1)\n");
+    }
+
+    #[test]
+    fn associated_type_name_in_scope_resolves_only_under_its_bound() {
+        // `T.Out` resolves to the projection only when `T` is bounded on an
+        // interface that declares `Out`. A projection on an unbounded parameter
+        // is just an unknown type (opaque), never a crash.
+        ok(&format!(
+            "{PRODUCER_IFACE}def ignore[T](T x) -> int64:\n    return 0\n\n\
+             def main():\n    print(1)\n"
         ));
     }
 
