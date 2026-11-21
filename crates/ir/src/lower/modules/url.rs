@@ -189,12 +189,14 @@ fn plain_call(lowerer: &mut FnLower, func: &str, args: Vec<Value>, ret: Ty) -> (
 
 /// `url.unquote(s[, errors])` / `url.unquote_plus(s[, errors])` (#1242). The
 /// `errors` keyword selects the UTF-8 decode mode for the percent-decoded octets
-/// ("strict" — the default — raises a catchable error on invalid UTF-8 like
-/// `str(bytes)`; "replace" substitutes U+FFFD). Both forms are emitted as
-/// throwing calls: strict mode can raise a `ValueError`, and an unrecognized
-/// `errors` name raises a `LookupError`. When `errors` is omitted the seam binder
-/// leaves the trailing slot absent, so we fall back to the one-arg entry point
-/// (which is itself the strict decode — identical to `errors="strict"`).
+/// ("replace" — the default — substitutes U+FFFD for invalid UTF-8, Python
+/// `urllib.parse.unquote` parity; "strict" raises a catchable error on invalid
+/// UTF-8 like `str(bytes)`). When `errors` is omitted the seam binder leaves the
+/// trailing slot absent, so we fall back to the one-arg entry point — itself the
+/// replace decode, identical to `errors="replace"`. That default path never
+/// raises, so it is a plain call; the `errors=`-bearing form is a throwing call
+/// because `errors="strict"` can raise a `ValueError` and an unrecognized
+/// `errors` name raises a `LookupError`.
 fn lower_unquote(
     lowerer: &mut FnLower,
     args: &[ast::Arg],
@@ -216,7 +218,11 @@ fn lower_unquote(
         } else {
             "zap_url_unquote"
         };
-        lowerer.throwing_call(Some(d), func, vec![s]);
+        lowerer.emit(Inst::Call {
+            dest: Some(d),
+            func: func.to_string(),
+            args: vec![s],
+        });
     }
     Ok((d, Ty::Ptr))
 }

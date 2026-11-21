@@ -15,9 +15,10 @@
 //! - `url.unquote(s[, errors]) -> str` — inverse of `quote`: decode `%XX` (hex
 //!   case-insensitive); a `+` stays literal; a malformed/truncated `%` escape
 //!   passes through unchanged. The optional `errors` str ("strict" | "replace",
-//!   default "strict", #1242) controls UTF-8 handling of the decoded octets:
-//!   "strict" raises a catchable error on invalid UTF-8 (like `str(bytes)`),
-//!   "replace" substitutes U+FFFD for each maximal invalid subpart.
+//!   default "replace", #1242) controls UTF-8 handling of the decoded octets:
+//!   "replace" (the default, Python `unquote` parity) substitutes U+FFFD for
+//!   each maximal invalid subpart; "strict" raises a catchable error on invalid
+//!   UTF-8 (like `str(bytes)`).
 //! - `url.unquote_plus(s[, errors]) -> str` — like `unquote` but also `+` ->
 //!   space, for `application/x-www-form-urlencoded` query values.
 //! - `url.encode_query(d: dict[str,str]) -> str` — build `k=v&...` with every

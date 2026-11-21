@@ -49,7 +49,7 @@ listed here (see [`README.md`](README.md)).
 | [1158](stdlib/1158-connect-deadline-kwargs.md) | net bounded-dial deadline parameter name — deadline_ns (kwargs-enabled) | Locked | 2026-11-20 |
 | [1159](stdlib/1159-netport-unix.md) | net.port raises ValueError on a Unix-domain socket | Locked | 2026-11-20 |
 | [1171](stdlib/1171-system-local-zone.md) | stdlib datetime — expose the system local zone as a reusable TimeZone | Accepted | 2026-11-20 |
-| [1242](stdlib/1242-url-unquote-errors.md) | url.unquote errors mode — strict (default) | replace, over a UTF-8 replacement decode path | Proposed | 2026-11-21 |
+| [1242](stdlib/1242-url-unquote-errors.md) | url.unquote errors mode — replace (default) | strict, over a UTF-8 replacement decode path | Accepted | 2026-11-21 |
 
 ## runtime
 

@@ -350,11 +350,12 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("url", "quote", &["s"]),
     ("url", "quote_path", &["s"]),
     // `unquote`/`unquote_plus` take an optional trailing `errors` ("strict" |
-    // "replace") controlling UTF-8 handling of the decoded octets (#1242). It is
-    // a trailing optional — omitting it (the common case) binds nothing and keeps
-    // the one-arg strict decode. Recommended to be keyword-only pending maintainer
-    // review (Python `unquote(string, encoding, errors)` style); the seam registry
-    // has no keyword-only marker yet, so it is positional-or-keyword for now.
+    // "replace", default "replace") controlling UTF-8 handling of the decoded
+    // octets (#1242). It is a trailing optional — omitting it (the common case)
+    // binds nothing and keeps the one-arg default (replace) decode. Recommended
+    // to be keyword-only pending maintainer review (Python `unquote(string,
+    // encoding, errors)` style); the seam registry has no keyword-only marker
+    // yet, so it is positional-or-keyword for now.
     ("url", "unquote", &["s", "errors"]),
     ("url", "unquote_plus", &["s", "errors"]),
     ("url", "encode_query", &["d"]),

@@ -110,10 +110,11 @@ static void *zap_url_decode(void *sp, int plus) {
  *   mode 0 "strict"  — validate as well-formed UTF-8 and raise a catchable
  *                      ValueError on any invalid sequence, exactly as
  *                      `str(bytes)` does (surrogates / overlong / out-of-range
- *                      all rejected). This is the default `url.unquote`.
+ *                      all rejected).
  *   mode 1 "replace" — substitute U+FFFD for each maximal invalid subpart
  *                      (`zap_utf8_decode_replace`), so a lenient W3C-baggage
- *                      decode never raises.
+ *                      decode never raises. This is the default `url.unquote`
+ *                      (Python `urllib.parse.unquote` parity).
  * The `%`-escape handling itself stays lenient in BOTH modes (a malformed `%`
  * is left literal); only the UTF-8 validity of the decoded octets differs. */
 static void *zap_url_decode_mode(void *sp, int plus, int mode) {
@@ -148,9 +149,10 @@ static int zap_url_errmode(void *errors_sp) {
     return 0; /* unreachable: zap_panic_typed unwinds */
 }
 
-/* `url.unquote(s)` / `url.unquote_plus(s)` — default (strict) decode. */
-void *zap_url_unquote(void *sp) { return zap_url_decode_mode(sp, 0, 0); }
-void *zap_url_unquote_plus(void *sp) { return zap_url_decode_mode(sp, 1, 0); }
+/* `url.unquote(s)` / `url.unquote_plus(s)` — default (replace) decode: invalid
+ * UTF-8 in the decoded octets becomes U+FFFD and never raises (Python parity). */
+void *zap_url_unquote(void *sp) { return zap_url_decode_mode(sp, 0, 1); }
+void *zap_url_unquote_plus(void *sp) { return zap_url_decode_mode(sp, 1, 1); }
 
 /* `url.unquote(s, errors=...)` / `url.unquote_plus(s, errors=...)` — the decode
  * mode is selected from the `errors` string at runtime (#1242). */

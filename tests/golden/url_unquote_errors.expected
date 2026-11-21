@@ -2,7 +2,7 @@ replace-ok
 valid-ok
 edge-ok
 mixed-ok
+default-replace-ok
 strict-raised
-strict2-raised
 strict-valid-ok
 mode-raised

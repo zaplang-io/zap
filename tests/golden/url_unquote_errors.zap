@@ -1,12 +1,13 @@
 # Golden fixture: url.unquote / url.unquote_plus `errors` mode (#1242).
 #
-# The percent decoder interprets the decoded octets as UTF-8. `errors="replace"`
-# substitutes U+FFFD for each maximal invalid subpart (matching CPython's
-# `urllib.parse.unquote(errors="replace")` / `bytes.decode("utf-8","replace")`
-# replacement counting), so leniently decoded W3C-baggage values never raise.
-# The default (and `errors="strict"`) validates the decoded octets as UTF-8 and
-# raises a catchable ValueError on any invalid sequence, exactly like
-# `str(bytes)`; an unrecognized `errors` name raises a catchable LookupError.
+# The percent decoder interprets the decoded octets as UTF-8. The default,
+# `errors="replace"`, substitutes U+FFFD for each maximal invalid subpart
+# (matching CPython's `urllib.parse.unquote(errors="replace")` /
+# `bytes.decode("utf-8","replace")` replacement counting), so leniently decoded
+# W3C-baggage values never raise. `errors="strict"` instead validates the
+# decoded octets as UTF-8 and raises a catchable ValueError on any invalid
+# sequence, exactly like `str(bytes)`; an unrecognized `errors` name raises a
+# catchable LookupError.
 import url
 
 
@@ -19,8 +20,8 @@ def main():
     print("replace-ok")
 
     # --- valid multibyte UTF-8 passes through unchanged under BOTH modes ---
-    assert url.unquote("%C3%A9") == "é"  # é   (2-byte), strict default
-    assert url.unquote("%C3%A9", errors="replace") == "é"
+    assert url.unquote("%C3%A9", errors="strict") == "é"  # é   (2-byte)
+    assert url.unquote("%C3%A9") == "é"  # default (replace) agrees
     assert url.unquote("%E2%82%AC") == "€"  # €   (3-byte)
     assert url.unquote("%E2%82%AC", errors="replace") == "€"
     assert url.unquote("%F0%9F%98%80") == "\U0001F600"  # 😀  (4-byte)
@@ -41,19 +42,18 @@ def main():
     assert url.unquote_plus("a+b%FF", errors="replace") == "a b�"
     print("mixed-ok")
 
-    # --- strict (the default) raises a catchable ValueError on invalid UTF-8 ---
+    # --- the DEFAULT (no `errors`) is replace (Python `unquote` parity): invalid
+    #     UTF-8 becomes U+FFFD and never raises ---
+    assert url.unquote("A%FFB") == "A�B"
+    assert url.unquote_plus("a+b%FF") == "a b�"
+    print("default-replace-ok")
+
+    # --- `errors="strict"` opts into the raising decode (catchable ValueError) ---
     try:
-        print(url.unquote("A%FFB"))
+        print(url.unquote("%FF", errors="strict"))
         print("strict-NO-RAISE")
     except ValueError:
         print("strict-raised")
-
-    # --- `errors="strict"` named explicitly raises the same way ---
-    try:
-        print(url.unquote("%FF", errors="strict"))
-        print("strict2-NO-RAISE")
-    except ValueError:
-        print("strict2-raised")
 
     # --- strict passes valid multibyte through unchanged (no raise) ---
     assert url.unquote("%E2%82%AC", errors="strict") == "€"

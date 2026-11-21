@@ -1,8 +1,8 @@
 ---
-title: url.unquote errors mode — strict (default) | replace, over a UTF-8 replacement decode path
-status: Proposed
+title: url.unquote errors mode — replace (default) | strict, over a UTF-8 replacement decode path
+status: Accepted
 issue: 1242
-pr:
+pr: 1246
 date: 2026-11-21
 domain: stdlib
 supersedes:
@@ -11,31 +11,31 @@ superseded-by:
 
 # `url.unquote` / `url.unquote_plus` `errors` mode
 
-**Status:** Proposed — **the API surface below is PROVISIONAL and awaits
-maintainer confirmation** (the issue leaves the exact signature and defaults
-open for review). The runtime decode path is the committed part; the keyword
-name, value set and default are the open question (see Rationale).
+**Status:** Accepted — the maintainer reviewed the open signature/default
+question (recorded below) and chose **default `"replace"` (option B, Python
+`urllib.parse.unquote` parity)**.
 
 ## Decision
 
 Add an optional trailing `errors` argument to the percent decoders:
 
 ```zap
-url.unquote(s: str[, errors: str]) -> str          # errors in {"strict","replace"}, default "strict"
+url.unquote(s: str[, errors: str]) -> str          # errors in {"replace","strict"}, default "replace"
 url.unquote_plus(s: str[, errors: str]) -> str      # same; also maps '+' -> space
 ```
 
 backed by a replacement-capable UTF-8 decode of the percent-decoded octets:
 
-- `errors="strict"` (the default) — validate the decoded octets as well-formed
-  UTF-8 and raise a **catchable `ValueError`** on any invalid sequence
-  (surrogates, overlong encodings and code points above U+10FFFF all rejected),
-  exactly as `str(bytes)` does.
-- `errors="replace"` — substitute **U+FFFD** for each *maximal invalid subpart*
-  (Unicode §3.9 best-practice substitution / WHATWG Encoding utf-8 decoder), so
-  a lenient W3C-Baggage value decode never raises. The replacement count matches
-  CPython's `urllib.parse.unquote(errors="replace")` /
-  `bytes.decode("utf-8","replace")` codepoint-for-codepoint.
+- `errors="replace"` (the default) — substitute **U+FFFD** for each *maximal
+  invalid subpart* (Unicode §3.9 best-practice substitution / WHATWG Encoding
+  utf-8 decoder), so a lenient W3C-Baggage value decode never raises. The
+  replacement count matches CPython's `urllib.parse.unquote(errors="replace")` /
+  `bytes.decode("utf-8","replace")` codepoint-for-codepoint. This is also
+  Python's own default for `unquote`.
+- `errors="strict"` — validate the decoded octets as well-formed UTF-8 and raise
+  a **catchable `ValueError`** on any invalid sequence (surrogates, overlong
+  encodings and code points above U+10FFFF all rejected), exactly as
+  `str(bytes)` does.
 - An unrecognized `errors` name raises a **catchable `LookupError`** (as
   CPython's codec machinery does).
 
@@ -87,10 +87,11 @@ Three candidate defaults, for the maintainer to choose:
   for the default, with `"strict"`/`"replace"` opt-in. Downside: keeps a mode
   that yields invalid `str`, which the rest of the language treats as an error.
 
-**Recommendation: (A).** It makes the honest, `str(bytes)`-consistent choice the
-default, breaks nothing in-tree, and still unblocks the otel consumer (which
-passes `errors="replace"` explicitly). If the maintainer prefers Python parity,
-(B) is a one-line default flip in the lowering (omitted → `_e(…, "replace")`).
+The implementer recommended (A); the **maintainer chose (B)** — Python
+`unquote` parity, and the least surprising for existing default callers (the old
+default never raised either, and replace keeps that property while yielding a
+*valid* `str`). The bare (no-`errors`) entry point is therefore the replace
+decode and never raises; `errors="strict"` is the opt-in to raising.
 
 ### Keyword-only recommendation
 
@@ -109,13 +110,13 @@ follow-up and would reuse `zap_utf8_decode_replace` unchanged.
 
 ## Consequences
 
-- Unblocks `zaplang-io/otel#4` (W3C Baggage value decoding) via
-  `url.unquote(v, errors="replace")`.
-- `url.unquote` / `url.unquote_plus` with no `errors` now **raise** on invalid
-  UTF-8 instead of silently passing bytes through (option A). This is the one
-  behavior change; it is surfaced here for maintainer sign-off.
+- Unblocks `zaplang-io/otel#4` (W3C Baggage value decoding): `url.unquote(v)`
+  (or explicit `errors="replace"`) now yields U+FFFD for invalid UTF-8.
+- `url.unquote` / `url.unquote_plus` with no `errors` now return a **valid** `str`
+  (invalid octets → U+FFFD) instead of silently constructing a malformed `str`
+  from raw octets. The default still never raises, so no caller gains a new
+  exception; `errors="strict"` is the explicit opt-in to raising on invalid UTF-8.
 - `str(bytes)` and the `parse_query*` readers are untouched.
-- Follow-ups if the maintainer agrees: (1) make `errors` keyword-only; (2)
-  expose `bytes.decode(encoding="utf-8", errors="strict")` reusing the same
-  replacement primitive; (3) if default (B) is preferred, flip the omitted-arg
-  default.
+- Follow-ups: (1) make `errors` keyword-only (seam registry needs a keyword-only
+  marker); (2) expose `bytes.decode(encoding="utf-8", errors=...)` reusing the
+  same `zap_utf8_decode_replace` primitive.
