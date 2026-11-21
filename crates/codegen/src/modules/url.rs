@@ -24,6 +24,14 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_url_quote_path", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_url_unquote", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_url_unquote_plus", &[p.into()], Some(p.into()));
+    // `errors=`-aware variants (#1242): (str, errors) -> str. Both may raise (a
+    // strict decode on invalid UTF-8, or an unknown `errors` name).
+    cg.declare_rt("zap_url_unquote_e", &[p.into(), p.into()], Some(p.into()));
+    cg.declare_rt(
+        "zap_url_unquote_plus_e",
+        &[p.into(), p.into()],
+        Some(p.into()),
+    );
     // Query builders: dict[str,str] -> str.
     cg.declare_rt("zap_url_encode_query", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_url_canonical_query", &[p.into()], Some(p.into()));

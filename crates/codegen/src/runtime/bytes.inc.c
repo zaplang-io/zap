@@ -137,6 +137,85 @@ static int zap_utf8_valid(const unsigned char *d, int64_t n, int64_t *bad) {
     return 1;
 }
 
+/* UTF-8 decode with U+FFFD substitution of maximal subparts (Unicode §3.9,
+ * "Best Practices for U+FFFD Substitution" / WHATWG Encoding utf-8 decoder).
+ * Each maximal invalid subsequence is replaced by a single U+FFFD (the 3-byte
+ * sequence EF BF BD); well-formed sequences (including surrogate / overlong
+ * rejection, matching `zap_utf8_valid`) pass through verbatim. The result is
+ * therefore always well-formed UTF-8. The replacement COUNT matches CPython's
+ * `bytes.decode("utf-8", "replace")` and `urllib.parse.unquote(errors="replace")`
+ * so decoded W3C-baggage octets agree codepoint-for-codepoint (#1242). Returns a
+ * fresh `str`; never raises. */
+static void *zap_utf8_decode_replace(const unsigned char *d, int64_t n) {
+    /* An invalid byte becomes the 3-byte U+FFFD while a valid byte copies 1:1, so
+     * n*3 is a safe upper bound on the output length (n > 0). */
+    char *out = (char *)zap_buf(n > 0 ? n * 3 : 1);
+    int64_t o = 0;
+    int64_t i = 0;
+    while (i < n) {
+        unsigned char c = d[i];
+        if (c < 0x80) {
+            out[o++] = (char)c;
+            i++;
+            continue;
+        }
+        int w;                  /* total length of a well-formed sequence here */
+        unsigned char lo2, hi2; /* the (restricted) legal range of the 2nd byte */
+        if (c >= 0xC2 && c <= 0xDF) {
+            w = 2, lo2 = 0x80, hi2 = 0xBF;
+        } else if (c == 0xE0) {
+            w = 3, lo2 = 0xA0, hi2 = 0xBF; /* reject the 3-byte overlong range */
+        } else if (c >= 0xE1 && c <= 0xEC) {
+            w = 3, lo2 = 0x80, hi2 = 0xBF;
+        } else if (c == 0xED) {
+            w = 3, lo2 = 0x80, hi2 = 0x9F; /* reject surrogates U+D800..U+DFFF */
+        } else if (c >= 0xEE && c <= 0xEF) {
+            w = 3, lo2 = 0x80, hi2 = 0xBF;
+        } else if (c == 0xF0) {
+            w = 4, lo2 = 0x90, hi2 = 0xBF; /* reject the 4-byte overlong range */
+        } else if (c >= 0xF1 && c <= 0xF3) {
+            w = 4, lo2 = 0x80, hi2 = 0xBF;
+        } else if (c == 0xF4) {
+            w = 4, lo2 = 0x80, hi2 = 0x8F; /* reject code points above U+10FFFF */
+        } else {
+            /* An invalid lead byte (0x80..0xC1 continuation/overlong, 0xF5..0xFF):
+             * one U+FFFD, consume exactly the one byte. */
+            out[o++] = (char)0xEF, out[o++] = (char)0xBF, out[o++] = (char)0xBD;
+            i++;
+            continue;
+        }
+        /* Walk the continuation bytes. The maximal subpart is the lead plus every
+         * continuation that stayed in range; a bad or missing (truncated) byte
+         * ends the subpart WITHOUT being consumed, so it is re-examined next. */
+        int accepted = 1; /* the lead byte is always part of the subpart */
+        int bad = 0;
+        for (int k = 1; k < w; k++) {
+            if (i + k >= n) {
+                bad = 1; /* truncated multibyte sequence */
+                break;
+            }
+            unsigned char cc = d[i + k];
+            unsigned char lo = (k == 1) ? lo2 : 0x80;
+            unsigned char hi = (k == 1) ? hi2 : 0xBF;
+            if (cc < lo || cc > hi) {
+                bad = 1;
+                break;
+            }
+            accepted++;
+        }
+        if (bad) {
+            out[o++] = (char)0xEF, out[o++] = (char)0xBF, out[o++] = (char)0xBD;
+            i += accepted; /* consume only the subpart; the bad byte is re-read */
+            continue;
+        }
+        for (int k = 0; k < w; k++) {
+            out[o++] = (char)d[i + k];
+        }
+        i += w;
+    }
+    return zap_str_adopt(out, o);
+}
+
 /* str(bytes): validate the bytes are well-formed UTF-8 (faulting with a clear
  * error otherwise) and return them as a str. str/bytes share the ZapStr layout,
  * so the result is a fresh str over a copy of the same bytes. */
