@@ -1,0 +1,71 @@
+name: Perf compare (throwaway)
+
+# THROWAWAY: a cross-language wall-clock comparison (Zap vs Go vs Python) on a
+# few small algorithms, so we can eyeball where the #568 codegen work lands Zap
+# relative to C-family AOT (Go) and a bytecode interpreter (CPython). NOT a gate
+# and NOT meant to merge — the standing, machine-independent perf guard lives in
+# crates/driver/tests/perf.rs. Close this PR once the numbers have been read.
+#
+# Runs only when the benchmark files or this workflow change (keeps it off every
+# unrelated PR), plus a manual trigger.
+on:
+  pull_request:
+    paths:
+      - "bench/perf-compare/**"
+      - ".github/workflows/perf-compare.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: perf-compare-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: Zap vs Go vs Python
+    runs-on: ubuntu-latest
+    env:
+      # Where llvm-sys / inkwell (llvm18-0) find LLVM 18 — matches the full CI job
+      # and .devcontainer/Dockerfile.
+      LLVM_SYS_180_PREFIX: /usr/lib/llvm-18
+      LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-Clink-arg=-fuse-ld=mold"
+      # best-of-N for each program.
+      REPS: "5"
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same LLVM 18 toolchain + system libraries the compiler links against as
+      # the `full` job in ci.yml.
+      - name: Install LLVM 18 and system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            llvm-18 llvm-18-dev libpolly-18-dev clang-18 libclang-18-dev \
+            libgc-dev libpcre2-dev python3-dev pkg-config zlib1g-dev \
+            libzstd-dev libffi-dev libedit-dev libxml2-dev libncurses-dev mold
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: perf-compare
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Release build of the compiler (default Immix collector) so generated code
+      # is representative, not a debug build.
+      - name: Build zapc (release, gc-immix)
+        run: cargo build --release -p zapc --bin zapc --features gc-immix
+
+      - name: Run comparison
+        run: ZAPC="$PWD/target/release/zapc" ./bench/perf-compare/run.sh
