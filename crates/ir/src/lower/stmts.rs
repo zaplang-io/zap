@@ -2647,6 +2647,10 @@ impl<'a> FnLower<'a> {
             func: format!("zap_list_get_{}", elem.val_suffix()),
             args: vec![lst, i],
         });
+        // A `bool`/`char` element reads its physical `i64` word; narrow it to its
+        // logical scalar type so a comprehension / `set(...)` / constructor over
+        // the collection sees a `bool`/`char`, matching string iteration (#1241).
+        let (e, ety) = self.narrow_read_elem(e, elem);
         self.push_loop(incr_bb, end_bb);
         body(self, e, ety)?;
         self.loops.pop();
@@ -3396,11 +3400,17 @@ impl<'a> FnLower<'a> {
         let lst_slot = self.spill_invariant(lst, Ty::List(elem));
         // A nested-collection element binds with its real type (#625) so the loop
         // body dispatches on the true `list`/`dict`/... rather than a `str` pointer.
+        // The element is physically read at `elem_ty` (the `i64`-word ABI for a
+        // `bool`/`char`), then narrowed to its logical read-back type `read_ty`
+        // (`bool`→`i1`, `char`→`char`) so the loop variable carries its true
+        // scalar identity and round-trips through the element-kind check — e.g.
+        // `for value in list[bool]: copied.append(value)` (#1241).
         let ety = self.elem_ty(elem);
+        let read_ty = self.elem_read_ty(elem);
         let single_var = if let Expr::Name(n, _) = target {
             // The loop variable is live across a `yield` placed after its use in
             // the body, so hoist it too (a plain alloca outside a generator).
-            Some(self.decl_slot(n, ety))
+            Some(self.decl_slot(n, read_ty))
         } else {
             None
         };
@@ -3442,9 +3452,10 @@ impl<'a> FnLower<'a> {
             func: format!("zap_list_get_{}", elem.val_suffix()),
             args: vec![lst_b, i],
         });
+        let (e, read_ty) = self.narrow_read_elem(e, elem);
         match target {
             Expr::Name(_, _) => self.store(single_var.expect("name slot"), e),
-            Expr::Tuple(elems, _) => self.bind_tuple_loop_target(elems, e, ety)?,
+            Expr::Tuple(elems, _) => self.bind_tuple_loop_target(elems, e, read_ty)?,
             _ => unreachable!("validated above"),
         }
         self.push_loop(incr_bb, end_bb);
