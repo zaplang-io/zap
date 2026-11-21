@@ -13573,6 +13573,160 @@ impl<'a> FnLower<'a> {
         Ok((acc, Ty::I1))
     }
 
+    /// Structural list equality (#1239): `a == b` / `a != b` on two lists is an
+    /// element-wise, order- and length-sensitive comparison — Python's value
+    /// semantics for sequences — not a pointer-identity test (`is` / `is not`
+    /// keep identity, and are intercepted at the top of `binop`). Without this
+    /// the operands fall through to the generic numeric/reference path, which
+    /// `ptrtoint`-compares the two list headers and so reports two separately
+    /// allocated but equal lists as unequal.
+    ///
+    /// Lengths are compared first; if they differ the lists are unequal and no
+    /// elements are read. Otherwise each pair of elements is compared through
+    /// `binop(Eq, ..)`, so elements reuse the exact same equality as a scalar
+    /// `==`: numeric joins, `str`/`bytes` by contents, a struct's `__eq__`, and
+    /// a nested `list`/`dict`/... element recurses into this same path (its full
+    /// ZIR type is recovered via [`FnLower::elem_ty`], #625). Lowered entirely
+    /// in-IR as a short-circuiting loop — no runtime entry point and no new ZIR
+    /// `Inst` variant, so no new codegen surface. `!=` negates the result.
+    fn list_cmp(
+        &mut self,
+        op: AstBin,
+        l: Value,
+        lelem: Elem,
+        r: Value,
+        rt: Ty,
+    ) -> Result<(Value, Ty), LowerError> {
+        let Ty::List(relem) = rt else {
+            return Err(err("a list compares for equality only with another list"));
+        };
+        // `result` holds the running verdict: it starts as "lengths agree" and is
+        // cleared to False on the first element mismatch. `idx` is the element
+        // cursor. Both are allocated in the current (pre-branch) block, like the
+        // list-membership scan, so they do not rely on alloca hoisting out of a
+        // conditionally entered block.
+        let result = self.alloca(Ty::I1);
+        let idx = self.alloca(Ty::I64);
+        let llen = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(llen),
+            func: "zap_list_len".to_string(),
+            args: vec![l],
+        });
+        let rlen = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(rlen),
+            func: "zap_list_len".to_string(),
+            args: vec![r],
+        });
+        let len_eq = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: len_eq,
+            pred: CmpPred::Eq,
+            lhs: llen,
+            rhs: rlen,
+        });
+        self.store(result, len_eq);
+
+        let loop_bb = self.new_block();
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let neq_bb = self.new_block();
+        let end_bb = self.new_block();
+
+        // Only walk elements when the lengths match; otherwise `result` is already
+        // False and we jump straight to the end.
+        self.set_term(Term::BrIf {
+            cond: len_eq,
+            then_bb: loop_bb,
+            else_bb: end_bb,
+        });
+
+        self.position(loop_bb);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        self.set_term(Term::Br(cond_bb));
+
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let in_range = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: in_range,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: llen,
+        });
+        self.set_term(Term::BrIf {
+            cond: in_range,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        // Element read-back dispatches on each side's own element kind and full
+        // ZIR type (a nested collection reads back as its real `list`/`dict`/...
+        // type, not a bare `str` pointer). Indices are always in range, so a
+        // plain `Call` suffices (no catchable out-of-range raise).
+        let lety = self.elem_ty(lelem);
+        let le = self.new_value(lety);
+        self.emit(Inst::Call {
+            dest: Some(le),
+            func: format!("zap_list_get_{}", lelem.val_suffix()),
+            args: vec![l, i],
+        });
+        let rety = self.elem_ty(relem);
+        let re = self.new_value(rety);
+        self.emit(Inst::Call {
+            dest: Some(re),
+            func: format!("zap_list_get_{}", relem.val_suffix()),
+            args: vec![r, i],
+        });
+        let (elem_eq, _) = self.binop(AstBin::Eq, le, lety, re, rety)?;
+        self.set_term(Term::BrIf {
+            cond: elem_eq,
+            then_bb: incr_bb,
+            else_bb: neq_bb,
+        });
+
+        // First mismatching element: the lists are unequal, stop scanning.
+        self.position(neq_bb);
+        let f = self.new_value(Ty::I1);
+        self.emit(Inst::BConst {
+            dest: f,
+            val: false,
+        });
+        self.store(result, f);
+        self.set_term(Term::Br(end_bb));
+
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+
+        self.position(end_bb);
+        let eq = self.load(result, Ty::I1);
+        if matches!(op, AstBin::Ne) {
+            let d = self.new_value(Ty::I1);
+            self.emit(Inst::Un {
+                dest: d,
+                op: UnOp::Not,
+                val: eq,
+            });
+            return Ok((d, Ty::I1));
+        }
+        Ok((eq, Ty::I1))
+    }
+
     /// The full ZIR type a collection element of kind `e` flows as. Identical to
     /// [`Elem::ty`] except for [`Elem::Nested`] (#625), whose precise
     /// `list`/`dict`/`set`/... type is recovered from the lowering interner so a
