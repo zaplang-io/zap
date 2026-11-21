@@ -25,6 +25,7 @@ listed here (see [`README.md`](README.md)).
 | [1227](lang/1227-generic-operator-dunder-dispatch.md) | Generic operator dunders dispatch in operator syntax via a mono rewrite | Locked | 2026-11-21 |
 | [1228](lang/1228-callable-module-const.md) | Callable module-level constants dispatch to __call__ through the method path | Locked | 2026-11-21 |
 | [1239](lang/1239-list-structural-equality.md) | List == / != is a structural element-wise compare, not pointer identity | Locked | 2026-11-21 |
+| [1241](lang/1241-bool-char-element-read-back-narrows.md) | A bool/char collection element reads back as its narrow scalar type | Locked | 2026-11-21 |
 
 ## stdlib
 

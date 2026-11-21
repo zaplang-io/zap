@@ -933,6 +933,159 @@ mod tests {
         }
     }
 
+    // --- #1241: a value read back from a `list[bool]`/`list[char]` round-trips
+    // through the element-kind check ------------------------------------------
+    //
+    // A `bool`/`char` element is stored and physically read as an `i64` word, but
+    // the loop variable / indexed read must carry its NARROW scalar identity
+    // (`bool`→`i1`, `char`→`char`) so it re-appends/re-stores into a same-kind
+    // collection. Before #1241 the read came back typed `i64`, so `append` saw
+    // `Elem::I64 != Elem::Bool` and rejected it with ZAP6001 even though it
+    // round-trips byte-for-byte — while the identical pattern on
+    // `list[int64]`/`list[float64]`/`list[str]` worked, because those kinds read
+    // back at their own type.
+
+    #[test]
+    fn bool_list_iterate_append_lowers_1241() {
+        // The exact issue repro: iterate a `list[bool]` and append the loop
+        // variable back into a `list[bool]`.
+        let m = lower_ok(
+            "def main():\n    \
+             list[bool] source = [True, False]\n    \
+             list[bool] copied = []\n    \
+             for value in source:\n        \
+             copied.append(value)\n    \
+             assert len(copied) == 2\n",
+        );
+        let text = format!("{m}");
+        // The element is physically read as an `i64` word and re-pushed as one,
+        // with the loop variable narrowed to `i1` in between (so its logical kind
+        // is `bool`, not `i64`) and re-widened on the store — the exact
+        // round-trip that makes the kind check pass.
+        assert!(
+            text.contains("zap_list_get_i64") && text.contains("zap_list_push_i64"),
+            "bool element must read/write through the i64-word entry points:\n{text}"
+        );
+        assert!(
+            text.contains("Trunc"),
+            "a bool read-back must narrow the i64 word to i1:\n{text}"
+        );
+    }
+
+    #[test]
+    fn bool_list_index_append_lowers_1241() {
+        // The indexed-read sibling of the iterate case: `copied.append(source[i])`
+        // reads a `list[bool]` element by index and appends it back.
+        lower_ok(
+            "def main():\n    \
+             list[bool] source = [True, False]\n    \
+             list[bool] copied = []\n    \
+             copied.append(source[0])\n    \
+             copied.append(source[1])\n    \
+             assert len(copied) == 2\n",
+        );
+    }
+
+    #[test]
+    fn bool_set_statement_for_iterate_append_1241() {
+        // A statement `for` over a `set[bool]` yields `bool` loop values that
+        // flow back into a `list[bool]`: the set/heap/deque/oset/dict statement
+        // loops all snapshot to a list and funnel through `lower_for_list`, so
+        // the same read-back narrowing covers them. (A *comprehension* over a
+        // bool collection still binds through the shared `iterate_list` and is a
+        // documented follow-up, so it is deliberately not asserted here.)
+        lower_ok(
+            "def main():\n    \
+             set[bool] on = {True, False}\n    \
+             list[bool] from_set = []\n    \
+             for v in on:\n        \
+             from_set.append(v)\n    \
+             assert len(from_set) == 2\n",
+        );
+    }
+
+    #[test]
+    fn bool_list_from_enum_variant_iterate_append_1241() {
+        // The issue's enum case: a sum-enum variant carries a `list[bool]`
+        // payload; extracting it via `match` and iterating it must still produce
+        // `bool` loop values that append into a `list[bool]`.
+        lower_ok(
+            "enum Attr:\n    \
+             Flags(list[bool] values)\n    \
+             Empty\n\
+             def snapshot(Attr a) -> list[bool]:\n    \
+             list[bool] out = []\n    \
+             match a:\n        \
+             case Attr.Flags(vs):\n            \
+             for value in vs:\n                \
+             out.append(value)\n        \
+             case Attr.Empty:\n            \
+             pass\n    \
+             return out\n\
+             def main():\n    \
+             list[bool] r = snapshot(Attr.Flags([True, False, True]))\n    \
+             assert len(r) == 3\n",
+        );
+    }
+
+    #[test]
+    fn generic_iterate_append_preserves_every_scalar_elem_kind_1241() {
+        // A generic `[T]` copy helper must monomorphize and lower for every
+        // scalar element kind — the regression matrix in the issue: `bool`
+        // alongside `int64`, `str`, and `float64`, which already worked. This is
+        // the walled garden: the loop-variable type must round-trip for all of
+        // them, not just the non-`bool` kinds.
+        lower_ok(
+            "def copy_all[T](list[T] src) -> list[T]:\n    \
+             list[T] out = []\n    \
+             for value in src:\n        \
+             out.append(value)\n    \
+             return out\n\
+             def main():\n    \
+             list[bool] bs = copy_all([True, False, True])\n    \
+             assert len(bs) == 3\n    \
+             list[int64] ns = copy_all([1, 2])\n    \
+             assert len(ns) == 2\n    \
+             list[str] ss = copy_all([\"a\", \"b\"])\n    \
+             assert len(ss) == 2\n    \
+             list[float64] fs = copy_all([1.0, 2.0])\n    \
+             assert len(fs) == 2\n",
+        );
+    }
+
+    #[test]
+    fn char_list_iterate_append_lowers_1241() {
+        // `char` is the sibling int-word Display kind (#709): it too reads back as
+        // an `i64` word, so iterating a `list[char]` and re-appending must narrow
+        // to `char` just like `bool` narrows to `i1`.
+        lower_ok(
+            "def main():\n    \
+             list[char] source = [c for c in \"abc\"]\n    \
+             list[char] copied = []\n    \
+             for value in source:\n        \
+             copied.append(value)\n    \
+             assert len(copied) == 3\n",
+        );
+    }
+
+    #[test]
+    fn bool_list_append_still_rejects_non_bool_1241() {
+        // The narrowing must not open the door to a genuinely wrong element kind:
+        // a value of a NON-int-word kind (`str` pointer, `f64`) appended to a
+        // `list[bool]` is still ZAP6001, and so is a bare integer literal, whose
+        // `i64` kind is distinct from `bool`.
+        for value in ["\"x\"", "1.0", "5"] {
+            let source = format!("def main():\n    list[bool] xs = []\n    xs.append({value})\n");
+            let (ast, parse, lex) = parse_str(&source);
+            assert!(parse.is_empty() && lex.is_empty(), "{value}: parse/lex");
+            let (_, errors) = lower_module(&ast);
+            assert!(
+                !errors.is_empty(),
+                "append({value}) into list[bool] must still be rejected"
+            );
+        }
+    }
+
     #[test]
     fn literal_element_mismatch_names_expected_and_actual_types() {
         let (ast, parse, lex) = parse_str("def main():\n    list[float64] xs = [1, 2]\n");

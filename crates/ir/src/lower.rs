@@ -13739,6 +13739,42 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    /// The narrow scalar type a value *read back* from a collection element of
+    /// kind `e` must carry. A `bool` (`Elem::Bool`) and a `char` (`Elem::Char`)
+    /// are stored and physically read as an `i64` word — [`Elem::ty`] is `i64`
+    /// so the runtime `zap_*_get_i64` ABI is honoured — yet the *logical* value
+    /// a program observes is a `bool`/`char`, not an integer. Typing the read
+    /// back as the physical `i64` word lost that identity: a `bool` read from a
+    /// `list[bool]` (by iteration or indexing) came back as `i64`, so
+    /// [`list_elem_kind`] mapped it to `Elem::I64`, and re-appending/re-storing
+    /// it into a `list[bool]` was wrongly rejected with ZAP6001 "wrong element
+    /// type" even though it round-trips byte-for-byte (#1241). String iteration
+    /// already yields a `char` for exactly this reason (`for c in s`), so lists
+    /// (and the set/dict/heap/deque/oset snapshots that funnel through list
+    /// iteration) must match. Every other element kind reads back at its
+    /// physical [`elem_ty`], so this is a no-op for them.
+    fn elem_read_ty(&self, e: Elem) -> Ty {
+        match e {
+            Elem::Bool => Ty::I1,
+            Elem::Char => Ty::Char,
+            other => self.elem_ty(other),
+        }
+    }
+
+    /// Narrow a freshly-read collection element word `v` (physically read at
+    /// [`elem_ty`]) to its logical read-back type ([`elem_read_ty`]). For the
+    /// int-word Display kinds (`bool`/`char`) this truncates the `i64` storage
+    /// word to `i1`/`char`; for every other kind it is the identity (#1241).
+    /// Returns the narrowed value and its logical type.
+    fn narrow_read_elem(&mut self, v: Value, e: Elem) -> (Value, Ty) {
+        let phys = self.elem_ty(e);
+        let read = self.elem_read_ty(e);
+        if phys == read {
+            return (v, phys);
+        }
+        (self.coerce(v, phys, read), read)
+    }
+
     fn lower_index_get(
         &mut self,
         base: &Expr,
@@ -13794,6 +13830,11 @@ impl<'a> FnLower<'a> {
                     &format!("zap_list_get_{}", elem.val_suffix()),
                     vec![bv, iv],
                 );
+                // A `bool`/`char` element reads its physical `i64` word; narrow
+                // it to `bool`/`char` so the value round-trips through the
+                // element-kind check and re-appends/re-stores into a same-kind
+                // collection (#1241).
+                let (d, ety) = self.narrow_read_elem(d, elem);
                 Ok((d, ety))
             }
             // `deque[T]` indexing (#983): `d[i]` yields the element at left-index

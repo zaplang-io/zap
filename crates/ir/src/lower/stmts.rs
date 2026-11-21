@@ -2640,6 +2640,16 @@ impl<'a> FnLower<'a> {
         self.position(body_bb);
         let i = self.load(idx, Ty::I64);
         // A nested-collection element reads back as its real type (#625).
+        //
+        // This yields the element's PHYSICAL word (`elem_ty`): a `bool`/`char`
+        // element comes through as its `i64` storage word, not narrowed to
+        // `i1`/`char`. Several internal callers (the container renderer in
+        // `repr.rs`, `extend`, dict copy/merge) feed this value straight into an
+        // `i64`-word runtime entry point without re-coercing, so narrowing here
+        // would miscompile them. The user-facing read-backs that must round-trip
+        // through the element-kind check (#1241) narrow at their own sites —
+        // `lower_for_list` (statement `for`, which the set/dict/heap/deque/oset
+        // loops route through) and `lower_index_get` (`xs[i]`).
         let ety = self.elem_ty(elem);
         let e = self.new_value(ety);
         self.emit(Inst::Call {
@@ -3396,11 +3406,17 @@ impl<'a> FnLower<'a> {
         let lst_slot = self.spill_invariant(lst, Ty::List(elem));
         // A nested-collection element binds with its real type (#625) so the loop
         // body dispatches on the true `list`/`dict`/... rather than a `str` pointer.
+        // The element is physically read at `elem_ty` (the `i64`-word ABI for a
+        // `bool`/`char`), then narrowed to its logical read-back type `read_ty`
+        // (`bool`→`i1`, `char`→`char`) so the loop variable carries its true
+        // scalar identity and round-trips through the element-kind check — e.g.
+        // `for value in list[bool]: copied.append(value)` (#1241).
         let ety = self.elem_ty(elem);
+        let read_ty = self.elem_read_ty(elem);
         let single_var = if let Expr::Name(n, _) = target {
             // The loop variable is live across a `yield` placed after its use in
             // the body, so hoist it too (a plain alloca outside a generator).
-            Some(self.decl_slot(n, ety))
+            Some(self.decl_slot(n, read_ty))
         } else {
             None
         };
@@ -3442,9 +3458,10 @@ impl<'a> FnLower<'a> {
             func: format!("zap_list_get_{}", elem.val_suffix()),
             args: vec![lst_b, i],
         });
+        let (e, read_ty) = self.narrow_read_elem(e, elem);
         match target {
             Expr::Name(_, _) => self.store(single_var.expect("name slot"), e),
-            Expr::Tuple(elems, _) => self.bind_tuple_loop_target(elems, e, ety)?,
+            Expr::Tuple(elems, _) => self.bind_tuple_loop_target(elems, e, read_ty)?,
             _ => unreachable!("validated above"),
         }
         self.push_loop(incr_bb, end_bb);
