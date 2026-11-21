@@ -71,10 +71,22 @@ pub fn build_harness(module: &Module) -> (Module, usize) {
     // Carry over every item except the user `main` (replaced) and top-level bare
     // statements (a script's main body, never part of the test harness), with
     // test/hook decorators stripped so the functions lower as plain functions.
+    //
+    // A module-level single-name binding (D-0112) — `const T NAME = expr` (#658)
+    // or mutable `T NAME = expr` (#662) — is NOT a bare statement: it is
+    // persistent module state that lowers to a module global, initialized once
+    // before `main`. A `@test` (or a function it calls, or a default argument,
+    // #1236) may read it, so it must be carried into the harness in its original
+    // position — preserving source/init order among the bindings. Dropping it was
+    // the #1236 bug: codegen then reported the name as an unknown variable even
+    // though sema had accepted the module. Every OTHER top-level statement is a
+    // script body (modlink already rejects executable top-level statements in a
+    // program, and a bare module docstring carries no code), so it is dropped.
     let mut items: Vec<Item> = Vec::new();
     for item in &module.items {
         match item {
             Item::Function(f) if f.name == "main" => {}
+            Item::Stmt(Stmt::Let { .. }) => items.push(item.clone()),
             Item::Stmt(_) => {}
             Item::Function(f) => {
                 let mut f = f.clone();
