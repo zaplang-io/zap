@@ -187,6 +187,40 @@ fn plain_call(lowerer: &mut FnLower, func: &str, args: Vec<Value>, ret: Ty) -> (
     (d, ret)
 }
 
+/// `url.unquote(s[, errors])` / `url.unquote_plus(s[, errors])` (#1242). The
+/// `errors` keyword selects the UTF-8 decode mode for the percent-decoded octets
+/// ("strict" — the default — raises a catchable error on invalid UTF-8 like
+/// `str(bytes)`; "replace" substitutes U+FFFD). Both forms are emitted as
+/// throwing calls: strict mode can raise a `ValueError`, and an unrecognized
+/// `errors` name raises a `LookupError`. When `errors` is omitted the seam binder
+/// leaves the trailing slot absent, so we fall back to the one-arg entry point
+/// (which is itself the strict decode — identical to `errors="strict"`).
+fn lower_unquote(
+    lowerer: &mut FnLower,
+    args: &[ast::Arg],
+    plus: bool,
+) -> Result<(Value, Ty), LowerError> {
+    let (s, _) = lowerer.expr(&args[0].value)?;
+    let d = lowerer.new_value(Ty::Ptr);
+    if let Some(errors_arg) = args.get(1) {
+        let (errors, _) = lowerer.expr(&errors_arg.value)?;
+        let func = if plus {
+            "zap_url_unquote_plus_e"
+        } else {
+            "zap_url_unquote_e"
+        };
+        lowerer.throwing_call(Some(d), func, vec![s, errors]);
+    } else {
+        let func = if plus {
+            "zap_url_unquote_plus"
+        } else {
+            "zap_url_unquote"
+        };
+        lowerer.throwing_call(Some(d), func, vec![s]);
+    }
+    Ok((d, Ty::Ptr))
+}
+
 fn lower(
     lowerer: &mut FnLower,
     method: &str,
@@ -197,6 +231,8 @@ fn lower(
     Ok(Some(match method {
         "split" => lower_split(lowerer, &args[0])?,
         "build" => lower_build(lowerer, &args[0])?,
+        "unquote" => lower_unquote(lowerer, args, false)?,
+        "unquote_plus" => lower_unquote(lowerer, args, true)?,
         "parse_query" => {
             // `dict[str, list[str]]`: the value is a NESTED collection, so its
             // element must be `Elem::Nested(list[str])`, NOT a bare `Elem::Ptr` —
@@ -224,8 +260,6 @@ fn lower(
             match method {
                 "quote" => plain_call(lowerer, "zap_url_quote", a, Ty::Ptr),
                 "quote_path" => plain_call(lowerer, "zap_url_quote_path", a, Ty::Ptr),
-                "unquote" => plain_call(lowerer, "zap_url_unquote", a, Ty::Ptr),
-                "unquote_plus" => plain_call(lowerer, "zap_url_unquote_plus", a, Ty::Ptr),
                 "encode_query" => plain_call(lowerer, "zap_url_encode_query", a, Ty::Ptr),
                 "canonical_query" => plain_call(lowerer, "zap_url_canonical_query", a, Ty::Ptr),
                 "encode_query_multi" => {

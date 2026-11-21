@@ -66,14 +66,14 @@ static int zap_url_hexval(unsigned char c) {
     return -1;
 }
 
-/* Decode `%XX` escapes back to bytes. A `%` not followed by two hex digits is
- * left literal (lenient, like Python's urllib). `plus` maps `+` -> space. */
-static void *zap_url_decode(void *sp, int plus) {
-    ZapStr *s = (ZapStr *)sp;
+/* Percent-decode `s` into `out` (which the caller sizes at >= s->len bytes),
+ * returning the decoded octet count. A `%` not followed by two hex digits is
+ * left literal (lenient, like Python's urllib); `plus` maps `+` -> space. This
+ * is the shared octet decoder — UTF-8 interpretation (if any) is layered on top
+ * by the caller, so the result need not be well-formed UTF-8. */
+static int64_t zap_url_decode_octets(const ZapStr *s, int plus, char *out) {
     int64_t n = s->len;
     const unsigned char *in = (const unsigned char *)s->data;
-    /* output is never longer than the input. */
-    char *out = (char *)zap_buf(n > 0 ? n : 1);
     int64_t o = 0;
     for (int64_t i = 0; i < n; i++) {
         unsigned char c = in[i];
@@ -92,11 +92,74 @@ static void *zap_url_decode(void *sp, int plus) {
             out[o++] = (char)c;
         }
     }
+    return o;
+}
+
+/* Lenient percent-decode to a `str` with NO UTF-8 interpretation — the decoded
+ * octets become the string's bytes verbatim. Used internally by the query
+ * readers (`parse_query` etc.), which keep Go/urllib leniency. */
+static void *zap_url_decode(void *sp, int plus) {
+    ZapStr *s = (ZapStr *)sp;
+    char *out = (char *)zap_buf(s->len > 0 ? s->len : 1);
+    int64_t o = zap_url_decode_octets(s, plus, out);
     return zap_str_new(out, o);
 }
 
-void *zap_url_unquote(void *sp) { return zap_url_decode(sp, 0); }
-void *zap_url_unquote_plus(void *sp) { return zap_url_decode(sp, 1); }
+/* Percent-decode `sp`, then interpret the decoded octets as UTF-8 under one of
+ * two error modes (#1242):
+ *   mode 0 "strict"  — validate as well-formed UTF-8 and raise a catchable
+ *                      ValueError on any invalid sequence, exactly as
+ *                      `str(bytes)` does (surrogates / overlong / out-of-range
+ *                      all rejected). This is the default `url.unquote`.
+ *   mode 1 "replace" — substitute U+FFFD for each maximal invalid subpart
+ *                      (`zap_utf8_decode_replace`), so a lenient W3C-baggage
+ *                      decode never raises.
+ * The `%`-escape handling itself stays lenient in BOTH modes (a malformed `%`
+ * is left literal); only the UTF-8 validity of the decoded octets differs. */
+static void *zap_url_decode_mode(void *sp, int plus, int mode) {
+    ZapStr *s = (ZapStr *)sp;
+    char *buf = (char *)zap_buf(s->len > 0 ? s->len : 1);
+    int64_t o = zap_url_decode_octets(s, plus, buf);
+    if (mode == 1) {
+        return zap_utf8_decode_replace((const unsigned char *)buf, o);
+    }
+    int64_t bad = 0;
+    if (!zap_utf8_valid((const unsigned char *)buf, o, &bad)) {
+        const char *m = "url.unquote: invalid UTF-8 in decoded bytes "
+                        "(pass errors=\"replace\" to substitute U+FFFD)";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
+    return zap_str_new(buf, o);
+}
+
+/* Resolve an `errors` str to a decode mode, raising a catchable LookupError for
+ * an unrecognized name (as CPython's codec machinery does). "strict" -> 0,
+ * "replace" -> 1. */
+static int zap_url_errmode(void *errors_sp) {
+    const ZapStr *e = (const ZapStr *)errors_sp;
+    if (e->len == 6 && memcmp(e->data, "strict", 6) == 0) {
+        return 0;
+    }
+    if (e->len == 7 && memcmp(e->data, "replace", 7) == 0) {
+        return 1;
+    }
+    const char *m = "url.unquote: errors must be \"strict\" or \"replace\"";
+    zap_panic_typed(ZAP_EXC_LOOKUP_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    return 0; /* unreachable: zap_panic_typed unwinds */
+}
+
+/* `url.unquote(s)` / `url.unquote_plus(s)` — default (strict) decode. */
+void *zap_url_unquote(void *sp) { return zap_url_decode_mode(sp, 0, 0); }
+void *zap_url_unquote_plus(void *sp) { return zap_url_decode_mode(sp, 1, 0); }
+
+/* `url.unquote(s, errors=...)` / `url.unquote_plus(s, errors=...)` — the decode
+ * mode is selected from the `errors` string at runtime (#1242). */
+void *zap_url_unquote_e(void *sp, void *errors) {
+    return zap_url_decode_mode(sp, 0, zap_url_errmode(errors));
+}
+void *zap_url_unquote_plus_e(void *sp, void *errors) {
+    return zap_url_decode_mode(sp, 1, zap_url_errmode(errors));
+}
 
 /* Byte-lexicographic compare of two ZapStr* (shorter sorts first on a prefix
  * tie) — the ordering AWS SigV4 applies to encoded query components. */

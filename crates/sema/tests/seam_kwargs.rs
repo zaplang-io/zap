@@ -2425,3 +2425,74 @@ fn dict_reserve_non_integer_is_rejected() {
         "ZAP4024",
     );
 }
+
+// ---------------------------------------------------------------------------
+// url.unquote / url.unquote_plus — optional `errors` kwarg (#1242).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn url_unquote_errors_by_keyword() {
+    assert_ok(&prog(
+        "    auto s = url.unquote(\"A%FFB\", errors=\"replace\")\n",
+    ));
+}
+
+#[test]
+fn url_unquote_plus_errors_by_keyword() {
+    assert_ok(&prog(
+        "    auto s = url.unquote_plus(\"a+b%FF\", errors=\"replace\")\n",
+    ));
+}
+
+#[test]
+fn url_unquote_errors_positional_is_accepted() {
+    // `errors` is positional-or-keyword in the first cut (keyword-only is the
+    // recommended-but-not-yet-enforced shape), so a second positional binds it.
+    assert_ok(&prog("    auto s = url.unquote(\"A%FFB\", \"replace\")\n"));
+}
+
+#[test]
+fn url_unquote_errors_omitted_is_accepted() {
+    // The trailing `errors` slot stays unbound when omitted — the common one-arg
+    // strict decode.
+    assert_ok(&prog("    auto s = url.unquote(\"A%20B\")\n"));
+}
+
+#[test]
+fn url_unquote_strict_keyword_is_accepted() {
+    assert_ok(&prog(
+        "    auto s = url.unquote(\"A%20B\", errors=\"strict\")\n",
+    ));
+}
+
+#[test]
+fn url_unquote_unknown_keyword_is_rejected() {
+    assert_code(
+        &prog("    auto s = url.unquote(\"A%FFB\", errorz=\"replace\")\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn url_unquote_too_many_args_is_rejected() {
+    assert_code(
+        &prog("    auto s = url.unquote(\"A%FFB\", \"replace\", \"extra\")\n"),
+        "ZAP4025",
+    );
+}
+
+#[test]
+fn url_unquote_non_str_errors_is_rejected() {
+    assert_code(
+        &prog("    auto s = url.unquote(\"A%FFB\", errors=7)\n"),
+        "ZAP4024",
+    );
+}
+
+#[test]
+fn url_unquote_plus_unknown_keyword_is_rejected() {
+    assert_code(
+        &prog("    auto s = url.unquote_plus(\"a+b\", mode=\"replace\")\n"),
+        "ZAP4023",
+    );
+}
