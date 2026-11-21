@@ -66,4 +66,5 @@ listed here (see [`README.md`](README.md)).
 | [917](tooling/917-one-temp-name-helper-no-clock.md) | One pid+counter temp-name helper per crate; test modules never read the clock | Locked | 2026-11-19 |
 | [1089](tooling/1089-decisions-as-per-file-adrs.md) | New decisions are per-file ADRs keyed to issue/PR number | Locked | 2026-11-19 |
 | [1232](tooling/1232-zap-test-module-resolution.md) | zap test resolves imports through the same module pipeline as builds | Accepted | 2026-11-21 |
+| [1236](tooling/1236-zap-test-harness-module-constants.md) | The zap test harness keeps module-level const/mutable bindings | Accepted | 2026-11-21 |
 

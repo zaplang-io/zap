@@ -524,6 +524,198 @@ mod tests {
             "expect_raises harness should lower: {errs:?}"
         );
     }
+
+    // ---- module-level constants in the harness (#1236) -------------------
+    //
+    // A module-level `const`/mutable binding (D-0112) is persistent module state
+    // that lowers to a module global; the harness must carry it over so a `@test`
+    // (or a function it calls, or a default argument) can read it. Before the
+    // fix, `build_harness` dropped every top-level `Item::Stmt`, so codegen
+    // reported the name as an unknown variable even though sema accepted the
+    // module. These assert the binding survives into the harness AND lowers
+    // (AST→ZIR is host-safe and is exactly where the old `ZAP6001: unknown
+    // variable` surfaced — no LLVM needed); the native run is covered in CI.
+
+    /// The bindings a module const lowers to must be present in the harness.
+    fn harness_keeps_binding(h: &Module, name: &str) -> bool {
+        h.items.iter().any(
+            |it| matches!(it, Item::Stmt(zapc_syntax::ast::Stmt::Let { name: n, .. }) if n == name),
+        )
+    }
+
+    #[test]
+    fn harness_keeps_scalar_module_const_and_lowers() {
+        let m = module("const int64 ANSWER = 42\n@test\ndef t():\n    assert ANSWER == 42\n");
+        let (h, n) = harness::build_harness(&m);
+        assert_eq!(n, 1);
+        assert!(
+            harness_keeps_binding(&h, "ANSWER"),
+            "the module const must be carried into the harness"
+        );
+        assert!(zapc_sema::check(&h).is_empty(), "harness should type-check");
+        let (_zir, errs) = zapc_ir::lower_module(&h);
+        assert!(
+            errs.is_empty(),
+            "scalar const harness should lower: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn harness_keeps_mutable_module_binding_and_lowers() {
+        // D-0112 Phase 2 (#662): a mutable module-level binding is also persistent
+        // state and must survive into the harness, not just a `const`.
+        let m = module("int64 counter = 7\n@test\ndef t():\n    assert counter == 7\n");
+        let (h, n) = harness::build_harness(&m);
+        assert_eq!(n, 1);
+        assert!(harness_keeps_binding(&h, "counter"));
+        assert!(zapc_sema::check(&h).is_empty());
+        let (_zir, errs) = zapc_ir::lower_module(&h);
+        assert!(
+            errs.is_empty(),
+            "mutable binding harness should lower: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn harness_keeps_struct_value_module_const_with_reference_field() {
+        // A value struct holding a REFERENCE field (a `str`), the timezone/Easter
+        // shape called out in #1236: `const TZ UTC = TZ("UTC")`.
+        let m = module(
+            "struct TZ:\n    str name\n\
+             const TZ UTC = TZ(\"UTC\")\n\
+             @test\ndef reads_struct_const():\n    assert UTC.name == \"UTC\"\n",
+        );
+        let (h, n) = harness::build_harness(&m);
+        assert_eq!(n, 1);
+        assert!(harness_keeps_binding(&h, "UTC"));
+        assert!(zapc_sema::check(&h).is_empty());
+        let (_zir, errs) = zapc_ir::lower_module(&h);
+        assert!(
+            errs.is_empty(),
+            "struct const harness should lower: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn harness_function_reading_module_const_called_from_test_lowers() {
+        let m = module(
+            "const int64 BASE = 10\n\
+             def scaled(int64 x) -> int64:\n    return x * BASE\n\
+             @test\ndef calls_fn_reading_const():\n    assert scaled(4) == 40\n",
+        );
+        let (h, _n) = harness::build_harness(&m);
+        assert!(harness_keeps_binding(&h, "BASE"));
+        assert!(zapc_sema::check(&h).is_empty());
+        let (_zir, errs) = zapc_ir::lower_module(&h);
+        assert!(
+            errs.is_empty(),
+            "fn-reading-const harness should lower: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn harness_default_argument_referencing_module_const_lowers() {
+        // A default argument that references a module const (#1236 acceptance).
+        let m = module(
+            "const int64 FALLBACK = 99\n\
+             def get(int64 x = FALLBACK) -> int64:\n    return x\n\
+             @test\ndef uses_default_from_const():\n    assert get() == 99\n",
+        );
+        let (h, _n) = harness::build_harness(&m);
+        assert!(harness_keeps_binding(&h, "FALLBACK"));
+        assert!(zapc_sema::check(&h).is_empty());
+        let (_zir, errs) = zapc_ir::lower_module(&h);
+        assert!(
+            errs.is_empty(),
+            "default-arg-const harness should lower: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn harness_preserves_initialization_order_of_dependent_consts() {
+        // One const initialized from another: both must be carried over in source
+        // order so the dependent initializer sees the earlier value.
+        let m = module(
+            "const int64 A = 2\nconst int64 B = A + 1\n\
+             @test\ndef ordered():\n    assert B == 3\n",
+        );
+        let (h, _n) = harness::build_harness(&m);
+        // The two bindings appear in source order, A before B.
+        let let_names: Vec<String> = h
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Stmt(zapc_syntax::ast::Stmt::Let { name, .. }) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(let_names, vec!["A", "B"], "init order must be preserved");
+        assert!(zapc_sema::check(&h).is_empty());
+        let (_zir, errs) = zapc_ir::lower_module(&h);
+        assert!(
+            errs.is_empty(),
+            "dependent-const harness should lower: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn harness_still_drops_module_docstring_and_has_no_stray_statements() {
+        // Only module-level bindings survive; a bare module docstring (a
+        // non-executable top-level statement) is still dropped, and no bare
+        // statement leaks into the harness.
+        let m = module("\"module doc\"\nconst int64 K = 1\n@test\ndef t():\n    assert K == 1\n");
+        let (h, _n) = harness::build_harness(&m);
+        assert!(harness_keeps_binding(&h, "K"));
+        let non_let_stmts = h
+            .items
+            .iter()
+            .filter(|it| {
+                matches!(it, Item::Stmt(s) if !matches!(s, zapc_syntax::ast::Stmt::Let { .. }))
+            })
+            .count();
+        assert_eq!(non_let_stmts, 0, "no non-binding statement should survive");
+        assert!(zapc_sema::check(&h).is_empty());
+        let (_zir, errs) = zapc_ir::lower_module(&h);
+        assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn harness_unknown_name_without_a_matching_const_still_errors() {
+        // Negative: the fix carries real bindings over; it does not invent them.
+        // A reference to a name with no declaration must still fail (here at sema,
+        // ZAP3001 — before lowering is even reached).
+        let m = module("@test\ndef t():\n    assert MISSING == 1\n");
+        let errs = zapc_sema::check(&m);
+        assert!(
+            errs.iter().any(|e| e.code == zapc_diag::ErrorCode::ZAP3001),
+            "an undefined name must still report ZAP3001, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn strip_test_items_keeps_module_consts_for_ordinary_builds() {
+        // Ordinary `zap run`/`build` behavior is unchanged: stripping `@test`
+        // items leaves module-level bindings in place (they are not test items).
+        let mut m = module(
+            "const int64 KEEP = 5\n\
+             @test\ndef t():\n    assert KEEP == 5\n\
+             def main():\n    print(KEEP)\n",
+        );
+        strip_test_items(&mut m);
+        assert!(
+            harness_keeps_binding(&m, "KEEP"),
+            "a normal build must retain module consts after @test stripping"
+        );
+        let test_fns = m
+            .items
+            .iter()
+            .filter(|it| matches!(it, Item::Function(f) if f.name == "t"))
+            .count();
+        assert_eq!(
+            test_fns, 0,
+            "the @test function must be stripped from a build"
+        );
+    }
 }
 
 /// `zap test` import-resolution (#1232; D-0054, SPEC §16 — tests use the same
@@ -748,6 +940,41 @@ mod import_resolution_tests {
         // All three @tests are discovered — the failing one is not dropped, so the
         // run will still report it (as FAIL at run time).
         assert_harness_ok(&module, 3);
+    }
+
+    /// A module-level `const` defined in an imported DEPENDENCY is readable from
+    /// a `@test` (the #1232 import fix + the #1236 harness-const fix together):
+    /// the linker merges the dependency's global, the harness carries it over,
+    /// and it lowers. Covers a scalar and a value-struct const with a reference
+    /// field (the timezone/Easter shape).
+    #[test]
+    fn module_const_from_dependency_is_readable_in_test() {
+        let p = Project::new("depconst");
+        p.write(
+            "zenv/pkg/cfg/src/cfg.zap",
+            "struct Zone:\n    str name\n\
+             const int64 LIMIT = 100\n\
+             const Zone UTC = Zone(\"UTC\")\n",
+        );
+        let entry = p.write(
+            "tests/cfg_test.zap",
+            "import cfg\n\
+             @test\ndef reads_scalar_dep_const():\n    assert cfg.LIMIT == 100\n\
+             @test\ndef reads_struct_dep_const():\n    assert cfg.UTC.name == \"UTC\"\n",
+        );
+
+        let module = resolve(&entry, vec![p.pkg_root()]).expect("dependency consts must resolve");
+        // The dependency's merged (mangled) globals must be present as bindings.
+        let dep_bindings = module
+            .items
+            .iter()
+            .filter(|it| matches!(it, Item::Stmt(zapc_syntax::ast::Stmt::Let { .. })))
+            .count();
+        assert!(
+            dep_bindings >= 2,
+            "both dependency consts must be merged in as module bindings, found {dep_bindings}"
+        );
+        assert_harness_ok(&module, 2);
     }
 
     // ---- negative cases --------------------------------------------------
