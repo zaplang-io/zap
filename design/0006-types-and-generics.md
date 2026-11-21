@@ -377,8 +377,18 @@ interface Add:
   mutation is sound by D-0023: a reference struct shares identity, so the
   mutation is the intended visible effect; a value struct copies on assign, so
   operating on the local is fine. Implemented in ticket #61.
-- **Operator interfaces double as generic bounds** (D-0017): once user generics
-  land, `def sum[T: Add](xs: list[T]) -> T` constrains `T` to addable types.
+- **Operator interfaces double as generic bounds** (D-0017, realized by I#1199,
+  see [lang/1199-operator-capability-interfaces](../decisions/lang/1199-operator-capability-interfaces.md)).
+  The operator capabilities are **declared prelude generic interfaces** carrying
+  the other operand's type and the result type — forward `Add[R, Out]` / `Mul` /
+  `Eq[R]` / `Ord[R]` / … and reflected `RMul[L, Out]` / `RAdd` / `REq[L]` /
+  `RCmp[L]` / … — so a generic can require an operator and name its result:
+  `def scale_all[T: RMul[f64, T]](list[T] xs, f64 k) -> list[T]` or
+  `def sum[T: Add[T, T]](list[T] xs) -> T`. Inside the body the operator
+  type-checks through the bound (result = the substituted `Out`), enforced
+  structurally per instantiation (static dispatch). The always-available
+  `Equatable` / `Comparable` capabilities likewise permit `==` / `<` on a
+  bounded parameter. Concrete `a OP b` dispatch is unchanged.
 
 **Implementation status (ticket #52).** Landed end-to-end (sema checks + AST→ZIR
 desugaring + runtime): the full dunder set above — arithmetic, bitwise/shift,

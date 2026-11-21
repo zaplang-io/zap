@@ -11,7 +11,8 @@ superseded-by:
 
 # Operator capabilities are declared prelude generic interfaces (forward + reflected)
 
-**Status:** Accepted (design locked; implementation blocked on generics)
+**Status:** Accepted — implemented (the generics prerequisites #1205/#1206/#1207
+landed, unblocking this).
 
 Follow-up of the reflected-operators epic #1189. Records the surface for #1199
 (naming a reflected capability as a generic bound). Builds on
@@ -61,13 +62,27 @@ mechanisms to maintain, and no path to naming the output type cleanly.
 
 ## Consequences
 
-- **Blocked on generics realization.** Needs generic-interface conformance
-  (#1205) and bounds referencing other type params (#1206); the associated-type
-  form is optional (#1207). All three sit under the generics epic #1204. #1199
-  implementation starts once #1205 + #1206 land.
-- When implemented: add the declared forward + reflected operator interfaces to
-  the prelude; teach sema to check conformance and resolve the output type;
-  enforce parametrized bounds; route bounded-generic operator calls through the
-  interface in monomorphization. The non-generic structural dispatch stays.
-- No change to today's behavior or spec surface until the prerequisites land;
-  `DECISIONS.md` stays frozen (this ADR is the record).
+- **Implemented** on the generics realization it needed — generic-interface
+  conformance (#1205), bounds referencing other type params (#1206), and the
+  (optional) associated-type form (#1207), all under epic #1204. What shipped:
+  - The forward (`Add[R, Out]` … `RShift`, `Eq[R]`, `Ord[R]`) and reflected
+    (`RAdd[L, Out]` … `RRShift`, `REq[L]`, `RCmp[L]`) interfaces are declared in
+    a dedicated prelude unit (`OPERATOR_PRELUDE_SRC`). Being pure interfaces
+    (no struct, no body, no code) they are prepended only when a program
+    actually bounds a type parameter by one — a precise structural scan of bound
+    positions, so an enum variant `Add(...)` or a `@derive(Eq, Ord)` never pulls
+    them in and non-generic / operator-free programs stay byte-for-byte
+    unchanged. (Unlike the value-struct prelude, which is needle-gated because
+    injecting a struct shifts struct indices.)
+  - sema resolves an operator whose operand is a value of a bounded type
+    parameter through the bound (`check_struct_binop` → `bound_dunder_sig`,
+    reusing the #1206 `subst_iface_sig` substitution), so `Out` is named
+    precisely; the existing always-available `Equatable`/`Comparable`
+    capabilities gain operator use through the same path.
+  - monomorphization enforces the bound structurally per instantiation (static
+    dispatch, no fat pointer) via the existing `satisfies_bound`; the concrete
+    `a OP b` dispatch and lowering are unchanged, so **no IR/codegen change**.
+- The non-generic structural dispatch stays; this is purely additive (it only
+  types paths that errored before). Tightening operators on an *unbounded* type
+  parameter (today opaque, so loosely accepted) is out of scope and tracked by
+  #1200. `DECISIONS.md` stays frozen (this ADR is the record).

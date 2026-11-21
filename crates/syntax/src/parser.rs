@@ -2831,6 +2831,116 @@ def new_ordered_dict[K, V]() -> OrderedMap[K, V]:
     return OrderedMap(store=d, order=ks)
 ";
 
+/// The operator-capability interfaces (D-0047 / #1199): each binary operator is
+/// backed by a structural dunder method, and these interfaces give the operator
+/// a NAME so generic code can require it as a bound and name the result type —
+/// `def scale_all[T: RMul[f64, T]](list[T] xs, f64 k) -> list[T]`. `self` is the
+/// operand that owns the dunder: the LEFT operand for a forward interface, the
+/// RIGHT operand for a reflected one (R-prefixed, #1180/#1198). `Out` is the
+/// operator's result type and `R`/`L` is the other operand's type. Conformance
+/// is implicit (a type that defines the dunder satisfies the interface), and
+/// dispatch of a concrete `a OP b` is unchanged and stays structural
+/// (#1192/#1194/#1202) — these interfaces add only the bound surface.
+///
+/// Unlike [`PRELUDE_SRC`] (needle-gated, since it carries value structs whose
+/// injection would shift struct indices and add code), these are pure interface
+/// declarations: they define no struct, carry no body, and emit no code unless
+/// a program actually names one as a bound. So [`with_prelude`] prepends them
+/// UNCONDITIONALLY — they are a true always-available part of the type surface,
+/// like the compiler-registered `Equatable`/`Comparable` capabilities — and a
+/// program that never bounds a type parameter by one is unaffected.
+pub const OPERATOR_PRELUDE_SRC: &str = "\
+interface Add[R, Out]:
+    def __add__(self, R other) -> Out
+
+interface Sub[R, Out]:
+    def __sub__(self, R other) -> Out
+
+interface Mul[R, Out]:
+    def __mul__(self, R other) -> Out
+
+interface TrueDiv[R, Out]:
+    def __truediv__(self, R other) -> Out
+
+interface FloorDiv[R, Out]:
+    def __floordiv__(self, R other) -> Out
+
+interface Mod[R, Out]:
+    def __mod__(self, R other) -> Out
+
+interface Pow[R, Out]:
+    def __pow__(self, R other) -> Out
+
+interface MatMul[R, Out]:
+    def __matmul__(self, R other) -> Out
+
+interface BitAnd[R, Out]:
+    def __and__(self, R other) -> Out
+
+interface BitOr[R, Out]:
+    def __or__(self, R other) -> Out
+
+interface BitXor[R, Out]:
+    def __xor__(self, R other) -> Out
+
+interface LShift[R, Out]:
+    def __lshift__(self, R other) -> Out
+
+interface RShift[R, Out]:
+    def __rshift__(self, R other) -> Out
+
+interface Eq[R]:
+    def __eq__(self, R other) -> bool
+
+interface Ord[R]:
+    def __cmp__(self, R other) -> int64
+
+interface RAdd[L, Out]:
+    def __radd__(self, L other) -> Out
+
+interface RSub[L, Out]:
+    def __rsub__(self, L other) -> Out
+
+interface RMul[L, Out]:
+    def __rmul__(self, L other) -> Out
+
+interface RTrueDiv[L, Out]:
+    def __rtruediv__(self, L other) -> Out
+
+interface RFloorDiv[L, Out]:
+    def __rfloordiv__(self, L other) -> Out
+
+interface RMod[L, Out]:
+    def __rmod__(self, L other) -> Out
+
+interface RPow[L, Out]:
+    def __rpow__(self, L other) -> Out
+
+interface RMatMul[L, Out]:
+    def __rmatmul__(self, L other) -> Out
+
+interface RBitAnd[L, Out]:
+    def __rand__(self, L other) -> Out
+
+interface RBitOr[L, Out]:
+    def __ror__(self, L other) -> Out
+
+interface RBitXor[L, Out]:
+    def __rxor__(self, L other) -> Out
+
+interface RLShift[L, Out]:
+    def __rlshift__(self, L other) -> Out
+
+interface RRShift[L, Out]:
+    def __rrshift__(self, L other) -> Out
+
+interface REq[L]:
+    def __req__(self, L other) -> bool
+
+interface RCmp[L]:
+    def __rcmp__(self, L other) -> int64
+";
+
 /// Parse the built-in [`PRELUDE_SRC`] into AST items. The prelude is authored to
 /// lex and parse cleanly; a failure here is a compiler bug. Callers (sema and
 /// the lowerer) prepend these ahead of the user's items, skipping any whose name
@@ -2841,6 +2951,20 @@ pub fn prelude_items() -> Vec<crate::ast::Item> {
     debug_assert!(
         perrs.is_empty() && lerrs.is_empty(),
         "built-in prelude must parse cleanly: {perrs:?} {lerrs:?}"
+    );
+    module.items
+}
+
+/// Parse the always-available operator-capability interfaces
+/// ([`OPERATOR_PRELUDE_SRC`], #1199). Like [`prelude_items`] this must parse
+/// cleanly; [`with_prelude`] prepends them to every module (they add no struct
+/// and emit no code, so this is byte-for-byte invisible to a program that names
+/// none of them).
+pub fn operator_prelude_items() -> Vec<crate::ast::Item> {
+    let (module, perrs, lerrs) = parse_str(OPERATOR_PRELUDE_SRC);
+    debug_assert!(
+        perrs.is_empty() && lerrs.is_empty(),
+        "operator prelude must parse cleanly: {perrs:?} {lerrs:?}"
     );
     module.items
 }
@@ -3087,6 +3211,80 @@ fn item_mentions_any(item: &crate::ast::Item, names: &std::collections::HashSet<
     names.iter().any(|n| dbg.contains(&format!("\"{n}\"")))
 }
 
+/// The operator-capability interface names (#1199), kept in sync with
+/// [`OPERATOR_PRELUDE_SRC`]. A type-parameter bound naming one of these is what
+/// makes [`with_prelude`] inject those interfaces.
+const OPERATOR_IFACE_NAMES: &[&str] = &[
+    "Add",
+    "Sub",
+    "Mul",
+    "TrueDiv",
+    "FloorDiv",
+    "Mod",
+    "Pow",
+    "MatMul",
+    "BitAnd",
+    "BitOr",
+    "BitXor",
+    "LShift",
+    "RShift",
+    "Eq",
+    "Ord",
+    "RAdd",
+    "RSub",
+    "RMul",
+    "RTrueDiv",
+    "RFloorDiv",
+    "RMod",
+    "RPow",
+    "RMatMul",
+    "RBitAnd",
+    "RBitOr",
+    "RBitXor",
+    "RLShift",
+    "RRShift",
+    "REq",
+    "RCmp",
+];
+
+/// Does any type-parameter bound in `generics` directly name an
+/// operator-capability interface (`[T: RMul[f64, T]]`)?
+fn generics_bound_by_operator_iface(generics: &[crate::ast::TypeParam]) -> bool {
+    generics.iter().any(|tp| {
+        matches!(&tp.bound,
+            Some(crate::ast::Type::Named { name, .. })
+                if OPERATOR_IFACE_NAMES.contains(&name.as_str()))
+    })
+}
+
+/// Does `module` bound any type parameter (on a function, a generic method, a
+/// struct, an enum, or a type alias) by an operator-capability interface
+/// (#1199)? This is a PRECISE structural check of bound positions, so an
+/// ordinary identifier that merely spells one of the names — an enum variant
+/// `Add(...)`, a `@derive(Eq, Ord)`, a user type `Mul` — never triggers
+/// injection; only a real bound does. Only then are the (otherwise unused and
+/// index-shifting) operator interfaces prepended.
+fn references_operator_iface(module: &Module) -> bool {
+    use crate::ast::Item;
+    module.items.iter().any(|it| match it {
+        Item::Function(f) => generics_bound_by_operator_iface(&f.generics),
+        Item::Struct(s) => {
+            generics_bound_by_operator_iface(&s.generics)
+                || s.methods
+                    .iter()
+                    .any(|m| generics_bound_by_operator_iface(&m.generics))
+        }
+        Item::Enum(e) => {
+            generics_bound_by_operator_iface(&e.generics)
+                || e.methods
+                    .iter()
+                    .any(|m| generics_bound_by_operator_iface(&m.generics))
+        }
+        Item::TypeAlias(a) => generics_bound_by_operator_iface(&a.generics),
+        _ => false,
+    })
+}
+
 /// Return `module` augmented with the built-in [`prelude_items`] when it uses the
 /// signals surface (see [`references_prelude`]); otherwise return a plain clone.
 /// A prelude item is skipped if the user already declares a type of that name, so
@@ -3108,11 +3306,40 @@ pub fn with_prelude(module: &Module) -> Module {
     // for any program that uses a dict (#498). Either way only the generic
     // `Optional[T]` enum is added, and an unused injection emits no code.
     let optional_only = !full && (references_optional_get(module) || uses_dict(module));
-    if !full && !optional_only {
-        return module.clone();
-    }
+    // The operator-capability interfaces (#1199) are injected only when a type
+    // parameter is actually bounded by one (`[T: RMul[f64, T]]`). The trigger is
+    // a PRECISE structural scan of bounds — not a Debug-substring needle — so a
+    // plain identifier such as an enum variant `Add(...)` or a `@derive(Eq)`
+    // never pulls them in. Lowering an interface materializes an itable layout
+    // (a `structs` entry), so injecting them unconditionally would shift struct
+    // indices for every program; gating keeps non-generic and operator-free
+    // programs byte-for-byte unchanged.
+    let operators = references_operator_iface(module);
     let user_names: std::collections::HashSet<&str> =
         module.items.iter().filter_map(item_type_name).collect();
+    // A user type of the same name shadows an operator interface (dropped here,
+    // like the rest of the prelude).
+    let mut items: Vec<crate::ast::Item> = if operators {
+        operator_prelude_items()
+            .into_iter()
+            .filter(|it| match item_type_name(it) {
+                Some(n) => !user_names.contains(n),
+                None => true,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // The needle-gated value-struct/function prelude is injected only when the
+    // program references it (so struct indices and output stay byte-identical
+    // otherwise, ticket #77).
+    if !full && !optional_only {
+        items.extend(module.items.iter().cloned());
+        return Module {
+            items,
+            span: module.span,
+        };
+    }
     let prelude = prelude_items();
     // Prelude *type* names the user has redefined (#689). A user type of the same
     // name shadows the prelude's (handled by the `Some(n)` arm below), but a
@@ -3128,24 +3355,22 @@ pub fn with_prelude(module: &Module) -> Module {
         .filter(|n| user_names.contains(n))
         .map(|n| n.to_string())
         .collect();
-    let mut items: Vec<crate::ast::Item> = prelude
-        .into_iter()
-        .filter(|it| {
-            // In the `Optional`-only path, inject nothing but the `Optional[T]`
-            // enum (it is self-contained — its methods reference only itself).
-            if optional_only {
-                return item_type_name(it) == Some("Optional") && !user_names.contains("Optional");
-            }
-            match item_type_name(it) {
-                Some(n) => !user_names.contains(n),
-                // A prelude helper with no type name of its own (a free
-                // function) is kept unless it mentions a user-shadowed prelude
-                // type (#689); `shadowed` empty → every program without such a
-                // collision is byte-for-byte unchanged.
-                None => !item_mentions_any(it, &shadowed),
-            }
-        })
-        .collect();
+    // Append the needle-gated prelude after the always-on operator interfaces.
+    items.extend(prelude.into_iter().filter(|it| {
+        // In the `Optional`-only path, inject nothing but the `Optional[T]`
+        // enum (it is self-contained — its methods reference only itself).
+        if optional_only {
+            return item_type_name(it) == Some("Optional") && !user_names.contains("Optional");
+        }
+        match item_type_name(it) {
+            Some(n) => !user_names.contains(n),
+            // A prelude helper with no type name of its own (a free
+            // function) is kept unless it mentions a user-shadowed prelude
+            // type (#689); `shadowed` empty → every program without such a
+            // collision is byte-for-byte unchanged.
+            None => !item_mentions_any(it, &shadowed),
+        }
+    }));
     items.extend(module.items.iter().cloned());
     Module {
         items,
