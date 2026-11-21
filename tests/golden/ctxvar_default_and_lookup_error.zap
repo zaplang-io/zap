@@ -9,7 +9,7 @@ def main() -> int64:
     print(WITH_DEFAULT.get())  # 5 — default, never set
     try:
         auto x = NO_DEFAULT.get()
-        print(x)               # unreached
+        print(x)  # unreached
     except Exception as e:
         print("caught")
     return 0

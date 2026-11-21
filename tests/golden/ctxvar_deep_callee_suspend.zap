@@ -10,8 +10,8 @@ def deep() -> int64:
 
 def worker(channel[int64] gate, channel[int64] out):
     auto tok = CUR.set(42)
-    auto g0 = <-gate           # park here until main releases us (suspend)
-    out <- deep()              # read the binding after the resume
+    auto g0 = <-gate  # park here until main releases us (suspend)
+    out <- deep()  # read the binding after the resume
     CUR.reset(tok)
 
 def main():
@@ -19,5 +19,5 @@ def main():
     auto out = channel[int64](1)
     scope:
         spawn worker(gate, out)
-        gate <- 0              # release the worker
+        gate <- 0  # release the worker
         print(<-out)

@@ -7,9 +7,9 @@ ContextVar[int64] W = ContextVar[int64]("w", default=-1)
 
 def worker(int64 id, channel[int64] ready, channel[int64] go, channel[int64] out):
     auto tok = W.set(id)
-    ready <- 1                 # signal "I have set my binding"
-    auto g = <-go              # wait until BOTH have set (forces interleave)
-    out <- W.get()             # read back MY own id
+    ready <- 1  # signal "I have set my binding"
+    auto g = <-go  # wait until BOTH have set (forces interleave)
+    out <- W.get()  # read back MY own id
     W.reset(tok)
 
 def main():
@@ -21,10 +21,10 @@ def main():
     scope:
         spawn worker(10, ready, go, out)
         spawn worker(20, ready, go, out)
-        auto a = <-ready        # both have set before we release either
+        auto a = <-ready  # both have set before we release either
         auto b = <-ready
         go <- 0
         go <- 0
         r1 = <-out
         r2 = <-out
-    print(r1 + r2)              # 30 iff isolated (10 + 20)
+    print(r1 + r2)  # 30 iff isolated (10 + 20)

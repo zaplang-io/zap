@@ -26,9 +26,9 @@ def main():
     auto tb = B.set(Span(id=99))
     auto tc = C.set("hello")
     churn()
-    print(A.get())             # 7
-    print(B.get().id)          # 99
-    print(C.get())             # hello
+    print(A.get())  # 7
+    print(B.get().id)  # 99
+    print(C.get())  # hello
     A.reset(ta)
     B.reset(tb)
     C.reset(tc)
