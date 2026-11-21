@@ -495,6 +495,23 @@ impl<'a> FnLower<'a> {
             }
         }
 
+        // Structural list equality (#1239): `l1 == l2` / `l1 != l2` compares the
+        // two lists element-wise (order- and length-sensitive), the Python value
+        // semantics for sequences, rather than by pointer identity. Must precede
+        // the generic numeric/reference fall-through below, which would otherwise
+        // `ptrtoint`-compare the list headers and report two separately allocated
+        // but equal lists as unequal. `is` / `is not` keep identity (handled at
+        // the top of `binop`). Equality is symmetric, so a list on either side is
+        // routed with the list operand on the left; `list_cmp` raises a clear
+        // error if the other operand is not itself a list.
+        if matches!(op, Eq | Ne) && (matches!(lt, Ty::List(_)) || matches!(rt, Ty::List(_))) {
+            if let Ty::List(lelem) = lt {
+                return self.list_cmp(op, l, lelem, r, rt);
+            }
+            let Ty::List(relem) = rt else { unreachable!() };
+            return self.list_cmp(op, r, relem, l, lt);
+        }
+
         // Operator overloading on user structs (D-0047): `a op b` desugars to the
         // matching dunder method, resolved like any struct method call. `in`
         // dispatches on the right operand (`x in a` -> `a.__contains__(x)`); every
