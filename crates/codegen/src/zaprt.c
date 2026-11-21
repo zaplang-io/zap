@@ -338,6 +338,9 @@ extern const ZapTypeDesc zap_desc_gobj;    /* scheduler G (precise)             
 extern const ZapTypeDesc zap_desc_ptrs;    /* a generic array-of-pointers buffer */
 extern const ZapTypeDesc zap_desc_sigsub;  /* SigSub: {next, chan} (ticket #77)  */
 extern const ZapTypeDesc zap_desc_atomicarray; /* AtomicArray[T] (#844)           */
+extern const ZapTypeDesc zap_desc_ctxvar;  /* ContextVar[T] key object (#1237)   */
+extern const ZapTypeDesc zap_desc_ctxnode; /* ContextVar binding node (#1237)    */
+extern const ZapTypeDesc zap_desc_ctxtoken;/* ContextVar reset token (#1237)     */
 
 /* Preemption guard (ticket #172): mark a window in which the current coroutine
  * must not be async-preempted (it is inside a runtime critical section that
@@ -5592,6 +5595,17 @@ typedef struct G {
      * engine under `race_mu`). The clock itself lives in the engine's gid-indexed
      * table, not here, so a non-`--race` build never allocates one. */
     int64_t race_gid;
+    /* Coroutine-local execution context (#1237, D-PROVISIONAL). Head of an
+     * immutable singly-linked list of `ZapCtxNode{var, value, next}` (newest
+     * first) holding the `ContextVar` bindings visible to THIS coroutine; NULL
+     * when empty. It lives in the G (not a thread-local) so a binding follows
+     * the coroutine across park/resume and worker migration, and two interleaved
+     * coroutines on one worker never see each other's bindings. `galloc`
+     * snapshots the parent's head into a spawned child (Python `copy_context`
+     * semantics): the child shares the immutable tail, and its own `set` swaps
+     * only its head, so later child/parent mutations never leak across the
+     * boundary. A GC-managed pointer -> listed in `zap_off_gobj`. */
+    void *coctx;
 } G;
 
 typedef struct P {
@@ -6217,6 +6231,12 @@ void zap_race_wg_acquire(void *wg);
 void zap_race_once_release(void *once);
 void zap_race_once_acquire(void *once);
 
+/* Context head for code running on `main`'s native thread (no coroutine `G`):
+ * a single process-wide chain (#1237). Declared here so `galloc` can snapshot it
+ * into a coroutine spawned directly from `main`; defined (and GC-rooted) with the
+ * other context code below. */
+static void *zap_main_coctx;
+
 static G *galloc(void *fn, void *arg) {
     size_t ss = zap_stack_size();
     G *g = NULL;
@@ -6245,6 +6265,16 @@ static G *galloc(void *fn, void *arg) {
     g->severed = 0; /* #825: not a timed-out orphan until a deadline severs it */
     g->shadow_head = NULL; /* precise GC (#48): a fresh G has an empty chain */
     g->race_gid = -1;      /* unassigned until the race engine first sees it */
+    /* Coroutine-local context (#1237): a spawned child inherits a SNAPSHOT of
+     * the spawning context's current head (Python `copy_context`). Spawned from a
+     * coroutine, that is the parent G's head; spawned from `main`'s native thread
+     * (no current G), it is the main-thread chain (`zap_main_coctx`) — so a
+     * top-level `cv.set` before `spawn` is visible to the child. This mirrors
+     * `zap_ctx_head`. Every spawn form (root / scoped / detached) funnels through
+     * here, so this is the one place the parent->child context edge is made. The
+     * list is immutable, so sharing the head pointer is a safe snapshot — the
+     * child's own `set` prepends a new head without mutating the shared tail. */
+    g->coctx = (cur_m && cur_m->current) ? cur_m->current->coctx : zap_main_coctx;
     zap_ctx_make(&g->ctx, g->stack, g->stack_size, g_bootstrap);
     all_add(g);
     return g;
@@ -6257,6 +6287,7 @@ static void gfree(G *g) {
     g->scope = NULL; /* drop the scope reference so a reused G starts clean */
     g->in_live = 0;
     g->severed = 0; /* #825: a reused G is not a severed orphan */
+    g->coctx = NULL; /* #1237: drop context bindings so a reused G starts clean */
     /* Keep the stack buffer for reuse (size-classed free list, one class). */
     zap_np_lock(&g_free_mu);
     g->link = g_free_head;
@@ -7333,6 +7364,167 @@ void zap_spawn_scoped(void *fn_, void *arg, void *scope_, const char *name) {
     g->name = name;
     zap_race_on_spawn(g); /* --race: parent->child happens-before edge (#678) */
     sched_enqueue(g);
+}
+
+/* ===========================================================================
+ * Coroutine-local execution context (#1237, D-PROVISIONAL) — Zap's analogue of
+ * Python `contextvars`. A `ContextVar[T]` object's IDENTITY (its pointer) is the
+ * lookup key. The per-coroutine bindings live as an immutable cons-list hung off
+ * the running coroutine's `G->coctx` (see the field comment on `struct G`), so a
+ * binding survives park/resume and worker migration, interleaved coroutines on
+ * one worker stay isolated, and a spawned child inherits a snapshot (galloc).
+ *
+ * Value representation: each node carries BOTH a traced reference slot
+ * (`value_ref`, for a reference-typed `ContextVar`) and an untraced word slot
+ * (`value_word`, for an `int64`-typed one). A node's `var->elem_ptr` says which
+ * is live. The node's precise GC descriptor traces {var, value_ref, next} only,
+ * so a scalar word is never mis-scanned as a pointer and a reference value is
+ * always kept alive and forwarded — the D-0078 §4.4 invariant, without boxing.
+ * ======================================================================== */
+
+/* `zap_main_coctx` (the main-thread context head) is declared above `galloc`
+ * so a spawn from `main` can snapshot it; it is registered as a precise-GC root
+ * in `zap_gc_register_statics` so its nodes are traced (under Boehm the static
+ * data segment is scanned conservatively anyway). */
+
+typedef struct ZapCtxVar {
+    void *name;         /* ZapStr* — the variable's name (diagnostics)          */
+    void *default_ref;  /* reference default (elem_ptr), or NULL                */
+    int64_t default_word; /* int64 default (!elem_ptr); untraced                */
+    uint8_t has_default;/* 1 iff get() returns the default when unbound         */
+    uint8_t elem_ptr;   /* 1 iff values are references (get/set_ptr), else word */
+} ZapCtxVar;
+
+typedef struct ZapCtxNode {
+    struct ZapCtxVar *var;    /* the key this node binds                        */
+    void *value_ref;          /* reference value (elem_ptr), or NULL            */
+    struct ZapCtxNode *next;  /* older bindings (immutable tail)                */
+    int64_t value_word;       /* int64 value (!elem_ptr); untraced              */
+} ZapCtxNode;
+
+typedef struct ZapCtxToken {
+    struct ZapCtxNode *prev_head; /* G->coctx just before the matching set()    */
+    struct ZapCtxVar *var;        /* the var set() bound (diagnostics only)     */
+} ZapCtxToken;
+
+/* Allocate a ContextVar key object. `_ptr` stores a reference default, `_i64` a
+ * word default; `has_default` says whether the default is meaningful. */
+void *zap_ctxvar_new_ptr(void *name, void *dflt, int64_t has_default) {
+    ZapCtxVar *v = (ZapCtxVar *)zap_obj(&zap_desc_ctxvar);
+    v->name = name;
+    v->default_ref = dflt;
+    v->default_word = 0;
+    v->has_default = has_default ? 1 : 0;
+    v->elem_ptr = 1;
+    return v;
+}
+
+void *zap_ctxvar_new_i64(void *name, int64_t dflt, int64_t has_default) {
+    ZapCtxVar *v = (ZapCtxVar *)zap_obj(&zap_desc_ctxvar);
+    v->name = name;
+    v->default_ref = NULL;
+    v->default_word = dflt;
+    v->has_default = has_default ? 1 : 0;
+    v->elem_ptr = 0;
+    return v;
+}
+
+/* The running coroutine's context head, or NULL off a coroutine (on `main`'s
+ * native thread before/without spawning). A plain non-coroutine `main` has no G,
+ * so it keeps one implicit process-wide chain here. */
+static void *zap_ctx_head(void) {
+    G *g = cur_m ? cur_m->current : NULL;
+    return g ? g->coctx : zap_main_coctx;
+}
+
+static void zap_ctx_set_head(void *head) {
+    G *g = cur_m ? cur_m->current : NULL;
+    if (g) {
+        g->coctx = head;
+    } else {
+        zap_main_coctx = head;
+    }
+}
+
+/* Find the newest live binding of `var` for the current coroutine, or NULL. */
+static ZapCtxNode *zap_ctxvar_find(ZapCtxVar *var) {
+    for (ZapCtxNode *n = (ZapCtxNode *)zap_ctx_head(); n; n = n->next) {
+        if (n->var == var) {
+            return n;
+        }
+    }
+    return NULL;
+}
+
+__attribute__((noreturn)) static void zap_ctxvar_unbound(ZapCtxVar *var) {
+    /* LookupError (the Python base of KeyError/IndexError), catchable. The name
+     * is carried on the var for a future richer message; v1 keeps a fixed string
+     * to stay independent of the ZapStr header layout. */
+    (void)var;
+    static const char m[] = "ContextVar has no value and no default";
+    zap_panic_typed(ZAP_EXC_LOOKUP_ERROR, zap_str_new(m, (int64_t)sizeof(m) - 1));
+}
+
+void *zap_ctxvar_get_ptr(void *var_) {
+    ZapCtxVar *var = (ZapCtxVar *)var_;
+    ZapCtxNode *n = zap_ctxvar_find(var);
+    if (n) {
+        return n->value_ref;
+    }
+    if (var->has_default) {
+        return var->default_ref;
+    }
+    zap_ctxvar_unbound(var);
+}
+
+int64_t zap_ctxvar_get_i64(void *var_) {
+    ZapCtxVar *var = (ZapCtxVar *)var_;
+    ZapCtxNode *n = zap_ctxvar_find(var);
+    if (n) {
+        return n->value_word;
+    }
+    if (var->has_default) {
+        return var->default_word;
+    }
+    zap_ctxvar_unbound(var);
+}
+
+/* Bind `var` for the current coroutine, returning a token that restores the
+ * previous context when passed to reset(). The new node PREPENDS to the current
+ * head; the immutable tail is shared, so reset() is an O(1) head restore and two
+ * interleaved coroutines (distinct heads) never observe each other's set. */
+static void *zap_ctxvar_set_common(ZapCtxVar *var, void *ref, int64_t word) {
+    void *prev = zap_ctx_head();
+    ZapCtxNode *node = (ZapCtxNode *)zap_obj(&zap_desc_ctxnode);
+    node->var = var;
+    node->value_ref = ref;
+    node->value_word = word;
+    node->next = (ZapCtxNode *)prev;
+    zap_ctx_set_head(node);
+    ZapCtxToken *tok = (ZapCtxToken *)zap_obj(&zap_desc_ctxtoken);
+    tok->prev_head = (ZapCtxNode *)prev;
+    tok->var = var;
+    return tok;
+}
+
+void *zap_ctxvar_set_ptr(void *var_, void *val) {
+    return zap_ctxvar_set_common((ZapCtxVar *)var_, val, 0);
+}
+
+void *zap_ctxvar_set_i64(void *var_, int64_t val) {
+    return zap_ctxvar_set_common((ZapCtxVar *)var_, NULL, val);
+}
+
+/* Restore the context to the state captured by `token` (the head just before the
+ * matching set()). Strictly-nested set/reset — the recommended usage and all the
+ * otel current-span pattern needs — restores exactly as Python does; a dropped
+ * node is reclaimed by the collector. */
+void zap_ctxvar_reset(void *token_) {
+    ZapCtxToken *tok = (ZapCtxToken *)token_;
+    if (!tok) {
+        return;
+    }
+    zap_ctx_set_head(tok->prev_head);
 }
 
 /* Block until every coroutine owned by `sc` has finished. Called from `main`
@@ -10453,10 +10645,28 @@ static const int32_t zap_off_gobj[] = {
     (int32_t)offsetof(G, stack),
     (int32_t)offsetof(G, arg),
     (int32_t)offsetof(G, scope),
+    (int32_t)offsetof(G, coctx), /* #1237: coroutine-local context chain head */
 };
 static const int32_t zap_off_sigsub[] = {
     (int32_t)offsetof(SigSub, next),
     (int32_t)offsetof(SigSub, chan),
+};
+/* Coroutine-local context (#1237). Each is a flat object of inline pointer
+ * fields -> a precise offset table (no custom trace kind). A node's untraced
+ * `value_word` (and a var's `default_word`) is deliberately absent here: a
+ * scalar binding's word must NOT be scanned as a pointer (D-0078 §4.4). */
+static const int32_t zap_off_ctxvar[] = {
+    (int32_t)offsetof(ZapCtxVar, name),
+    (int32_t)offsetof(ZapCtxVar, default_ref),
+};
+static const int32_t zap_off_ctxnode[] = {
+    (int32_t)offsetof(ZapCtxNode, var),
+    (int32_t)offsetof(ZapCtxNode, value_ref),
+    (int32_t)offsetof(ZapCtxNode, next),
+};
+static const int32_t zap_off_ctxtoken[] = {
+    (int32_t)offsetof(ZapCtxToken, prev_head),
+    (int32_t)offsetof(ZapCtxToken, var),
 };
 
 const ZapTypeDesc zap_desc_atomic = {0, ZAP_TD_ATOMIC, 0, NULL};
@@ -10480,9 +10690,15 @@ const ZapTypeDesc zap_desc_pyobj = {(int64_t)sizeof(ZapPy), ZAP_TD_ATOMIC, 0, NU
  * header only (the real size is per-object, via zap_gc_alloc_var). */
 const ZapTypeDesc zap_desc_strobj = {(int64_t)sizeof(ZapStr), ZAP_TD_ATOMIC, 0,
                                      NULL};
-const ZapTypeDesc zap_desc_gobj = {(int64_t)sizeof(G), ZAP_TD_PRECISE, 3, zap_off_gobj};
+const ZapTypeDesc zap_desc_gobj = {(int64_t)sizeof(G), ZAP_TD_PRECISE, 4, zap_off_gobj};
 const ZapTypeDesc zap_desc_sigsub = {(int64_t)sizeof(SigSub), ZAP_TD_PRECISE, 2,
                                      zap_off_sigsub};
+const ZapTypeDesc zap_desc_ctxvar = {(int64_t)sizeof(ZapCtxVar), ZAP_TD_PRECISE, 2,
+                                     zap_off_ctxvar};
+const ZapTypeDesc zap_desc_ctxnode = {(int64_t)sizeof(ZapCtxNode), ZAP_TD_PRECISE, 3,
+                                      zap_off_ctxnode};
+const ZapTypeDesc zap_desc_ctxtoken = {(int64_t)sizeof(ZapCtxToken), ZAP_TD_PRECISE, 2,
+                                       zap_off_ctxtoken};
 
 #ifdef ZAP_GC_IMMIX
 /* Custom root: the reflection registry is a static table (not a heap object)
@@ -10522,6 +10738,7 @@ static void zap_reflect_mark_roots(void) {
 __attribute__((constructor)) static void zap_gc_register_statics(void) {
     zap_gc_add_root((void **)&g_cancelled);
     zap_gc_add_root((void **)&zap_current_exc);
+    zap_gc_add_root((void **)&zap_main_coctx); /* #1237: main-thread context chain */
     zap_gc_add_root_fn(zap_reflect_mark_roots);
     zap_gc_add_root_fn(zap_scope_wait_mark_roots);
     zap_gc_add_root_fn(zap_netpoll_mark_roots);

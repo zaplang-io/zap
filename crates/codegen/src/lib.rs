@@ -3703,6 +3703,26 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), i.into(), p.into(), p.into()],
             Some(i.into()),
         );
+        // ContextVar[T] coroutine-local execution context (#1237). `_new(name,
+        // default, has_default)` allocates the key object; reference values use
+        // the `_ptr` entry points, `int64` values the `_i64` ones. `get` may
+        // raise LookupError (routed as an `invoke` by lowering). `set` returns a
+        // ContextToken; `reset` consumes one.
+        self.declare_rt(
+            "zap_ctxvar_new_ptr",
+            &[p.into(), p.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_ctxvar_new_i64",
+            &[p.into(), i.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt("zap_ctxvar_get_ptr", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_ctxvar_get_i64", &[p.into()], Some(i.into()));
+        self.declare_rt("zap_ctxvar_set_ptr", &[p.into(), p.into()], Some(p.into()));
+        self.declare_rt("zap_ctxvar_set_i64", &[p.into(), i.into()], Some(p.into()));
+        self.declare_rt("zap_ctxvar_reset", &[p.into()], None);
         // `channel[float64]` (#800): the element travels as a reinterpreted
         // `double` word.
         self.declare_rt("zap_chan_send_f64", &[p.into(), f64t.into()], None);
@@ -4993,6 +5013,8 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             | Ty::Array(..)
             | Ty::Chan(_)
             | Ty::AtomicArray(_)
+            | Ty::ContextVar(_)
+            | Ty::CtxToken
             | Ty::Bytes
             | Ty::Match
             | Ty::Func(_)

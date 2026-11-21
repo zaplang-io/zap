@@ -146,6 +146,7 @@ fn subst_ty(ty: &Ty, subst: &HashMap<&str, &Ty>) -> Ty {
         Ty::OSet(e) => Ty::OSet(Box::new(subst_ty(e, subst))),
         Ty::Chan(e) => Ty::Chan(Box::new(subst_ty(e, subst))),
         Ty::AtomicArray(e) => Ty::AtomicArray(Box::new(subst_ty(e, subst))),
+        Ty::ContextVar(e) => Ty::ContextVar(Box::new(subst_ty(e, subst))),
         Ty::Dict(k, v) => Ty::Dict(Box::new(subst_ty(k, subst)), Box::new(subst_ty(v, subst))),
         Ty::Tuple(elems) => Ty::Tuple(elems.iter().map(|e| subst_ty(e, subst)).collect()),
         _ => ty.clone(),
@@ -2683,6 +2684,8 @@ impl Checker {
                     "oset" => Ty::OSet(Box::new(elem(0))),
                     "channel" => Ty::Chan(Box::new(elem(0))),
                     "AtomicArray" => Ty::AtomicArray(Box::new(elem(0))),
+                    "ContextVar" => Ty::ContextVar(Box::new(elem(0))),
+                    "ContextToken" => Ty::CtxToken,
                     "dict" => Ty::Dict(Box::new(elem(0)), Box::new(elem(1))),
                     _ => self.resolve_type(t),
                 }
@@ -2972,6 +2975,16 @@ impl Checker {
                         .unwrap_or(Ty::Unknown);
                     Ty::AtomicArray(Box::new(el))
                 }
+                // Coroutine-local execution context (#1237). `ContextVar[T]` carries
+                // its value type; `ContextToken` is the opaque, non-generic token.
+                "ContextVar" => {
+                    let el = args
+                        .first()
+                        .map(|a| self.resolve_type(a))
+                        .unwrap_or(Ty::Unknown);
+                    Ty::ContextVar(Box::new(el))
+                }
+                "ContextToken" => Ty::CtxToken,
                 other => {
                     // A transparent type alias (#606) resolves to its target
                     // with the generic parameters substituted, recursively, so
@@ -6565,6 +6578,8 @@ impl Checker {
             Ty::List(_) | Ty::Dict(_, _) | Ty::Set(_) | Ty::Heap(_) | Ty::Chan(_) => true,
             Ty::Deque(_) | Ty::OSet(_) => true,
             Ty::AtomicArray(_) => true,
+            // Coroutine-local context (#1237): both are GC-managed references.
+            Ty::ContextVar(_) | Ty::CtxToken => true,
             _ if Self::is_optional_ty(t) => true,
             Ty::Named(n) => self.structs.get(n).is_some_and(|s| !s.is_value),
             _ => false,
@@ -6999,6 +7014,80 @@ impl Checker {
                     }
                 }
                 return Ty::AtomicArray(Box::new(elem));
+            }
+            // ContextVar construction `ContextVar[T]("name")` /
+            // `ContextVar[T]("name", default=d)` (#1237, PROVISIONAL). The value
+            // type `T` is the subscript; the first argument is a `str` name (used
+            // in diagnostics), and an optional `default` (positional or keyword)
+            // of type `T` is returned by `get()` when the variable is unbound in
+            // the current coroutine. Supported `T` mirrors `AtomicArray` for v1:
+            // a reference type or `int64` (a scalar is boxed in the runtime;
+            // other scalar/value-struct kinds are a documented follow-up).
+            if matches!(base.as_ref(), Expr::Name(n, _) if n == "ContextVar") {
+                let elem = self.chan_elem_from_expr(index);
+                let elem_ok =
+                    matches!(elem, Ty::Int64 | Ty::Str | Ty::Bytes) || self.is_identity_ty(&elem);
+                if !elem_ok {
+                    self.error(
+                        ErrorCode::ZAP4028,
+                        format!(
+                            "ContextVar[T] supports reference types or int64, not {} \
+                             (PROVISIONAL; other element kinds are a follow-up)",
+                            elem.display()
+                        ),
+                        span,
+                    );
+                }
+                if args.is_empty() || args.len() > 2 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!(
+                            "ContextVar[T](name, default=...) takes a name and an \
+                             optional default, got {} arguments",
+                            args.len()
+                        ),
+                        span,
+                    );
+                }
+                for (i, a) in args.iter().enumerate() {
+                    let at = self.infer(&a.value);
+                    let is_default =
+                        a.name.as_deref() == Some("default") || (i == 1 && a.name.is_none());
+                    if is_default {
+                        // The default must be assignable to the value type `T`.
+                        if !assignable(&at, &elem) && !matches!(at, Ty::Unknown) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "ContextVar[{}] default has type {}",
+                                    elem.display(),
+                                    at.display()
+                                ),
+                                expr_span(&a.value),
+                            );
+                        }
+                    } else if i == 0 && a.name.is_none() {
+                        // The first positional argument is the name (a `str`).
+                        if !matches!(at, Ty::Str | Ty::Unknown) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!("ContextVar name must be a str, found {}", at.display()),
+                                expr_span(&a.value),
+                            );
+                        }
+                    } else {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!(
+                                "unexpected argument to ContextVar[T]; expected \
+                                 name and optional default=, found {:?}",
+                                a.name
+                            ),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+                return Ty::ContextVar(Box::new(elem));
             }
             // Heap construction `heap[T]()` / `heap[T](cmp="max")` (D-0057). The
             // element type `T` is the subscript; the only accepted argument is the
@@ -8259,6 +8348,12 @@ impl Checker {
                 let elem = (**elem).clone();
                 return self.check_atomicarray_method(name, args, &elem, *span);
             }
+            // ContextVar[T] methods (#1237): get()->T, set(v)->ContextToken,
+            // reset(token)->unit. Typed precisely against the value type `T`.
+            if let Ty::ContextVar(elem) = &bt {
+                let elem = (**elem).clone();
+                return self.check_ctxvar_method(name, args, &elem, *span);
+            }
             // Built-in `deque[T]` methods (#983): append/appendleft/pop/popleft/
             // get/clear, typed precisely (pop/get yield `T`).
             if let Ty::Deque(elem) = &bt {
@@ -9134,6 +9229,83 @@ impl Checker {
                         "AtomicArray has no method '{other}' (supported: load, store, \
                          compare_and_swap, len)"
                     ),
+                    span,
+                );
+                Ty::Unknown
+            }
+        }
+    }
+
+    /// Type a `ContextVar[T]` method (#1237, PROVISIONAL). Coroutine-local
+    /// execution context; all bindings are per-coroutine and restored by token.
+    ///   `get() -> T`                (current value; raises LookupError if unbound
+    ///                                and the variable has no default)
+    ///   `set(v) -> ContextToken`    (bind `v` for the current coroutine)
+    ///   `reset(token)`              (-> unit; restore to the pre-`set` state)
+    fn check_ctxvar_method(&mut self, name: &str, args: &[Arg], elem: &Ty, span: Span) -> Ty {
+        match name {
+            "get" => {
+                if !args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!("ContextVar.get() takes no arguments, got {}", args.len()),
+                        span,
+                    );
+                }
+                elem.clone()
+            }
+            "set" => {
+                if args.len() != 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!("ContextVar.set(v) takes one argument, got {}", args.len()),
+                        span,
+                    );
+                } else {
+                    let vt = self.infer(&args[0].value);
+                    if !assignable(&vt, elem) && !matches!(vt, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "ContextVar[{}] value has type {}",
+                                elem.display(),
+                                vt.display()
+                            ),
+                            expr_span(&args[0].value),
+                        );
+                    }
+                }
+                Ty::CtxToken
+            }
+            "reset" => {
+                if args.len() != 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!(
+                            "ContextVar.reset(token) takes one argument, got {}",
+                            args.len()
+                        ),
+                        span,
+                    );
+                } else {
+                    let tt = self.infer(&args[0].value);
+                    if !matches!(tt, Ty::CtxToken | Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "ContextVar.reset expects a ContextToken, found {}",
+                                tt.display()
+                            ),
+                            expr_span(&args[0].value),
+                        );
+                    }
+                }
+                Ty::Unit
+            }
+            other => {
+                self.error(
+                    ErrorCode::ZAP4080,
+                    format!("ContextVar has no method '{other}' (supported: get, set, reset)"),
                     span,
                 );
                 Ty::Unknown
@@ -10887,6 +11059,150 @@ mod tests {
             e.iter().any(|x| x.code == ErrorCode::ZAP4033),
             "non-integer capacity must error (ZAP4033), got {e:?}"
         );
+    }
+
+    // ---- ContextVar[T] coroutine-local execution context (#1237) -----------
+
+    #[test]
+    fn ctxvar_int64_surface_type_checks() {
+        // get()->T, set(v)->ContextToken, reset(token). int64 value.
+        ok("def main():\n    \
+            ContextVar[int64] cv = ContextVar[int64](\"req_id\", default=0)\n    \
+            auto tok = cv.set(42)\n    \
+            auto v = cv.get()\n    \
+            cv.reset(tok)\n");
+    }
+
+    #[test]
+    fn ctxvar_reference_value_get_is_typed_as_element() {
+        // A reference value: get() returns the element type, so a field access on
+        // the result type-checks (it would not if get() returned Unknown/ptr).
+        ok("struct Span:\n    int64 id\n\
+            def main():\n    \
+            ContextVar[Span] cur = ContextVar[Span](\"span\")\n    \
+            auto tok = cur.set(Span(id=1))\n    \
+            auto s = cur.get()\n    \
+            print(s.id)\n    \
+            cur.reset(tok)\n");
+    }
+
+    #[test]
+    fn ctxvar_no_default_is_allowed() {
+        // The default is optional; a name-only ContextVar type-checks (get() will
+        // raise LookupError at runtime when unbound).
+        ok("def main():\n    \
+            ContextVar[str] cv = ContextVar[str](\"name\")\n    \
+            auto tok = cv.set(\"hi\")\n    \
+            cv.reset(tok)\n");
+    }
+
+    #[test]
+    fn ctxvar_rejects_unsupported_value_type() {
+        // v1 mirrors AtomicArray: a reference type or int64; a float value type
+        // is rejected (a documented follow-up).
+        let e = errors("def main():\n    ContextVar[float64] cv = ContextVar[float64](\"x\")\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4028),
+            "float value type must be rejected (ZAP4028), got {e:?}"
+        );
+    }
+
+    #[test]
+    fn ctxvar_set_value_must_match_element() {
+        let e = errors(
+            "def main():\n    \
+            ContextVar[int64] cv = ContextVar[int64](\"x\")\n    \
+            cv.set(\"not an int\")\n",
+        );
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4024),
+            "a str value for an int64 ContextVar must error (ZAP4024), got {e:?}"
+        );
+    }
+
+    #[test]
+    fn ctxvar_default_must_match_element() {
+        let e = errors(
+            "def main():\n    ContextVar[int64] cv = ContextVar[int64](\"x\", default=\"nope\")\n",
+        );
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4024),
+            "a str default for an int64 ContextVar must error (ZAP4024), got {e:?}"
+        );
+    }
+
+    #[test]
+    fn ctxvar_get_arity_is_checked() {
+        let e = errors(
+            "def main():\n    \
+            ContextVar[int64] cv = ContextVar[int64](\"x\")\n    \
+            auto v = cv.get(5)\n",
+        );
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4025),
+            "get() with an argument must error (ZAP4025), got {e:?}"
+        );
+    }
+
+    #[test]
+    fn ctxvar_reset_requires_a_token() {
+        let e = errors(
+            "def main():\n    \
+            ContextVar[int64] cv = ContextVar[int64](\"x\")\n    \
+            cv.reset(5)\n",
+        );
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4024),
+            "reset() with a non-token must error (ZAP4024), got {e:?}"
+        );
+    }
+
+    #[test]
+    fn ctxvar_unknown_method_is_rejected() {
+        let e = errors(
+            "def main():\n    \
+            ContextVar[int64] cv = ContextVar[int64](\"x\")\n    \
+            cv.frobnicate()\n",
+        );
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4080),
+            "unknown method must error (ZAP4080), got {e:?}"
+        );
+    }
+
+    #[test]
+    fn ctxvar_name_must_be_str() {
+        let e = errors("def main():\n    ContextVar[int64] cv = ContextVar[int64](123)\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4024),
+            "a non-str name must error (ZAP4024), got {e:?}"
+        );
+    }
+
+    #[test]
+    fn ctxvar_module_global_is_accepted() {
+        // A module-level ContextVar (the realistic otel pattern) type-checks and
+        // passes the sharing lint (ContextVar is in BUILTIN_SHAREABLE_TYPES), so
+        // a deep callee can read it without threading it through every frame.
+        ok(
+            "ContextVar[int64] CUR = ContextVar[int64](\"cur\", default=-1)\n\
+            def deep() -> int64:\n    \
+            return CUR.get()\n\
+            def main():\n    \
+            auto tok = CUR.set(5)\n    \
+            print(deep())\n    \
+            CUR.reset(tok)\n",
+        );
+    }
+
+    #[test]
+    fn ctxvar_token_type_round_trips() {
+        // The token returned by set() is a ContextToken and can be annotated as
+        // such, then passed back to reset().
+        ok("def main():\n    \
+            ContextVar[int64] cv = ContextVar[int64](\"x\", default=0)\n    \
+            ContextToken t = cv.set(7)\n    \
+            cv.reset(t)\n");
     }
 
     #[test]

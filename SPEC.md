@@ -2176,6 +2176,7 @@ change), **I** Internal (no contract). Sections marked **S** are **frozen for
 | First-class function values + closures | Locked (D-0067) | **S** |
 | Concurrency model + surface (`select`, `scope:`, `spawn detached`) | Locked (D-0031/D-0044/D-0045) | **S** |
 | Sync primitives + `Atomic[T]` | Locked (D-0032/D-0066) | **S** |
+| Coroutine-local context (`ContextVar[T]`/`ContextToken`) | Provisional (#1237) | **E** |
 | Exceptions, resource cleanup (`with` / context managers) | Locked (D-0069) | **S** |
 | Modules & visibility | Locked | **S** |
 | Regex | Locked (design 0001) | **S** |

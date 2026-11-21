@@ -306,6 +306,48 @@ impl Keyword {
         })
     }
 
+    /// Is this keyword a built-in **nominal type name** (`int64`, `str`, `set`,
+    /// `list`, `dict`, …)? These are hard keywords in type position, but a `.name`
+    /// member position is unambiguous, so they are also accepted there as member
+    /// names (#1237): without this a method literally called `set` — e.g.
+    /// `ContextVar.set`, matching Python `contextvars` — could not be parsed.
+    pub fn is_nominal_type(self) -> bool {
+        use Keyword::*;
+        matches!(
+            self,
+            Int32
+                | Int64
+                | Float32
+                | Float64
+                | I32
+                | I64
+                | F32
+                | F64
+                | Uint8
+                | Uint16
+                | Uint32
+                | Uint64
+                | U8
+                | U16
+                | U32
+                | U64
+                | Usize
+                | Bool
+                | Char
+                | Str
+                | Bytes
+                | Bigint
+                | Complex
+                | List
+                | Dict
+                | Set
+                | Heap
+                | Array
+                | Range
+                | Channel
+        )
+    }
+
     /// The source spelling of this keyword.
     pub fn as_str(self) -> &'static str {
         use Keyword::*;

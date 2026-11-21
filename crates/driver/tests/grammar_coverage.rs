@@ -665,6 +665,14 @@ def f(Opt o):
     auto n = len(xs)
     print(str(n))
 "#),
+    // `member_name` — a `.name` member/method name: an IDENT, `None`, or a
+    // built-in type-name keyword (#1237). The ContextVar example exercises the
+    // TYPE_KEYWORD alternative (`cv.set`) and the IDENT one (`cv.reset`).
+    cov("member_name",       Compiles , r#"def main():
+    ContextVar[int64] cv = ContextVar[int64]("x", default=0)
+    auto t = cv.set(1)
+    cv.reset(t)
+"#),
     cov("call_expr",         Compiles , r#"def g() -> int64:
     return 1
 def f():

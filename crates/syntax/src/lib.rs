@@ -67,4 +67,7 @@ pub const BUILTIN_SHAREABLE_TYPES: &[&str] = &[
     "ConcurrentMap",
     "ConcurrentSet",
     "ConcurrentStack",
+    // `ContextVar` — coroutine-local execution context (#1237): a key safely
+    // readable/bindable from any coroutine, so it may back a module global.
+    "ContextVar",
 ];

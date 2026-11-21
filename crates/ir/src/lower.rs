@@ -2280,6 +2280,17 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
                 };
                 Ok(Ty::AtomicArray(e))
             }
+            // Coroutine-local execution context (#1237). `ContextVar[T]` carries
+            // its value element (reference -> pointer slot, `int64` -> word slot,
+            // picking `zap_ctxvar_*_ptr` vs `_i64`); `ContextToken` is opaque.
+            "ContextVar" => {
+                let e = match args.first() {
+                    Some(a) => value_elem_of(a, env)?,
+                    None => Elem::Ptr,
+                };
+                Ok(Ty::ContextVar(e))
+            }
+            "ContextToken" => Ok(Ty::CtxToken),
             other => {
                 // A tier-1 enum is its unboxed backing integer; a tier-3 enum is
                 // its tagged struct; a struct is its layout (D-0018/D-0046).
@@ -2594,6 +2605,7 @@ fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError
         | Ty::Heap(_)
         | Ty::Chan(_)
         | Ty::AtomicArray(_)
+        | Ty::ContextVar(_)
         | Ty::Deque(_)
         | Ty::OSet(_) => Ok(Elem::Nested(nested.borrow_mut().intern(t))),
         // A `bytes` element is a `ZapStr` pointer word — the same storage, GC
@@ -2603,7 +2615,7 @@ fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError
         // pointer to `str`; without it, `len(rows[i])` counted codepoints
         // (`zap_str_len_cp`) rather than bytes (`zap_str_len`).
         Ty::Bytes => Ok(Elem::Bytes),
-        Ty::Ptr | Ty::Array(..) | Ty::Match | Ty::Func(_) | Ty::Py => Ok(Elem::Ptr),
+        Ty::Ptr | Ty::Array(..) | Ty::Match | Ty::Func(_) | Ty::Py | Ty::CtxToken => Ok(Elem::Ptr),
         Ty::Bigint | Ty::Complex => Err(err(
             "collections of bigint or complex values are not supported yet",
         )),
@@ -8232,6 +8244,9 @@ impl<'a> FnLower<'a> {
             if is_name(base, "AtomicArray") {
                 return self.lower_atomicarray_new(index, args);
             }
+            if is_name(base, "ContextVar") {
+                return self.lower_ctxvar_new(index, args);
+            }
         }
         if let Expr::Name(fname, fspan) = callee {
             if fname == "sum" {
@@ -9185,6 +9200,9 @@ impl<'a> FnLower<'a> {
             }
             if let Ty::AtomicArray(elem) = bty {
                 return self.lower_atomicarray_method(recv, elem, name, args);
+            }
+            if let Ty::ContextVar(elem) = bty {
+                return self.lower_ctxvar_method(recv, elem, name, args);
             }
             if let Ty::Array(d, ndim) = bty {
                 return self.lower_array_method(recv, d, ndim, name, args);
@@ -11436,6 +11454,128 @@ impl<'a> FnLower<'a> {
             other => Err(err(format!(
                 "AtomicArray has no method '{other}' (supported: load, store, \
                  compare_and_swap, len)"
+            ))),
+        }
+    }
+
+    /// Lower `ContextVar[T]("name")` / `ContextVar[T]("name", default=d)`
+    /// construction (#1237) to a `zap_ctxvar_new_{ptr,i64}` runtime allocation.
+    /// The returned object's identity IS the per-coroutine lookup key; the
+    /// optional default is stored in it (returned by `get()` when unbound). The
+    /// `_ptr` vs `_i64` split follows the element kind, like `AtomicArray`.
+    fn lower_ctxvar_new(
+        &mut self,
+        elem_expr: &Expr,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let elem = value_elem_of(&expr_to_type(elem_expr)?, &self.ctx.tyenv())?;
+        let is_ptr = !matches!(elem, Elem::I64);
+        let suffix = if is_ptr { "ptr" } else { "i64" };
+        let ety = elem.ty();
+        // The name is the first positional argument (a `str`, a pointer word).
+        let Some(name_arg) = args.first() else {
+            return Err(err("ContextVar[T](name, default=...) requires a name"));
+        };
+        if name_arg.name.is_some() {
+            return Err(err(
+                "ContextVar[T]'s first argument (the name) is positional",
+            ));
+        }
+        let (nv, nt) = self.expr(&name_arg.value)?;
+        let name_val = self.coerce(nv, nt, Ty::Ptr);
+        // Optional default: a second positional argument, or a `default=` keyword.
+        let default_arg = args
+            .iter()
+            .enumerate()
+            .find_map(|(i, a)| match a.name.as_deref() {
+                Some("default") => Some(a),
+                None if i == 1 => Some(a),
+                _ => None,
+            });
+        let (dval, has) = match default_arg {
+            Some(a) => {
+                let (v, vt) = self.expr(&a.value)?;
+                (self.coerce(v, vt, ety), 1i64)
+            }
+            None => {
+                // A placeholder the runtime never reads (has_default == 0): a null
+                // reference for the `_ptr` entry point, a zero word for `_i64`.
+                let z = if is_ptr {
+                    let d = self.new_value(ety);
+                    self.emit(Inst::NullConst { dest: d });
+                    d
+                } else {
+                    self.iconst(Ty::I64, 0)
+                };
+                (z, 0)
+            }
+        };
+        let has_v = self.iconst(Ty::I64, has);
+        let cv = self.new_value(Ty::ContextVar(elem));
+        self.emit(Inst::Call {
+            dest: Some(cv),
+            func: format!("zap_ctxvar_new_{suffix}"),
+            args: vec![name_val, dval, has_v],
+        });
+        Ok((cv, Ty::ContextVar(elem)))
+    }
+
+    /// Lower a `ContextVar[T]` method (#1237) to its runtime entry point. The
+    /// receiver `recv` is the ContextVar object (the lookup key). `get` may raise
+    /// `LookupError` (unbound with no default), so it routes through
+    /// [`throwing_call`] — an `invoke` to the active landing pad inside a `try`,
+    /// a plain `call` otherwise — matching the index/divide faults (#383). `set`
+    /// returns a `ContextToken`; `reset` consumes one. The `_ptr`/`_i64` split
+    /// picks how the value word is passed/returned (a reference is a pointer, an
+    /// `int64` a word), like `AtomicArray`.
+    fn lower_ctxvar_method(
+        &mut self,
+        recv: Value,
+        elem: Elem,
+        name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let is_ptr = !matches!(elem, Elem::I64);
+        let suffix = if is_ptr { "ptr" } else { "i64" };
+        let ety = elem.ty();
+        match name {
+            "get" => {
+                if !args.is_empty() {
+                    return Err(err("ContextVar.get() takes no arguments"));
+                }
+                let dest = self.new_value(ety);
+                self.throwing_call(Some(dest), &format!("zap_ctxvar_get_{suffix}"), vec![recv]);
+                Ok((dest, ety))
+            }
+            "set" => {
+                if args.len() != 1 {
+                    return Err(err("ContextVar.set(v) takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                let v = self.coerce(v, vt, ety);
+                let tok = self.new_value(Ty::CtxToken);
+                self.emit(Inst::Call {
+                    dest: Some(tok),
+                    func: format!("zap_ctxvar_set_{suffix}"),
+                    args: vec![recv, v],
+                });
+                Ok((tok, Ty::CtxToken))
+            }
+            "reset" => {
+                if args.len() != 1 {
+                    return Err(err("ContextVar.reset(token) takes exactly one argument"));
+                }
+                let (t, tt) = self.expr(&args[0].value)?;
+                let t = self.coerce(t, tt, Ty::CtxToken);
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_ctxvar_reset".to_string(),
+                    args: vec![t],
+                });
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
+            other => Err(err(format!(
+                "ContextVar has no method '{other}' (supported: get, set, reset)"
             ))),
         }
     }

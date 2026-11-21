@@ -24,6 +24,7 @@ listed here (see [`README.md`](README.md)).
 | [1222](lang/1222-imported-generic-bound-name.md) | The module linker mangles the interface name inside a type-parameter bound | Locked | 2026-11-21 |
 | [1227](lang/1227-generic-operator-dunder-dispatch.md) | Generic operator dunders dispatch in operator syntax via a mono rewrite | Locked | 2026-11-21 |
 | [1228](lang/1228-callable-module-const.md) | Callable module-level constants dispatch to __call__ through the method path | Locked | 2026-11-21 |
+| [1237](lang/1237-coroutine-local-context.md) | Coroutine-local execution context (ContextVar[T] / ContextToken) | Proposed | 2026-11-21 |
 | [1239](lang/1239-list-structural-equality.md) | List == / != is a structural element-wise compare, not pointer identity | Locked | 2026-11-21 |
 | [1241](lang/1241-bool-char-element-read-back-narrows.md) | A bool/char collection element reads back as its narrow scalar type | Locked | 2026-11-21 |
 

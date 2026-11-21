@@ -594,7 +594,15 @@ postfix       ::= atom { trailer } ;
 
 trailer       ::= "(" [ arg_list ] ")"           (* call *)
                 | "[" subscript "]"               (* index or slice *)
-                | "." IDENT ;                     (* attribute *)
+                | "." member_name ;               (* attribute *)
+member_name   ::= IDENT | "None" | TYPE_KEYWORD ;
+                  (* A `.name` position is unambiguous, so besides an IDENT it
+                     accepts `None` (the Optional empty-variant name, above) and
+                     a built-in nominal type-name keyword (#1237): `set`, `list`,
+                     `dict`, `str`, `bytes`, `int64`, … may be member/method
+                     names, so `cv.set(...)` (matching Python `contextvars`)
+                     parses. `TYPE_KEYWORD` is the same terminal `type_name`
+                     accepts. *)
 call_expr     ::= postfix "(" [ arg_list ] ")" ;
 
 subscript     ::= index_elem { "," index_elem } ;  (* multi-axis: N-D array index/slice (#502), or type args *)
