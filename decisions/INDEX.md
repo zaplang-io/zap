@@ -24,6 +24,7 @@ listed here (see [`README.md`](README.md)).
 | [1222](lang/1222-imported-generic-bound-name.md) | The module linker mangles the interface name inside a type-parameter bound | Locked | 2026-11-21 |
 | [1227](lang/1227-generic-operator-dunder-dispatch.md) | Generic operator dunders dispatch in operator syntax via a mono rewrite | Locked | 2026-11-21 |
 | [1228](lang/1228-callable-module-const.md) | Callable module-level constants dispatch to __call__ through the method path | Locked | 2026-11-21 |
+| [1239](lang/1239-list-structural-equality.md) | List == / != is a structural element-wise compare, not pointer identity | Locked | 2026-11-21 |
 | [1241](lang/1241-bool-char-element-read-back-narrows.md) | A bool/char collection element reads back as its narrow scalar type | Locked | 2026-11-21 |
 
 ## stdlib
@@ -50,6 +51,7 @@ listed here (see [`README.md`](README.md)).
 | [1158](stdlib/1158-connect-deadline-kwargs.md) | net bounded-dial deadline parameter name — deadline_ns (kwargs-enabled) | Locked | 2026-11-20 |
 | [1159](stdlib/1159-netport-unix.md) | net.port raises ValueError on a Unix-domain socket | Locked | 2026-11-20 |
 | [1171](stdlib/1171-system-local-zone.md) | stdlib datetime — expose the system local zone as a reusable TimeZone | Accepted | 2026-11-20 |
+| [1242](stdlib/1242-url-unquote-errors.md) | url.unquote errors mode — replace (default) | strict, over a UTF-8 replacement decode path | Accepted | 2026-11-21 |
 
 ## runtime
 

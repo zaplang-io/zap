@@ -12,11 +12,15 @@
 //! - `url.quote_path(s) -> str` — like `quote` but leaves `/` unescaped (for an
 //!   already-structured path). SigV4 CanonicalURI single-encode; the non-S3
 //!   services double-encode, i.e. `url.quote_path(url.quote_path(path))`.
-//! - `url.unquote(s) -> str` — inverse of `quote`: decode `%XX` (hex
+//! - `url.unquote(s[, errors]) -> str` — inverse of `quote`: decode `%XX` (hex
 //!   case-insensitive); a `+` stays literal; a malformed/truncated `%` escape
-//!   passes through unchanged.
-//! - `url.unquote_plus(s) -> str` — like `unquote` but also `+` -> space, for
-//!   `application/x-www-form-urlencoded` query values.
+//!   passes through unchanged. The optional `errors` str ("strict" | "replace",
+//!   default "replace", #1242) controls UTF-8 handling of the decoded octets:
+//!   "replace" (the default, Python `unquote` parity) substitutes U+FFFD for
+//!   each maximal invalid subpart; "strict" raises a catchable error on invalid
+//!   UTF-8 (like `str(bytes)`).
+//! - `url.unquote_plus(s[, errors]) -> str` — like `unquote` but also `+` ->
+//!   space, for `application/x-www-form-urlencoded` query values.
 //! - `url.encode_query(d: dict[str,str]) -> str` — build `k=v&...` with every
 //!   key and value `quote`-encoded, in the dict's iteration order (unspecified,
 //!   i.e. hash order; use `canonical_query` when a deterministic order matters).
@@ -53,7 +57,7 @@ use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
 
-use super::{expect_argc, ModuleCheck};
+use super::{expect_argc, expect_argc_range, ModuleCheck};
 use crate::{assignable, expr_span, Checker, Ty};
 
 pub(super) const MODULE: ModuleCheck = ModuleCheck { name: "url", check };
@@ -69,6 +73,41 @@ fn expect_str(checker: &mut Checker, method: &str, args: &[Arg], span: Span) {
                 ErrorCode::ZAP4024,
                 format!(
                     "url.{method}() expects a str argument, found {}",
+                    t.display()
+                ),
+                expr_span(&arg.value),
+            );
+        }
+    }
+}
+
+/// Type-check `url.unquote` / `url.unquote_plus` (#1242): a required `str`/`bytes`
+/// first argument and an optional `errors` `str` (the seam binder has already
+/// reordered any keyword and stripped its name, so a supplied `errors` lands in
+/// `args[1]`). Each argument is inferred either way so it is still checked on an
+/// arity mismatch.
+fn expect_unquote(checker: &mut Checker, method: &str, args: &[Arg], span: Span) {
+    expect_argc_range(checker, "url", method, args, 1, 2, span);
+    if let Some(arg) = args.first() {
+        let t = checker.infer(&arg.value);
+        if !assignable(&t, &Ty::Str) && !assignable(&t, &Ty::Bytes) {
+            checker.error(
+                ErrorCode::ZAP4024,
+                format!(
+                    "url.{method}() expects a str argument, found {}",
+                    t.display()
+                ),
+                expr_span(&arg.value),
+            );
+        }
+    }
+    if let Some(arg) = args.get(1) {
+        let t = checker.infer(&arg.value);
+        if !assignable(&t, &Ty::Str) {
+            checker.error(
+                ErrorCode::ZAP4024,
+                format!(
+                    "url.{method}() expects a str `errors` argument, found {}",
                     t.display()
                 ),
                 expr_span(&arg.value),
@@ -106,9 +145,18 @@ const URL_PARTS: &str = "UrlParts";
 
 fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Option<Ty> {
     Some(match method {
-        // Byte-level percent codec.
-        "quote" | "quote_path" | "unquote" | "unquote_plus" => {
+        // Byte-level percent encoders: str -> str.
+        "quote" | "quote_path" => {
             expect_str(checker, method, args, span);
+            Ty::Str
+        }
+        // Percent decoders: `(s: str[, errors: str]) -> str` (#1242). `errors`
+        // ("strict" | "replace") selects how invalid UTF-8 in the decoded octets
+        // is handled; it is optional and defaults to strict. The value set is not
+        // statically constrained (an unknown name raises at runtime, like
+        // CPython's codec lookup), so `errors` only needs to be a `str`.
+        "unquote" | "unquote_plus" => {
+            expect_unquote(checker, method, args, span);
             Ty::Str
         }
         // Query builders over a dict[str,str].
