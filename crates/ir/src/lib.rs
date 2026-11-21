@@ -2397,6 +2397,111 @@ mod tests {
         lower_module(&ast).1
     }
 
+    // ---- callable module-level constants via `__call__` (#1228, D-0047) -------
+    //
+    // `MO(args)` where `MO` is a module global of a struct type that defines
+    // `__call__` desugars to `MO.__call__(args)`. Before the fix this reached the
+    // bare-name call path and reported ZAP6001 "call to unknown function 'MO'".
+    // The dispatch goes through the resolved-method path, so omitted default
+    // arguments and keyword arguments are filled exactly as the explicit
+    // `MO.__call__(args)` form fills them.
+
+    /// The `Weekday` callable-struct source shared by the `__call__`-dispatch
+    /// tests; `{body}` is spliced in as `main`'s body.
+    fn weekday_src(body: &str) -> String {
+        format!(
+            "struct Weekday:\n    int64 day\n    int64 occurrence\n\
+             \x20   def __call__(self, int64 n = 1) -> Weekday:\n        return Weekday(self.day, n)\n\
+             const Weekday MO = Weekday(0, 1)\n\
+             def main():\n{body}"
+        )
+    }
+
+    #[test]
+    fn callable_module_const_dispatches_to_call_with_explicit_arg() {
+        // The issue repro: `MO(-1)` on a module `const` of a callable type lowers
+        // to `MO.__call__(-1)` — receiver plus the one explicit argument.
+        let m = lower_ok(&weekday_src(
+            "    auto last = MO(-1)\n    print(last.occurrence)\n",
+        ));
+        let text = format!("{m}");
+        assert_eq!(
+            call_arg_counts(&text, "Weekday____call__"),
+            vec![2],
+            "one `__call__` dispatch: receiver + the explicit argument; text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn callable_module_const_fills_omitted_default_argument() {
+        // `MO()` relying on the default (the dateutil form) fills `n = 1`, so the
+        // dispatch still passes two arguments (receiver + default), not one.
+        let m = lower_ok(&weekday_src("    auto d = MO()\n    print(d.occurrence)\n"));
+        let text = format!("{m}");
+        assert_eq!(
+            call_arg_counts(&text, "Weekday____call__"),
+            vec![2],
+            "the omitted default argument is filled (receiver + default); text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn callable_module_const_keyword_argument() {
+        // A keyword argument routes through the same resolved-method path.
+        let m = lower_ok(&weekday_src(
+            "    auto d = MO(n=2)\n    print(d.occurrence)\n",
+        ));
+        let text = format!("{m}");
+        assert_eq!(
+            call_arg_counts(&text, "Weekday____call__"),
+            vec![2],
+            "text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn callable_module_const_plain_value_use_emits_no_call() {
+        // Reading a field of the constant (`MO.day`) is the unchanged plain-value
+        // use: it loads the global and reads the field, with no `__call__`.
+        let m = lower_ok(&weekday_src("    print(MO.day)\n"));
+        let text = format!("{m}");
+        assert!(
+            call_arg_counts(&text, "Weekday____call__").is_empty(),
+            "a plain-value field read must not dispatch to `__call__`; text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn local_callable_value_also_fills_omitted_default() {
+        // The local-value form shares the same resolved-method dispatch, so it
+        // fills defaults identically (the sugar and the explicit form agree).
+        let m = lower_ok(
+            "struct Weekday:\n    int64 day\n    int64 occurrence\n\
+             \x20   def __call__(self, int64 n = 1) -> Weekday:\n        return Weekday(self.day, n)\n\
+             def main():\n    auto mo = Weekday(0, 1)\n    auto d = mo()\n    print(d.occurrence)\n",
+        );
+        let text = format!("{m}");
+        assert_eq!(
+            call_arg_counts(&text, "Weekday____call__"),
+            vec![2],
+            "text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn callable_module_const_wrong_arity_is_rejected_cleanly() {
+        // Too many positional arguments is a clean lowering error, not a silent
+        // mismatch that only the native backend would catch.
+        let errs = lower_errs(&weekday_src(
+            "    auto d = MO(1, 2)\n    print(d.occurrence)\n",
+        ));
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("positional arguments")),
+            "wrong arity rejected cleanly: {errs:?}"
+        );
+    }
+
     #[test]
     fn spawn_of_method_lowers_to_named_method_spawn() {
         // `spawn recv.method(args)` (I#475) desugars to a named `Inst::Spawn` on

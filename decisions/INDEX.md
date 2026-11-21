@@ -22,6 +22,7 @@ listed here (see [`README.md`](README.md)).
 | [1206](lang/1206-param-referencing-bounds.md) | Bounds referencing other type parameters — capture and substitute the bound's arguments | Accepted | 2026-11-20 |
 | [1207](lang/1207-associated-output-types.md) | Associated / output types on interfaces (`type Out`), projected as `T.Out` | Accepted | 2026-11-20 |
 | [1222](lang/1222-imported-generic-bound-name.md) | The module linker mangles the interface name inside a type-parameter bound | Locked | 2026-11-21 |
+| [1228](lang/1228-callable-module-const.md) | Callable module-level constants dispatch to __call__ through the method path | Locked | 2026-11-21 |
 
 ## stdlib
 
