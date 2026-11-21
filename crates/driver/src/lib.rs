@@ -169,23 +169,85 @@ fn front_end_program(
     target: &Target,
     warnings_as_errors: bool,
 ) -> Result<(Module, zapc_sema::TypeMap), ExitCode> {
-    let mut module = match modlink::load_program(entry, target) {
-        Ok(m) => m,
-        Err(diags) => {
-            report(
-                diags
-                    .into_iter()
-                    .map(|d| Report {
-                        file: d.file,
-                        code: d.code,
-                        message: d.message,
-                        span: Some((d.span.start, d.span.end)),
-                    })
-                    .collect(),
-            );
-            return Err(ExitCode::from(1));
+    match front_end_reports(entry, target) {
+        Err(errs) => {
+            report(errs);
+            Err(ExitCode::from(1))
         }
-    };
+        Ok((module, types, warns)) => {
+            // Non-fatal warnings (e.g. a call to an `@deprecated` function,
+            // I#472/D-0109; the `Eq`-without-`Hash` dict/set-key warning, D-0047;
+            // the shared-mutable sharing lint, #664/D-0113) are surfaced here but
+            // never fail the build — unless `--warnings-as-errors` is set (off by
+            // default), a team CI knob that promotes any surviving warning to a
+            // build failure without changing what the language considers legal.
+            // They print before the error batch (there is none on this arm) so an
+            // error, if any, stays the last thing on stderr.
+            if !warns.is_empty() {
+                let n = warns.len();
+                report_warnings(warns);
+                if warnings_as_errors {
+                    eprintln!("zap: {n} warning(s) treated as errors (--warnings-as-errors)");
+                    return Err(ExitCode::from(1));
+                }
+            }
+            Ok((module, types))
+        }
+    }
+}
+
+/// The whole-program front end, returning structured diagnostics instead of
+/// printing them: link the import graph (modlink, I#283/D-0081), desugar
+/// decorators, and type-check. `Ok((module, types, warnings))` carries the
+/// merged, qualified module, sema's inferred-type map (#1167), and any non-fatal
+/// warnings (already `# noqa`-suppressed, #664/D-0113); `Err(errors)` carries the
+/// fatal diagnostics as [`Report`]s. Shared by the printing build path
+/// ([`front_end_program`]) and `zap test` (which routes through the SAME module
+/// resolution, D-0054/SPEC §16; #1232) so there is one resolver, not two.
+fn front_end_reports(
+    entry: &str,
+    target: &Target,
+) -> Result<(Module, zapc_sema::TypeMap, Vec<Report>), Vec<Report>> {
+    let module = modlink::load_program(entry, target).map_err(modlink_reports)?;
+    front_end_tail(entry, module)
+}
+
+/// Like [`front_end_reports`], but with explicit dependency package-search roots
+/// instead of reading them from the environment. Lets tests resolve a `zenv`
+/// dependency against a temporary package tree without touching the process-wide
+/// `ZAP_ZENV`, mirroring [`modlink::load_program_with`]. Test-only: production
+/// code always resolves roots from the environment via [`front_end_reports`].
+#[cfg(test)]
+fn front_end_reports_with(
+    entry: &str,
+    target: &Target,
+    pkg_roots: Vec<PathBuf>,
+) -> Result<(Module, zapc_sema::TypeMap, Vec<Report>), Vec<Report>> {
+    let module = modlink::load_program_with(entry, target, pkg_roots).map_err(modlink_reports)?;
+    front_end_tail(entry, module)
+}
+
+/// Turn module-linker diagnostics into the uniform [`Report`] shape.
+fn modlink_reports(diags: Vec<modlink::ModDiag>) -> Vec<Report> {
+    diags
+        .into_iter()
+        .map(|d| Report {
+            file: d.file,
+            code: d.code,
+            message: d.message,
+            span: Some((d.span.start, d.span.end)),
+        })
+        .collect()
+}
+
+/// The decorator-desugar + type-check tail shared by both front-end entry points
+/// (the only difference between them is how the import graph's dependency roots
+/// are sourced). Takes the already-linked, merged module and finishes the front
+/// end: desugar decorators, then type-check.
+fn front_end_tail(
+    entry: &str,
+    mut module: Module,
+) -> Result<(Module, zapc_sema::TypeMap, Vec<Report>), Vec<Report>> {
     // Desugar registering (dotted) function decorators — `@app.get("/x")` — into
     // the method-call registration the receiver already accepts, before sema, so
     // the synthesized call is type-checked normally (I#457, D-0087).
@@ -194,16 +256,14 @@ fn front_end_program(
     // style errors before type-checking.
     let deco_diags = decorator_desugar::desugar_registering_decorators(&mut module);
     if !deco_diags.is_empty() {
-        report(sema_reports(entry, deco_diags));
-        return Err(ExitCode::from(1));
+        return Err(sema_reports(entry, deco_diags));
     }
     // Expand user-defined behavioral decorators (`before`/`after`, D-0036; epic
     // #651) into wrapper functions, before sema, so the generated code is
     // type-checked and `zap expand`-visible like any other.
     let beh_diags = behavioral_decorator::expand_behavioral_decorators(&mut module);
     if !beh_diags.is_empty() {
-        report(sema_reports(entry, beh_diags));
-        return Err(ExitCode::from(1));
+        return Err(sema_reports(entry, beh_diags));
     }
     // Analysis mode (#1167): same diagnostics as `analyze`, plus the inferred
     // type of every expression (a `TypeMap`), which lowering hands to the
@@ -211,37 +271,18 @@ fn front_end_program(
     // derive is pinned from sema's type instead (#1132/#1162). `zapc_ir` cannot
     // compute this — it does not depend on the sema checker — so the driver does.
     let (errs, warns, types) = zapc_sema::analyze_types(&module);
+    if !errs.is_empty() {
+        return Err(sema_reports(entry, errs));
+    }
     // Per-site suppression (#664, D-0113): drop warnings whose source line
     // carries a `# noqa` pragma. The spans are byte offsets into the entry
     // file's source (sema diagnostics are attributed to `entry`), so the entry
-    // source is the line reference. Shared with the in-process test path so the
-    // behavior is identical (`zapc_sema::apply_suppressions`).
+    // source is the line reference.
     let warns = match std::fs::read_to_string(entry) {
         Ok(src) => zapc_sema::apply_suppressions(&src, warns),
         Err(_) => warns,
     };
-    // Non-fatal warnings (e.g. a call to an `@deprecated` function, I#472/D-0109;
-    // the `Eq`-without-`Hash` dict/set-key warning, D-0047; the shared-mutable
-    // sharing lint, #664/D-0113) are surfaced here but never fail the build —
-    // unless `--warnings-as-errors` is set (off by default), a team CI knob that
-    // promotes any surviving warning to a build failure without changing what
-    // the language considers legal. They print before the error batch so an
-    // error, if any, stays the last thing on stderr.
-    if !warns.is_empty() {
-        report_warnings(sema_reports(entry, warns.clone()));
-        if warnings_as_errors {
-            eprintln!(
-                "zap: {} warning(s) treated as errors (--warnings-as-errors)",
-                warns.len()
-            );
-            return Err(ExitCode::from(1));
-        }
-    }
-    if !errs.is_empty() {
-        report(sema_reports(entry, errs));
-        return Err(ExitCode::from(1));
-    }
-    Ok((module, types))
+    Ok((module, types, sema_reports(entry, warns)))
 }
 
 /// Front-end + AST→ZIR lowering. Host-safe (no LLVM needed). Used by both
