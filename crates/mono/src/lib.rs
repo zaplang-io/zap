@@ -5154,6 +5154,74 @@ mod tests {
         monomorphize(&module).expect("monomorphization succeeds")
     }
 
+    /// Like [`mono_prelude`] but expects monomorphization to REJECT the program
+    /// (e.g. a concrete type that does not satisfy a prelude operator bound).
+    fn mono_prelude_err(src: &str) -> String {
+        let (module, perrs, lerrs) = parse_str(src);
+        assert!(perrs.is_empty(), "parse errors: {perrs:?}");
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        let module = zapc_syntax::parser::with_prelude(&module);
+        monomorphize(&module)
+            .expect_err("monomorphization should reject the unsatisfied bound")
+            .message
+    }
+
+    // ---- operator-capability interface bounds (#1199) ---------------------
+    //
+    // The real prelude operator interfaces (`RMul[L, Out]`, `Add[R, Out]`, …)
+    // used as generic bounds, enforced structurally at the instantiation just
+    // like any other generic-interface bound (static dispatch, no fat pointer).
+
+    #[test]
+    fn operator_reflected_bound_accepts_conformer() {
+        // `T := Vec2` makes the bound `RMul[f64, Vec2]`; Vec2 defines
+        // `__rmul__(self, f64) -> Vec2`, so it conforms and the instance emits.
+        let m = mono_prelude(
+            "value struct Vec2:\n    f64 x\n\
+             \x20   def __rmul__(self, f64 k) -> Vec2:\n        return Vec2(x=self.x * k)\n\n\
+             def scale_all[T: RMul[f64, T]](list[T] xs, f64 k) -> list[T]:\n    \
+             return [k * x for x in xs]\n\n\
+             def main():\n    list[Vec2] v = scale_all([Vec2(x=1.0)], 2.0)\n    print(str(len(v)))\n",
+        );
+        assert!(
+            fn_names(&m).iter().any(|n| n == "scale_all$Vec2"),
+            "conforming instance emitted: {:?}",
+            fn_names(&m)
+        );
+    }
+
+    #[test]
+    fn operator_reflected_bound_rejects_non_conformer() {
+        // `Bad` has no `__rmul__`, so `T := Bad` fails the `RMul[f64, Bad]` bound;
+        // the diagnostic names the bound.
+        let msg = mono_prelude_err(
+            "value struct Bad:\n    f64 x\n\n\
+             def scale_all[T: RMul[f64, T]](list[T] xs, f64 k) -> list[T]:\n    \
+             return [k * x for x in xs]\n\n\
+             def main():\n    list[Bad] v = scale_all([Bad(x=1.0)], 2.0)\n    print(str(len(v)))\n",
+        );
+        assert!(
+            msg.contains("RMul[float64, Bad]") && msg.contains("Bad"),
+            "diagnostic names the unsatisfied operator bound: {msg}"
+        );
+    }
+
+    #[test]
+    fn operator_forward_bound_accepts_conformer() {
+        // The forward `Add[T, T]` bound: `Num` defines `__add__(self, Num) -> Num`.
+        let m = mono_prelude(
+            "value struct Num:\n    int64 n\n\
+             \x20   def __add__(self, Num o) -> Num:\n        return Num(n=self.n + o.n)\n\n\
+             def add2[T: Add[T, T]](T a, T b) -> T:\n    return a + b\n\n\
+             def main():\n    Num s = add2(Num(n=1), Num(n=2))\n    print(str(s.n))\n",
+        );
+        assert!(
+            fn_names(&m).iter().any(|n| n == "add2$Num"),
+            "conforming instance emitted: {:?}",
+            fn_names(&m)
+        );
+    }
+
     #[test]
     fn qualified_queue_explicit_desugars_to_new_queue_instance() {
         // `concurrent.Queue[int64]()` monomorphizes to exactly the bare

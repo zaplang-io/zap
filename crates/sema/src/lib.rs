@@ -6354,6 +6354,15 @@ impl Checker {
             if left_is_struct && self.lookup_dunder(l, dunder).is_some() {
                 return Some(self.op_result(l, dunder, iface, binop_symbol(op), span));
             }
+            // 1b. Left-via-bound (#1199): the left operand is a value of a type
+            //     parameter whose bound provides the forward dunder, e.g. `a + b`
+            //     with `a: T, T: Add[R, Out]`. The result is the bound's
+            //     (substituted) `Out`, provided its `R` accepts the right operand.
+            //     This is the "left owns the operator" case for bounded generics,
+            //     so it sits with the forward/struct path, ahead of reflected.
+            if let Some(sig) = self.bound_dunder_sig(l, r, dunder) {
+                return Some(sig.ret);
+            }
             // 2. Reflected fallback: the right operand is a struct whose
             //    reflected dunder accepts the left operand's type. The result is
             //    that dunder's declared return type.
@@ -6363,6 +6372,13 @@ impl Checker {
                         return Some(sig.ret);
                     }
                 }
+            }
+            // 2b. Reflected-via-bound (#1199): the right operand is a value of a
+            //     type parameter whose bound provides the reflected dunder, e.g.
+            //     `k * x` with `x: T, T: RMul[L, Out]`. The result is the bound's
+            //     `Out`, provided its `L` accepts the left operand.
+            if let Some(sig) = self.bound_dunder_sig(r, l, rdunder) {
+                return Some(sig.ret);
             }
             // 3. A struct left with neither a forward dunder nor a reflected
             //    handler on the right: the original "operator not supported"
@@ -6396,6 +6412,13 @@ impl Checker {
             if left_is_struct && self.lookup_dunder(l, fwd).is_some() {
                 return Some(Ty::Bool);
             }
+            // Forward-via-bound (#1199): the left operand is a value of a type
+            // parameter whose bound provides `__eq__`/`__cmp__` accepting the
+            // right operand (e.g. `[T: Ord[T]]`, or the built-in `Comparable`).
+            // A relational result is always `bool`, whatever the dunder returns.
+            if self.bound_dunder_sig(l, r, fwd).is_some() {
+                return Some(Ty::Bool);
+            }
             // Reflected fallback: the right operand is a struct whose reflected
             // comparison dunder accepts the left operand's type.
             if self.struct_info(r).is_some() {
@@ -6404,6 +6427,11 @@ impl Checker {
                         return Some(Ty::Bool);
                     }
                 }
+            }
+            // Reflected-via-bound (#1199): the right operand's bound provides
+            // `__req__`/`__rcmp__` accepting the left operand.
+            if self.bound_dunder_sig(r, l, rfl).is_some() {
+                return Some(Ty::Bool);
             }
             // A struct left with neither a forward dunder nor a reflected handler
             // on the right: the original "operator not supported" error.
@@ -6434,6 +6462,40 @@ impl Checker {
         sig.params
             .get(1)
             .is_some_and(|p| self.coercible(left, &p.ty))
+    }
+
+    /// Resolve an operator through a bounded type parameter (#1199). If
+    /// `operand` is a value of a type parameter `T` whose bound (or a refined
+    /// supertype of it) declares `dunder`, and that dunder's operand parameter
+    /// accepts `other`, return the dunder's signature with the bound's type
+    /// arguments substituted in — so an operator interface such as
+    /// `RMul[f64, T]` yields `Out := T` as the operator's result type.
+    ///
+    /// This is what makes the operator-capability interfaces (prelude `Add`,
+    /// `RMul`, `Ord`, … ) usable as generic bounds: inside a bounded generic
+    /// body the operator type-checks against the bound (static dispatch after
+    /// monomorphization), mirroring the bounded-method-call path in `check_call`
+    /// (`subst_iface_sig`). The concrete `a OP b` dispatch is unchanged; this
+    /// only covers the case where an operand's type is a bounded type variable,
+    /// which `struct_info` never matches.
+    fn bound_dunder_sig(&self, operand: &Ty, other: &Ty, dunder: &str) -> Option<FnSig> {
+        let Ty::Named(n) = operand else {
+            return None;
+        };
+        let b = self.tyvar_bounds.get(n)?;
+        let sig = self.iface_method(&b.iface, dunder)?;
+        let sig = self.subst_iface_sig(&b.iface, &b.args, Some(n.as_str()), &sig);
+        // Parameter 0 is `self` (the operand owning the dunder); parameter 1 is
+        // the other operand. An arity-short signature accepts nothing.
+        if sig
+            .params
+            .get(1)
+            .is_some_and(|p| self.coercible(other, &p.ty))
+        {
+            Some(sig)
+        } else {
+            None
+        }
     }
 
     /// Check an augmented assignment `a OP= b` with a user-struct LHS (D-0047),
@@ -15991,6 +16053,117 @@ def main():
         ok("value struct Sorter[K: Comparable]:\n    K pivot\n\
             \x20   def opaque[K](self, K a) -> int64:\n        a.nope()\n        return 0\n\n\
             def main():\n    print(1)\n");
+    }
+
+    // --- operator capabilities as generic bounds (#1199) ---------------------
+    //
+    // The prelude now declares the forward (`Add[R, Out]`, `Mul`, `Eq[R]`,
+    // `Ord[R]`, …) and reflected (`RAdd[L, Out]`, `RMul`, `REq[L]`, `RCmp[L]`,
+    // …) operator-capability interfaces (D-0047/#1180/#1198). A generic can
+    // require one as a bound and use the operator in its body, typed through the
+    // bound. Concrete-value dispatch is unchanged (#1192/#1194/#1202); these
+    // tests pin the bounded-generic path through `check_struct_binop`.
+
+    // `Vec2` is scalar-right-multipliable (`f64 * Vec2 -> Vec2` via `__rmul__`)
+    // and self-addable (`Vec2 + Vec2 -> Vec2`), so it conforms to `RMul[f64,
+    // Vec2]` and `Add[Vec2, Vec2]`.
+    const VEC2_DECL: &str = "struct Vec2:\n    f64 x\n\
+        \x20   def __rmul__(self, f64 k) -> Vec2:\n        return Vec2(x=self.x * k)\n\
+        \x20   def __add__(self, Vec2 o) -> Vec2:\n        return Vec2(x=self.x + o.x)\n\n";
+
+    #[test]
+    fn reflected_operator_through_bound_resolves_result() {
+        // The motivating case (issue #1199 / ADR): `k * x` with `x: T` and
+        // `T: RMul[f64, T]` resolves to `Out := T`, so the comprehension builds
+        // a `list[T]` that matches the declared return. If the operator did not
+        // route through the bound this would be the old "needs numbers" error.
+        ok(&format!(
+            "{VEC2_DECL}def scale_all[T: RMul[f64, T]](list[T] xs, f64 k) -> list[T]:\n    \
+             return [k * x for x in xs]\n\n\
+             def main():\n    auto v = scale_all([Vec2(x=1.0)], 2.0)\n    print(str(len(v)))\n"
+        ));
+    }
+
+    #[test]
+    fn forward_operator_through_bound_resolves_result() {
+        // The left operand owns the operator: `a + b` with `a, b: T` and
+        // `T: Add[T, T]` resolves to `Out := T`.
+        ok(&format!(
+            "{VEC2_DECL}def sum2[T: Add[T, T]](T a, T b) -> T:\n    return a + b\n\n\
+             def main():\n    print(str(sum2(Vec2(x=1.0), Vec2(x=2.0)).x))\n"
+        ));
+    }
+
+    #[test]
+    fn operator_bound_result_type_is_enforced() {
+        // The substituted result is a real type, not `Unknown`: binding the
+        // `T`-typed `k * x` to a `str` local is a type error. This distinguishes
+        // the routed path from a loose fall-through.
+        let m = msgs(&format!(
+            "{VEC2_DECL}def scale_one[T: RMul[f64, T]](T x, f64 k) -> T:\n    \
+             str bad = k * x\n    return x\n\n\
+             def main():\n    print(str(scale_one(Vec2(x=1.0), 2.0).x))\n"
+        ));
+        assert!(
+            !m.is_empty(),
+            "assigning a T result to str must error; got none"
+        );
+    }
+
+    #[test]
+    fn operator_without_matching_bound_still_errors() {
+        // A bound that does not provide the operator's dunder does not light it
+        // up: `a + b` under `T: Ord[T]` (comparison only) is still rejected.
+        let m = msgs(
+            "def bad[T: Ord[T]](T a, T b) -> T:\n    return a + b\n\n\
+             def main():\n    print(1)\n",
+        );
+        assert!(
+            !m.is_empty(),
+            "`+` under an Ord-only bound must error; got none"
+        );
+    }
+
+    #[test]
+    fn relational_operator_through_ord_bound() {
+        // `a < b` with `a, b: T` and `T: Ord[T]` type-checks to `bool` through
+        // the bound's `__cmp__`.
+        ok("struct Money:\n    int64 cents\n\
+            \x20   def __cmp__(self, Money o) -> int64:\n        return self.cents - o.cents\n\n\
+            def less[T: Ord[T]](T a, T b) -> bool:\n    return a < b\n\n\
+            def main():\n    print(str(less(Money(cents=1), Money(cents=2))))\n");
+    }
+
+    #[test]
+    fn builtin_comparable_bound_enables_relational_operator() {
+        // The built-in `Comparable` capability (its `__cmp__` provides ordering)
+        // likewise enables `<` on a bounded type parameter — the operator path
+        // looks the dunder up through the bound and its refined supertypes.
+        ok(
+            "def less[T: Comparable](T a, T b) -> bool:\n    return a < b\n\n\
+            def main():\n    print(str(less(1, 2)))\n",
+        );
+    }
+
+    #[test]
+    fn reflected_equality_through_bound() {
+        // `k == x` with `x: T` and `T: REq[int64]` routes through the right
+        // operand's reflected equality dunder, result `bool`.
+        ok("struct Tag:\n    int64 n\n\
+            \x20   def __req__(self, int64 k) -> bool:\n        return self.n == k\n\n\
+            def has[T: REq[int64]](int64 k, T x) -> bool:\n    return k == x\n\n\
+            def main():\n    print(str(has(1, Tag(n=1))))\n");
+    }
+
+    #[test]
+    fn unbounded_type_parameter_operator_is_unchanged() {
+        // An unbounded `T` is opaque (`Ty::Unknown`), so `a + b` type-checks
+        // loosely — exactly as before #1199. The operator-capability bounds are
+        // purely additive: they add a *typed* path for bounded parameters and
+        // change nothing about the unconstrained-generic behavior (slices 1-4).
+        // Tightening unbounded operators is out of scope (tracked by #1200).
+        ok("def passthru[T](T a, T b) -> T:\n    return a\n\n\
+            def main():\n    print(passthru(1, 2))\n");
     }
 
     #[test]
