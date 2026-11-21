@@ -21,6 +21,7 @@ listed here (see [`README.md`](README.md)).
 | [1205](lang/1205-generic-interface-conformance.md) | Generic-interface conformance — substitute the interface's type parameters | Accepted | 2026-11-20 |
 | [1206](lang/1206-param-referencing-bounds.md) | Bounds referencing other type parameters — capture and substitute the bound's arguments | Accepted | 2026-11-20 |
 | [1207](lang/1207-associated-output-types.md) | Associated / output types on interfaces (`type Out`), projected as `T.Out` | Accepted | 2026-11-20 |
+| [1222](lang/1222-imported-generic-bound-name.md) | The module linker mangles the interface name inside a type-parameter bound | Locked | 2026-11-21 |
 
 ## stdlib
 
