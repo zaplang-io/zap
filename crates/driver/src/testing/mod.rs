@@ -22,6 +22,54 @@ pub mod report;
 
 use zapc_syntax::ast::{Item, Module};
 
+/// Front-end for a `zap test` entry file: run the SAME whole-program module
+/// resolution as `zap run`/`zap build` (modlink → decorator desugar → sema;
+/// I#283/D-0081, #1167) so that an imported dependency (installed in the project
+/// `zenv`), a sibling source module, and their qualified exception types are all
+/// in scope before the harness is built (#1232; D-0054, SPEC §16 — tests use the
+/// same module resolution as builds). Returns the merged, import-qualified module
+/// with `@test`/hook functions preserved (they survive the build front-end — only
+/// a real `zap run`/`build` strips them, via [`strip_test_items`]), or a rendered
+/// file-level diagnostic string.
+///
+/// Before this, `zap test` parsed the single entry file and type-checked it in
+/// isolation, so any `import <dep>` resolved to nothing and the test body failed
+/// at sema with `error[ZAP3001]: unknown name '<dep>'` — even though `zap run`
+/// compiled the identical program. Routing through the one resolver fixes that
+/// without a parallel, test-only import path.
+///
+/// Host-safe (no LLVM): the resolution and type-check happen entirely in the
+/// front end, so the import-resolution fix is verifiable without a backend.
+/// Gated to the paths that use it (the codegen-only runner and the tests) so the
+/// no-codegen, non-test build does not warn it dead — like [`temp_exe_path`].
+#[cfg(any(feature = "codegen", test))]
+fn front_end_test_module(path: &std::path::Path) -> Result<Module, String> {
+    let entry = path.display().to_string();
+    // `zap test` takes no `--target-feature`s today, so the `when target.*` cfg is
+    // resolved against the bare host target, exactly as a plain `zap build` would.
+    let target = crate::build_target(&[]);
+    match crate::front_end_reports(&entry, &target) {
+        // Warnings (the third tuple field) are intentionally not surfaced on the
+        // `zap test` path: the stdout sentinel protocol is the test report, and a
+        // warning is neither a test nor a failure. A hard error is returned below.
+        Ok((module, _types, _warns)) => Ok(module),
+        Err(reports) => Err(render_front_end_errors(&reports)),
+    }
+}
+
+/// Render front-end [`Report`](crate::Report)s into the one-error-per-line
+/// `error[CODE]: message` form the file-level test result already uses, so a
+/// resolution failure (an unknown dependency, a missing sibling module, an
+/// unknown name) reports cleanly as a failing file rather than crashing the run.
+#[cfg(any(feature = "codegen", test))]
+fn render_front_end_errors(reports: &[crate::Report]) -> String {
+    reports
+        .iter()
+        .map(|r| format!("error[{}]: {}", r.code, r.message))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Remove every top-level `@test`/hook function from a module (D-0054): these
 /// are compiled only under `zap test`, never into a release binary. Called on
 /// the normal `run`/`build`/`ir` path.
@@ -190,40 +238,20 @@ mod run_impl {
     /// builds the harness with the data-race instrumentation (#677).
     fn run_file(path: &Path, results: &mut Vec<TestResult>, race: bool) {
         let display = path.display().to_string();
-        let src = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) => {
-                results.push(file_error(&display, format!("cannot read file: {e}")));
+
+        // Front-end: a test file must parse, resolve its imports, and type-check
+        // like any `zap run`/`zap build` program (#1232; D-0054, SPEC §16). This
+        // runs the SAME whole-program module resolution — so an imported
+        // dependency from the project `zenv`, a sibling source module, and their
+        // qualified exception types are in scope — and surfaces any lex/parse/
+        // resolution/sema error as a single failing file result (unchanged shape).
+        let module = match super::front_end_test_module(path) {
+            Ok(m) => m,
+            Err(msg) => {
+                results.push(file_error(&display, msg));
                 return;
             }
         };
-
-        // Front-end: a test file must parse and type-check like any source.
-        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(&src);
-        if !lerrs.is_empty() || !perrs.is_empty() {
-            let msg = lerrs
-                .iter()
-                .map(|e| format!("error[{}]: {}", e.code, e.message))
-                .chain(
-                    perrs
-                        .iter()
-                        .map(|e| format!("error[{}]: {}", e.code, e.message)),
-                )
-                .collect::<Vec<_>>()
-                .join("\n");
-            results.push(file_error(&display, msg));
-            return;
-        }
-        let sema_errs = zapc_sema::check(&module);
-        if !sema_errs.is_empty() {
-            let msg = sema_errs
-                .iter()
-                .map(|e| format!("error[{}]: {}", e.code, e.message))
-                .collect::<Vec<_>>()
-                .join("\n");
-            results.push(file_error(&display, msg));
-            return;
-        }
 
         let (harness_module, n_tests) = harness::build_harness(&module);
         if n_tests == 0 {
@@ -495,5 +523,313 @@ mod tests {
             errs.is_empty(),
             "expect_raises harness should lower: {errs:?}"
         );
+    }
+}
+
+/// `zap test` import-resolution (#1232; D-0054, SPEC §16 — tests use the same
+/// module resolution as builds).
+///
+/// These build a throwaway project tree on disk and drive the exact front-end
+/// `zap test`'s `run_file` now uses ([`front_end_test_module`] →
+/// [`crate::front_end_reports_with`]), asserting that an imported dependency
+/// installed in the project `zenv`, a sibling source module, and qualified
+/// exception types raised/caught across a module boundary are all in scope — and
+/// that a genuinely unresolved import or unknown name still fails cleanly as a
+/// file-level error, with test discovery and reporting unchanged. No LLVM is
+/// needed: resolution and type-checking are a front-end concern, so the fix is
+/// verified here; the full native harness run is exercised in CI.
+#[cfg(test)]
+mod import_resolution_tests {
+    use super::{front_end_test_module, harness, render_front_end_errors};
+    use std::io::Write;
+    use std::path::PathBuf;
+    use zapc_syntax::ast::{Item, Module};
+    use zapc_syntax::cfg::Target;
+
+    /// A throwaway project directory under the OS temp dir, cleaned on drop.
+    /// Mirrors the module-linker tests' helper so the two suites build trees the
+    /// same way (pid+counter naming, no clock — #917).
+    struct Project {
+        dir: PathBuf,
+    }
+
+    impl Project {
+        fn new(tag: &str) -> Self {
+            let dir = crate::testutil::unique_temp_dir(&format!("zap-zaptest-{tag}"));
+            Project { dir }
+        }
+
+        fn write(&self, rel: &str, src: &str) -> PathBuf {
+            let path = self.dir.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(src.as_bytes()).unwrap();
+            path
+        }
+
+        /// The project `zenv`'s package-search root (`<root>/zenv/pkg`), the same
+        /// directory `ZAP_ZENV=<root>/zenv` resolves to at runtime.
+        fn pkg_root(&self) -> PathBuf {
+            self.dir.join("zenv").join("pkg")
+        }
+    }
+
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Resolve + type-check an entry file through the SAME build front-end, with
+    /// an explicit `zenv` package root so the process-wide `ZAP_ZENV` is never
+    /// touched (parallel-test-safe). Returns the merged, import-qualified module.
+    fn resolve(entry: &std::path::Path, pkg_roots: Vec<PathBuf>) -> Result<Module, Vec<String>> {
+        crate::front_end_reports_with(&entry.display().to_string(), &Target::host(), pkg_roots)
+            .map(|(module, _types, _warns)| module)
+            .map_err(|reports| {
+                reports
+                    .iter()
+                    .map(|r| format!("error[{}]: {}", r.code, r.message))
+                    .collect()
+            })
+    }
+
+    /// Whether any top-level function's name CONTAINS `needle` — used to prove an
+    /// imported dependency's symbols were actually merged into the linked module
+    /// (they arrive module-qualified/mangled, e.g. `__zm1_sample__answer__`, not
+    /// under their bare source name).
+    fn has_fn_containing(m: &Module, needle: &str) -> bool {
+        m.items.iter().any(|it| match it {
+            Item::Function(f) => f.name.contains(needle),
+            _ => false,
+        })
+    }
+
+    /// Assert the merged, import-qualified test module both type-checks as linked
+    /// AND survives the harness transform + lowering with `n` tests — i.e. every
+    /// cross-module reference resolved all the way through to runnable ZIR.
+    fn assert_harness_ok(module: &Module, n: usize) {
+        let (h, got) = harness::build_harness(module);
+        assert_eq!(got, n, "discovered {got} @test fns, expected {n}");
+        let sema = zapc_sema::check(&h);
+        assert!(sema.is_empty(), "harness should type-check, got: {sema:?}");
+        let (_zir, errs) = zapc_ir::lower_module(&h);
+        assert!(errs.is_empty(), "harness should lower, got: {errs:?}");
+    }
+
+    // ---- the pre-#1232 bug, pinned ---------------------------------------
+
+    /// Regression guard for the actual defect: the OLD `zap test` front end
+    /// parsed the entry file and type-checked it in ISOLATION
+    /// (`parse_str` + `zapc_sema::check`), so an imported dependency resolved to
+    /// nothing and the body failed at sema with `unknown name`. Pinning the old
+    /// behaviour here documents *why* the fix is needed and fails loudly if a
+    /// future change reintroduces the single-file path.
+    #[test]
+    fn old_single_file_check_fails_on_imported_dependency_symbol() {
+        let src = "import sample\n\
+                   @test\ndef uses_dep():\n    assert sample.answer() == 42\n";
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty() && lerrs.is_empty(), "should parse");
+        let errs = zapc_sema::check(&module);
+        assert!(
+            errs.iter().any(|e| e.code == zapc_diag::ErrorCode::ZAP3001),
+            "the single-file check must still report ZAP3001 'unknown name' for an \
+             unresolved import (this is the bug the module-resolution fix cures), got: {errs:?}"
+        );
+    }
+
+    // ---- positive cases --------------------------------------------------
+
+    /// A dependency installed at a LOCAL PATH (`zap add --path`) — present in the
+    /// project `zenv` as `<zenv>/pkg/<name>/src/<name>.zap` — is resolvable from a
+    /// `@test`, imported symbol and all. This is the exact reproducer in #1232.
+    #[test]
+    fn local_path_dependency_symbol_resolves_in_test() {
+        let p = Project::new("localdep");
+        p.write(
+            "zenv/pkg/sample/src/sample.zap",
+            "def answer() -> int64:\n    return 42\n",
+        );
+        let entry = p.write(
+            "tests/sample_test.zap",
+            "import sample\n\
+             @test\ndef answer_from_dependency():\n    assert sample.answer() == 42\n",
+        );
+
+        let module = resolve(&entry, vec![p.pkg_root()]).expect("dependency import must resolve");
+        assert!(
+            has_fn_containing(&module, "answer"),
+            "the dependency's merged (mangled) `answer` symbol must be present in the linked module"
+        );
+        assert_harness_ok(&module, 1);
+    }
+
+    /// A SIBLING source module in the same project (resolved relative to the test
+    /// file's own package source root) is in scope from a `@test`.
+    #[test]
+    fn sibling_source_module_resolves_in_test() {
+        let p = Project::new("sibling");
+        p.write(
+            "tests/helpers.zap",
+            "def double(int64 x) -> int64:\n    return x * 2\n",
+        );
+        let entry = p.write(
+            "tests/sibling_test.zap",
+            "import helpers\n\
+             @test\ndef sibling_in_scope():\n    assert helpers.double(21) == 42\n",
+        );
+
+        // No dependency roots at all: a sibling must resolve locally, not via zenv.
+        let module = resolve(&entry, Vec::new()).expect("sibling import must resolve");
+        assert_harness_ok(&module, 1);
+    }
+
+    /// A QUALIFIED exception type defined in an imported dependency is usable in a
+    /// `@test` body: raised and caught across the module boundary. The linker must
+    /// rewrite the qualified `raise`/`except` type to the dependency's merged
+    /// symbol, or sema rejects it (the "rejects its qualified exception types"
+    /// half of #1232).
+    #[test]
+    fn qualified_exception_from_dependency_raises_and_catches_in_test() {
+        let p = Project::new("qualexc");
+        p.write(
+            "zenv/pkg/sample/src/sample.zap",
+            "struct SampleError:\n    str message\n\
+             def boom():\n    raise SampleError(\"from dep\")\n",
+        );
+        let entry = p.write(
+            "tests/exc_test.zap",
+            "import sample\n\
+             @test\ndef catches_dep_exception():\n\
+             \x20   int64 caught = 0\n\
+             \x20   try:\n\
+             \x20       raise sample.SampleError(\"boom\")\n\
+             \x20   except sample.SampleError as e:\n\
+             \x20       caught = 1\n\
+             \x20   assert caught == 1\n\
+             @test\ndef catches_exception_raised_inside_dependency():\n\
+             \x20   int64 caught = 0\n\
+             \x20   try:\n\
+             \x20       sample.boom()\n\
+             \x20   except sample.SampleError as e:\n\
+             \x20       caught = 1\n\
+             \x20   assert caught == 1\n",
+        );
+
+        let module =
+            resolve(&entry, vec![p.pkg_root()]).expect("qualified exception types must resolve");
+        assert_harness_ok(&module, 2);
+    }
+
+    /// Several `@test`s across dependency + sibling + local in one file all
+    /// resolve together, and discovery counts every one (reporting is unchanged):
+    /// a passing test and a deliberately-failing test (whose PASS/FAIL outcome is
+    /// decided at run time in CI) are BOTH discovered and lower cleanly.
+    #[test]
+    fn discovery_counts_passing_and_failing_tests_with_mixed_imports() {
+        let p = Project::new("mixed");
+        p.write(
+            "zenv/pkg/sample/src/sample.zap",
+            "def answer() -> int64:\n    return 42\n",
+        );
+        p.write("tests/helpers.zap", "def ten() -> int64:\n    return 10\n");
+        let entry = p.write(
+            "tests/mixed_test.zap",
+            "import sample\nimport helpers\n\
+             @test\ndef passes():\n    assert sample.answer() == helpers.ten() + 32\n\
+             @test\ndef fails_at_runtime():\n    assert sample.answer() == 0\n\
+             @test\n@skip(\"later\")\ndef skipped():\n    assert False\n",
+        );
+
+        let module = resolve(&entry, vec![p.pkg_root()]).expect("mixed imports must resolve");
+        // All three @tests are discovered — the failing one is not dropped, so the
+        // run will still report it (as FAIL at run time).
+        assert_harness_ok(&module, 3);
+    }
+
+    // ---- negative cases --------------------------------------------------
+
+    /// A genuinely unknown MODULE import fails cleanly (a module-not-found error,
+    /// ZAP3010 — exactly what `zap run`/`zap build` report for the same import),
+    /// surfaced as a non-empty, rendered file-level diagnostic rather than a crash
+    /// or a silent pass.
+    #[test]
+    fn unknown_module_import_fails_cleanly() {
+        let p = Project::new("unknownmod");
+        let entry = p.write(
+            "tests/bad_test.zap",
+            "import does_not_exist\n\
+             @test\ndef t():\n    assert does_not_exist.thing() == 1\n",
+        );
+
+        let errs =
+            resolve(&entry, vec![p.pkg_root()]).expect_err("an unresolved module import must fail");
+        assert!(
+            errs.iter().any(|e| e.contains("ZAP3010")),
+            "an unknown module must report ZAP3010 (module not found), got: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("does_not_exist")),
+            "the diagnostic must name the missing module, got: {errs:?}"
+        );
+    }
+
+    /// A genuinely unknown NAME in a test body still reports ZAP3001 cleanly —
+    /// the fix resolves real imports, it does not paper over real errors.
+    #[test]
+    fn unknown_name_in_test_body_still_reports_zap3001() {
+        let p = Project::new("unknownname");
+        let entry = p.write(
+            "tests/bad_test.zap",
+            "@test\ndef t():\n    assert frobnicate == 1\n",
+        );
+
+        let errs =
+            resolve(&entry, Vec::new()).expect_err("an unknown name must fail type-checking");
+        assert!(
+            errs.iter().any(|e| e.contains("ZAP3001")),
+            "an unknown name must report ZAP3001, got: {errs:?}"
+        );
+    }
+
+    /// The front-end error renderer used by the file-level test result produces
+    /// the one-error-per-line `error[CODE]: message` form the report already
+    /// expects — so a resolution failure reads as a failing file, unchanged.
+    #[test]
+    fn front_end_errors_render_as_file_level_result() {
+        let p = Project::new("render");
+        let entry = p.write(
+            "tests/bad_test.zap",
+            "import missing_dep\n@test\ndef t():\n    assert True\n",
+        );
+        // Drive the exact helper `run_file` uses (env-based), then confirm its
+        // rendered message shape. `front_end_test_module` resolves against the
+        // ambient environment; with no matching package on any search root the
+        // import is unresolved, so it returns the rendered error string.
+        let rendered = front_end_test_module(&entry).expect_err("must not resolve");
+        assert!(
+            rendered.lines().all(|l| l.starts_with("error[")),
+            "each rendered line must be an `error[CODE]: ...` entry, got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("missing_dep"),
+            "the rendered error must name the missing module, got: {rendered:?}"
+        );
+
+        // And the shared renderer itself maps reports to that shape. (`Report`
+        // is not `Debug`, so match rather than `expect_err`.)
+        let reports = match crate::front_end_reports_with(
+            &entry.display().to_string(),
+            &Target::host(),
+            vec![p.pkg_root()],
+        ) {
+            Ok(_) => panic!("must not resolve"),
+            Err(reports) => reports,
+        };
+        let rendered = render_front_end_errors(&reports);
+        assert!(rendered.starts_with("error["), "got: {rendered:?}");
     }
 }

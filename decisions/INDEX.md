@@ -22,6 +22,7 @@ listed here (see [`README.md`](README.md)).
 | [1206](lang/1206-param-referencing-bounds.md) | Bounds referencing other type parameters — capture and substitute the bound's arguments | Accepted | 2026-11-20 |
 | [1207](lang/1207-associated-output-types.md) | Associated / output types on interfaces (`type Out`), projected as `T.Out` | Accepted | 2026-11-20 |
 | [1222](lang/1222-imported-generic-bound-name.md) | The module linker mangles the interface name inside a type-parameter bound | Locked | 2026-11-21 |
+| [1227](lang/1227-generic-operator-dunder-dispatch.md) | Generic operator dunders dispatch in operator syntax via a mono rewrite | Locked | 2026-11-21 |
 | [1228](lang/1228-callable-module-const.md) | Callable module-level constants dispatch to __call__ through the method path | Locked | 2026-11-21 |
 
 ## stdlib
@@ -64,4 +65,5 @@ listed here (see [`README.md`](README.md)).
 |---|-------|--------|------|
 | [917](tooling/917-one-temp-name-helper-no-clock.md) | One pid+counter temp-name helper per crate; test modules never read the clock | Locked | 2026-11-19 |
 | [1089](tooling/1089-decisions-as-per-file-adrs.md) | New decisions are per-file ADRs keyed to issue/PR number | Locked | 2026-11-19 |
+| [1232](tooling/1232-zap-test-module-resolution.md) | zap test resolves imports through the same module pipeline as builds | Accepted | 2026-11-21 |
 
