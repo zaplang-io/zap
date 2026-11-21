@@ -594,6 +594,33 @@ fn provides_dunder(
     methods.iter().any(|m| m.name == dunder) || derives_trait(decorators, derive_trait)
 }
 
+/// The forward and reflected operator dunders for a binary operator (D-0047,
+/// #1180), or `None` for an operator that is not dispatched to a dunder
+/// (logical / comparison / membership / identity / channel send). The names
+/// mirror `reflected_op_dunder` and the forward-dunder table in the IR crate's
+/// operator lowering (`crates/ir/src/lower/operators.rs`); they are duplicated
+/// here because the two crates do not share a map, and the IR table is the
+/// authority — any new overloadable operator must be added to both.
+fn op_dunders(op: BinOp) -> Option<(&'static str, &'static str)> {
+    use BinOp::*;
+    Some(match op {
+        Add => ("__add__", "__radd__"),
+        Sub => ("__sub__", "__rsub__"),
+        Mul => ("__mul__", "__rmul__"),
+        Div => ("__truediv__", "__rtruediv__"),
+        FloorDiv => ("__floordiv__", "__rfloordiv__"),
+        Mod => ("__mod__", "__rmod__"),
+        Pow => ("__pow__", "__rpow__"),
+        MatMul => ("__matmul__", "__rmatmul__"),
+        BitAnd => ("__and__", "__rand__"),
+        BitOr => ("__or__", "__ror__"),
+        BitXor => ("__xor__", "__rxor__"),
+        Shl => ("__lshift__", "__rlshift__"),
+        Shr => ("__rshift__", "__rrshift__"),
+        _ => return None,
+    })
+}
+
 /// Structural equality of two optional types, treating `None` (no annotation /
 /// no return) as the unit type so an absent return matches an absent return.
 fn opt_type_eq(a: Option<&Type>, b: Option<&Type>) -> bool {
@@ -2797,6 +2824,36 @@ impl Mono<'_> {
                 // byte-for-byte unchanged; only the inferred `CTy` is added.
                 let (lhs_e, lcty) = self.rewrite_expr(lhs, env, None)?;
                 let (rhs_e, rcty) = self.rewrite_expr(rhs, env, None)?;
+                // A *generic* operator dunder (`def __add__[T]` / `def __radd__[T]`,
+                // #1227) cannot be dispatched by IR lowering, which only knows the
+                // un-instantiated mangled name (`Delta____radd__`) and so reports
+                // ZAP6001. Detect the D-0047 / #1180 dispatch here — the left
+                // operand's forward dunder wins when its type declares one, else the
+                // right operand's reflected dunder — and, when the resolved method is
+                // generic, rewrite the operator into the specialized method call the
+                // explicit `x.__radd__[T](y)` form already lowers. A non-generic
+                // dunder is left as an operator: IR lowering dispatches it unchanged
+                // (#1180/#1201), so the operator surface is untouched for every type
+                // that worked before.
+                if let Some((reflected, owner, owner_args, dunder)) =
+                    self.operator_dunder_dispatch(*op, &lcty, &rcty)
+                {
+                    let (recv_e, arg_e, arg_cty) = if reflected {
+                        (rhs_e, lhs_e, lcty)
+                    } else {
+                        (lhs_e, rhs_e, rcty)
+                    };
+                    return self.rewrite_operator_dunder(
+                        &owner,
+                        &owner_args,
+                        dunder,
+                        recv_e,
+                        arg_e,
+                        arg_cty,
+                        expected,
+                        *span,
+                    );
+                }
                 let cty = self.binary_result(*op, &lcty, &rcty);
                 Ok((
                     Expr::Binary {
@@ -3421,6 +3478,99 @@ impl Mono<'_> {
     /// types, then fall back to the expected-type sink against the return type for
     /// any parameter the arguments do not pin down (Fork I). Errors naming the
     /// unresolved parameter if neither rule determines it.
+    /// Decide whether a binary operator dispatches to a *generic* operator
+    /// dunder that must be rewritten to a specialized method call (#1227).
+    /// Returns `(is_reflected, owner, owner_args, dunder)`: the owner type that
+    /// declares the dunder, its (possibly empty) generic arguments, and the
+    /// dunder name. `None` means IR lowering can dispatch the operator as-is —
+    /// the operator has no dunder, neither operand's type declares one, or the
+    /// declared dunder is non-generic (handled unchanged in `operators.rs`).
+    ///
+    /// Mirrors the D-0047 / #1180 precedence exactly: the left operand's forward
+    /// dunder wins whenever its type declares one (generic or not), which also
+    /// suppresses the reflected fallback; otherwise the right operand's reflected
+    /// dunder applies. Only a generic match is reported, because a non-generic
+    /// dunder already lowers correctly and must keep its operator form (so the
+    /// `operator_index_call` / #1201 goldens stay byte-identical).
+    fn operator_dunder_dispatch(
+        &self,
+        op: BinOp,
+        lcty: &CTy,
+        rcty: &CTy,
+    ) -> Option<(bool, String, Vec<Type>, &'static str)> {
+        let (fwd, refl) = op_dunders(op)?;
+        if let CTy::Ty(Type::Named { name, args, .. }) = lcty {
+            if let Some(m) = self.find_method(name, fwd) {
+                // A declared forward dunder wins and suppresses the reflected
+                // fallback; only its generic form needs the rewrite.
+                if m.generics.is_empty() {
+                    return None;
+                }
+                return Some((false, name.clone(), args.clone(), fwd));
+            }
+        }
+        if let CTy::Ty(Type::Named { name, args, .. }) = rcty {
+            if let Some(m) = self.find_method(name, refl) {
+                if !m.generics.is_empty() {
+                    return Some((true, name.clone(), args.clone(), refl));
+                }
+            }
+        }
+        None
+    }
+
+    /// Rewrite an operator whose dispatch target is a generic dunder into the
+    /// specialized method call `recv.dunder$targs(arg)` (#1227). `recv`/`arg` are
+    /// the already-rewritten operand expressions placed in call order (for a
+    /// reflected dunder the receiver is the right operand and the argument is the
+    /// left); `arg_cty` is the argument's inferred type, used — together with the
+    /// `expected` sink — to infer the method's type parameters. This produces
+    /// exactly the AST an explicit `recv.dunder[targs](arg)` call produces, so
+    /// the proven generic-method-call lowering path handles it from here.
+    #[allow(clippy::too_many_arguments)]
+    fn rewrite_operator_dunder(
+        &mut self,
+        owner: &str,
+        owner_args: &[Type],
+        dunder: &str,
+        recv_e: Expr,
+        arg_e: Expr,
+        arg_cty: CTy,
+        expected: Option<&Type>,
+        span: Span,
+    ) -> Result<(Expr, CTy), LowerError> {
+        let method = self
+            .find_method(owner, dunder)
+            .expect("caller verified the generic dunder exists");
+        let tparams: Vec<String> = method.generics.iter().map(|g| g.name.clone()).collect();
+        let owner_subst = self.subst_map(owner, owner_args);
+        let argpairs = vec![(None, arg_cty)];
+        let targs = self.infer_fn_targs(
+            method,
+            &owner_subst,
+            &argpairs,
+            expected,
+            &format!("operator method '{dunder}' of '{owner}'"),
+        )?;
+        let ret_cty = self.fn_ret_cty(method.ret.as_ref(), &owner_subst, &tparams, &targs);
+        let method_spec = self.request_method(owner, owner_args, dunder, &targs);
+        let node = Expr::Call {
+            callee: Box::new(Expr::Attr {
+                base: Box::new(recv_e),
+                name: method_spec,
+                span,
+            }),
+            args: vec![Arg {
+                name: None,
+                value: arg_e,
+                spread: ast::ArgSpread::None,
+                span,
+            }],
+            span,
+        };
+        Ok((node, ret_cty))
+    }
+
     fn infer_fn_targs(
         &self,
         f: &Function,
@@ -5219,6 +5369,137 @@ mod tests {
             fn_names(&m).iter().any(|n| n == "add2$Num"),
             "conforming instance emitted: {:?}",
             fn_names(&m)
+        );
+    }
+
+    // ---- generic operator dunders in operator syntax (#1227) --------------
+    //
+    // A *generic* operator dunder (`def __add__[T]` / `def __radd__[T]`) cannot
+    // be dispatched by IR lowering, which only knows the un-instantiated mangled
+    // name. Mono resolves the D-0047 / #1180 dispatch and rewrites the operator
+    // into the specialized method call the explicit `x.__radd__[T](y)` form
+    // already lowers. A *non-generic* dunder must stay an operator so IR lowering
+    // dispatches it unchanged (the `operator_index_call` / #1201 behavior).
+
+    #[test]
+    fn generic_reflected_operator_dispatches_per_left_operand_type() {
+        // The issue's shape: `a + delta` / `a - delta` where `delta`'s type has a
+        // generic reflected dunder rewrites to the specialized method call,
+        // instantiated with the concrete left-operand type. Both a `Date` and a
+        // `DateTime` left operand and both `__radd__`/`__rsub__` are covered.
+        let m = mono_ok(
+            "struct Date:\n    int64 day\n\
+             struct DateTime:\n    int64 day\n\
+             struct Shift:\n    int64 n\n\
+             \x20   def __radd__[T](self, T x) -> T:\n        return x\n\
+             \x20   def __rsub__[T](self, T x) -> T:\n        return x\n\
+             def main():\n    \
+             auto d = Date(1)\n    auto t = DateTime(2)\n    \
+             auto a = d + Shift(1)\n    auto b = t + Shift(1)\n    \
+             auto c = d - Shift(1)\n    auto e = t - Shift(1)\n    \
+             print(a.day)\n    print(b.day)\n    print(c.day)\n    print(e.day)\n",
+        );
+        let syms = method_call_syms(&m);
+        for want in [
+            "__radd__$Date",
+            "__radd__$DateTime",
+            "__rsub__$Date",
+            "__rsub__$DateTime",
+        ] {
+            assert!(
+                syms.iter().any(|s| s == want),
+                "operator rewritten to {want}: {syms:?}"
+            );
+        }
+        // Each specialized reflected method is emitted on its owner struct.
+        let shift = struct_named(&m, "Shift").expect("Shift emitted");
+        let methods: Vec<&String> = shift.methods.iter().map(|mth| &mth.name).collect();
+        for want in [
+            "__radd__$Date",
+            "__radd__$DateTime",
+            "__rsub__$Date",
+            "__rsub__$DateTime",
+        ] {
+            assert!(
+                methods.iter().any(|n| *n == want),
+                "{want} attached to Shift: {methods:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_forward_operator_dispatches_to_specialized_call() {
+        // A generic *forward* dunder dispatches too, keyed on the right-operand
+        // (argument) type: `c + 1` -> `__add__$int64`, `c + "x"` -> `__add__$str`.
+        let m = mono_ok(
+            "struct Counter:\n    int64 n\n\
+             \x20   def __add__[T](self, T other) -> int64:\n        return self.n\n\
+             def main():\n    auto c = Counter(7)\n    print(c + 1)\n    print(c + \"x\")\n",
+        );
+        let syms = method_call_syms(&m);
+        assert!(
+            syms.iter().any(|s| s == "__add__$int64"),
+            "int64 instance: {syms:?}"
+        );
+        assert!(
+            syms.iter().any(|s| s == "__add__$str"),
+            "str instance: {syms:?}"
+        );
+    }
+
+    #[test]
+    fn nongeneric_reflected_operator_stays_an_operator() {
+        // A non-generic reflected dunder is dispatched by IR lowering, so mono
+        // must leave the operator untouched — no specialized method-call symbol.
+        let m = mono_ok(
+            "struct Scale:\n    int64 k\n\
+             \x20   def __rmul__(self, int64 x) -> int64:\n        return x * self.k\n\
+             def main():\n    print(3 * Scale(10))\n",
+        );
+        let syms = method_call_syms(&m);
+        assert!(
+            !syms.iter().any(|s| s.starts_with("__rmul__")),
+            "non-generic reflected op stays an operator: {syms:?}"
+        );
+    }
+
+    #[test]
+    fn forward_dunder_wins_over_a_generic_reflected_dunder() {
+        // D-0047 precedence: when the left operand's type declares a forward
+        // dunder it wins, and the right operand's reflected dunder is never
+        // consulted — even a generic one (which would otherwise be rewritten).
+        let m = mono_ok(
+            "struct L:\n    int64 v\n\
+             \x20   def __add__(self, R o) -> int64:\n        return self.v\n\
+             struct R:\n    int64 w\n\
+             \x20   def __radd__[T](self, T x) -> T:\n        return x\n\
+             def main():\n    print(L(1) + R(2))\n",
+        );
+        let syms = method_call_syms(&m);
+        assert!(
+            !syms.iter().any(|s| s.starts_with("__add__")),
+            "forward dunder stays an operator: {syms:?}"
+        );
+        assert!(
+            !syms.iter().any(|s| s.starts_with("__radd__")),
+            "reflected dunder not consulted when forward wins: {syms:?}"
+        );
+    }
+
+    #[test]
+    fn generic_operator_with_uninferable_type_arg_is_rejected() {
+        // When the generic dunder's own type parameter appears in neither the
+        // argument nor the return type it cannot be inferred from the operator;
+        // the rewrite reports the same clean "cannot infer type argument" error
+        // the explicit generic-method-call form produces.
+        let msg = mono_err(
+            "struct D:\n    int64 d\n\
+             \x20   def __radd__[U](self, int64 x) -> int64:\n        return x\n\
+             def main():\n    print(5 + D(1))\n",
+        );
+        assert!(
+            msg.contains("cannot infer type argument 'U'"),
+            "clean inference error: {msg}"
         );
     }
 
