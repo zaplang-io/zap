@@ -15,10 +15,17 @@
 //! evaluator reports `.ty` as out of fragment until then, so an unresolved
 //! element type never silently misleads.
 
-use zapc_sema_types::{AttrArg, AttrInfo, FieldInfo, Ty, TypeInfo, TypeShape, VariantInfo};
-use zapc_syntax::ast::{
-    Decorator, EnumDef, EnumVariant, Expr, Field, StructDef, Type, VariantField,
+use std::collections::{HashMap, HashSet};
+
+use zapc_sema_types::{
+    primitive_name, AttrArg, AttrInfo, FieldInfo, Ty, TypeInfo, TypeShape, VariantInfo,
 };
+use zapc_syntax::ast::{
+    Decorator, EnumDef, EnumVariant, Expr, Field, Module, StructDef, Type, VariantField,
+};
+
+use crate::CtError;
+use zapc_syntax::span::Span;
 
 /// Build the [`TypeInfo`] for a concrete `struct` declaration: its declared data
 /// fields in declaration order (#1066), each a full [`FieldInfo`].
@@ -149,5 +156,206 @@ fn ty_of_decl(t: &Type) -> Ty {
         "bigint" => Ty::Bigint,
         "complex" => Ty::Complex,
         _ => Ty::Unknown,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TypeRegistry — the no-sema `Type`/`Ty` -> `TypeInfo` resolver (#1253)
+// ---------------------------------------------------------------------------
+
+/// A registry of a module's user `struct`/`enum` declarations, built once from
+/// the AST, that resolves a declared [`Type`] or a resolved [`Ty`] to its
+/// [`TypeInfo`] — the no-sema analog of E1's `Checker::reflect_type_info`.
+///
+/// This is what drives `type_info(T).kind`-switch **container recursion**
+/// (#1253): a container shape stores its element/key/value type, and the
+/// evaluator resolves that back to a nested `TypeInfo` so a comptime kind-switch
+/// can recurse on `info.elem` / `info.key` / `info.value` / `info.inner` /
+/// `info.elems`. Resolution is **one level** (like E1): it never flattens the
+/// type graph, so a depth-capped walk over recursive type shapes terminates.
+#[derive(Debug, Default, Clone)]
+pub struct TypeRegistry {
+    /// User struct/enum name -> its one-level `TypeInfo`.
+    types: HashMap<String, TypeInfo>,
+    /// User type name -> declared method names (for the override hook).
+    methods: HashMap<String, HashSet<String>>,
+}
+
+impl TypeRegistry {
+    /// An empty registry.
+    pub fn new() -> TypeRegistry {
+        TypeRegistry::default()
+    }
+
+    /// Register a struct declaration.
+    pub fn add_struct(&mut self, def: &StructDef) {
+        self.types
+            .insert(def.name.clone(), type_info_of_struct(def));
+        self.methods.insert(
+            def.name.clone(),
+            def.methods.iter().map(|m| m.name.clone()).collect(),
+        );
+    }
+
+    /// Register an enum declaration.
+    pub fn add_enum(&mut self, def: &EnumDef) {
+        self.types.insert(def.name.clone(), type_info_of_enum(def));
+        self.methods.insert(
+            def.name.clone(),
+            def.methods.iter().map(|m| m.name.clone()).collect(),
+        );
+    }
+
+    /// Build a registry from every struct/enum declared in `module`.
+    pub fn from_module(module: &Module) -> TypeRegistry {
+        let mut reg = TypeRegistry::new();
+        for item in &module.items {
+            match item {
+                zapc_syntax::ast::Item::Struct(s) => reg.add_struct(s),
+                zapc_syntax::ast::Item::Enum(e) => reg.add_enum(e),
+                _ => {}
+            }
+        }
+        reg
+    }
+
+    /// `true` when the named user type declares a method `method` — the override
+    /// hook (#1248): a type that supplies its own handler (e.g. `serialize`) is
+    /// preferred over reflection, so a comptime kind-switch can short-circuit to
+    /// it. Full override *policy* (which method, how it is called) is E3; this
+    /// is the mechanism.
+    pub fn has_method(&self, type_name: &str, method: &str) -> bool {
+        self.methods
+            .get(type_name)
+            .is_some_and(|set| set.contains(method))
+    }
+
+    /// Resolve a resolved [`Ty`] (as stored in a container `TypeShape`) to its
+    /// [`TypeInfo`]. Used by the evaluator's `.elem`/`.key`/`.value`/`.inner`/
+    /// `.elems` container accessors.
+    pub fn resolve_ty(&self, ty: &Ty, span: Span) -> Result<TypeInfo, CtError> {
+        if let Some(name) = primitive_name(ty) {
+            return Ok(TypeInfo {
+                shape: TypeShape::Primitive {
+                    name: name.to_string(),
+                },
+            });
+        }
+        let shape = match ty {
+            Ty::List(e) => TypeShape::List {
+                elem: (**e).clone(),
+            },
+            Ty::Dict(k, v) => TypeShape::Dict {
+                key: (**k).clone(),
+                value: (**v).clone(),
+            },
+            Ty::Tuple(es) => TypeShape::Tuple { elems: es.clone() },
+            // `Optional[T]` erases its element at the `Ty` level (sema tracks it
+            // as `Named("Optional")`), so a container element that is itself an
+            // optional reflects as a bare optional (`Unknown` element) — the
+            // one-level limitation inherited from E1's `Ty` model.
+            Ty::Named(n) if n == "Optional" => TypeShape::Optional { elem: Ty::Unknown },
+            Ty::Named(n) if !n.starts_with('$') => {
+                return self.named(n, span);
+            }
+            other => {
+                return Err(CtError::not_available(
+                    format!("a comptime type `{}`", other.display()),
+                    span,
+                ));
+            }
+        };
+        Ok(TypeInfo { shape })
+    }
+
+    /// Resolve a declared [`Type`] (as written) to its [`TypeInfo`]. Used by the
+    /// evaluator's `field.ty` accessor and for a top-level entry; unlike
+    /// [`resolve_ty`](Self::resolve_ty) it recovers an `Optional[T]`'s element
+    /// from the declared argument (E1 parity).
+    pub fn resolve_type(&self, t: &Type, span: Span) -> Result<TypeInfo, CtError> {
+        match t {
+            Type::Tuple { elems, .. } => Ok(TypeInfo {
+                shape: TypeShape::Tuple {
+                    elems: elems.iter().map(ty_of_type).collect(),
+                },
+            }),
+            Type::Named { name, args, .. } => {
+                if name == "Optional" {
+                    let elem = args.first().map(ty_of_type).unwrap_or(Ty::Unknown);
+                    return Ok(TypeInfo {
+                        shape: TypeShape::Optional { elem },
+                    });
+                }
+                if (name == "list" || name == "List") && args.len() == 1 {
+                    return Ok(TypeInfo {
+                        shape: TypeShape::List {
+                            elem: ty_of_type(&args[0]),
+                        },
+                    });
+                }
+                if (name == "dict" || name == "Dict") && args.len() == 2 {
+                    return Ok(TypeInfo {
+                        shape: TypeShape::Dict {
+                            key: ty_of_type(&args[0]),
+                            value: ty_of_type(&args[1]),
+                        },
+                    });
+                }
+                let bare = Ty::Named(name.clone());
+                if args.is_empty() {
+                    if let Some(prim) = primitive_name(&ty_of_type(t)) {
+                        return Ok(TypeInfo {
+                            shape: TypeShape::Primitive {
+                                name: prim.to_string(),
+                            },
+                        });
+                    }
+                    if !name.starts_with('$') {
+                        return self.named(name, span);
+                    }
+                }
+                Err(CtError::not_available(
+                    format!("a comptime type `{}`", bare.display()),
+                    span,
+                ))
+            }
+            Type::Func { .. } => Err(CtError::not_available("a comptime function type", span)),
+        }
+    }
+
+    fn named(&self, name: &str, span: Span) -> Result<TypeInfo, CtError> {
+        self.types
+            .get(name)
+            .cloned()
+            .ok_or_else(|| CtError::not_available(format!("a comptime type `{name}`"), span))
+    }
+}
+
+/// Best-effort map of a declared [`Type`] to a resolved [`Ty`], for the
+/// container/primitive cases the registry resolves. Mirrors the `Ty` erasure of
+/// `Optional` (→ `Named("Optional")`).
+fn ty_of_type(t: &Type) -> Ty {
+    match t {
+        Type::Tuple { elems, .. } => Ty::Tuple(elems.iter().map(ty_of_type).collect()),
+        Type::Func { .. } => Ty::Unknown,
+        Type::Named { name, args, .. } => match (name.as_str(), args.len()) {
+            ("list" | "List", 1) => Ty::List(Box::new(ty_of_type(&args[0]))),
+            ("dict" | "Dict", 2) => Ty::Dict(
+                Box::new(ty_of_type(&args[0])),
+                Box::new(ty_of_type(&args[1])),
+            ),
+            ("Optional", _) => Ty::Named("Optional".to_string()),
+            _ => {
+                // A bare name: a primitive maps to its `Ty`, any other (user
+                // struct/enum, or an unsupported parameterized container) keeps
+                // its name so the registry can resolve it (or fail cleanly).
+                let prim = ty_of_decl(t);
+                if matches!(prim, Ty::Unknown) {
+                    Ty::Named(name.clone())
+                } else {
+                    prim
+                }
+            }
+        },
     }
 }

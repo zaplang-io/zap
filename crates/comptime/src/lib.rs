@@ -102,7 +102,7 @@ use zapc_syntax::ast::{Expr, Function};
 use zapc_syntax::span::Span;
 
 pub use error::{CtError, CtErrorKind};
-pub use reflect_ast::{type_info_of_enum, type_info_of_struct};
+pub use reflect_ast::{type_info_of_enum, type_info_of_struct, TypeRegistry};
 pub use reflect_field::{desugar_reflect_field, field_decl_type, reflect_field};
 pub use unroll::{materialize, unroll};
 pub use value::Value;
@@ -194,6 +194,12 @@ pub struct Evaluator<'a> {
     /// recursion detection (direct or transitive self-calls are out of
     /// fragment).
     active: Vec<&'a str>,
+    /// The user-type registry (#1253): resolves a container's element/key/value
+    /// type and a field's declared type back to a nested `TypeInfo`, driving the
+    /// `type_info(T).kind`-switch container recursion. `None` means container
+    /// element accessors (`.elem`/`.key`/…) and `field.ty` are unavailable
+    /// (they report the out-of-fragment error as in #1250).
+    registry: Option<&'a TypeRegistry>,
 }
 
 impl<'a> Default for Evaluator<'a> {
@@ -211,7 +217,16 @@ impl<'a> Evaluator<'a> {
             step_cap: DEFAULT_STEP_CAP,
             depth_cap: DEFAULT_DEPTH_CAP,
             active: Vec::new(),
+            registry: None,
         }
+    }
+
+    /// Attach a [`TypeRegistry`] so container recursion (`.elem`/`.key`/
+    /// `.value`/`.inner`/`.elems`), `field.ty`, and the `reflect.has_override`
+    /// hook resolve user types (#1253).
+    pub fn with_registry(mut self, registry: &'a TypeRegistry) -> Self {
+        self.registry = Some(registry);
+        self
     }
 
     /// An evaluator that can call any of `funcs` by name (the common case:
@@ -252,5 +267,24 @@ impl<'a> Evaluator<'a> {
     /// to the call site.
     pub fn call(&mut self, name: &str, args: Vec<Value>, span: Span) -> Result<Value, CtError> {
         self.call_fn(name, args, span)
+    }
+}
+
+/// Bind the seven `TypeKind` names (`Struct`, `Enum`, `Tuple`, `Primitive`,
+/// `List`, `Dict`, `Optional`) as comptime [`Value::Kind`] constants in `env`,
+/// so a comptime kind-switch can be written `comptime if info.kind == Struct:`
+/// (#1253). This seeds the names the deferred `reflect`/`comptime` surface will
+/// expose as a `Kind` enum; host-side the driver seeds them here.
+pub fn seed_kind_constants(env: &mut Env) {
+    for (name, kind) in [
+        ("Struct", TypeKind::Struct),
+        ("Enum", TypeKind::Enum),
+        ("Tuple", TypeKind::Tuple),
+        ("Primitive", TypeKind::Primitive),
+        ("List", TypeKind::List),
+        ("Dict", TypeKind::Dict),
+        ("Optional", TypeKind::Optional),
+    ] {
+        env.define(name, Value::Kind(kind));
     }
 }

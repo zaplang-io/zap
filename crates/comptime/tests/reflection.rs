@@ -160,7 +160,11 @@ fn positional_attr_arg_has_no_name() {
 }
 
 #[test]
-fn field_type_recursion_is_deferred_to_1253() {
+fn field_type_recursion_needs_a_registry() {
+    // `field.ty` (the kind-switch recursion, #1253) resolves a field's type to a
+    // nested `TypeInfo` — but only with a `TypeRegistry` attached. Without one
+    // (as here, a bare evaluator), it is cleanly out of fragment rather than a
+    // panic. (The registry-backed resolution is exercised in kind_switch.rs.)
     let ti = struct_info("T", vec![field("f", 0, vec![])]);
     let e = common::eval_with(
         "info.fields[0].ty",
@@ -168,7 +172,7 @@ fn field_type_recursion_is_deferred_to_1253() {
     )
     .unwrap_err();
     assert!(e.is_not_available(), "{}", e.message);
-    assert!(e.message.contains("#1253"), "{}", e.message);
+    assert!(e.message.contains("type registry"), "{}", e.message);
 }
 
 // --- HQ9: resolve a serialized field name at comptime -----------------------

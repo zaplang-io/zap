@@ -55,7 +55,7 @@ pub use zapc_sema_types::{Ty as SemaTy, TypeMap};
 
 mod comptime_for;
 pub use comptime_for::{
-    reflect_field_access, unroll_enum_variants, unroll_struct_fields,
+    reflect_field_access, type_registry, unroll_enum_variants, unroll_struct_fields,
     unroll_struct_fields_with_access,
 };
 
