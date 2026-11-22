@@ -42,6 +42,23 @@ pub const SHAREABLE_MARKER: &str = "shareable";
 /// (D-0158); the full spec is `docs/design/scoped.md`.
 pub const SCOPED_MARKER: &str = "scoped";
 
+/// The `@exception` exception-type marker (#1278).
+///
+/// A nominal marker a type author applies to a `struct` to make it a
+/// *catchable exception*: only an `@exception` struct may be `raise`d or named
+/// in an `except` clause (a plain struct may not — closing the `raise Point(..)`
+/// footgun). `@exception(Parent)` additionally groups the struct under another
+/// `@exception` struct, so `except Parent` catches it (and every other member of
+/// the family). A family root is not a distinct kind — it is simply an
+/// `@exception` that other exceptions point at, and stays raiseable itself.
+/// Families are emergent and may be multi-level, exactly like the built-in
+/// hierarchy (`LookupError ⊃ IndexError`) and Python's `OSError ⊃
+/// FileNotFoundError`. This adds exactly ONE catch-family edge per member: NO
+/// field or method inheritance, NO subtype assignability (strictly disjoint from
+/// the deferred Full-OO epic #66). The full spec is Discussion #1280 and
+/// `decisions/lang/1278-exception-families.md`.
+pub const EXCEPTION_MARKER: &str = "exception";
+
 /// The built-in types that carry the `@shareable` marker implicitly (#664,
 /// D-0113): the concurrency primitives and concurrent collections whose whole
 /// purpose is safe concurrent shared access. Seeding the lint's one membership

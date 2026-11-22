@@ -831,6 +831,50 @@ void *zap_exception_cause_message(void *exc) {
     return msg ? msg : zap_str_new("", 0);
 }
 
+/* User `@exception(Parent)` family edges (#1278): a member type-id mapped to its
+ * declared parent type-id. User exception ids are name-hashes in the >= 1024
+ * range; a member with no edge keeps the built-in default parent (Exception).
+ *
+ * The table is append-only and populated EXCLUSIVELY at startup by
+ * `zap_exception_register_parent`, which codegen emits into `@__zap_init_globals`
+ * — run once at the very top of `main`, before any user statement and therefore
+ * before any coroutine/thread is spawned. After startup it is immutable, so the
+ * read in `zap_exception_parent` (reachable concurrently during exception
+ * handling) needs no lock. */
+typedef struct { int64_t member; int64_t parent; } ZapExcEdge;
+static ZapExcEdge *g_exc_edges = NULL;
+static size_t g_exc_edge_count = 0;
+static size_t g_exc_edge_cap = 0;
+
+void zap_exception_register_parent(int64_t member, int64_t parent) {
+    /* Idempotent on the member: sema guarantees a single parent per member, so a
+     * repeat registration (there is none today) is simply ignored rather than
+     * overwriting or duplicating. */
+    for (size_t i = 0; i < g_exc_edge_count; i++) {
+        if (g_exc_edges[i].member == member) return;
+    }
+    if (g_exc_edge_count == g_exc_edge_cap) {
+        size_t ncap = g_exc_edge_cap ? g_exc_edge_cap * 2 : 8;
+        ZapExcEdge *n = (ZapExcEdge *)realloc(g_exc_edges, ncap * sizeof(ZapExcEdge));
+        if (!n) return; /* OOM: table unchanged; family catch degrades to Exception */
+        g_exc_edges = n;
+        g_exc_edge_cap = ncap;
+    }
+    g_exc_edges[g_exc_edge_count].member = member;
+    g_exc_edges[g_exc_edge_count].parent = parent;
+    g_exc_edge_count++;
+}
+
+/* The registered parent of a user exception id, or 0 if none (not a member of
+ * any `@exception(Parent)` family — i.e. a family root or a family-less
+ * `@exception`). */
+static int64_t zap_exception_user_parent(int64_t type_id) {
+    for (size_t i = 0; i < g_exc_edge_count; i++) {
+        if (g_exc_edges[i].member == type_id) return g_exc_edges[i].parent;
+    }
+    return 0;
+}
+
 static int64_t zap_exception_parent(int64_t type_id) {
     switch (type_id) {
     case ZAP_EXC_EXCEPTION: return ZAP_EXC_BASE;
@@ -844,7 +888,16 @@ static int64_t zap_exception_parent(int64_t type_id) {
     case ZAP_EXC_INDEX_ERROR: case ZAP_EXC_KEY_ERROR: return ZAP_EXC_LOOKUP_ERROR;
     case ZAP_EXC_ZERO_DIVISION_ERROR: return ZAP_EXC_ARITHMETIC_ERROR;
     case ZAP_EXC_CANCELLED: return ZAP_EXC_BASE;
-    default: return type_id >= 1024 ? ZAP_EXC_EXCEPTION : 0;
+    default:
+        /* A user exception id (>= 1024): thread through its declared
+         * `@exception(Parent)` family edge (#1278) if it has one, else default
+         * to Exception. A built-in arm above always wins, so user families never
+         * perturb the built-in hierarchy. */
+        if (type_id >= 1024) {
+            int64_t p = zap_exception_user_parent(type_id);
+            return p ? p : ZAP_EXC_EXCEPTION;
+        }
+        return 0;
     }
 }
 

@@ -180,6 +180,23 @@ impl Rewriter<'_> {
 
     fn struct_def(&mut self, s: &mut StructDef) {
         self.rename_decl(&mut s.name);
+        // `@exception(Parent)` (#1278): the parent names another exception struct
+        // in this module, so it must mangle to the same symbol as that struct's
+        // renamed declaration — otherwise a cross-module `except pkg.Parent` would
+        // not match a member raised inside the package. Decorator args are not
+        // otherwise rewritten; mangle only this marker's bare parent name through
+        // the own-symbol mangler (`rename_decl`), which no-ops on anything that is
+        // not one of this module's own top-level symbols. (A non-bare parent is
+        // rejected in sema as ZAP5136, so it never reaches here.)
+        for d in &mut s.decorators {
+            if d.name == zapc_syntax::EXCEPTION_MARKER {
+                for a in &mut d.args {
+                    if let Expr::Name(n, _) = &mut a.value {
+                        self.rename_decl(n);
+                    }
+                }
+            }
+        }
         let tl = generics_set(&s.generics, &HashSet::new());
         self.bounds(&mut s.generics, &tl);
         for field in &mut s.fields {

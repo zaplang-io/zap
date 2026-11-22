@@ -345,6 +345,14 @@ struct StructCtx {
     /// fields have their `__exit__` run (reverse declaration order) at every
     /// `with`-exit. Sema enforces the static `@scoped` rules (`crates/sema/src/scoped.rs`).
     scoped_structs: HashSet<u32>,
+    /// `@exception(Parent)` family edges (#1278), as resolved `(member_type_id,
+    /// parent_type_id)` pairs (the same name-hash ids `raise`/`except` use). Each
+    /// becomes a `zap_exception_register_parent(member, parent)` call emitted once
+    /// at startup (in `@__zap_init_globals`), so the runtime's parent-chain walk
+    /// (`zap_exception_is_a`) threads a member through its declared family instead
+    /// of straight to the built-in `Exception`. Empty when no `@exception(Parent)`
+    /// edge exists.
+    exception_parents: Vec<(i64, i64)>,
     /// Registered enums (tier-1 and tier-3), keyed by type name.
     enums: HashMap<String, EnumLow>,
     /// Python import aliases (ticket #27, D-0012): the in-scope name
@@ -915,6 +923,13 @@ impl StructCtx {
     /// calls `@__zap_init_globals` once at its top exactly when this is true.
     fn has_globals(&self) -> bool {
         !self.globals.borrow().is_empty()
+    }
+
+    /// Whether `@__zap_init_globals` has any work and so must be emitted and
+    /// called from `main`'s prologue: module globals to initialize (D-0112) or
+    /// `@exception(Parent)` family edges to register at startup (#1278).
+    fn has_init_work(&self) -> bool {
+        self.has_globals() || !self.exception_parents.is_empty()
     }
 
     /// Whether `sid` uses the physical inline / register / sret layout (D-0051):
@@ -1578,12 +1593,40 @@ pub fn lower_module_opts_with_types(
         s
     };
 
+    // `@exception(Parent)` family edges (#1278), resolved to `(member_id,
+    // parent_id)` name-hash pairs — the same ids `raise`/`except` compute. sema
+    // has already validated that each parent is an `@exception` struct and that
+    // the forest is acyclic, so this is a straight read of the declarations.
+    let exception_parents: Vec<(i64, i64)> = module
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ast::Item::Struct(st) => st
+                .decorators
+                .iter()
+                .find(|d| d.name == zapc_syntax::EXCEPTION_MARKER)
+                .and_then(|d| d.args.first())
+                .and_then(|a| match &a.value {
+                    ast::Expr::Name(parent, _) => Some(parent.clone()),
+                    _ => None,
+                })
+                .map(|parent| {
+                    let member_id = custom_exception_type_id(&st.name);
+                    let parent_id = exception_type_id_name(&parent)
+                        .unwrap_or_else(|| custom_exception_type_id(&parent));
+                    (member_id, parent_id)
+                }),
+            _ => None,
+        })
+        .collect();
+
     let mut ctx = StructCtx {
         ids,
         names,
         fields,
         value_ids,
         scoped_structs,
+        exception_parents,
         enums,
         py,
         arch_imports,
@@ -1937,7 +1980,7 @@ pub fn lower_module_opts_with_types(
     // consts initialize in dependency-then-source order.
     match lower_init_globals(module, &sigs, &ctx) {
         Ok(func) => {
-            if ctx.has_globals() {
+            if ctx.has_init_work() {
                 out.funcs.push(func);
             }
         }
@@ -5850,7 +5893,7 @@ fn lower_fn(
         // synthetic `@__zap_init_globals`. Emitted under the landing pad so a
         // raise inside an initializer unwinds to the top-level handler like any
         // other. Only `main` carries this (a REPL entry does not re-init).
-        if is_main && b.ctx.has_globals() {
+        if is_main && b.ctx.has_init_work() {
             b.throwing_call(None, INIT_GLOBALS_FN, vec![]);
         }
         for st in &f.body.stmts {
@@ -5975,6 +6018,20 @@ fn lower_init_globals(
         sigs,
         ctx,
     );
+    // Register every `@exception(Parent)` family edge (#1278) with the runtime
+    // FIRST — before the module `const` initializers run — so the family is live
+    // even if an initializer raises and catches a family member. Both ids are
+    // plain i64 name-hashes (no GC roots); registration is idempotent in the
+    // runtime, so a re-run (there is none today) would be harmless.
+    for (member_id, parent_id) in &b.ctx.exception_parents {
+        let m = b.iconst(Ty::I64, *member_id);
+        let p = b.iconst(Ty::I64, *parent_id);
+        b.emit(Inst::Call {
+            dest: None,
+            func: "zap_exception_register_parent".to_string(),
+            args: vec![m, p],
+        });
+    }
     for item in &module.items {
         let ast::Item::Stmt(Stmt::Let {
             is_const,
