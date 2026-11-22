@@ -74,7 +74,8 @@ pub fn materialize(v: &Value, span: Span) -> Option<Expr> {
         | Value::Variant(_)
         | Value::Attr(_)
         | Value::AttrArg(_)
-        | Value::Kind(_) => return None,
+        | Value::Kind(_)
+        | Value::Span(_) => return None,
     })
 }
 

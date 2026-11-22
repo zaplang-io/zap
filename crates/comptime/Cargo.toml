@@ -27,6 +27,11 @@ path = "src/lib.rs"
 [dependencies]
 zapc_syntax = { path = "../syntax" }
 zapc_sema_types = { path = "../sema_types" }
+# The stable `ZAPnnnn` code scheme (#239) and the line/col + caret renderer
+# (#571), reused by the #1256 diagnostics layer so a comptime/`@derive` failure
+# renders like any other front-end error. `zapc_diag` is a leaf crate (no deps),
+# so this adds no cycle and keeps the engine LLVM-free.
+zapc_diag = { path = "../diag" }
 
 [dev-dependencies]
 # Tests drive the real E1 resolver (`analyze_reflect` ⇒ `Reflector`) to build

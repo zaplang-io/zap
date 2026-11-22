@@ -11,6 +11,14 @@
 //! **`not available at comptime`** (see [`CtError::not_available`]); the static
 //! early-reject lint (#1254) shares the same wording so the two layers read
 //! identically.
+//!
+//! One failure mode is *not* a fault in the fragment: a library generator may
+//! **deliberately** abort compilation with [`CtError::user`] — the engine
+//! primitive behind `comptime.error(at, msg)` (#1256, the Zig `@compileError`
+//! model). Its message is the author's own text and it is rendered as a clean,
+//! span-attributed diagnostic (`ZAP7002`), optionally wrapped by the derive
+//! driver in a consumer-grade "cannot derive X for T" backtrace (see
+//! [`crate::diagnostics`]).
 
 use zapc_syntax::span::Span;
 
@@ -46,6 +54,12 @@ pub enum CtErrorKind {
     /// recursion/call-depth limit (epic #1249, HQ5). A hard limit with a clear
     /// diagnostic, never a tunable quota.
     Budget,
+    /// A **library-authored** abort via `comptime.error(at, msg)` (#1256): a
+    /// generator deliberately stopped compilation with its own message and span
+    /// (the Zig `@compileError` model). Not a fault in the fragment — the
+    /// comptime code ran correctly and *chose* to fail — so it renders as the
+    /// author's text (`ZAP7002`), never the "not available at comptime" wording.
+    UserError,
 }
 
 impl CtError {
@@ -78,8 +92,23 @@ impl CtError {
         }
     }
 
+    /// A library-authored abort: `comptime.error(at, msg)` (#1256). `message` is
+    /// the author's own text and `span` is the declaration it chose to point at.
+    pub fn user(message: impl Into<String>, span: Span) -> CtError {
+        CtError {
+            message: message.into(),
+            span,
+            kind: CtErrorKind::UserError,
+        }
+    }
+
     /// `true` when this is the canonical out-of-fragment error.
     pub fn is_not_available(&self) -> bool {
         self.kind == CtErrorKind::NotAvailable
+    }
+
+    /// `true` when this is a library-authored `comptime.error(...)` abort.
+    pub fn is_user(&self) -> bool {
+        self.kind == CtErrorKind::UserError
     }
 }

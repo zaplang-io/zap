@@ -524,6 +524,9 @@ impl<'a> Evaluator<'a> {
                 // type (which preserves an `Optional`/container element the
                 // resolved `Ty` erases), so a kind-switch can recurse on it.
                 "ty" | "type_info" => self.resolve_type_value(&f.decl_ty, span),
+                // The field's source span (#1256), for `comptime.error(f.span,
+                // msg)` — point a library diagnostic at the user's declaration.
+                "span" => Ok(Value::Span(f.span)),
                 _ => Err(no_field_err("FieldInfo", name, span)),
             },
             Value::Variant(v) => match name {
@@ -541,6 +544,9 @@ impl<'a> Evaluator<'a> {
                         .map(|a| Value::Attr(Rc::new(a.clone())))
                         .collect(),
                 )),
+                // The variant's source span (#1256), for a `comptime.error`
+                // pointing at an unde-rivable enum variant.
+                "span" => Ok(Value::Span(v.span)),
                 _ => Err(no_field_err("VariantInfo", name, span)),
             },
             Value::Attr(a) => match name {
@@ -551,6 +557,9 @@ impl<'a> Evaluator<'a> {
                         .map(|x| Value::AttrArg(Rc::new(x.clone())))
                         .collect(),
                 )),
+                // The attribute's source span (#1256), for a `comptime.error`
+                // pointing at a malformed `@attr(...)` the library rejects.
+                "span" => Ok(Value::Span(a.span)),
                 _ => Err(no_field_err("AttrInfo", name, span)),
             },
             Value::AttrArg(a) => match name {
@@ -605,6 +614,10 @@ impl<'a> Evaluator<'a> {
                 // `reflect.<fn>(...)` module builtins (#1253 override hook).
                 if matches!(&**base, Expr::Name(m, _) if m == "reflect") {
                     return self.eval_reflect_builtin(name, args, span, env);
+                }
+                // `comptime.<fn>(...)` diagnostics builtins (#1256).
+                if matches!(&**base, Expr::Name(m, _) if m == "comptime") {
+                    return self.eval_comptime_builtin(name, args, span, env);
                 }
                 self.eval_method(base, name, args, span, env)
             }
@@ -667,6 +680,62 @@ impl<'a> Evaluator<'a> {
             }
             other => Err(CtError::not_available(
                 format!("`reflect.{other}(...)`"),
+                span,
+            )),
+        }
+    }
+
+    /// `comptime.<fn>(...)` comptime builtins (#1256, HQ4 diagnostics).
+    ///
+    /// `comptime.error(msg)` / `comptime.error(at, msg)` is the library-author
+    /// primitive (the Zig `@compileError` model): it *always* aborts comptime
+    /// evaluation with a [`CtError::user`] carrying the author's `msg` and a
+    /// span — `at` (a [`Value::Span`], typically `field.span`) when supplied,
+    /// else the call site. So a codec generator can stop compilation pointing
+    /// at the user's offending field with its own wording, which the derive
+    /// driver renders (optionally inside a "cannot derive X for T" backtrace,
+    /// [`crate::diagnostics`]). It never returns a value.
+    fn eval_comptime_builtin(
+        &mut self,
+        name: &str,
+        args: &[Arg],
+        span: Span,
+        env: &mut Env,
+    ) -> Result<Value, CtError> {
+        match name {
+            "error" => {
+                let argv = self.eval_args(args, env)?;
+                match argv.as_slice() {
+                    // `comptime.error("msg")` — point at the call site.
+                    [Value::Str(msg)] => Err(CtError::user(msg.to_string(), span)),
+                    // `comptime.error(field.span, "msg")` — point at `at`.
+                    [Value::Span(at), Value::Str(msg)] => Err(CtError::user(msg.to_string(), *at)),
+                    // A single non-string, or a first arg that is not a span:
+                    // report the shape clearly rather than silently mis-reading.
+                    [only] => Err(CtError::value(
+                        format!(
+                            "`comptime.error(msg)` expects a `str` message, found `{}`",
+                            only.type_name()
+                        ),
+                        span,
+                    )),
+                    [first, _] => Err(CtError::value(
+                        format!(
+                            "`comptime.error(at, msg)` expects a `Span` (e.g. `field.span`) \
+                             as its first argument, found `{}`",
+                            first.type_name()
+                        ),
+                        span,
+                    )),
+                    _ => Err(CtError::value(
+                        "`comptime.error(...)` takes either a message, or a span and a \
+                         message (`comptime.error(field.span, \"...\")`)",
+                        span,
+                    )),
+                }
+            }
+            other => Err(CtError::not_available(
+                format!("`comptime.{other}(...)`"),
                 span,
             )),
         }
