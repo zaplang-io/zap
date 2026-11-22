@@ -312,10 +312,11 @@ this spec with two refinements worth recording:
   applies to every element type. Allocating a non-`bytes` element in `alloc`, or a
   pointerful `T` in `new`, is a compile error (`ZAP5130`).
 - **Exhaustion exception.** `cap` overflow / heap OOM raises a **catchable**
-  exception as specified, but v1 raises a `RuntimeError` whose message names it a
-  memory error rather than a first-class `MemoryError` — Zap has no `MemoryError`
-  type yet. Promoting it to a dedicated `MemoryError` is a small, separable
-  language-surface follow-up tracked under the #553 epic.
+  first-class `MemoryError` (parent `Exception`), as specified in §2.3/§3 (#882,
+  decisions/lang/882-memoryerror-exception.md). This replaces the arena v1
+  stopgap, which raised a `RuntimeError` whose message merely named it a memory
+  error (Zap had no `MemoryError` type then); `except MemoryError` and
+  `except Exception` catch it, `except RuntimeError` no longer does.
 
 A statically-known `size > cap` is rejected at compile time (`ZAP5132`,
 `check_arena_sizing`); a runtime `size > cap` fails `arena()` open (NULL →
