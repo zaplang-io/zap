@@ -1977,6 +1977,28 @@ impl Checker {
             // so they are untouched too.
             (Ty::List(a), Ty::List(b)) => self.coercible(a, b),
             (Ty::Dict(ak, av), Ty::Dict(bk, bv)) => assignable(ak, bk) && self.coercible(av, bv),
+            // Bare-payload widening into `Optional[T]` (#1265): a concrete value
+            // of type `T` coerces to `Optional[T]` by implicit `Some(T)` wrapping,
+            // matching Python's `x: Optional[int] = 1`, and completing the bare-
+            // `None` widening that already holds (`None` infers to `Unknown`,
+            // which `assignable` admits everywhere). Previously this was accepted
+            // *only* in a struct-constructor field (which sema does not type-check
+            // at all) and rejected in every other position — `return 1`
+            // (`ZAP4003`), an `Optional[T]` parameter (`ZAP4021`), a typed binding
+            // and a list-literal element (`ZAP4001`) — even though an explicit
+            // `Optional.Some(1)` was accepted everywhere. IR lowering performs the
+            // wrap at its shared coercion chokepoint (#1262, `gen_opt_some`), so an
+            // admitted bare payload lowers to a tagged `Some` end-to-end.
+            //
+            // This is payload-agnostic: sema tracks `Optional[T]` opaquely as
+            // `Named("Optional")` with the payload erased (`resolve_type` /
+            // `is_optional_ty`), so — exactly as for an explicit `Optional.Some(e)`
+            // or a constructor field — the payload's own type is verified
+            // downstream (mono / lowering), not here. The source must not itself be
+            // an `Optional`: an `Optional[U]` value flows by the ordinary
+            // `Optional`-to-`Optional` identity (the `from == to` check in
+            // `assignable`), never by re-wrapping into `Some(Some(..))`.
+            (from, to) if Self::is_optional_ty(to) && !Self::is_optional_ty(from) => true,
             _ => false,
         }
     }
