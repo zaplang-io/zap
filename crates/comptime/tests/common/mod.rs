@@ -8,8 +8,47 @@
 #![allow(dead_code)]
 
 use zapc_comptime::{CtError, Env, Evaluator, Value};
-use zapc_syntax::ast::{Expr, Function, Item, Stmt};
+use zapc_syntax::ast::{Block, EnumDef, Expr, Function, Item, Stmt, StructDef};
 use zapc_syntax::span::Span;
+
+/// Parse a module source into its struct declarations.
+pub fn parse_structs(src: &str) -> Vec<StructDef> {
+    let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+    assert!(lerrs.is_empty(), "unexpected lex errors: {lerrs:?}");
+    assert!(perrs.is_empty(), "unexpected parse errors: {perrs:?}");
+    module
+        .items
+        .into_iter()
+        .filter_map(|i| match i {
+            Item::Struct(s) => Some(s),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Parse a module source into its enum declarations.
+pub fn parse_enums(src: &str) -> Vec<EnumDef> {
+    let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+    assert!(lerrs.is_empty(), "unexpected lex errors: {lerrs:?}");
+    assert!(perrs.is_empty(), "unexpected parse errors: {perrs:?}");
+    module
+        .items
+        .into_iter()
+        .filter_map(|i| match i {
+            Item::Enum(e) => Some(e),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Parse a comptime-for-style loop body: the indented statements of
+/// `def __harness():\n <body>\n`, returned as a [`Block`].
+pub fn parse_body(body_src: &str) -> Block {
+    let indented: String = body_src.lines().map(|l| format!("    {l}\n")).collect();
+    let wrapped = format!("def __harness():\n{indented}");
+    let fns = parse_fns(&wrapped);
+    fns.into_iter().next().expect("one function").body
+}
 
 /// Parse a module source into its free functions, asserting it is lex/parse
 /// clean.

@@ -53,6 +53,9 @@ use zapc_syntax::span::Span;
 // slice (#1167); re-exported here so the carrier crosses the sema->ir boundary.
 pub use zapc_sema_types::{Ty as SemaTy, TypeMap};
 
+mod comptime_for;
+pub use comptime_for::{unroll_enum_variants, unroll_struct_fields};
+
 /// A lowering error: a human-readable message. Produced by monomorphization and
 /// by the main AST->ZIR lowering pass, which share this type (monomorphization
 /// is the first lowering stage). `zapc_ir` re-exports it as `zapc_ir::LowerError`

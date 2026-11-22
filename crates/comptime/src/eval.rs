@@ -937,7 +937,7 @@ fn parse_int_lit(lex: &str) -> Option<u128> {
 }
 
 /// The source span of an expression (mirrors `mono::expr_span`).
-fn expr_span(e: &Expr) -> Span {
+pub(crate) fn expr_span(e: &Expr) -> Span {
     match e {
         Expr::Int(_, s)
         | Expr::Float(_, s)

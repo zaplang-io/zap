@@ -28,6 +28,7 @@ listed here (see [`README.md`](README.md)).
 | [1239](lang/1239-list-structural-equality.md) | List == / != is a structural element-wise compare, not pointer identity | Locked | 2026-11-21 |
 | [1241](lang/1241-bool-char-element-read-back-narrows.md) | A bool/char collection element reads back as its narrow scalar type | Locked | 2026-11-21 |
 | [1250](lang/1250-comptime-evaluator.md) | Comptime value model + pure tree-walking evaluator (Tier B1, E2) | Accepted | 2026-11-22 |
+| [1251](lang/1251-comptime-for-unroller.md) | comptime for loop unroller wired to mono (E2) | Accepted | 2026-11-22 |
 | [1257](lang/1257-type-info.md) | Compile-time type introspection — reflect.type_info(T) (read-only, E1) | Accepted | 2026-11-22 |
 | [1262](lang/1262-optional-scalar-coercion.md) | Bare payload `T` auto-wraps to `Some(T)` in every `Optional[T]` position sema accepts | Locked | 2026-11-22 |
 

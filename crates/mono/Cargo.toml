@@ -25,3 +25,8 @@ zapc_syntax = { path = "../syntax" }
 # inferred types without depending on the sema *checker*. `zapc_sema_types` is a
 # leaf over `zapc_syntax`, so this adds no dependency cycle.
 zapc_sema_types = { path = "../sema_types" }
+# The comptime evaluator + `comptime for` unroll engine (#1250/#1251). A leaf
+# over `zapc_syntax` + `zapc_sema_types` — no sema `Checker`, no LLVM — so mono
+# can fold/unroll comptime code during per-instantiation specialization without
+# a dependency cycle or an LLVM toolchain.
+zapc_comptime = { path = "../comptime" }
