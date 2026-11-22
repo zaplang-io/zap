@@ -168,6 +168,16 @@ struct_def    ::= decorators [ "value" ] "struct" IDENT [ generics ] ":" NEWLINE
                      Prelude generic structs use this same grammar: `Atomic[T]`
                      (the `sync` atomic cell, I#176/D-0066) is `struct Atomic[T]`
                      whose methods lower to inline LLVM atomics — no new syntax. *)
+                  (* A body `function` whose first parameter is `self` is an
+                     INSTANCE method, called on a value (`v.m(...)`). A `function`
+                     whose first parameter is NOT `self` (or that has none) is an
+                     ASSOCIATED function (I#1260): no receiver, called only as
+                     `Type.func(...)` — including through an import,
+                     `pkg.Type.func(...)` — never on an instance. The canonical use
+                     is named / alternate constructors returning the declaring type.
+                     No new syntax and no `@staticmethod`/`@classmethod`: the
+                     explicit `self` distinguishes the two, and the type name is
+                     statically known (no runtime class object, so no `cls`). *)
 field         ::= decorators type IDENT [ ":" INT ] [ "=" expr ] NEWLINE ;
                   (* ":" INT is a C-style bitfield width (I#173, D-0068): the
                      field packs into INT bits of the value struct's backing
@@ -205,7 +215,10 @@ enum_def      ::= decorators "enum" IDENT [ generics ] ":" NEWLINE
                   (* tier-1 (all bare constants) -> unboxed int; a data-carrying
                      variant makes the whole enum a tagged value (D-0018/D-0046).
                      `function` = methods on the enum (D-0046); [ generics ] is
-                     reserved now, monomorphized when user generics land. *)
+                     reserved now, monomorphized when user generics land. As on a
+                     struct, a receiverless `function` (first parameter not `self`)
+                     is an associated function called as `Enum.func(...)` (I#1260);
+                     a `self`-first `function` stays an instance method. *)
 type_alias    ::= "type" IDENT [ generics ] "=" type NEWLINE ;
                   (* transparent type alias (#606, D-0105): `type Row = (int64,
                      str)`, or the generic form `type Pair[T] = (T, T)`. The
