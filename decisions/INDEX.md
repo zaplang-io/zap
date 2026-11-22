@@ -55,6 +55,7 @@ listed here (see [`README.md`](README.md)).
 | [1159](stdlib/1159-netport-unix.md) | net.port raises ValueError on a Unix-domain socket | Locked | 2026-11-20 |
 | [1171](stdlib/1171-system-local-zone.md) | stdlib datetime — expose the system local zone as a reusable TimeZone | Accepted | 2026-11-20 |
 | [1242](stdlib/1242-url-unquote-errors.md) | url.unquote errors mode — replace (default) | strict, over a UTF-8 replacement decode path | Accepted | 2026-11-21 |
+| [1261](stdlib/1261-ip-presentation-wire.md) | net IP presentation↔wire conversion — inet_pton / inet_ntop | Locked | 2026-11-22 |
 
 ## runtime
 

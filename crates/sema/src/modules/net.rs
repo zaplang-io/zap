@@ -140,6 +140,24 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             Ty::List(Box::new(Ty::Str))
         }
 
+        // ---- IP presentation <-> wire conversion (ticket #1261) ----
+        // net.inet_pton(family, text) -> bytes: parse an IPv4/IPv6 literal into
+        // its network-order octets (4 bytes for "ipv4", 16 for "ipv6"). A pure,
+        // I/O-free operation (no sockets, no DNS); malformed text, an unknown
+        // family, or a family/text mismatch raises ValueError at runtime.
+        "inet_pton" => {
+            expect_argc(checker, "net", method, args, 2, span);
+            Ty::Bytes
+        }
+        // net.inet_ntop(family, packed) -> str: format 4-/16-byte octets into
+        // canonical text (RFC 5952 for IPv6, with ::ffff:a.b.c.d IPv4-mapped
+        // handling). An unknown family or a packed width that does not match the
+        // family (not 4 for "ipv4" / 16 for "ipv6") raises ValueError at runtime.
+        "inet_ntop" => {
+            expect_argc(checker, "net", method, args, 2, span);
+            Ty::Str
+        }
+
         // ---- Unix domain sockets (ticket #993, epic #985) ----
         // net.listen_unix(path) -> listener handle; net.connect_unix(path) ->
         // connection handle. Both reuse net.accept/recv/send/close_* (opaque
