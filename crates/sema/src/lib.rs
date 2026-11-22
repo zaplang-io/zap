@@ -8619,8 +8619,11 @@ impl Checker {
             {
                 // A receiverless `def` is an associated function (#1260): it is
                 // callable only as `Type.func(...)`, never on an instance. Reject
-                // `value.func(...)` with ZAP4085 before typing it as a method.
-                if !sig.params.first().is_some_and(|p| p.name == "self") {
+                // `value.func(...)` with ZAP4085 before typing it as a method. A
+                // `@derive`d dunder (`to_json`/`__hash__`/…) has a synthesized
+                // *unnamed* receiver, not a real parameter, so it is NOT associated
+                // and stays a normal instance method call.
+                if sig_is_associated(&sig) {
                     if let Ty::Named(owner) = &bt {
                         self.error(
                             ErrorCode::ZAP4085,
@@ -10172,9 +10175,11 @@ impl Checker {
             .and_then(|i| i.methods.get(name))
             .or_else(|| self.enums.get(tyname).and_then(|i| i.methods.get(name)))
             .cloned()?;
-        // An instance method (first parameter is `self`) is not callable through
-        // the type; it needs a receiver.
-        if sig.params.first().is_some_and(|p| p.name == "self") {
+        // An instance method (a `self` receiver, or a synthesized `@derive`d
+        // dunder's unnamed receiver) is not callable through the type; it needs a
+        // receiver. Only a genuine receiverless user `def` dispatches as an
+        // associated call.
+        if !sig_is_associated(&sig) {
             self.error(
                 ErrorCode::ZAP4086,
                 format!(
@@ -10954,6 +10959,20 @@ fn next_elem(ret: &Ty) -> Ty {
         }
     }
     ret.clone()
+}
+
+/// Is this method signature a **receiverless associated function** (#1260), as
+/// opposed to an instance method? A user instance method's first parameter is
+/// named `self`. A `@derive`d dunder's synthesized receiver (`to_json`,
+/// `__hash__`, `__eq__`, …) is an *unnamed* parameter ([`param`] leaves the name
+/// empty), which is still a receiver, not an associated function. Only a genuine
+/// receiverless user `def` — a first parameter with a real, non-`self` name, or
+/// no parameters at all — is associated.
+fn sig_is_associated(sig: &FnSig) -> bool {
+    match sig.params.first() {
+        Some(p) => !p.name.is_empty() && p.name != "self",
+        None => true,
+    }
 }
 
 /// A readable placeholder receiver name for the ZAP4086 "needs a receiver"
@@ -18398,6 +18417,44 @@ def main():
              bytes w = Message.to_wire()\n    \
              print(len(w))\n"
         ));
+    }
+
+    #[test]
+    fn derived_dunder_instance_methods_are_not_associated() {
+        // Regression (#1260): a `@derive`d codec/dunder (`to_json`, `to_csv`,
+        // `to_yaml`, `__hash__`, …) has a SYNTHESIZED unnamed receiver, not a
+        // real first parameter. It must stay an instance method — callable as
+        // `value.to_json()` — and NOT be misread as a receiverless associated
+        // function (which would wrongly reject the call with ZAP4085).
+        ok("@derive(Json)\nstruct Rec:\n    int64 n\n\
+            def main():\n    \
+            auto r = Rec(1)\n    \
+            str j = r.to_json()\n    \
+            print(j)\n");
+        ok("@derive(Csv)\nstruct Row:\n    int64 a\n    int64 b\n\
+            def main():\n    \
+            auto r = Row(1, 2)\n    \
+            str c = r.to_csv()\n    \
+            print(c)\n");
+        ok("@derive(Yaml)\nstruct Doc:\n    int64 v\n\
+            def main():\n    \
+            auto d = Doc(1)\n    \
+            str y = d.to_yaml()\n    \
+            print(y)\n");
+        // A hand-written struct that derives Hash: `value.__hash__()` resolves.
+        ok("@derive(Hash, Eq)\nstruct Key:\n    int64 k\n\
+            def main():\n    \
+            auto key = Key(5)\n    \
+            int64 h = key.__hash__()\n    \
+            print(h)\n");
+        // And the derived decoder `from_json` associated function still resolves
+        // alongside the instance `to_json` on the same type.
+        ok("@derive(Json)\nstruct Both:\n    int64 n\n\
+            def main():\n    \
+            auto a = Both(1)\n    \
+            str j = a.to_json()\n    \
+            auto b = Both.from_json(j)\n    \
+            print(b.n)\n");
     }
 
     #[test]
