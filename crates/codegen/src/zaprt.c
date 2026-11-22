@@ -782,6 +782,12 @@ enum {
      * Ctrl-D / closed-stdin signal, matching CPython's `input()` raising
      * `EOFError`. An ordinary catchable exception under `Exception`. */
     ZAP_EXC_EOF_ERROR = 17,
+    /* Raised when an `arena` allocation cannot be satisfied: a `cap` overflow or
+     * heap OOM (#553/#882, D-0158, decisions/lang/882-memoryerror-exception.md).
+     * An ordinary catchable exception under `Exception` (never `RuntimeError`),
+     * matching CPython's `MemoryError`. Replaces the arena v1 stopgap, which
+     * raised a `RuntimeError` whose message merely named it a memory error. */
+    ZAP_EXC_MEMORY_ERROR = 18,
 };
 
 void *zap_exception_new(int64_t type_id, void *message) {
@@ -833,6 +839,7 @@ static int64_t zap_exception_parent(int64_t type_id) {
     case ZAP_EXC_STOP_ITERATION: case ZAP_EXC_EXCEPTION_GROUP:
     case ZAP_EXC_SCOPE_TIMEOUT: case ZAP_EXC_TIMEOUT_ERROR:
     case ZAP_EXC_ASSERTION_ERROR: case ZAP_EXC_EOF_ERROR:
+    case ZAP_EXC_MEMORY_ERROR:
         return ZAP_EXC_EXCEPTION;
     case ZAP_EXC_INDEX_ERROR: case ZAP_EXC_KEY_ERROR: return ZAP_EXC_LOOKUP_ERROR;
     case ZAP_EXC_ZERO_DIVISION_ERROR: return ZAP_EXC_ARITHMETIC_ERROR;

@@ -3090,14 +3090,17 @@ void zap_panic_typed(int64_t type_id, void *message) {
     zap_raise(zap_exception_new(type_id, message));
 }
 
-/* Arena cap / heap-OOM (#553, D-0158). A generated NULL-check on an arena
+/* Arena cap / heap-OOM (#553/#882, D-0158). A generated NULL-check on an arena
  * allocation (`a.alloc`/`a.new`) calls this when the runtime returned NULL; it
- * raises a catchable error (RuntimeError, named a memory error in the message —
- * a first-class MemoryError type is a tracked follow-up) and never returns, so
- * the enclosing arena `with` tears the arena down on the unwind path. */
+ * raises a catchable first-class `MemoryError` (#882,
+ * decisions/lang/882-memoryerror-exception.md) and never returns, so the
+ * enclosing arena `with` tears the arena down on the unwind path. */
 __attribute__((noreturn)) void zap_arena_oom(void) {
+    /* The "MemoryError:" prefix is retained in the message because the uncaught
+     * reporter (`zap_report_exc_line`) renders only the message string, never
+     * the exception's type name, so this keeps an uncaught arena OOM legible. */
     const char *m = "MemoryError: arena allocation exceeds its cap or the heap is exhausted";
-    zap_panic_typed(ZAP_EXC_RUNTIME_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    zap_panic_typed(ZAP_EXC_MEMORY_ERROR, zap_str_new(m, (int64_t)strlen(m)));
     abort(); /* unreachable: zap_panic_typed unwinds */
 }
 

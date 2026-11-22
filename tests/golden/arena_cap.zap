@@ -1,6 +1,6 @@
-# `cap` overflow raises a catchable error (#553): allocating past the hard byte
-# ceiling raises (v1: a RuntimeError whose message names it a memory error), here
-# caught so the program is deterministic under both collectors.
+# `cap` overflow raises a catchable error (#553/#882): allocating past the hard
+# byte ceiling raises a MemoryError (parent Exception), here caught via
+# `except Exception` so the program is deterministic under both collectors.
 def main():
     auto caught = 0
     try:

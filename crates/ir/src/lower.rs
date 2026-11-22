@@ -16934,6 +16934,7 @@ fn exception_type_id_name(name: &str) -> Option<i64> {
         "TimeoutError" => 15,
         "AssertionError" => 16,
         "EOFError" => 17,
+        "MemoryError" => 18,
         _ => return None,
     })
 }

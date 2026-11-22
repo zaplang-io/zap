@@ -10,6 +10,7 @@ listed here (see [`README.md`](README.md)).
 
 | # | Title | Status | Date |
 |---|-------|--------|------|
+| [882](lang/882-memoryerror-exception.md) | First-class MemoryError exception type; arena cap/OOM raises it (not RuntimeError) | Locked | 2026-11-22 |
 | [1075](lang/1075-bare-none-optional-lowering.md) | Type-contextual bare `None` lowering is one shared mechanism | Locked | 2026-11-19 |
 | [1078](lang/1078-global-regex-match-iter.md) | Global regex match `=~ m/.../g` yields an iterable `list[Match]` (eager) | Locked | 2026-11-19 |
 | [1082](lang/1106-bytesview.md) | Borrowed-bytes `bytesview` — non-owning view over `bytes` | Locked | 2026-11-19 |
