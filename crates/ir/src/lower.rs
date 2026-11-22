@@ -8927,6 +8927,69 @@ impl<'a> FnLower<'a> {
                 });
                 return Ok((d, Ty::I64));
             }
+            // Exact scalar `min`/`max` (#1279): compute the lesser / greater of
+            // two numeric scalars with a compare + `select`. Integer operands
+            // are widened to a common 64-bit width and compared with a signed
+            // (or unsigned, #552) `icmp` — never through `f64` — so adjacent
+            // `int64` values above 2^53 stay distinct. A tie returns the FIRST
+            // argument (Python `min`/`max` semantics): `min` selects the left
+            // operand on `l <= r`, `max` on `l >= r`. Float operands compare at
+            // `f64` (mirroring the `<`/`<=` operators). Sema (#1279) has already
+            // restricted this to two numeric scalars of a single signedness.
+            if fname == "min" || fname == "max" {
+                if args.len() != 2 || args.iter().any(|a| a.name.is_some()) {
+                    return Err(err(
+                        "min()/max() takes exactly two positional numeric arguments",
+                    ));
+                }
+                let is_max = fname == "max";
+                let (l, lt) = self.expr(&args[0].value)?;
+                let (r, rt) = self.expr(&args[1].value)?;
+                let is_float = matches!(lt, Ty::F32 | Ty::F64) || matches!(rt, Ty::F32 | Ty::F64);
+                if is_float {
+                    let lf = self.as_f64(l, lt);
+                    let rf = self.as_f64(r, rt);
+                    let cond = self.new_value(Ty::I1);
+                    self.emit(Inst::FCmp {
+                        dest: cond,
+                        pred: if is_max { CmpPred::Ge } else { CmpPred::Le },
+                        lhs: lf,
+                        rhs: rf,
+                    });
+                    let d = self.new_value(Ty::F64);
+                    self.emit(Inst::Select {
+                        dest: d,
+                        cond,
+                        a: lf,
+                        b: rf,
+                    });
+                    return Ok((d, Ty::F64));
+                }
+                // Integer path: widen both operands to a common 64-bit width so
+                // mixed-width operands (e.g. `int32`, an untyped literal) share
+                // a type; codegen reads the operand type's sign to pick signed
+                // vs unsigned `icmp` (#552). The selected value and the result
+                // type are that common integer width.
+                let unsigned = lt.is_unsigned() || rt.is_unsigned();
+                let int_ty = if unsigned { Ty::U64 } else { Ty::I64 };
+                let li = self.coerce(l, lt, int_ty);
+                let ri = self.coerce(r, rt, int_ty);
+                let cond = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: cond,
+                    pred: if is_max { CmpPred::Ge } else { CmpPred::Le },
+                    lhs: li,
+                    rhs: ri,
+                });
+                let d = self.new_value(int_ty);
+                self.emit(Inst::Select {
+                    dest: d,
+                    cond,
+                    a: li,
+                    b: ri,
+                });
+                return Ok((d, int_ty));
+            }
             // String/char builtins (ticket #284, D-0025).
             if fname == "ord" {
                 // ord(c): the codepoint number of a `char`, as an `int`.
