@@ -133,8 +133,34 @@ impl Rewriter<'_> {
         }
     }
 
+    /// Rewrite a **top-level** function: its name is a module member, so it is
+    /// mangled with the module prefix like any other top-level declaration.
     fn function(&mut self, f: &mut Function, extra_tlocals: &HashSet<String>) {
         self.rename_decl(&mut f.name);
+        self.function_body(f, extra_tlocals);
+    }
+
+    /// Rewrite a struct/enum **method** (#1258): everything a top-level function
+    /// rewrite does *except* renaming the method's own name. A method is not a
+    /// top-level symbol — it lives in its type's namespace and is resolved by the
+    /// `{Struct}__{method}` mangling in lowering (built from the type's own,
+    /// already-prefixed name). Mangling the method name with the module prefix is
+    /// wrong whenever the method name happens to coincide with one of the
+    /// declaring module's top-level symbols (e.g. a free function of the same
+    /// name): the method's definition would then be emitted under
+    /// `{Struct}__{prefix}{method}` while every call site resolves it to
+    /// `{Struct}__{method}`, so an imported module's method call failed with the
+    /// generic `ZAP6001` ("no method '…' on that value"). The standalone build
+    /// has an empty prefix, so the mangle was a no-op and the gap stayed hidden.
+    fn method(&mut self, m: &mut Function, extra_tlocals: &HashSet<String>) {
+        self.function_body(m, extra_tlocals);
+    }
+
+    /// The shared body of function/method rewriting: generics bounds, parameter
+    /// types/defaults, return type, and the body block. The caller decides
+    /// whether to rename the declaration's own name first (top-level: yes;
+    /// method: no — see [`Self::method`]).
+    fn function_body(&mut self, f: &mut Function, extra_tlocals: &HashSet<String>) {
         let tl = generics_set(&f.generics, extra_tlocals);
         self.bounds(&mut f.generics, &tl);
         let locals = collect_bindings_fn(f);
@@ -163,7 +189,7 @@ impl Rewriter<'_> {
             }
         }
         for m in &mut s.methods {
-            self.function(m, &tl);
+            self.method(m, &tl);
         }
     }
 
@@ -180,7 +206,7 @@ impl Rewriter<'_> {
             }
         }
         for m in &mut e.methods {
-            self.function(m, &tl);
+            self.method(m, &tl);
         }
     }
 
