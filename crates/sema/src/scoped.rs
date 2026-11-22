@@ -371,7 +371,7 @@ impl Checker {
                 let owns_scoped = info
                     .fields
                     .iter()
-                    .any(|t| matches!(t, Ty::Named(n) if self.scoped_types.contains(n)));
+                    .any(|f| matches!(&f.ty, Ty::Named(n) if self.scoped_types.contains(n)));
                 if owns_scoped {
                     added.push(name.clone());
                 }

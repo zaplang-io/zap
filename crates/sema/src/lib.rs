@@ -25,7 +25,10 @@ mod scoped;
 // unqualified (and via `crate::` from submodules) as before; re-export `Ty` so
 // the public `zapc_sema::Ty` is unchanged for downstream code.
 use zapc_sema_types::*;
-pub use zapc_sema_types::{Ty, TypeMap};
+pub use zapc_sema_types::{
+    AttrArg, AttrInfo, FieldInfo, ReflectError, Ty, TypeInfo, TypeKind, TypeMap, TypeShape,
+    VariantInfo,
+};
 
 /// Built-in stdlib module registry (ticket #121): per-module type-checking lives
 /// in `modules/<name>.rs`, dispatched by a data table instead of a hand-written
@@ -273,6 +276,62 @@ pub fn analyze_queryable(module: &Module) -> (Vec<TypeError>, Vec<TypeError>, An
 pub fn analyze_types(module: &Module) -> (Vec<TypeError>, Vec<TypeError>, TypeMap) {
     let (errors, warnings, facts) = analyze_queryable(module);
     (errors, warnings, facts.type_map())
+}
+
+/// A read-only compile-time **type introspection** facade (#1257, epic #1248
+/// phase E1): the struct/enum registries a module's analysis built, exposed so a
+/// host can resolve `reflect.type_info(T)` for any type `T`. The assert-tested
+/// consumer in E1; the comptime evaluator (E2/#1250) drives it later. Pure and
+/// read-only — it never re-runs analysis or mutates state. Built by
+/// [`analyze_reflect`].
+pub struct Reflector {
+    checker: Checker,
+}
+
+impl Reflector {
+    /// Resolve a type, exactly as written in the AST, to its read-only
+    /// [`TypeInfo`] — or the "not available for introspection" [`ReflectError`]
+    /// for a type E1 does not describe (anchored at the type's span, never a
+    /// panic).
+    pub fn type_info(&self, ty: &Type) -> Result<TypeInfo, ReflectError> {
+        self.checker.reflect_type_info(ty)
+    }
+
+    /// Convenience for the common `reflect.type_info(Name)` case: resolve a bare
+    /// type *name* (`"Point"`, `"int"`, `"Color"`). The synthesized anchor span
+    /// is the default.
+    pub fn type_info_by_name(&self, name: &str) -> Result<TypeInfo, ReflectError> {
+        self.checker.reflect_type_info(&Type::Named {
+            name: name.to_string(),
+            args: Vec::new(),
+            span: Span::default(),
+        })
+    }
+}
+
+/// Type-check a module and return `(errors, warnings, reflector)` (#1257): the
+/// same diagnostics as [`analyze`], plus a [`Reflector`] over the retained
+/// struct/enum registries for compile-time type introspection.
+///
+/// Runs the identical passes in the identical order as [`analyze`] — so the
+/// diagnostics are byte-identical — and differs only in that it keeps the
+/// populated checker alive behind the [`Reflector`] instead of discarding it.
+/// The prelude is prepended exactly as in [`analyze`].
+pub fn analyze_reflect(module: &Module) -> (Vec<TypeError>, Vec<TypeError>, Reflector) {
+    let mut module = zapc_syntax::parser::with_prelude(module);
+    zapc_syntax::cfg::resolve_cfg(&mut module, &zapc_syntax::cfg::Target::host());
+    let module = &module;
+    let mut c = Checker::new();
+    c.collect_types(module);
+    c.check_value_struct_recursion(module);
+    c.check_bitfields(module);
+    c.collect_sigs(module);
+    c.validate_decorators(module);
+    c.check_scoped(module);
+    c.check_module(module);
+    let errors = std::mem::take(&mut c.errors);
+    let warnings = std::mem::take(&mut c.warnings);
+    (errors, warnings, Reflector { checker: c })
 }
 
 /// Convenience for tests: lex, parse, and type-check `src`.
@@ -1418,8 +1477,19 @@ impl Checker {
                             fields: v
                                 .fields
                                 .iter()
-                                .map(|f| (f.name.clone(), self.resolve_type(&f.ty)))
+                                .enumerate()
+                                .map(|(i, f)| FieldInfo {
+                                    name: f.name.clone(),
+                                    ty: self.resolve_type(&f.ty),
+                                    decl_ty: f.ty.clone(),
+                                    index: i,
+                                    // Enum variant payload fields carry no
+                                    // attribute grammar today (#1257, HQ9).
+                                    attrs: Vec::new(),
+                                    span: f.span,
+                                })
                                 .collect(),
+                            span: v.span,
                         })
                         .collect();
                     let derives_json = e.decorators.iter().any(|d| {
@@ -1507,7 +1577,7 @@ impl Checker {
             {
                 continue;
             }
-            let fields = info.fields.clone();
+            let fields: Vec<Ty> = info.fields.iter().map(|f| f.ty.clone()).collect();
             let mut visited = HashSet::new();
             if fields
                 .iter()
@@ -1582,7 +1652,7 @@ impl Checker {
                             info.fields
                                 .clone()
                                 .iter()
-                                .all(|f| self.ty_auto_hashable(f, visited))
+                                .all(|f| self.ty_auto_hashable(&f.ty, visited))
                         } else {
                             false
                         }
@@ -2309,7 +2379,19 @@ impl Checker {
                 .entry("to_yaml".into())
                 .or_insert_with(|| unary(Ty::Str));
         }
-        let fields = s.fields.iter().map(|f| self.resolve_type(&f.ty)).collect();
+        let fields = s
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| FieldInfo {
+                name: f.name.clone(),
+                ty: self.resolve_type(&f.ty),
+                decl_ty: f.ty.clone(),
+                index: i,
+                attrs: f.decorators.iter().map(attr_info_of).collect(),
+                span: f.span,
+            })
+            .collect();
         StructInfo {
             methods,
             is_value: s.is_value,
@@ -3030,6 +3112,114 @@ impl Checker {
                 Ty::Tuple(elems.iter().map(|e| self.resolve_type(e)).collect())
             }
             Type::Func { .. } => Ty::Unknown,
+        }
+    }
+
+    /// Resolve a type `t` (as written) to its read-only [`TypeInfo`] for
+    /// compile-time type introspection — `reflect.type_info(T)` (#1257, epic
+    /// #1248 phase E1; design in Discussion #1243).
+    ///
+    /// Pure and read-only: it reads the struct/enum registries and never mutates
+    /// the checker, so it is safe to call after analysis. The result is
+    /// **nominal** for a user struct/enum (it carries the type name and its
+    /// declared data fields / variants in declaration order, #1066),
+    /// **structural** for the built-in containers (`tuple`/`list[T]`/`dict[K,V]`/
+    /// `Optional[T]`: element/key/value types, no nominal name), and a canonical
+    /// spelling for a primitive. A type E1 does not describe — an unsupported
+    /// container (`set`/`heap`/`deque`/`channel`/…), a function type, a Python
+    /// handle, a compiler-synthesized `$…` type, or an un-inferable/opaque type —
+    /// returns the "not available for introspection" [`ReflectError`] anchored at
+    /// the type's span, **never a panic**.
+    ///
+    /// Introspection is deliberately **one level** (Discussion #1243, HQ1a): a
+    /// field/element carries its own type, which can be reflected again — this
+    /// resolver does not flatten the type graph, so it is finite on recursive
+    /// types. Consuming the value (indexing/iterating) is E2 (#1250); E1 only
+    /// produces it, asserted host-side.
+    fn reflect_type_info(&self, t: &Type) -> Result<TypeInfo, ReflectError> {
+        let span = type_span(t);
+        let ty = self.resolve_type(t);
+
+        // `Optional[T]` erases its element at the `Ty` level (sema tracks `T?`
+        // opaquely as `Named("Optional")`, see `is_optional_ty`), so recover the
+        // element from the declared type's first argument when it is written
+        // directly as `Optional[T]`. A bare `Optional` (or an alias to one) has
+        // no recoverable element and reports `Unknown`.
+        if Self::is_optional_ty(&ty) {
+            let elem = match t {
+                Type::Named { args, .. } => args
+                    .first()
+                    .map(|a| self.resolve_type(a))
+                    .unwrap_or(Ty::Unknown),
+                _ => Ty::Unknown,
+            };
+            return Ok(TypeInfo {
+                shape: TypeShape::Optional { elem },
+            });
+        }
+
+        if let Some(name) = primitive_name(&ty) {
+            return Ok(TypeInfo {
+                shape: TypeShape::Primitive {
+                    name: name.to_string(),
+                },
+            });
+        }
+
+        match &ty {
+            Ty::List(e) => Ok(TypeInfo {
+                shape: TypeShape::List {
+                    elem: (**e).clone(),
+                },
+            }),
+            Ty::Dict(k, v) => Ok(TypeInfo {
+                shape: TypeShape::Dict {
+                    key: (**k).clone(),
+                    value: (**v).clone(),
+                },
+            }),
+            Ty::Tuple(elems) => Ok(TypeInfo {
+                shape: TypeShape::Tuple {
+                    elems: elems.clone(),
+                },
+            }),
+            // A user struct or enum, resolved by name. A compiler-synthesized
+            // `$…` type (a generator state, an iface fat-pointer layout) is
+            // registered as a struct but is not user-nameable, so it is not
+            // introspectable.
+            Ty::Named(n) if !n.starts_with('$') => {
+                if let Some(info) = self.structs.get(n) {
+                    Ok(TypeInfo {
+                        shape: TypeShape::Struct {
+                            name: n.clone(),
+                            fields: info.fields.clone(),
+                        },
+                    })
+                } else if let Some(info) = self.enums.get(n) {
+                    let variants = info
+                        .variants
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| VariantInfo {
+                            name: v.name.clone(),
+                            index: i,
+                            fields: v.fields.clone(),
+                            // No variant-level attribute grammar in E1 (HQ9).
+                            attrs: Vec::new(),
+                            span: v.span,
+                        })
+                        .collect();
+                    Ok(TypeInfo {
+                        shape: TypeShape::Enum {
+                            name: n.clone(),
+                            variants,
+                        },
+                    })
+                } else {
+                    Err(ReflectError::unsupported(&render_type(t), span))
+                }
+            }
+            _ => Err(ReflectError::unsupported(&render_type(t), span)),
         }
     }
 
@@ -8554,7 +8744,7 @@ impl Checker {
         }
         // A user struct: leaf iff every field is a pointer-free machine scalar.
         if let Some(info) = self.structs.get(n) {
-            let leaf = info.fields.iter().all(is_leaf_scalar_ty);
+            let leaf = info.fields.iter().all(|f| is_leaf_scalar_ty(&f.ty));
             if !leaf {
                 self.error(
                     ErrorCode::ZAP5130,
@@ -10383,7 +10573,7 @@ impl Checker {
             let at = self.infer(&a.value);
             let field = match &a.name {
                 Some(fname) => {
-                    let f = v.fields.iter().find(|(n, _)| n == fname);
+                    let f = v.fields.iter().find(|f| &f.name == fname);
                     if f.is_none() {
                         self.error(
                             ErrorCode::ZAP4063,
@@ -10399,13 +10589,14 @@ impl Checker {
                     f
                 }
             };
-            if let Some((fname, fty)) = field {
-                if !assignable(&at, fty) {
+            if let Some(field) = field {
+                if !assignable(&at, &field.ty) {
                     self.error(
                         ErrorCode::ZAP4064,
                         format!(
-                            "field '{fname}' of '{enum_name}.{variant}' has type {}, found {}",
-                            fty.display(),
+                            "field '{}' of '{enum_name}.{variant}' has type {}, found {}",
+                            field.name,
+                            field.ty.display(),
                             at.display()
                         ),
                         expr_span(&a.value),
@@ -10579,8 +10770,8 @@ impl Checker {
         let mut pos = 0usize;
         for a in args {
             let fty = match &a.name {
-                Some(fname) => match v.fields.iter().find(|(n, _)| n == fname) {
-                    Some((_, t)) => t.clone(),
+                Some(fname) => match v.fields.iter().find(|f| &f.name == fname) {
+                    Some(f) => f.ty.clone(),
                     None => {
                         self.error(
                             ErrorCode::ZAP4063,
@@ -10594,7 +10785,7 @@ impl Checker {
                     let t = v
                         .fields
                         .get(pos)
-                        .map(|(_, t)| t.clone())
+                        .map(|f| f.ty.clone())
                         .unwrap_or(Ty::Unknown);
                     pos += 1;
                     t
@@ -10702,6 +10893,91 @@ fn expr_span(e: &Expr) -> Span {
         | Expr::Yield { span, .. }
         | Expr::IfElse { span, .. }
         | Expr::Named { span, .. } => *span,
+    }
+}
+
+/// The source span of a type as written (#1257): the reflection anchor for the
+/// "not available for introspection" diagnostic. `Type` has no `span()` accessor,
+/// so match per variant.
+fn type_span(t: &Type) -> Span {
+    match t {
+        Type::Named { span, .. } | Type::Tuple { span, .. } | Type::Func { span, .. } => *span,
+    }
+}
+
+/// Render a type as written (#1257) for the "not available for introspection"
+/// diagnostic, so it names what the author wrote (`Widget`, `set[int64]`,
+/// `fn(int64) -> int64`) rather than the resolved type's display (which collapses
+/// an un-inferable type to `<unknown>`).
+fn render_type(t: &Type) -> String {
+    match t {
+        Type::Named { name, args, .. } => {
+            if args.is_empty() {
+                name.clone()
+            } else {
+                let inner = args.iter().map(render_type).collect::<Vec<_>>().join(", ");
+                format!("{name}[{inner}]")
+            }
+        }
+        Type::Tuple { elems, .. } => {
+            let inner = elems.iter().map(render_type).collect::<Vec<_>>().join(", ");
+            if elems.len() == 1 {
+                format!("({inner},)")
+            } else {
+                format!("({inner})")
+            }
+        }
+        Type::Func { params, ret, .. } => {
+            let ps = params
+                .iter()
+                .map(render_type)
+                .collect::<Vec<_>>()
+                .join(", ");
+            match ret {
+                Some(r) => format!("fn({ps}) -> {}", render_type(r)),
+                None => format!("fn({ps})"),
+            }
+        }
+    }
+}
+
+/// Render an attribute (decorator) argument's value to a canonical string for
+/// reflection (#1257, HQ9). E1 captures attributes as structured,
+/// comptime-queryable *data* — not typed values — so a scalar literal / name is
+/// rendered to the string a consumer would key on, and any richer expression
+/// renders as `…` (its presence and keyword name are still recorded). A string
+/// literal renders without its surrounding quotes, so `@field(rename="id")`
+/// yields the value `id`.
+fn render_attr_value(e: &Expr) -> String {
+    match e {
+        Expr::Int(lex, _) | Expr::Float(lex, _) | Expr::Imaginary(lex, _) => lex.clone(),
+        Expr::Str { value, .. } => value.clone(),
+        Expr::Bool(b, _) => b.to_string(),
+        Expr::None(_) => "None".to_string(),
+        Expr::Name(n, _) => n.clone(),
+        Expr::Unary { .. } => {
+            // A signed numeric literal (`@range(min=-1)`): render as written when
+            // it is a negation of a literal, else fall back.
+            "…".to_string()
+        }
+        _ => "…".to_string(),
+    }
+}
+
+/// Build a reflected [`AttrInfo`] from a parsed field decorator (#1257). The
+/// spread forms (`*expr` / `**expr`) have no name and render as `…`.
+fn attr_info_of(d: &Decorator) -> AttrInfo {
+    AttrInfo {
+        name: d.name.clone(),
+        args: d
+            .args
+            .iter()
+            .map(|a| AttrArg {
+                name: a.name.clone(),
+                value: render_attr_value(&a.value),
+            })
+            .collect(),
+        span: d.span,
     }
 }
 

@@ -693,9 +693,18 @@ pub struct EnumInfo {
 #[derive(Clone)]
 pub struct EnumVariantInfo {
     pub name: String,
-    /// Payload fields in declaration order (`(name, type)`); empty for a
-    /// tier-1 constant or a payload-free variant.
-    pub fields: Vec<(String, Ty)>,
+    /// Payload fields in declaration order; empty for a tier-1 constant or a
+    /// payload-free variant. Enriched from bare `(name, type)` pairs to full
+    /// [`FieldInfo`] records (#1257, E1) so compile-time reflection can report a
+    /// variant payload with the same shape as a struct field (name, resolved and
+    /// declared type, positional index, span). Enum variant payload fields carry
+    /// no attribute surface in the grammar today, so `FieldInfo::attrs` is always
+    /// empty here.
+    pub fields: Vec<FieldInfo>,
+    /// Source span of the whole variant declaration (#1257): the reflection
+    /// anchor for a per-variant diagnostic once the comptime evaluator (E2/#1250)
+    /// can drive `type_info` over variants.
+    pub span: Span,
 }
 
 impl EnumInfo {
@@ -716,11 +725,16 @@ pub struct StructInfo {
     /// assign/pass/return, no shared identity), laid out inline. A plain
     /// `struct` is a reference type (D-0023) with `is_value == false`.
     pub is_value: bool,
-    /// Resolved field types in declaration order (D-0139/#808). Used to decide
-    /// whether a `value struct` auto-derives `Equatable`+`Hashable` (it does iff
-    /// every field is itself hashable). Empty is a legitimate value (a fieldless
-    /// struct).
-    pub fields: Vec<Ty>,
+    /// Declared data fields in declaration order (D-0139/#808, D-0066 order
+    /// preserved per #1066). Enriched from a bare `Vec<Ty>` to full [`FieldInfo`]
+    /// records (#1257, E1): each field carries its name, resolved type, declared
+    /// (syntactic) type, 0-based positional index, attribute list, and span —
+    /// the data compile-time reflection (`reflect.type_info`) reports. The
+    /// `value struct` auto-derive check (`Equatable`+`Hashable`, iff every field
+    /// is itself hashable) reads `field.ty`. Empty is a legitimate value (a
+    /// fieldless struct). Compiler-synthesized types (e.g. a generator state
+    /// `$gen:…`) register with no fields.
+    pub fields: Vec<FieldInfo>,
 }
 
 impl StructInfo {
@@ -763,6 +777,246 @@ impl InterfaceInfo {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Compile-time type introspection — the read-only `reflect.type_info(T)` model
+// (#1257, epic #1248 phase E1; design resolved in Discussion #1243).
+//
+// E1 is the smallest shippable slice of the reflection epic: a read-only
+// description of a type's *shape*, assert-tested host-side. There is **no
+// comptime evaluator, no codegen, and no runtime materialization** here — the
+// comptime-unrolled `for`, typed `reflect.field`, the kind-switch and `@derive`
+// are later phases (#1250/#1251/#1252/#1253, E3). This module defines only the
+// value model; the resolver that maps a `Ty`/`Type` onto it lives in `zapc_sema`
+// (it needs the struct/enum registries and `resolve_type`).
+// ---------------------------------------------------------------------------
+
+/// The broad category a type falls into for compile-time introspection
+/// (Discussion #1243). Nominal kinds (`Struct`/`Enum`) carry a type name;
+/// `Primitive` carries its canonical spelling; the structural container kinds
+/// (`Tuple`/`List`/`Dict`/`Optional`) carry element/key/value types but no
+/// nominal name. The set is deliberately the one E1 describes; later phases
+/// extend it if a consumer needs more (e.g. `set`/`heap`), which is why a
+/// container outside this set resolves to the "not available for introspection"
+/// [`ReflectError`] rather than silently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeKind {
+    Struct,
+    Enum,
+    Tuple,
+    Primitive,
+    List,
+    Dict,
+    Optional,
+}
+
+impl TypeKind {
+    /// The lowercase spelling used in diagnostics and (eventually) the comptime
+    /// `TypeKind` enum surface.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TypeKind::Struct => "struct",
+            TypeKind::Enum => "enum",
+            TypeKind::Tuple => "tuple",
+            TypeKind::Primitive => "primitive",
+            TypeKind::List => "list",
+            TypeKind::Dict => "dict",
+            TypeKind::Optional => "optional",
+        }
+    }
+}
+
+/// One argument of a reflected attribute (#1257, HQ9). `name` is set for a
+/// keyword argument (`rename="id"` → `name = Some("rename")`), `None` for a bare
+/// positional argument. `value` is the argument rendered to a canonical string
+/// (a string literal without its quotes, a numeric lexeme, `true`/`false`, a
+/// bare name, or `…` for a form E1 does not render). E1 captures attributes as
+/// *structured, comptime-queryable data* only — there is no per-attribute
+/// compiler semantics; a library layer (E3) decides what an attribute means.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttrArg {
+    pub name: Option<String>,
+    pub value: String,
+}
+
+/// A reflected attribute (decorator) recorded on a struct field (#1257, HQ9):
+/// the `@field(rename="id")` / `@default(0)` / `@validate(max_len=3)` metadata
+/// already parsed on the field. Name plus its argument list, in source order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttrInfo {
+    pub name: String,
+    pub args: Vec<AttrArg>,
+    pub span: Span,
+}
+
+/// A reflected data field — a struct field or an enum-variant payload field
+/// (#1257). Carries everything the `@derive`/serde layer (E3) and its
+/// diagnostics (HQ4) will need: the field name, its resolved canonical [`Ty`],
+/// the declared (syntactic) [`Type`] exactly as written (which, unlike the
+/// resolved `Ty`, preserves an `Optional`/container element type), its 0-based
+/// positional index, the attribute list, and the source span.
+#[derive(Clone, Debug)]
+pub struct FieldInfo {
+    pub name: String,
+    /// The field's resolved, canonical type. This is what the rest of the
+    /// compiler (mono/codegen, the auto-hashable check) reads.
+    pub ty: Ty,
+    /// The declared type exactly as written in source. Retained alongside `ty`
+    /// because the resolved `Ty` erases an `Optional[T]`'s element (sema tracks
+    /// `T?` opaquely as `Named("Optional")`); the declared `Type` keeps it, so a
+    /// later phase can introspect an optional/container field's element.
+    pub decl_ty: Type,
+    pub index: usize,
+    pub attrs: Vec<AttrInfo>,
+    pub span: Span,
+}
+
+/// A reflected enum variant (#1257, HQ8): its name, 0-based declaration index,
+/// payload fields (empty for a unit/tier-1 variant), attributes (always empty in
+/// E1 — the grammar has no variant-level attribute surface yet), and span.
+#[derive(Clone, Debug)]
+pub struct VariantInfo {
+    pub name: String,
+    pub index: usize,
+    pub fields: Vec<FieldInfo>,
+    pub attrs: Vec<AttrInfo>,
+    pub span: Span,
+}
+
+/// The kind-specific payload of a [`TypeInfo`] (#1257). An enum rather than a
+/// bag of optional fields so each kind carries exactly — and only — the data it
+/// can have, and a `match` over it is exhaustive.
+#[derive(Clone, Debug)]
+pub enum TypeShape {
+    /// A user struct: nominal, with its declared data fields in declaration
+    /// order (#1066).
+    Struct {
+        name: String,
+        fields: Vec<FieldInfo>,
+    },
+    /// A user enum: nominal, with its variants in declaration order.
+    Enum {
+        name: String,
+        variants: Vec<VariantInfo>,
+    },
+    /// A tuple: structural, positional element types (the empty tuple `()` has
+    /// no elements).
+    Tuple { elems: Vec<Ty> },
+    /// A primitive scalar/string type, carrying its canonical spelling
+    /// (`int64`, `bool`, `str`, `char`, `float64`, …).
+    Primitive { name: String },
+    /// `list[T]`: structural, element type `T`.
+    List { elem: Ty },
+    /// `dict[K, V]`: structural, key type `K` and value type `V`.
+    Dict { key: Ty, value: Ty },
+    /// `T?` / `Optional[T]`: structural, element type `T`. `elem` is
+    /// [`Ty::Unknown`] only for a bare, un-parameterized `Optional`.
+    Optional { elem: Ty },
+}
+
+/// The read-only introspection record `reflect.type_info(T)` yields (#1257): a
+/// type's shape as a compile-time value. Produced by the resolver in
+/// `zapc_sema`; consumed (indexed / iterated) only by the later comptime
+/// evaluator (E2). The thin accessors mirror the eventual comptime surface
+/// (`ti.kind`, `ti.name`, `ti.fields`, `ti.variants`).
+#[derive(Clone, Debug)]
+pub struct TypeInfo {
+    pub shape: TypeShape,
+}
+
+impl TypeInfo {
+    pub fn kind(&self) -> TypeKind {
+        match &self.shape {
+            TypeShape::Struct { .. } => TypeKind::Struct,
+            TypeShape::Enum { .. } => TypeKind::Enum,
+            TypeShape::Tuple { .. } => TypeKind::Tuple,
+            TypeShape::Primitive { .. } => TypeKind::Primitive,
+            TypeShape::List { .. } => TypeKind::List,
+            TypeShape::Dict { .. } => TypeKind::Dict,
+            TypeShape::Optional { .. } => TypeKind::Optional,
+        }
+    }
+
+    /// The nominal name — `Some` for a struct/enum (the type name) and for a
+    /// primitive (its canonical spelling); `None` for the structural container
+    /// kinds (tuple/list/dict/optional).
+    pub fn name(&self) -> Option<&str> {
+        match &self.shape {
+            TypeShape::Struct { name, .. } | TypeShape::Enum { name, .. } => Some(name),
+            TypeShape::Primitive { name } => Some(name),
+            TypeShape::Tuple { .. }
+            | TypeShape::List { .. }
+            | TypeShape::Dict { .. }
+            | TypeShape::Optional { .. } => None,
+        }
+    }
+
+    /// The struct's declared data fields, in declaration order; empty for any
+    /// non-struct kind.
+    pub fn fields(&self) -> &[FieldInfo] {
+        match &self.shape {
+            TypeShape::Struct { fields, .. } => fields,
+            _ => &[],
+        }
+    }
+
+    /// The enum's variants, in declaration order; empty for any non-enum kind.
+    pub fn variants(&self) -> &[VariantInfo] {
+        match &self.shape {
+            TypeShape::Enum { variants, .. } => variants,
+            _ => &[],
+        }
+    }
+}
+
+/// The failure of a `type_info(T)` resolution (#1257): `T` is a type E1 does not
+/// describe — an unsupported container (`set`/`heap`/`channel`/…), a function
+/// type, a Python handle, or an un-inferable/opaque type. `message` is the exact
+/// "not available for introspection" diagnostic and `span` points at the type as
+/// written, so a later phase (E2's comptime call site) can surface it as a real,
+/// span-attributed compile error instead of a panic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReflectError {
+    pub message: String,
+    pub span: Span,
+}
+
+impl ReflectError {
+    /// Build the canonical "not available for introspection" error for a type
+    /// rendered as `display`, anchored at `span`.
+    pub fn unsupported(display: &str, span: Span) -> Self {
+        ReflectError {
+            message: format!("`{display}` is not available for introspection"),
+            span,
+        }
+    }
+}
+
+/// Classify a resolved [`Ty`] as an introspectable primitive, returning its
+/// canonical spelling (#1257). These are the leaf scalar/string value types that
+/// have no further sub-structure to reflect. Collections, views, user types,
+/// and un-inferable types are not primitives (they are other kinds, or
+/// unsupported). An untyped literal reports its concrete default.
+pub fn primitive_name(ty: &Ty) -> Option<&'static str> {
+    Some(match ty {
+        Ty::Int64 | Ty::UntypedInt => "int64",
+        Ty::Int32 => "int32",
+        Ty::Uint8 => "uint8",
+        Ty::Uint16 => "uint16",
+        Ty::Uint32 => "uint32",
+        Ty::Uint64 => "uint64",
+        Ty::Usize => "usize",
+        Ty::Float64 | Ty::UntypedFloat => "float64",
+        Ty::Float32 => "float32",
+        Ty::Bool => "bool",
+        Ty::Str => "str",
+        Ty::Bytes => "bytes",
+        Ty::Char => "char",
+        Ty::Bigint => "bigint",
+        Ty::Complex => "complex",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,6 +1052,70 @@ mod tests {
         // An untyped literal still fits any unsigned type.
         assert!(assignable(&Ty::UntypedInt, &Ty::Uint8));
         assert!(assignable(&Ty::UntypedInt, &Ty::Usize));
+    }
+
+    #[test]
+    fn reflect_primitive_name_classification() {
+        // Scalars / string value types are primitives; untyped literals report
+        // their concrete default.
+        assert_eq!(primitive_name(&Ty::Int64), Some("int64"));
+        assert_eq!(primitive_name(&Ty::UntypedInt), Some("int64"));
+        assert_eq!(primitive_name(&Ty::UntypedFloat), Some("float64"));
+        assert_eq!(primitive_name(&Ty::Char), Some("char"));
+        assert_eq!(primitive_name(&Ty::Bigint), Some("bigint"));
+        assert_eq!(primitive_name(&Ty::Bytes), Some("bytes"));
+        // Collections, user types, and un-inferable types are not primitives.
+        assert_eq!(primitive_name(&Ty::List(Box::new(Ty::Int64))), None);
+        assert_eq!(primitive_name(&Ty::Named("Point".into())), None);
+        assert_eq!(primitive_name(&Ty::Unknown), None);
+        assert_eq!(primitive_name(&Ty::Unit), None);
+    }
+
+    #[test]
+    fn reflect_typeinfo_accessors_per_shape() {
+        let s = TypeInfo {
+            shape: TypeShape::Struct {
+                name: "Point".into(),
+                fields: vec![FieldInfo {
+                    name: "x".into(),
+                    ty: Ty::Int64,
+                    decl_ty: Type::Named {
+                        name: "int64".into(),
+                        args: vec![],
+                        span: Span::default(),
+                    },
+                    index: 0,
+                    attrs: vec![],
+                    span: Span::default(),
+                }],
+            },
+        };
+        assert_eq!(s.kind(), TypeKind::Struct);
+        assert_eq!(s.name(), Some("Point"));
+        assert_eq!(s.fields().len(), 1);
+        assert!(s.variants().is_empty());
+
+        let list = TypeInfo {
+            shape: TypeShape::List { elem: Ty::Str },
+        };
+        assert_eq!(list.kind(), TypeKind::List);
+        assert_eq!(list.name(), None, "a container is structural");
+        assert!(list.fields().is_empty());
+
+        let prim = TypeInfo {
+            shape: TypeShape::Primitive {
+                name: "bool".into(),
+            },
+        };
+        assert_eq!(prim.kind(), TypeKind::Primitive);
+        assert_eq!(prim.name(), Some("bool"));
+    }
+
+    #[test]
+    fn reflect_error_message_is_the_exact_phrase() {
+        let e = ReflectError::unsupported("set[int64]", Span::new(3, 9));
+        assert_eq!(e.message, "`set[int64]` is not available for introspection");
+        assert_eq!(e.span, Span::new(3, 9));
     }
 
     #[test]
