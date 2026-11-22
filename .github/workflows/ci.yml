@@ -771,6 +771,142 @@ jobs:
         continue-on-error: true
         run: cargo test
 
+  # Merge-queue failure reporter (I#1268). The full LLVM/arm64/Windows matrix runs
+  # ONLY on `merge_group` (see the header), so its check results attach to the
+  # ephemeral `gh-readonly-queue/<base>/pr-<N>-<sha>` ref, never the PR head.
+  # GitHub never mirrors them to the PR, so a queue eviction is silent: from the
+  # PR you cannot tell "failed in the queue" from "never queued" from "evicted
+  # because a PR ahead failed", and the failing logs vanish with the queue branch.
+  #
+  # This job turns a GENUINE queue failure/cancellation into a *sticky* PR comment
+  # (keyed by the hidden `<!-- mq-report -->` marker, so repeated evictions update
+  # one comment instead of spamming). Resulting semantics:
+  #   * comment present  -> the PR genuinely failed/was cancelled in the queue,
+  #   * no comment, PR fell out -> a non-failure eviction (base moved, a PR ahead
+  #     failed) — this job never ran because nothing it `needs:` failed.
+  #
+  # We deliberately do NOT re-add the full matrix to `pull_request`: that would
+  # burn exactly the Actions minutes the fast/full split exists to save
+  # (Epic #1088 / Discussion #1087). A reporter job adds visibility at ~one cheap
+  # ubuntu step per genuine failure instead.
+  #
+  # It fires ONLY on `merge_group` AND only when a needed queue job `failure()`d or
+  # was `cancelled()` (timeout/eviction) — never on a green queue run, never on
+  # `pull_request` or `push`. Least privilege: job-level `pull-requests: write`
+  # only (the workflow default is not widened). It is intentionally NOT in
+  # `ci-gate`'s `needs:`, so whether it posts — or itself errors — cannot block or
+  # change the merge outcome.
+  #
+  # `needs:` every job that runs in the queue and can fail (the full matrix, the
+  # four required Windows jobs, plus `changes`/`host` which also run in-queue).
+  # `windows-crates` is excluded on purpose: it is `continue-on-error` (never
+  # reports failure to dependents), exactly as it is excluded from `ci-gate`.
+  #
+  # NOTE: `merge_group` cannot be triggered locally, so this only truly proves out
+  # on the next real queued PR. The YAML and the `pr-<N>` parse are validated
+  # ahead of that (see decisions/tooling/1268-merge-queue-failure-reporting.md).
+  merge-queue-report:
+    name: merge-queue failure report
+    needs:
+      - changes
+      - host
+      - full
+      - arm64
+      - windows-ctxswitch
+      - windows-a3
+      - windows-netpoller
+      - windows-runtime
+    if: ${{ always() && github.event_name == 'merge_group' && (failure() || cancelled()) }}
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Post or update the merge-queue failure comment
+        uses: actions/github-script@v7
+        env:
+          # The per-job results, as a compact JSON object the script parses. Each
+          # value is one of success / failure / cancelled / skipped.
+          JOB_RESULTS: >-
+            {"changes":"${{ needs.changes.result }}","host":"${{ needs.host.result }}","full":"${{ needs.full.result }}","arm64":"${{ needs.arm64.result }}","windows-ctxswitch":"${{ needs.windows-ctxswitch.result }}","windows-a3":"${{ needs.windows-a3.result }}","windows-netpoller":"${{ needs.windows-netpoller.result }}","windows-runtime":"${{ needs.windows-runtime.result }}"}
+        with:
+          script: |
+            const marker = '<!-- mq-report -->';
+
+            // The merge-queue candidate ref is
+            //   gh-readonly-queue/<base>/pr-<N>-<sha>
+            // Anchor on the `pr-<N>-<hex-sha>` tail so a base branch containing
+            // slashes (e.g. release/1.x) can't confuse the parse.
+            const ref = process.env.GITHUB_REF_NAME || '';
+            const m = ref.match(/pr-(\d+)-[0-9a-f]+$/);
+            if (!m) {
+              core.info(`GITHUB_REF_NAME='${ref}' is not a merge-queue ref; nothing to report.`);
+              return;
+            }
+            const prNumber = parseInt(m[1], 10);
+
+            let results = {};
+            try {
+              results = JSON.parse(process.env.JOB_RESULTS || '{}');
+            } catch (e) {
+              core.warning(`Could not parse JOB_RESULTS: ${e}`);
+            }
+
+            const failed = Object.keys(results).filter((j) => results[j] === 'failure');
+            const cancelled = Object.keys(results).filter((j) => results[j] === 'cancelled');
+
+            if (failed.length === 0 && cancelled.length === 0) {
+              // The `if:` already gates on failure()/cancelled(), but the failure
+              // may be in a transitive ancestor (e.g. `changes`) whose result we
+              // did not enumerate. Nothing concrete to name -> stay silent rather
+              // than post a vacuous comment.
+              core.info('No needed job reported failure/cancelled; nothing to report.');
+              return;
+            }
+
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const tick = (j) => `\`${j}\``;
+            const lines = [];
+            lines.push(marker);
+            lines.push('### ⛔ Merge-queue CI failure');
+            lines.push('');
+            lines.push(
+              'This PR failed while being tested **inside the merge queue**. The full ' +
+              'LLVM 18 / aarch64 / Windows matrix runs only on the `merge_group` ' +
+              'candidate, so its results attach to the queue ref and are **not** shown ' +
+              "on this PR's own checks. Details:");
+            lines.push('');
+            if (failed.length) lines.push(`- **Failed:** ${failed.map(tick).join(', ')}`);
+            if (cancelled.length) lines.push(`- **Cancelled / timed-out:** ${cancelled.map(tick).join(', ')}`);
+            lines.push('');
+            lines.push(`[View the merge-queue run →](${runUrl})`);
+            if (failed.length === 0 && cancelled.length) {
+              lines.push('');
+              lines.push(
+                '> Only cancellations were seen. That is usually a job timeout (e.g. a ' +
+                'golden-test timeout flake) — but the merge queue also cancels a ' +
+                "candidate when a PR *ahead* of it fails, so check the run before " +
+                'assuming this PR is at fault.');
+            }
+            lines.push('');
+            lines.push(`<sub>Updated ${new Date().toISOString()} · run ${process.env.GITHUB_RUN_ID} · auto-generated by the \`merge-queue-report\` job (I#1268)</sub>`);
+            const body = lines.join('\n');
+
+            const { owner, repo } = context.repo;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+            const prior = comments.find((c) => c.body && c.body.includes(marker));
+            if (prior) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: prior.id, body });
+              core.info(`Updated sticky merge-queue comment ${prior.id} on PR #${prNumber}.`);
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+              core.info(`Created sticky merge-queue comment on PR #${prNumber}.`);
+            }
+
   # Aggregate status gate. THIS is the single required status check for `main`
   # (branch-protection ruleset), replacing the per-matrix contexts. It runs on all
   # three events (pull_request, merge_group, push), is never path-gated (always
