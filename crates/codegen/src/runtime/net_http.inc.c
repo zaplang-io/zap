@@ -132,6 +132,289 @@ static char *zap_net_dupz(const ZapStr *s) {
     return out;
 }
 
+/* ---- IP presentation <-> wire conversion (ticket #1261) ------------------- *
+ * Pure, I/O-free conversion between IP address TEXT and its network-order
+ * OCTETS, exposed as `net.inet_pton(family, text) -> bytes` and
+ * `net.inet_ntop(family, packed) -> str`. No sockets, no DNS. The parser and
+ * formatter are hand-written (not libc inet_pton/inet_ntop) so rejection
+ * semantics and the RFC 5952 canonical output are byte-identical across
+ * platforms. `family` is the portable string "ipv4"/"ipv6"; every rejection
+ * raises a catchable ValueError. See decisions/stdlib/1261-ip-presentation-wire.md. */
+
+/* Raise a catchable ValueError from a NUL-terminated C message. */
+static void zap_ip_value_error(const char *msg) {
+    zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(msg, (int64_t)strlen(msg)));
+}
+
+/* "ipv4" -> 4, "ipv6" -> 6; anything else raises ValueError (never returns). */
+static int zap_ip_family(const ZapStr *fam) {
+    if (fam && fam->len == 4 && memcmp(fam->data, "ipv4", 4) == 0) {
+        return 4;
+    }
+    if (fam && fam->len == 4 && memcmp(fam->data, "ipv6", 4) == 0) {
+        return 6;
+    }
+    zap_ip_value_error("net: address family must be \"ipv4\" or \"ipv6\"");
+    return 0; /* unreachable: zap_ip_value_error unwinds */
+}
+
+/* Hex digit value, or -1. Accepts upper/lowercase (RFC 4291 allows either on
+ * input; the formatter always emits lowercase). */
+static int zap_ip_hexval(int c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+/* Parse exactly four dotted-decimal octets of `s` (len bytes) into out[4].
+ * Returns 1 on success, 0 on malformed. Rejects out-of-range octets (>255), a
+ * leading zero ("01", "00"), the wrong field count, an empty octet, and any
+ * non-digit or trailing junk. */
+static int zap_ipv4_parse(const char *s, size_t len, unsigned char out[4]) {
+    size_t i = 0;
+    for (int field = 0; field < 4; field++) {
+        if (field > 0) {
+            if (i >= len || s[i] != '.') {
+                return 0;
+            }
+            i++;
+        }
+        if (i >= len || s[i] < '0' || s[i] > '9') {
+            return 0; /* each octet needs at least one digit */
+        }
+        int start = (int)i;
+        int val = 0;
+        int ndigits = 0;
+        while (i < len && s[i] >= '0' && s[i] <= '9') {
+            val = val * 10 + (s[i] - '0');
+            ndigits++;
+            if (ndigits > 3 || val > 255) {
+                return 0;
+            }
+            i++;
+        }
+        /* A multi-digit octet must not start with '0' (reject "01"/"00"). */
+        if (ndigits > 1 && s[start] == '0') {
+            return 0;
+        }
+        out[field] = (unsigned char)val;
+    }
+    return i == len; /* reject trailing junk */
+}
+
+/* Parse an IPv6 literal `src` (srclen bytes) into out[16] network order. Handles
+ * "::" zero compression and a trailing embedded IPv4 ("::ffff:1.2.3.4"). Returns
+ * 1 on success, 0 on malformed: more than one "::", a group of >4 hex digits, a
+ * "::" that expands to zero groups, an embedded IPv4 anywhere but last, a wrong
+ * total length, or any non-hex junk. (ISC/BSD inet_pton6 shape.) */
+static int zap_ipv6_parse(const char *src, size_t srclen, unsigned char out[16]) {
+    unsigned char tmp[16];
+    memset(tmp, 0, sizeof(tmp));
+    unsigned char *tp = tmp;
+    unsigned char *const endp = tmp + 16;
+    unsigned char *colonp = NULL; /* where a "::" was seen, or NULL */
+    const char *curtok;           /* start of the current group */
+    int seen_xdigits = 0;
+    unsigned int val = 0;
+    size_t i = 0;
+
+    /* A leading ':' is only legal as part of a leading "::". */
+    if (i < srclen && src[i] == ':') {
+        i++;
+        if (i >= srclen || src[i] != ':') {
+            return 0;
+        }
+    }
+    curtok = src + i;
+    while (i < srclen) {
+        int ch = (unsigned char)src[i++];
+        int digit = zap_ip_hexval(ch);
+        if (digit >= 0) {
+            val = (val << 4) | (unsigned int)digit;
+            if (++seen_xdigits > 4) {
+                return 0;
+            }
+            continue;
+        }
+        if (ch == ':') {
+            curtok = src + i;
+            if (!seen_xdigits) {
+                if (colonp) {
+                    return 0; /* a second "::" */
+                }
+                colonp = tp;
+                continue;
+            }
+            if (i == srclen) {
+                return 0; /* a trailing ':' that is not part of "::" */
+            }
+            if (tp + 2 > endp) {
+                return 0;
+            }
+            *tp++ = (unsigned char)((val >> 8) & 0xff);
+            *tp++ = (unsigned char)(val & 0xff);
+            seen_xdigits = 0;
+            val = 0;
+            continue;
+        }
+        if (ch == '.' && (tp + 4) <= endp) {
+            /* Embedded IPv4 tail: re-parse from the group start to the end. */
+            size_t v4len = srclen - (size_t)(curtok - src);
+            if (!zap_ipv4_parse(curtok, v4len, tp)) {
+                return 0;
+            }
+            tp += 4;
+            seen_xdigits = 0;
+            i = srclen; /* the IPv4 parse consumed the remainder */
+            break;
+        }
+        return 0; /* any other character is invalid */
+    }
+    if (seen_xdigits) {
+        if (tp + 2 > endp) {
+            return 0;
+        }
+        *tp++ = (unsigned char)((val >> 8) & 0xff);
+        *tp++ = (unsigned char)(val & 0xff);
+    }
+    if (colonp != NULL) {
+        /* "::" must stand for at least one group of zeros. */
+        if (tp == endp) {
+            return 0;
+        }
+        int n = (int)(tp - colonp);
+        for (int j = 1; j <= n; j++) {
+            endp[-j] = colonp[n - j];
+            colonp[n - j] = 0;
+        }
+        tp = endp;
+    }
+    if (tp != endp) {
+        return 0; /* wrong number of groups */
+    }
+    memcpy(out, tmp, 16);
+    return 1;
+}
+
+/* Format the 16 octets `in` into canonical RFC 5952 text at `out` (needs room
+ * for 46 bytes incl. NUL). Returns the string length. Lowercase, no leading
+ * zeros, longest zero run (>=2 groups, leftmost on tie) compressed to "::", and
+ * the IPv4-mapped prefix (::ffff:) rendered with an embedded dotted IPv4. */
+static int zap_ipv6_format(const unsigned char in[16], char *out) {
+    unsigned int words[8];
+    for (int i = 0; i < 8; i++) {
+        words[i] = ((unsigned int)in[2 * i] << 8) | (unsigned int)in[2 * i + 1];
+    }
+    /* Longest run of consecutive zero words (leftmost on tie). */
+    int best_base = -1, best_len = 0, cur_base = -1, cur_len = 0;
+    for (int i = 0; i < 8; i++) {
+        if (words[i] == 0) {
+            if (cur_base < 0) {
+                cur_base = i;
+                cur_len = 1;
+            } else {
+                cur_len++;
+            }
+            if (cur_len > best_len) {
+                best_len = cur_len;
+                best_base = cur_base;
+            }
+        } else {
+            cur_base = -1;
+            cur_len = 0;
+        }
+    }
+    if (best_len < 2) { /* never compress a single zero group */
+        best_base = -1;
+        best_len = 0;
+    }
+    /* IPv4-mapped: five zero groups then 0xffff -> embed dotted IPv4. */
+    int mapped = (best_base == 0 && best_len == 5 && words[5] == 0xffff);
+
+    char *p = out;
+    for (int i = 0; i < 8; i++) {
+        if (best_base != -1 && i >= best_base && i < best_base + best_len) {
+            if (i == best_base) {
+                *p++ = ':';
+            }
+            continue;
+        }
+        if (i != 0) {
+            *p++ = ':';
+        }
+        if (mapped && i == 6) {
+            p += snprintf(p, 16, "%u.%u.%u.%u", in[12], in[13], in[14], in[15]);
+            break;
+        }
+        p += snprintf(p, 8, "%x", words[i]);
+    }
+    /* A zero run that reaches the final group leaves a trailing "::". */
+    if (best_base != -1 && best_base + best_len == 8) {
+        *p++ = ':';
+    }
+    *p = '\0';
+    return (int)(p - out);
+}
+
+/* net.inet_pton(family, text) -> bytes. Parse an IPv4/IPv6 literal into its
+ * network-order octets (4 or 16 bytes). Raises ValueError on an unknown family,
+ * malformed text, or a family/text mismatch. */
+void *zap_net_inet_pton(void *family_, void *text_) {
+    const ZapStr *fam = (const ZapStr *)family_;
+    const ZapStr *text = (const ZapStr *)text_;
+    int f = zap_ip_family(fam);
+    const char *s = (text && text->len > 0) ? text->data : "";
+    size_t len = (text && text->len > 0) ? (size_t)text->len : 0;
+    /* An embedded NUL can never belong to a valid literal; reject up front so a
+     * strchr-style C view of the bytes can never be surprised. */
+    if (len > 0 && memchr(s, '\0', len)) {
+        zap_ip_value_error(f == 4 ? "net.inet_pton: invalid IPv4 address"
+                                  : "net.inet_pton: invalid IPv6 address");
+    }
+    unsigned char octets[16];
+    if (f == 4) {
+        if (!zap_ipv4_parse(s, len, octets)) {
+            zap_ip_value_error("net.inet_pton: invalid IPv4 address");
+        }
+        return zap_str_new((const char *)octets, 4);
+    }
+    if (!zap_ipv6_parse(s, len, octets)) {
+        zap_ip_value_error("net.inet_pton: invalid IPv6 address");
+    }
+    return zap_str_new((const char *)octets, 16);
+}
+
+/* net.inet_ntop(family, packed) -> str. Format 4-/16-byte octets into canonical
+ * text. Raises ValueError on an unknown family or a packed width that does not
+ * match the family (not 4 for "ipv4", not 16 for "ipv6"). */
+void *zap_net_inet_ntop(void *family_, void *packed_) {
+    const ZapStr *fam = (const ZapStr *)family_;
+    const ZapStr *packed = (const ZapStr *)packed_;
+    int f = zap_ip_family(fam);
+    int64_t len = packed ? packed->len : 0;
+    const unsigned char *b = (const unsigned char *)(packed ? packed->data : NULL);
+    char buf[48];
+    if (f == 4) {
+        if (len != 4) {
+            zap_ip_value_error("net.inet_ntop: \"ipv4\" requires exactly 4 packed bytes");
+        }
+        int n = snprintf(buf, sizeof(buf), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+        return zap_str_new(buf, n);
+    }
+    if (len != 16) {
+        zap_ip_value_error("net.inet_ntop: \"ipv6\" requires exactly 16 packed bytes");
+    }
+    int n = zap_ipv6_format(b, buf);
+    return zap_str_new(buf, (int64_t)n);
+}
+
 /* ---- connection transport tag (I#556) ------------------------------------- *
  * `http.read_request` / `http.respond` accept EITHER a plaintext (`net`,
  * `ZapSock`) or a TLS (`tls.accept`, `ZapTls`) connection — at the Zap type level

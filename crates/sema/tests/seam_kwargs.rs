@@ -746,6 +746,39 @@ fn math_net_positional_unchanged() {
     ));
 }
 
+// --- #1261 IP presentation<->wire: keyword binding on `family`/`text`/`packed`.
+#[test]
+fn net_inet_pton_ntop_keyword_reorder_and_unknown() {
+    // inet_pton(family, text) binds both keywords, in either order.
+    assert_ok(&prog(
+        "    auto b = net.inet_pton(family=\"ipv4\", text=\"1.2.3.4\")\n",
+    ));
+    assert_ok(&prog(
+        "    auto b = net.inet_pton(text=\"::1\", family=\"ipv6\")\n",
+    ));
+    // inet_ntop(family, packed) binds both keywords, in either order.
+    assert_ok(&prog(
+        "    auto s = net.inet_ntop(family=\"ipv4\", packed=bytes([1, 2, 3, 4]))\n",
+    ));
+    assert_ok(&prog(
+        "    auto s = net.inet_ntop(packed=bytes([0, 1]), family=\"ipv6\")\n",
+    ));
+    // Positional forms are unchanged.
+    assert_ok(&prog("    auto b = net.inet_pton(\"ipv6\", \"::1\")\n"));
+    assert_ok(&prog(
+        "    auto s = net.inet_ntop(\"ipv4\", bytes([0, 0, 0, 0]))\n",
+    ));
+    // An unknown keyword is a bind-time error on both.
+    assert_code(
+        &prog("    auto b = net.inet_pton(family=\"ipv4\", txt=\"1.2.3.4\")\n"),
+        "ZAP4023",
+    );
+    assert_code(
+        &prog("    auto s = net.inet_ntop(fam=\"ipv4\", packed=bytes([1, 2, 3, 4]))\n"),
+        "ZAP4023",
+    );
+}
+
 #[test]
 fn net_udp_keyword_reorder_and_unknown() {
     // udp_bind(sock, host, port): name-order reorder and swapped host/port.

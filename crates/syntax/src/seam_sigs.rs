@@ -538,6 +538,10 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("net", "lookup_ipv4", &["name"]),
     ("net", "lookup_ipv6", &["name"]),
     ("net", "lookup_addr", &["ip"]),
+    // IP presentation <-> wire conversion (#1261). `family` is the selector, the
+    // canonical keyword-bindable param.
+    ("net", "inet_pton", &["family", "text"]),
+    ("net", "inet_ntop", &["family", "packed"]),
     // Unix domain sockets (#993, epic #985). The 0-arg unixgram_socket carries
     // no params, so it needs no kwargs row.
     ("net", "listen_unix", &["path"]),
