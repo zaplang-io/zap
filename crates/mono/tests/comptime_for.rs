@@ -128,6 +128,46 @@ fn unroll_with_reflect_field_access_end_to_end() {
     assert_eq!(render(&stmts), vec!["emit(value.n)", "emit(value.name)"]);
 }
 
+// --- #1253: kind-switch registry built from a module -------------------------
+
+#[test]
+fn type_registry_resolves_container_recursion() {
+    let src = "struct P:\n    int64 x\nstruct Holder:\n    list[P] ps\n    dict[str, int64] m\n";
+    let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+    assert!(lerrs.is_empty() && perrs.is_empty(), "{lerrs:?} {perrs:?}");
+    let reg = zapc_mono::type_registry(&module);
+
+    // Holder.ps : list[P] -> elem is the struct P.
+    let info = reg
+        .resolve_type(
+            &zapc_syntax::ast::Type::Named {
+                name: "Holder".to_string(),
+                args: vec![],
+                span: zapc_syntax::span::Span::new(0, 0),
+            },
+            zapc_syntax::span::Span::new(0, 0),
+        )
+        .unwrap();
+    assert_eq!(info.kind(), zapc_comptime::TypeKind::Struct);
+    // ps field's type is a list whose element resolves back to struct P.
+    let ps_ty = reg
+        .resolve_type(
+            &info.fields()[0].decl_ty,
+            zapc_syntax::span::Span::new(0, 0),
+        )
+        .unwrap();
+    assert_eq!(ps_ty.kind(), zapc_comptime::TypeKind::List);
+    if let zapc_comptime::TypeShape::List { elem } = &ps_ty.shape {
+        let p = reg
+            .resolve_ty(elem, zapc_syntax::span::Span::new(0, 0))
+            .unwrap();
+        assert_eq!(p.kind(), zapc_comptime::TypeKind::Struct);
+        assert_eq!(p.name(), Some("P"));
+    } else {
+        panic!("expected list");
+    }
+}
+
 #[test]
 fn unroll_with_comptime_library_function() {
     // HQ9: a registered comptime function folds per field to its constant.

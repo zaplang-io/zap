@@ -23,9 +23,9 @@
 use std::rc::Rc;
 
 use zapc_comptime::{
-    desugar_reflect_field, reflect_field, unroll, Env, Evaluator, TypeInfo, Value,
+    desugar_reflect_field, reflect_field, unroll, Env, Evaluator, TypeInfo, TypeRegistry, Value,
 };
-use zapc_syntax::ast::{Block, EnumDef, Expr, Stmt, StructDef};
+use zapc_syntax::ast::{Block, EnumDef, Expr, Module, Stmt, StructDef};
 use zapc_syntax::span::Span;
 
 use crate::{err, LowerError};
@@ -54,6 +54,17 @@ pub fn unroll_enum_variants(
 ) -> Result<Vec<Stmt>, LowerError> {
     let info = zapc_comptime::type_info_of_enum(def);
     unroll_member(info, loop_var, "variants", body, funcs)
+}
+
+/// Build the comptime [`TypeRegistry`] for a module's user `struct`/`enum`
+/// declarations (#1253): the no-sema resolver that drives `type_info(T).kind`-
+/// switch container recursion. Mono attaches this to the evaluator (via
+/// `Evaluator::with_registry`) so `info.elem` / `info.key` / `info.value` /
+/// `info.inner` / `info.elems` and `field.ty` resolve a container's element /
+/// a field's type back to a nested `TypeInfo`. Reflect the **post-substitution**
+/// module so the registry holds the concrete instantiations (#154/#164).
+pub fn type_registry(module: &Module) -> TypeRegistry {
+    TypeRegistry::from_module(module)
 }
 
 /// Typed `reflect.field(value, index)` for the concrete struct `def` (#1252):

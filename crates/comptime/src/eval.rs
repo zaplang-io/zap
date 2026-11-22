@@ -8,6 +8,7 @@
 
 use std::rc::Rc;
 
+use zapc_sema_types::TypeShape;
 use zapc_syntax::ast::{Arg, ArgSpread, BinOp, Block, Expr, Stmt, UnOp};
 use zapc_syntax::span::Span;
 
@@ -470,6 +471,44 @@ impl<'a> Evaluator<'a> {
                         .map(|v| Value::Variant(Rc::new(v.clone())))
                         .collect(),
                 )),
+                // Container element accessors (#1253): resolve the element/key/
+                // value type back to a nested `TypeInfo` so a comptime
+                // kind-switch can recurse on it.
+                "elem" => match &ti.shape {
+                    TypeShape::List { elem } => self.resolve_ty_value(elem, span),
+                    _ => Err(container_accessor_err("elem", "list", ti, span)),
+                },
+                "key" => match &ti.shape {
+                    TypeShape::Dict { key, .. } => self.resolve_ty_value(key, span),
+                    _ => Err(container_accessor_err("key", "dict", ti, span)),
+                },
+                "value" => match &ti.shape {
+                    TypeShape::Dict { value, .. } => self.resolve_ty_value(value, span),
+                    _ => Err(container_accessor_err("value", "dict", ti, span)),
+                },
+                "inner" => match &ti.shape {
+                    TypeShape::Optional { elem } => {
+                        if matches!(elem, zapc_sema_types::Ty::Unknown) {
+                            Err(CtError::not_available(
+                                "a bare `Optional`'s element type at comptime",
+                                span,
+                            ))
+                        } else {
+                            self.resolve_ty_value(elem, span)
+                        }
+                    }
+                    _ => Err(container_accessor_err("inner", "optional", ti, span)),
+                },
+                "elems" => match &ti.shape {
+                    TypeShape::Tuple { elems } => {
+                        let mut out = Vec::with_capacity(elems.len());
+                        for e in elems {
+                            out.push(self.resolve_ty_value(e, span)?);
+                        }
+                        Ok(Value::list(out))
+                    }
+                    _ => Err(container_accessor_err("elems", "tuple", ti, span)),
+                },
                 _ => Err(no_field_err("TypeInfo", name, span)),
             },
             Value::Field(f) => match name {
@@ -481,12 +520,10 @@ impl<'a> Evaluator<'a> {
                         .map(|a| Value::Attr(Rc::new(a.clone())))
                         .collect(),
                 )),
-                // `.ty` (recursing into the field's own type's `type_info`) is
-                // the kind-switch / container recursion, deferred to #1253.
-                "ty" | "type_info" => Err(CtError::not_available(
-                    "a field's comptime type (`.ty` recursion, #1253)",
-                    span,
-                )),
+                // A field's own comptime type (#1253): resolve from the declared
+                // type (which preserves an `Optional`/container element the
+                // resolved `Ty` erases), so a kind-switch can recurse on it.
+                "ty" | "type_info" => self.resolve_type_value(&f.decl_ty, span),
                 _ => Err(no_field_err("FieldInfo", name, span)),
             },
             Value::Variant(v) => match name {
@@ -558,10 +595,89 @@ impl<'a> Evaluator<'a> {
             }
         }
         match callee {
-            Expr::Attr { base, name, .. } => self.eval_method(base, name, args, span, env),
+            Expr::Attr { base, name, .. } => {
+                // `reflect.<fn>(...)` module builtins (#1253 override hook).
+                if matches!(&**base, Expr::Name(m, _) if m == "reflect") {
+                    return self.eval_reflect_builtin(name, args, span, env);
+                }
+                self.eval_method(base, name, args, span, env)
+            }
             Expr::Name(fname, _) => self.eval_name_call(fname, args, span, env),
             _ => Err(CtError::not_available("call of a computed callee", span)),
         }
+    }
+
+    /// `reflect.<fn>(...)` comptime builtins. For now the override hook:
+    /// `reflect.has_override(info, "serialize")` -> `bool`, true when the type
+    /// `info` describes declares that method, so a kind-switch can short-circuit
+    /// to a user-supplied handler instead of recursing (#1248 resolved decision;
+    /// full override *policy* is E3).
+    fn eval_reflect_builtin(
+        &mut self,
+        name: &str,
+        args: &[Arg],
+        span: Span,
+        env: &mut Env,
+    ) -> Result<Value, CtError> {
+        match name {
+            "has_override" => {
+                let argv = self.eval_args(args, env)?;
+                if argv.len() != 2 {
+                    return Err(CtError::value(
+                        "`reflect.has_override(info, name)` takes exactly 2 arguments",
+                        span,
+                    ));
+                }
+                let type_name = match &argv[0] {
+                    Value::Type(ti) => ti.name().map(|s| s.to_string()),
+                    other => {
+                        return Err(CtError::value(
+                            format!(
+                                "`reflect.has_override` expects a `TypeInfo`, found `{}`",
+                                other.type_name()
+                            ),
+                            span,
+                        ))
+                    }
+                };
+                let method = match &argv[1] {
+                    Value::Str(s) => s.to_string(),
+                    other => {
+                        return Err(CtError::value(
+                            format!(
+                                "`reflect.has_override` method name must be a `str`, found `{}`",
+                                other.type_name()
+                            ),
+                            span,
+                        ))
+                    }
+                };
+                let reg = self.registry.ok_or_else(|| {
+                    CtError::not_available("`reflect.has_override` without a type registry", span)
+                })?;
+                Ok(Value::Bool(
+                    type_name.is_some_and(|t| reg.has_method(&t, &method)),
+                ))
+            }
+            other => Err(CtError::not_available(
+                format!("`reflect.{other}(...)`"),
+                span,
+            )),
+        }
+    }
+
+    /// Resolve a resolved `Ty` (from a container shape) to a nested `TypeInfo`
+    /// value via the registry (#1253).
+    fn resolve_ty_value(&self, ty: &zapc_sema_types::Ty, span: Span) -> Result<Value, CtError> {
+        let reg = self.registry.ok_or_else(|| no_registry_err(span))?;
+        Ok(Value::Type(Rc::new(reg.resolve_ty(ty, span)?)))
+    }
+
+    /// Resolve a declared `Type` (e.g. a field's `decl_ty`) to a nested
+    /// `TypeInfo` value via the registry (#1253).
+    fn resolve_type_value(&self, t: &zapc_syntax::ast::Type, span: Span) -> Result<Value, CtError> {
+        let reg = self.registry.ok_or_else(|| no_registry_err(span))?;
+        Ok(Value::Type(Rc::new(reg.resolve_type(t, span)?)))
     }
 
     fn eval_method(
@@ -717,8 +833,12 @@ impl<'a> Evaluator<'a> {
         }
 
         // Bind parameters positionally into a fresh function scope (comptime
-        // functions do not close over their caller's locals).
+        // functions do not close over their caller's locals). The `TypeKind`
+        // constants are comptime globals, so seed them first (a parameter of the
+        // same name still shadows, bound next) — this lets a kind-switch inside
+        // a comptime function write `if info.kind == Struct:` (#1253).
         let mut fenv = Env::new();
+        crate::seed_kind_constants(&mut fenv);
         self.bind_params(func, &args, &mut fenv, span)?;
 
         self.active.push(func.name.as_str());
@@ -905,6 +1025,30 @@ impl<'a> Evaluator<'a> {
 
 fn no_field_err(record: &str, name: &str, span: Span) -> CtError {
     CtError::value(format!("`{record}` has no comptime field `{name}`"), span)
+}
+
+/// A container element accessor used on the wrong kind (`.elem` on a non-list, …).
+fn container_accessor_err(
+    accessor: &str,
+    expected_kind: &str,
+    ti: &zapc_sema_types::TypeInfo,
+    span: Span,
+) -> CtError {
+    CtError::value(
+        format!(
+            "`.{accessor}` is only available on a `{expected_kind}`, not a `{}`",
+            ti.kind().as_str()
+        ),
+        span,
+    )
+}
+
+/// The registry is required for container recursion / `field.ty` but absent.
+fn no_registry_err(span: Span) -> CtError {
+    CtError::not_available(
+        "a comptime type reference without a type registry (container recursion / `.ty`)",
+        span,
+    )
 }
 
 /// Parse an integer literal lexeme to its non-negative magnitude. Handles the
