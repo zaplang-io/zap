@@ -15,7 +15,9 @@
 //! evaluator reports `.ty` as out of fragment until then, so an unresolved
 //! element type never silently misleads.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use zapc_sema_types::{
     primitive_name, AttrArg, AttrInfo, FieldInfo, Ty, TypeInfo, TypeShape, VariantInfo,
@@ -179,6 +181,33 @@ pub struct TypeRegistry {
     types: HashMap<String, TypeInfo>,
     /// User type name -> declared method names (for the override hook).
     methods: HashMap<String, HashSet<String>>,
+    /// `type_info(T)` memo (#1255, HQ5): each type's record is computed once and
+    /// reused on every later introspection, keyed by a canonical type key. An
+    /// in-process cache for v1 (on-disk / cross-build caching deferred).
+    cache: RefCell<HashMap<String, Rc<TypeInfo>>>,
+    /// Memo accounting, so a benchmark can assert each type is computed once.
+    stats: Cell<MemoStats>,
+}
+
+/// `type_info(T)` memo accounting (#1255): the comptime-reflection compile-time
+/// cost signal. `computed` is the number of distinct type records actually
+/// built (memo misses); `reused` the number served from the memo (hits). The
+/// stable, deterministic metric a CI compile-time benchmark tracks — growth or a
+/// regression (more computations than expected) is visible without timing
+/// flakiness.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoStats {
+    /// Distinct type records built (memo misses).
+    pub computed: u64,
+    /// Type records served from the memo (memo hits).
+    pub reused: u64,
+}
+
+impl MemoStats {
+    /// Total introspection requests (`computed + reused`).
+    pub fn total(self) -> u64 {
+        self.computed + self.reused
+    }
 }
 
 impl TypeRegistry {
@@ -230,10 +259,47 @@ impl TypeRegistry {
             .is_some_and(|set| set.contains(method))
     }
 
+    /// The `type_info(T)` memo accounting so far (#1255).
+    pub fn memo_stats(&self) -> MemoStats {
+        self.stats.get()
+    }
+
+    /// Reset the memo accounting (keeps the cache); for benchmarking a region.
+    pub fn reset_stats(&self) {
+        self.stats.set(MemoStats::default());
+    }
+
+    /// Serve a cached record for `key`, or compute it with `build` once and
+    /// cache it (#1255). Errors are not cached (and don't count as computed).
+    fn memoized(
+        &self,
+        key: String,
+        build: impl FnOnce() -> Result<TypeInfo, CtError>,
+    ) -> Result<TypeInfo, CtError> {
+        if let Some(rc) = self.cache.borrow().get(&key) {
+            let mut s = self.stats.get();
+            s.reused += 1;
+            self.stats.set(s);
+            return Ok((**rc).clone());
+        }
+        let ti = build()?;
+        let mut s = self.stats.get();
+        s.computed += 1;
+        self.stats.set(s);
+        self.cache.borrow_mut().insert(key, Rc::new(ti.clone()));
+        Ok(ti)
+    }
+
     /// Resolve a resolved [`Ty`] (as stored in a container `TypeShape`) to its
     /// [`TypeInfo`]. Used by the evaluator's `.elem`/`.key`/`.value`/`.inner`/
-    /// `.elems` container accessors.
+    /// `.elems` container accessors. Memoized per type (#1255).
     pub fn resolve_ty(&self, ty: &Ty, span: Span) -> Result<TypeInfo, CtError> {
+        self.memoized(format!("ty:{}", ty.display()), || {
+            self.resolve_ty_uncached(ty, span)
+        })
+    }
+
+    fn resolve_ty_uncached(&self, ty: &Ty, span: Span) -> Result<TypeInfo, CtError> {
         if let Some(name) = primitive_name(ty) {
             return Ok(TypeInfo {
                 shape: TypeShape::Primitive {
@@ -271,8 +337,14 @@ impl TypeRegistry {
     /// Resolve a declared [`Type`] (as written) to its [`TypeInfo`]. Used by the
     /// evaluator's `field.ty` accessor and for a top-level entry; unlike
     /// [`resolve_ty`](Self::resolve_ty) it recovers an `Optional[T]`'s element
-    /// from the declared argument (E1 parity).
+    /// from the declared argument (E1 parity). Memoized per type (#1255).
     pub fn resolve_type(&self, t: &Type, span: Span) -> Result<TypeInfo, CtError> {
+        self.memoized(format!("type:{}", type_key(t)), || {
+            self.resolve_type_uncached(t, span)
+        })
+    }
+
+    fn resolve_type_uncached(&self, t: &Type, span: Span) -> Result<TypeInfo, CtError> {
         match t {
             Type::Tuple { elems, .. } => Ok(TypeInfo {
                 shape: TypeShape::Tuple {
@@ -328,6 +400,31 @@ impl TypeRegistry {
             .get(name)
             .cloned()
             .ok_or_else(|| CtError::not_available(format!("a comptime type `{name}`"), span))
+    }
+}
+
+/// A canonical, faithful key for a declared [`Type`] — distinct types get
+/// distinct keys (so the memo never collides `Optional[int64]` with
+/// `Optional[str]`), unlike the `Optional`-erasing [`ty_of_type`].
+fn type_key(t: &Type) -> String {
+    match t {
+        Type::Named { name, args, .. } => {
+            if args.is_empty() {
+                name.clone()
+            } else {
+                let inner: Vec<String> = args.iter().map(type_key).collect();
+                format!("{name}[{}]", inner.join(","))
+            }
+        }
+        Type::Tuple { elems, .. } => {
+            let inner: Vec<String> = elems.iter().map(type_key).collect();
+            format!("({})", inner.join(","))
+        }
+        Type::Func { params, ret, .. } => {
+            let ps: Vec<String> = params.iter().map(type_key).collect();
+            let r = ret.as_ref().map(|r| type_key(r)).unwrap_or_default();
+            format!("fn({})->{}", ps.join(","), r)
+        }
     }
 }
 

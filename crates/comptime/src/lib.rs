@@ -92,6 +92,7 @@ mod lint;
 mod ops;
 mod reflect_ast;
 mod reflect_field;
+mod specialize;
 mod unroll;
 mod value;
 mod walk;
@@ -106,8 +107,9 @@ use zapc_syntax::span::Span;
 pub use error::{CtError, CtErrorKind};
 pub use leaf::{classify_call, LeafKind, ALL_LEAF_KINDS};
 pub use lint::lint_comptime_callable;
-pub use reflect_ast::{type_info_of_enum, type_info_of_struct, TypeRegistry};
+pub use reflect_ast::{type_info_of_enum, type_info_of_struct, MemoStats, TypeRegistry};
 pub use reflect_field::{desugar_reflect_field, field_decl_type, reflect_field};
+pub use specialize::SpecializationCache;
 pub use unroll::{materialize, unroll};
 pub use value::Value;
 
