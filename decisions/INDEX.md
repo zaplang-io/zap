@@ -42,6 +42,7 @@ listed here (see [`README.md`](README.md)).
 | [1265](lang/1265-optional-implicit-widening.md) | A bare value of type `T` implicitly widens to `Optional[T]` in every position | Locked | 2026-11-22 |
 | [1278](lang/1278-exception-families.md) | Package-defined exception families via a single @exception marker | Locked | 2026-11-22 |
 | [1279](lang/1279-scalar-min-max.md) | Exact scalar min/max built-in free functions | Locked | 2026-11-22 |
+| [1290](lang/1290-derivable-registration.md) | "@derivable(Trait) registration model (E3a)" | Accepted | 2026-11-22 |
 
 ## stdlib
 

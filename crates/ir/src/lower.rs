@@ -1054,6 +1054,12 @@ pub fn lower_module_opts_with_types(
     // preserves user-expression spans, so they still key into `types` (which
     // sema recorded over its own `with_prelude` module).
     let module = zapc_syntax::parser::with_prelude(module);
+    // The library-registered derivable traits (#1290, E3a) must be collected
+    // from the PRE-monomorphization module: a `@derivable(Trait)` generator is a
+    // generic free function, which mono drops when it has no instantiation. We
+    // keep only the trait names, so a `@derive(Trait)` can be reported as
+    // deferred-to-E3b (#1291) rather than "unknown derivable trait".
+    let library_derivables = library_derivable_traits(&module);
     // Monomorphize user generics to concrete declarations (I#154, D-0017/D-0064)
     // before any id/type collection runs, so the rest of lowering and all of
     // codegen only ever see concrete types.
@@ -1827,7 +1833,7 @@ pub fn lower_module_opts_with_types(
     // Decorators & annotations (ticket #16, D-0036). Register the signatures of
     // the methods `@derive(...)` will generate, so user calls (`u.eq(v)`) resolve
     // during body lowering, and collect the runtime-reflection metadata.
-    let deco = DecoratorPlan::collect(module, &ctx, &mut errors);
+    let deco = DecoratorPlan::collect(module, &ctx, &library_derivables, &mut errors);
     for (sid, traits) in &deco.derived {
         for t in traits {
             for (mname, psig, ret) in t.signatures(*sid) {
@@ -3314,15 +3320,42 @@ fn field_type_hashable(
     }
 }
 
+/// The library-registered derivable trait names in a module (#1290, E3a): the
+/// `Trait` of each `@derivable(Trait)` on a free function. Collected from the
+/// **pre-monomorphization** AST, because mono drops an uninstantiated generic
+/// generator before the decorator pass runs.
+fn library_derivable_traits(module: &ast::Module) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for item in &module.items {
+        if let ast::Item::Function(f) = item {
+            for d in &f.decorators {
+                if d.name == "derivable" {
+                    if let Some(ast::Expr::Name(t, _)) = d.args.first().map(|a| &a.value) {
+                        set.insert(t.clone());
+                    }
+                }
+            }
+        }
+    }
+    set
+}
+
 impl DecoratorPlan {
     fn collect(
         module: &ast::Module,
         ctx: &StructCtx,
+        library_derivables: &HashSet<String>,
         errors: &mut Vec<LowerError>,
     ) -> DecoratorPlan {
         // Names declared as metadata (annotations) or behavioral decorators.
         // These are what the reflection registry records; the built-in
         // compile-time decorators (`@derive` etc.) leave no runtime trace.
+        //
+        // `library_derivables` (the names a `@derivable(Trait)` generator
+        // registered, #1290, E3a) is collected by the caller from the PRE-mono
+        // module, because mono drops an uninstantiated generic generator; a
+        // `@derive` of one of these is reported as deferred-to-E3b (#1291), not
+        // "unknown derivable trait" (which would contradict sema).
         let mut meta_names: HashSet<String> = HashSet::new();
         for item in &module.items {
             match item {
@@ -3369,6 +3402,21 @@ impl DecoratorPlan {
                                             } else if !traits.contains(&tr) {
                                                 traits.push(tr);
                                             }
+                                        }
+                                        None if library_derivables.contains(t) => {
+                                            // A library `@derivable(T)` trait
+                                            // (#1290): resolved by sema, but its
+                                            // forwarding-impl synthesis is E3b
+                                            // (#1291). Report it as deferred, not
+                                            // "unknown", so nothing half-generates.
+                                            errors.push(err(format!(
+                                                "@derive({t}) on struct '{}' uses a \
+                                                 library-registered derivable trait, \
+                                                 whose code generation is not \
+                                                 implemented yet (deferred to E3b, \
+                                                 #1291)",
+                                                s.name
+                                            )));
                                         }
                                         None => errors.push(err(format!(
                                             "unknown derivable trait '{t}' on struct '{}'",

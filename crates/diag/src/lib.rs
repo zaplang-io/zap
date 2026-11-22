@@ -647,6 +647,17 @@ define_codes! {
          generic has nothing to key or store. `@cache` is a free-function \
          decorator in v1 (not a method). Key on a scalar/`str` id and return a \
          value, or memoize by hand over a module-level dict.";
+    ZAP5057 = 5057 : "invalid @derivable",
+        "`@derivable(Trait)` (E3, #1290, epic #1248) registers a derivable trait \
+         so a library can implement `@derive(Trait)` as a comptime generator. It \
+         takes exactly one positional trait NAME (a bare identifier, e.g. \
+         `@derivable(Serialize)`) and applies to a generic free function — the \
+         generator generic, `def _derive_x[T](...)`. It is rejected here when: it \
+         has no argument, more than one, or a keyword/non-identifier argument; it \
+         is on a non-generic function or a non-function target; the trait name \
+         collides with a compiler built-in derivable (`Eq`/`Ord`/`Json`/`Csv`/ \
+         `Yaml`/`Repr`/`Hash`, which cannot be redefined in v1); or the same \
+         trait name is registered by `@derivable` more than once.";
     ZAP5060 = 5060 : "generator tier-1 enum method not supported",
         "Generators on a tier-1 (unboxed-integer) enum method are not supported \
          yet — tier-1 enum methods do not lower at all yet, generator or not. \
