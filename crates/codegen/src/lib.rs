@@ -2557,6 +2557,14 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[ptr.into(), i64t.into()],
             Some(i64t.into()),
         );
+        // `@exception(Parent)` family-edge registration (#1278): records a
+        // user member type-id -> parent type-id edge at startup (called from
+        // `@__zap_init_globals`), consulted by `zap_exception_parent`'s chain walk.
+        self.declare_rt(
+            "zap_exception_register_parent",
+            &[i64t.into(), i64t.into()],
+            None,
+        );
         // Explicit `raise ... from <cause>` chaining (#604, D-0103): set the
         // cause slot before raising, and read the cause's message for the Zap
         // `<caught>.cause` attribute.

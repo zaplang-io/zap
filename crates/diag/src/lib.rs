@@ -835,6 +835,42 @@ define_codes! {
          PARAMETER is the intended read-only borrowing API. To keep bytes past the \
          backing's lifetime, materialize an owned copy with `.str()`. (Cross-frame \
          returning a view of a parameter needs lifetime tracking deferred past v1.)";
+    ZAP5136 = 5136 : "invalid @exception application",
+        "An `@exception` struct marker (#1278) is malformed. It applies to a \
+         `struct` and takes an OPTIONAL single positional naming the parent \
+         exception type: `@exception` makes the struct a catchable exception on \
+         its own, and `@exception(Parent)` additionally groups it under another \
+         `@exception` struct so `except Parent` catches it. Keyword arguments, \
+         more than one argument, or a parent that is not a bare type name is \
+         rejected here.";
+    ZAP5137 = 5137 : "@exception parent is not an exception type",
+        "The parent named in `@exception(Parent)` (#1278) must itself be a \
+         `struct` carrying the `@exception` marker. A family is built out of \
+         exceptions only: the parent is an ordinary `@exception` (a family root \
+         is not a distinct kind and is itself raiseable), exactly like the \
+         built-in `LookupError ⊃ IndexError` or Python's `OSError ⊃ \
+         FileNotFoundError`. The named type is either undefined, not a struct, or \
+         a struct without `@exception`. This marker adds ONLY a catch-family edge \
+         — it is NOT struct inheritance (no fields or methods are inherited), so a \
+         plain struct can never be an exception parent.";
+    ZAP5138 = 5138 : "exception family has a cycle",
+        "The `@exception(Parent)` edges (#1278) form a cycle (e.g. `A` names `B` \
+         as its parent and `B` names `A`, or a type names itself). An exception \
+         family is a forest: each member has at most one parent and the parent \
+         chain must terminate at a root. Break the cycle so every member reaches \
+         a family root.";
+    ZAP5139 = 5139 : "cannot raise a non-exception type",
+        "`raise X(...)` requires `X` to be a struct carrying the `@exception` \
+         marker (#1278). Raising a plain struct is rejected so that a value type \
+         is never accidentally thrown (the former `raise Point(\"oops\")` footgun). \
+         Mark the type `@exception` (optionally grouping it under a family with \
+         `@exception(Parent)`), or raise one of the built-in exception types.";
+    ZAP5140 = 5140 : "cannot catch a non-exception type",
+        "An `except T` clause names a type `T` that is neither a built-in \
+         exception nor a struct carrying the `@exception` marker (#1278). Only \
+         exceptions can be caught. Mark `T` `@exception` if it is meant to be \
+         raised and caught, or catch its `@exception` family parent / a built-in \
+         exception instead.";
 
     // ---- ZAP6xxx — lowering / IR / codegen (Experimental) ------------------
     ZAP6001 = 6001 : "lowering error",

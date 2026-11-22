@@ -176,6 +176,50 @@ fn semantic_codes() {
     );
 }
 
+/// Package-defined exception families (#1278): the `@exception` marker and its
+/// optional `@exception(Parent)` family edge, plus the raiseability gate. The
+/// codes pinned here are the whole diagnostic surface of the feature.
+#[test]
+fn exception_family_codes() {
+    // Malformed `@exception` application: more than one positional parent arg.
+    assert_code(
+        "@exception(a, b)\nstruct E:\n    int64 x = 0\n\ndef main():\n    pass\n",
+        "ZAP5136",
+    );
+    // `@exception(Parent)` where Parent is a declared type but not `@exception`.
+    assert_code(
+        "struct Plain:\n    int64 x = 0\n\n@exception(Plain)\nstruct E:\n    \
+         int64 x = 0\n\ndef main():\n    pass\n",
+        "ZAP5137",
+    );
+    // A cycle in the family forest (`A`'s parent `B`, `B`'s parent `A`).
+    assert_code(
+        "@exception(B)\nstruct A:\n    int64 x = 0\n\n@exception(A)\nstruct B:\n    \
+         int64 x = 0\n\ndef main():\n    pass\n",
+        "ZAP5138",
+    );
+    // Raising a plain (non-`@exception`) struct — the closed footgun.
+    assert_code(
+        "struct Point:\n    int64 x = 0\n\ndef main():\n    raise Point()\n",
+        "ZAP5139",
+    );
+    // Catching a plain (non-`@exception`) struct.
+    assert_code(
+        "struct Point:\n    int64 x = 0\n\ndef main():\n    try:\n        pass\n    \
+         except Point:\n        pass\n",
+        "ZAP5140",
+    );
+
+    // Accept-case: a well-formed family raises and catches cleanly — none of the
+    // feature's diagnostics fire.
+    let ok = "@exception\nstruct Base:\n    int64 x = 0\n\n@exception(Base)\nstruct Child:\n    \
+              int64 x = 0\n\ndef main():\n    try:\n        raise Child()\n    \
+              except Base:\n        pass\n";
+    for code in ["ZAP5136", "ZAP5137", "ZAP5138", "ZAP5139", "ZAP5140"] {
+        assert_no_code(ok, code);
+    }
+}
+
 /// Assert that checking `src` does NOT surface a diagnostic with `code` — used
 /// for the arena accept-cases, which must type-check without tripping the
 /// leaf-only (`ZAP5130`) or arena-escape (`ZAP5131`) rules.

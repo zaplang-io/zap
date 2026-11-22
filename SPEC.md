@@ -1108,10 +1108,19 @@ finally:
   shorthand for raising `Exception(message)`. A typed `except E` catches `E`
   and its subclasses; clauses are tested in source order. A bare `except` is a
   catch-all and must be last. In `except E as e`, `e` is the message string.
-- A user-defined struct may be raised as an exception with one string message
-  (`raise MyError(message)`). User-defined exception types derive from
-  `Exception`; they can be named in `except` clauses and retain their identity
-  when propagated.
+- A user-defined exception is a `struct` marked `@exception` (#1278). Only an
+  `@exception` struct may be raised (`raise MyError(message)`, one string
+  message) or named in an `except` clause; raising or catching a plain struct is
+  a compile error (ZAP5139 / ZAP5140). An `@exception` type derives from the
+  built-in `Exception` (so `except Exception` still catches it) and retains its
+  identity when propagated. `@exception(Parent)` additionally groups the struct
+  under another `@exception` struct, forming a catchable **family**: `except
+  Parent` then catches the member (and every sibling), while a more specific
+  clause earlier in source order still wins. The parent is itself an ordinary
+  raiseable `@exception` (a family root is not a distinct kind), families may be
+  multi-level, and each member has at most one parent (an acyclic forest). The
+  marker adds only a catch-family edge — no field or method inheritance (general
+  inheritance is the deferred Full-OO epic #66).
 - `raise E(message) from cause` chains an explicit cause (D-0103). The `cause`
   is recorded on the raised exception; when `cause` is a caught exception it is
   stored as that exception (keeping its type and any further cause), otherwise a

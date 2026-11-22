@@ -2,6 +2,7 @@
 # SPEC §10 (I#471): typed exceptions retain their identity, match subclasses,
 # dispatch except clauses in source order, preserve the message binding, and
 # propagate through finally when no clause matches.
+@exception
 struct ParseError:
     str message
 

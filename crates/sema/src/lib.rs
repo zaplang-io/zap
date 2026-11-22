@@ -14,7 +14,7 @@ use zapc_syntax::ast::*;
 use zapc_syntax::fstring::{self, FStringPart, FormatSpec};
 use zapc_syntax::genanalysis;
 use zapc_syntax::span::Span;
-use zapc_syntax::{BUILTIN_SHAREABLE_TYPES, SCOPED_MARKER, SHAREABLE_MARKER};
+use zapc_syntax::{BUILTIN_SHAREABLE_TYPES, EXCEPTION_MARKER, SCOPED_MARKER, SHAREABLE_MARKER};
 
 mod scoped;
 
@@ -230,6 +230,7 @@ pub fn analyze(module: &Module) -> (Vec<TypeError>, Vec<TypeError>) {
     c.collect_sigs(module);
     c.validate_decorators(module);
     c.check_scoped(module);
+    c.check_exceptions();
     c.check_module(module);
     (c.errors, c.warnings)
 }
@@ -258,6 +259,7 @@ pub fn analyze_queryable(module: &Module) -> (Vec<TypeError>, Vec<TypeError>, An
     c.collect_sigs(module);
     c.validate_decorators(module);
     c.check_scoped(module);
+    c.check_exceptions();
     c.check_module(module);
     let facts = c.analysis.take().unwrap_or_default();
     (c.errors, c.warnings, facts)
@@ -328,6 +330,7 @@ pub fn analyze_reflect(module: &Module) -> (Vec<TypeError>, Vec<TypeError>, Refl
     c.collect_sigs(module);
     c.validate_decorators(module);
     c.check_scoped(module);
+    c.check_exceptions();
     c.check_module(module);
     let errors = std::mem::take(&mut c.errors);
     let warnings = std::mem::take(&mut c.warnings);
@@ -511,6 +514,15 @@ struct Checker {
     /// generic spelling is covered by its base. Consulted by the `@scoped`
     /// well-formedness, with-head-only, and escape checks (`crates/sema/src/scoped.rs`).
     scoped_types: HashSet<String>,
+    /// Structs marked `@exception` (#1278): the catchable exception types. Only a
+    /// name in this set (or a built-in exception, [`is_exception_type`]) may be
+    /// `raise`d or named in an `except` clause. Seeded in [`Checker::collect_types`].
+    exception_types: HashSet<String>,
+    /// `@exception(Parent)` family edges (#1278): member type name → (parent type
+    /// name, span of the member struct's decorator) for diagnostics. Validated in
+    /// [`Checker::check_exceptions`] (parent must be `@exception`, forest acyclic).
+    /// Lowering reads this to emit one `zap_exception_register_parent` edge each.
+    exception_parents: HashMap<String, (String, Span)>,
     /// The receiver name (`self`) whose field is a legal move target for a fresh
     /// `@scoped` value (#876, D-0159), set only while walking a method of a
     /// `@scoped` struct. `Some("self")` inside such a method; `None` in a free
@@ -744,6 +756,22 @@ fn is_exception_type(name: &str) -> bool {
     )
 }
 
+/// The head type name a `raise` operand constructs or names, if it is a simple
+/// type reference (#1278 raiseability gate). `raise Foo("msg")` → `"Foo"`, bare
+/// `raise Foo` → `"Foo"`. Anything else (a re-raise of a bound value, a method
+/// call, an arbitrary expression) yields `None`, so it is never gated — only a
+/// name that turns out to be a declared non-exception type is rejected.
+fn raised_type_name(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Call { callee, .. } => match &**callee {
+            Expr::Name(n, _) => Some(n.as_str()),
+            _ => None,
+        },
+        Expr::Name(n, _) => Some(n.as_str()),
+        _ => None,
+    }
+}
+
 /// The classification of an `arena` allocation's first (type) argument (#553,
 /// D-0158): a `bytes` buffer, a leaf struct, a machine scalar, or an invalid /
 /// already-reported argument.
@@ -815,6 +843,13 @@ const BUILTIN_DECORATORS: &[&str] = &[
     // makes it a with-bound affine resource (must define __enter__/__exit__,
     // contagious through ownership). See `docs/design/scoped.md`.
     SCOPED_MARKER,
+    // Exception-type marker (#1278): `@exception` on a `struct` makes it a
+    // catchable exception (raiseable + nameable in `except`); `@exception(Parent)`
+    // additionally groups it under another `@exception` struct so `except Parent`
+    // catches it. Only an `@exception` struct may be raised/caught. One catch-family
+    // edge per member — no field/method inheritance (disjoint from #66). The parent
+    // must itself be an `@exception`; cycles are rejected. See `check_exceptions`.
+    EXCEPTION_MARKER,
     // JSON codec hooks (ticket #346, D-0086): `@json(timestamp="epoch"|"iso8601")`
     // on a `DateTime` field selects its wire form; `@json(open)` on an enum marks
     // it an open (forward-compatible) string enum. See `design/0010-json.md`.
@@ -1172,6 +1207,8 @@ impl Checker {
             deprecated: HashMap::new(),
             shareable_types: HashSet::new(),
             scoped_types: HashSet::new(),
+            exception_types: HashSet::new(),
+            exception_parents: HashMap::new(),
             scoped_self_base: None,
             share_lint_globals: HashSet::new(),
             scopes: Vec::new(),
@@ -1532,6 +1569,17 @@ impl Checker {
                     // marked structs; contagion closes it in `check_scoped`.
                     if s.decorators.iter().any(|d| d.name == SCOPED_MARKER) {
                         self.scoped_types.insert(s.name.clone());
+                    }
+                    // Seed the `@exception` set (#1278) and record any
+                    // `@exception(Parent)` family edge; `check_exceptions`
+                    // validates the parent and acyclicity once the whole
+                    // program is collected.
+                    if let Some(d) = s.decorators.iter().find(|d| d.name == EXCEPTION_MARKER) {
+                        self.exception_types.insert(s.name.clone());
+                        if let Some(Expr::Name(parent, _)) = d.args.first().map(|a| &a.value) {
+                            self.exception_parents
+                                .insert(s.name.clone(), (parent.clone(), d.span));
+                        }
                     }
                 }
                 Item::Interface(i) => {
@@ -3871,6 +3919,34 @@ impl Checker {
                     );
                 }
             }
+            // Exception-type marker (#1278). `@exception` applies to a `struct`
+            // and takes an OPTIONAL single positional naming the parent exception
+            // type: `@exception` (family-less / family root) or `@exception(Parent)`
+            // (grouped under `Parent`). The parent must be a bare type name; that it
+            // names an `@exception` struct and that the resulting forest is acyclic
+            // are checked in `check_exceptions` (it needs the whole program).
+            EXCEPTION_MARKER => {
+                self.require_target(d, target, DecoTarget::Struct);
+                if keywords != 0 || positionals > 1 {
+                    self.error(
+                        ErrorCode::ZAP5136,
+                        "@exception takes an optional parent exception type, \
+                         e.g. @exception or @exception(DNSException)"
+                            .to_string(),
+                        d.span,
+                    );
+                } else if let Some(a) = d.args.first() {
+                    if !matches!(&a.value, Expr::Name(_, _)) {
+                        self.error(
+                            ErrorCode::ZAP5136,
+                            "@exception's parent must be a bare exception type name, \
+                             e.g. @exception(DNSException)"
+                                .to_string(),
+                            d.span,
+                        );
+                    }
+                }
+            }
             // --- test framework (D-0054, issue #73) ---
             "test" | "before" | "after" | "before_all" | "after_all" => {
                 self.require_target(d, target, DecoTarget::Function);
@@ -3982,6 +4058,75 @@ impl Checker {
                     span,
                 );
             }
+        }
+    }
+
+    /// Validate the `@exception` family graph (#1278), after all types are
+    /// collected. Each `@exception(Parent)` edge must name a parent that is
+    /// itself an `@exception` struct (ZAP5137), and the member→parent edges must
+    /// form a forest — no cycles (ZAP5138). The runtime chain-walk this feeds is
+    /// depth-agnostic, so multi-level families are supported directly; acyclicity
+    /// is the only structural obligation (and it guarantees the walk terminates).
+    fn check_exceptions(&mut self) {
+        // Collect diagnostics first (immutable reads of the family maps), then
+        // emit — `self.error` needs `&mut self`, so it cannot run inside a borrow
+        // of `self.exception_parents`.
+        let mut diags: Vec<(ErrorCode, String, Span)> = Vec::new();
+
+        // 1. Parent must be a declared `@exception` struct. A parent that is a
+        //    built-in exception name, a non-exception user type, or undefined is
+        //    rejected here (built-ins are a closed set with no user members, so a
+        //    user family cannot hang off one).
+        for (member, (parent, span)) in &self.exception_parents {
+            if !self.exception_types.contains(parent) {
+                let hint = if member == parent {
+                    " (a type cannot be its own parent)".to_string()
+                } else if self.user_types.contains(parent) {
+                    format!(" ('{parent}' is a type but is not marked `@exception`)")
+                } else if is_exception_type(parent) {
+                    format!(
+                        " (built-in exception '{parent}' cannot be a user family parent; \
+                         raise/catch it directly instead)"
+                    )
+                } else {
+                    format!(" ('{parent}' is not a declared type)")
+                };
+                diags.push((
+                    ErrorCode::ZAP5137,
+                    format!("@exception parent '{parent}' is not an exception type{hint}"),
+                    *span,
+                ));
+            }
+        }
+        // 2. No cycles. Walk each member's parent chain; a repeat means a cycle.
+        //    Report once per member that sits on a cycle, at its own decorator.
+        for (member, (_, span)) in &self.exception_parents {
+            let mut seen: HashSet<&str> = HashSet::new();
+            seen.insert(member.as_str());
+            let mut cur = member.as_str();
+            while let Some((parent, _)) = self.exception_parents.get(cur) {
+                if !seen.insert(parent.as_str()) {
+                    // Closing a loop. Only flag the member when the cycle actually
+                    // contains it (a chain leading *into* someone else's cycle is
+                    // reported at that member instead).
+                    if parent == member {
+                        diags.push((
+                            ErrorCode::ZAP5138,
+                            format!(
+                                "exception family cycle through '{member}': its \
+                                 `@exception(...)` parent chain loops back to itself"
+                            ),
+                            *span,
+                        ));
+                    }
+                    break;
+                }
+                cur = parent.as_str();
+            }
+        }
+
+        for (code, msg, span) in diags {
+            self.error(code, msg, span);
         }
     }
 
@@ -5015,13 +5160,36 @@ impl Checker {
                     }
                 }
             },
-            Stmt::Raise { value, cause, .. } => {
+            Stmt::Raise { value, cause, span } => {
                 // `raise StopIteration` (the iterator exhaustion signal, D-0048)
                 // names a compiler-known exception, not a user value, so it is
                 // not inferred (which would flag it as an unknown name).
                 if let Some(e) = value {
                     if !is_stop_iteration(e) {
                         self.infer(e);
+                    }
+                    // Raiseability gate (#1278): only an `@exception` struct (or a
+                    // built-in exception) may be thrown. When the operand clearly
+                    // names a declared type that is not an exception — `raise
+                    // Point("oops")` or bare `raise Point` — reject it (ZAP5139).
+                    // A bound exception value (`raise e`) is a local, never in
+                    // `user_types`, so re-raises and `raise ... from ...` are
+                    // unaffected.
+                    if let Some(name) = raised_type_name(e) {
+                        if self.user_types.contains(name)
+                            && !is_exception_type(name)
+                            && !self.exception_types.contains(name)
+                        {
+                            self.error(
+                                ErrorCode::ZAP5139,
+                                format!(
+                                    "cannot raise '{name}': it is not an exception type — mark \
+                                     it `@exception` (optionally `@exception(Parent)` to group \
+                                     it under a family), or raise a built-in exception"
+                                ),
+                                *span,
+                            );
+                        }
                     }
                 }
                 // `raise <exc> from <cause>` (#604, D-0103): the cause is an
@@ -5070,7 +5238,24 @@ impl Checker {
                     match &ex.ty {
                         Some(Type::Named { name, args, .. })
                             if args.is_empty()
-                                && (is_exception_type(name) || self.user_types.contains(name)) => {}
+                                && (is_exception_type(name)
+                                    || self.exception_types.contains(name)) => {}
+                        // A declared type that exists but is not an `@exception`
+                        // cannot be caught (#1278): point at the fix rather than
+                        // calling it "unknown".
+                        Some(Type::Named { name, args, .. })
+                            if args.is_empty() && self.user_types.contains(name) =>
+                        {
+                            self.error(
+                                ErrorCode::ZAP5140,
+                                format!(
+                                    "cannot catch '{name}': it is not an exception type — mark it \
+                                 `@exception` if it should be catchable, or catch its \
+                                 `@exception` family parent or a built-in exception"
+                                ),
+                                ex.span,
+                            )
+                        }
                         Some(Type::Named { name, .. }) => self.error(
                             ErrorCode::ZAP3001,
                             format!("unknown exception type '{name}'"),
@@ -18097,8 +18282,9 @@ def main():
     except* ValueError:
         print("handled")
 "#);
-        // A user-defined exception type is a valid `except*` target.
+        // A user-defined `@exception` type is a valid `except*` target (#1278).
         ok(r#"
+@exception
 struct MyError:
     str msg
 def main():

@@ -1,0 +1,6 @@
+xmod base caught local member:
+local member
+xmod base caught dep raise:
+example.com
+xmod concrete caught:
+downstream

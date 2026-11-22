@@ -889,7 +889,7 @@ mod import_resolution_tests {
         let p = Project::new("qualexc");
         p.write(
             "zenv/pkg/sample/src/sample.zap",
-            "struct SampleError:\n    str message\n\
+            "@exception\nstruct SampleError:\n    str message\n\
              def boom():\n    raise SampleError(\"from dep\")\n",
         );
         let entry = p.write(

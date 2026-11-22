@@ -39,6 +39,7 @@ listed here (see [`README.md`](README.md)).
 | [1260](lang/1260-associated-functions.md) | A receiverless def on a struct/enum is an associated function, called as Type.func(...) | Locked | 2026-11-22 |
 | [1262](lang/1262-optional-scalar-coercion.md) | Bare payload `T` auto-wraps to `Some(T)` in every `Optional[T]` position sema accepts | Locked | 2026-11-22 |
 | [1265](lang/1265-optional-implicit-widening.md) | A bare value of type `T` implicitly widens to `Optional[T]` in every position | Locked | 2026-11-22 |
+| [1278](lang/1278-exception-families.md) | Package-defined exception families via a single @exception marker | Locked | 2026-11-22 |
 
 ## stdlib
 

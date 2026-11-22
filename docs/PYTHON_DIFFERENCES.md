@@ -323,8 +323,11 @@ deliberately differs in a few places:
   Decimal("-1")` is `0`, where CPython yields `-0`.
 - **Flat exception model.** CPython's `decimal.InvalidOperation` (malformed
   literal, unknown rounding tag) and `decimal.DivisionByZero` both surface as
-  Zap's `ValueError` (Zap has no exception subclassing — the `statistics` /
-  `StatisticsError` precedent).
+  Zap's `ValueError` (these modules map errors onto the built-in hierarchy
+  rather than defining their own `@exception` family — the `statistics` /
+  `StatisticsError` precedent). Zap *does* support package-defined exception
+  families since #1278 (`@exception` / `@exception(Parent)`, a catch-family edge
+  only, not general subclassing); `decimal` deliberately stays flat.
 - **`quantize` never raises on precision.** CPython raises `InvalidOperation` if
   the quantized result would exceed the context precision; with no context, Zap's
   `quantize` always succeeds.
