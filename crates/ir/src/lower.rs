@@ -8942,6 +8942,149 @@ impl<'a> FnLower<'a> {
                 });
                 return Ok((d, int_ty));
             }
+            // Scalar integer-preserving `abs` (#1283). A float yields its f64
+            // magnitude via `zap_math_fabs` (correct for -0.0 and NaN). An
+            // unsigned value is already its own magnitude (identity, uint64). A
+            // signed integer stays an integer: `|x| = x < 0 ? -x : x`, computed
+            // with an integer negate and `select` — never through float. The one
+            // value with no int64 result, `INT64_MIN` (its magnitude 2^63 does
+            // not fit int64), raises a catchable ArithmeticError rather than
+            // silently wrapping back to INT64_MIN.
+            if fname == "abs" {
+                if args.len() != 1 || args.iter().any(|a| a.name.is_some()) {
+                    return Err(err("abs() takes exactly one positional numeric argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                if matches!(vt, Ty::F32 | Ty::F64) {
+                    let f = self.as_f64(v, vt);
+                    let d = self.new_value(Ty::F64);
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_math_fabs".to_string(),
+                        args: vec![f],
+                    });
+                    return Ok((d, Ty::F64));
+                }
+                if vt.is_unsigned() {
+                    let u = self.coerce(v, vt, Ty::U64);
+                    return Ok((u, Ty::U64));
+                }
+                let li = self.coerce(v, vt, Ty::I64);
+                // Guard INT64_MIN: `-INT64_MIN` overflows (two's complement wraps
+                // back to INT64_MIN), so raise ArithmeticError instead.
+                let intmin = self.iconst(Ty::I64, i64::MIN);
+                let is_min = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: is_min,
+                    pred: CmpPred::Eq,
+                    lhs: li,
+                    rhs: intmin,
+                });
+                let throw_bb = self.new_block();
+                let cont_bb = self.new_block();
+                self.set_term(Term::BrIf {
+                    cond: is_min,
+                    then_bb: throw_bb,
+                    else_bb: cont_bb,
+                });
+                self.position(throw_bb);
+                let msg = self.new_value(Ty::Ptr);
+                self.emit(Inst::StrConst {
+                    dest: msg,
+                    bytes: b"abs() of the smallest int64 (-2**63) has no int64 result".to_vec(),
+                });
+                let arith = self.iconst(Ty::I64, 8); // ZAP_EXC_ARITHMETIC_ERROR
+                self.throwing_call(None, "zap_panic_typed", vec![arith, msg]);
+                if !self.terminated() {
+                    self.set_term(Term::Unreachable);
+                }
+                self.position(cont_bb);
+                let zero = self.iconst(Ty::I64, 0);
+                let is_neg = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: is_neg,
+                    pred: CmpPred::Lt,
+                    lhs: li,
+                    rhs: zero,
+                });
+                let neg = self.new_value(Ty::I64);
+                self.emit(Inst::Un {
+                    dest: neg,
+                    op: UnOp::Neg,
+                    val: li,
+                });
+                let d = self.new_value(Ty::I64);
+                self.emit(Inst::Select {
+                    dest: d,
+                    cond: is_neg,
+                    a: neg,
+                    b: li,
+                });
+                return Ok((d, Ty::I64));
+            }
+            // Scalar `divmod(a, b)` -> `(quotient, remainder)` (#1283). Uses the
+            // same floored `//` and `%` helpers the operators do, so
+            // `divmod(a, b) == (a // b, a % b)` for every sign and the integer
+            // path never goes through float. A zero divisor raises
+            // ZeroDivisionError from the helper (an unwinding `invoke`).
+            if fname == "divmod" {
+                if args.len() != 2 || args.iter().any(|a| a.name.is_some()) {
+                    return Err(err(
+                        "divmod() takes exactly two positional numeric arguments",
+                    ));
+                }
+                let (l, lt) = self.expr(&args[0].value)?;
+                let (r, rt) = self.expr(&args[1].value)?;
+                let is_float = matches!(lt, Ty::F32 | Ty::F64) || matches!(rt, Ty::F32 | Ty::F64);
+                let (q, rem, elem_ty) = if is_float {
+                    let lf = self.as_f64(l, lt);
+                    let rf = self.as_f64(r, rt);
+                    // Float floor-div by zero yields inf (a plain call, like `//`);
+                    // float modulo by zero raises (a throwing call, like `%`).
+                    let q = self.new_value(Ty::F64);
+                    self.emit(Inst::Call {
+                        dest: Some(q),
+                        func: "zap_ffloordiv".to_string(),
+                        args: vec![lf, rf],
+                    });
+                    let rem = self.new_value(Ty::F64);
+                    self.throwing_call(Some(rem), "zap_ffmod", vec![lf, rf]);
+                    (q, rem, Ty::F64)
+                } else {
+                    let unsigned = lt.is_unsigned() || rt.is_unsigned();
+                    let int_ty = if unsigned { Ty::U64 } else { Ty::I64 };
+                    let li = self.coerce(l, lt, int_ty);
+                    let ri = self.coerce(r, rt, int_ty);
+                    let (divf, modf) = if unsigned {
+                        ("zap_udiv", "zap_umod")
+                    } else {
+                        ("zap_ifloordiv", "zap_imod")
+                    };
+                    let q = self.new_value(int_ty);
+                    self.throwing_call(Some(q), divf, vec![li, ri]);
+                    let rem = self.new_value(int_ty);
+                    self.throwing_call(Some(rem), modf, vec![li, ri]);
+                    (q, rem, int_ty)
+                };
+                // Build the `(quotient, remainder)` 2-tuple (same shape as a
+                // tuple literal / `return a, b`).
+                let sid = self.ctx.tuples.borrow_mut().intern(vec![elem_ty, elem_ty]);
+                let dest = self.new_value(Ty::Struct(sid));
+                self.emit(Inst::StructNew { dest, sid });
+                self.emit(Inst::FieldSet {
+                    base: dest,
+                    sid,
+                    idx: 0,
+                    val: q,
+                });
+                self.emit(Inst::FieldSet {
+                    base: dest,
+                    sid,
+                    idx: 1,
+                    val: rem,
+                });
+                return Ok((dest, Ty::Struct(sid)));
+            }
             // String/char builtins (ticket #284, D-0025).
             if fname == "ord" {
                 // ord(c): the codepoint number of a `char`, as an `int`.
