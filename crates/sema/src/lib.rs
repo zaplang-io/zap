@@ -309,6 +309,25 @@ impl Reflector {
             span: Span::default(),
         })
     }
+
+    /// The **library-registered** derivable traits (#1290, E3a): for each module
+    /// `@derivable(Trait)`, the tuple `(trait name, generator function name,
+    /// registration span)`. This is the binding E3b (#1291) consumes to splice
+    /// the forwarding impl; E1/E2 consumers ignore it. The compiler built-in
+    /// derivables (`Eq`/`Repr`/…) are **not** listed — they have no library
+    /// generator. Order is unspecified (registry is a map).
+    pub fn library_derivables(&self) -> Vec<(&str, &str, Span)> {
+        self.checker
+            .derivable
+            .iter()
+            .filter_map(|(name, e)| match e {
+                DerivableEntry::Library { generator, span } => {
+                    Some((name.as_str(), generator.as_str(), *span))
+                }
+                DerivableEntry::Builtin => None,
+            })
+            .collect()
+    }
 }
 
 /// Type-check a module and return `(errors, warnings, reflector)` (#1257): the
@@ -474,6 +493,12 @@ struct Checker {
     annotations: HashMap<String, Vec<String>>,
     /// Declared `decorator` names (behavioral, D-0036).
     user_decorators: HashSet<String>,
+    /// The derivable-trait registry (#1290, E3a): trait name → how it is
+    /// derived (a compiler built-in, or a library `@derivable` generator).
+    /// Pre-seeded with [`DERIVABLE_TRAITS`] and extended, order-independently,
+    /// from each module `@derivable(...)` in [`Checker::collect_types`]. Consulted
+    /// where `@derive(X)` is validated, in place of the old closed list.
+    derivable: HashMap<String, DerivableEntry>,
     /// Receiver name → canonical `arch.*` module registry name, for the
     /// architecture-specific intrinsics family (I#139 Tier 2, D-0199). Built
     /// from the module's `import arch.x86_64 [as name]` / `import arch.aarch64
@@ -829,6 +854,11 @@ fn is_leaf_scalar_ty(t: &Ty) -> bool {
 /// compile-time error (consistent with compile-time typo-catching, D-0016).
 const BUILTIN_DECORATORS: &[&str] = &[
     "derive",
+    // Derivable-trait registration (E3, #1290): `@derivable(Trait)` on a generic
+    // free function registers it as the generator for `@derive(Trait)`. The
+    // registration is collected in `collect_types`; the arg-shape/target check is
+    // in `check_builtin_decorator`.
+    "derivable",
     "cache",
     "default",
     "validate",
@@ -942,10 +972,34 @@ fn deprecated_message(decorators: &[zapc_syntax::ast::Decorator]) -> Option<Opti
     Some(msg)
 }
 
-/// The traits `@derive(...)` can generate (D-0036). Only `Eq` and `Repr` are
-/// lowered to code in this increment; the rest are accepted here and reported as
-/// deferred by the lowering pass.
+/// The compiler **built-in** derivable traits (D-0036) — the ones the hard-coded
+/// scaffold lowers (dunder synthesis at `collect_sigs`, codegen in `zapc_ir`).
+/// They are **pre-registered** in the derivable registry (#1290, E3a) so every
+/// existing `@derive(...)` program keeps compiling once resolution moves to the
+/// registry; a library `@derivable(...)` adds to the set without touching these.
 const DERIVABLE_TRAITS: &[&str] = &["Eq", "Ord", "Json", "Csv", "Yaml", "Repr", "Hash"];
+
+/// One entry in the derivable-trait registry (#1290, E3a — epic #1289 / #1248).
+/// `@derive(X)` resolves against this registry instead of a closed list, so a
+/// library can make a new trait derivable.
+#[derive(Clone, Debug)]
+enum DerivableEntry {
+    /// A compiler built-in ([`DERIVABLE_TRAITS`]): lowered by the existing
+    /// scaffold. Pre-registered at [`Checker::new`] for back-compat (D-0036).
+    Builtin,
+    /// A library-registered derivable: a generic free function marked
+    /// `@derivable(Trait)` is its **generator**. E3a records the binding (the
+    /// generator's name and the registration span); the forwarding-impl
+    /// synthesis that consumes it is **E3b** (#1291). Until then a
+    /// `@derive(<library trait>)` resolves cleanly but lowering reports it as
+    /// deferred rather than half-generating.
+    Library {
+        /// The name of the generic generator `def` carrying `@derivable`.
+        generator: String,
+        /// The span of the `@derivable(...)` application (for diagnostics).
+        span: Span,
+    },
+}
 
 /// Where a decorator/annotation is attached — used for target-suitability
 /// checks (e.g. `@derive` only on a struct).
@@ -1201,6 +1255,10 @@ impl Checker {
             cyclic_aliases: HashSet::new(),
             annotations: HashMap::new(),
             user_decorators: HashSet::new(),
+            derivable: DERIVABLE_TRAITS
+                .iter()
+                .map(|t| (t.to_string(), DerivableEntry::Builtin))
+                .collect(),
             arch_imports: HashMap::new(),
             unsafe_depth: 0,
             target_feature_fns: HashSet::new(),
@@ -1452,6 +1510,76 @@ impl Checker {
 
     // --- collection passes ---
 
+    /// Collect a `@derivable(Trait)` registration from a free function (#1290,
+    /// E3a). Runs in [`Checker::collect_types`] pass 1 so the binding is visible
+    /// to every `@derive(...)` in the module, whichever is declared first. The
+    /// arg-shape and target of `@derivable` itself are validated in
+    /// [`Checker::check_builtin_decorator`]; here a well-formed
+    /// `@derivable(<identifier>)` is registered and only the registration-level
+    /// diagnostics are emitted (non-generic generator, collision with a built-in,
+    /// duplicate trait).
+    fn collect_derivable(&mut self, f: &zapc_syntax::ast::Function) {
+        let Some(d) = f.decorators.iter().find(|d| d.name == "derivable") else {
+            return;
+        };
+        // Only a well-formed `@derivable(<one positional identifier>)` registers;
+        // a malformed application is reported by `check_builtin_decorator`.
+        let name = match d.args.as_slice() {
+            [a] if a.name.is_none() => match &a.value {
+                Expr::Name(n, _) => n.clone(),
+                _ => return,
+            },
+            _ => return,
+        };
+        // The generator is specialized per concrete type, so it must be generic.
+        if f.generics.is_empty() {
+            self.error(
+                ErrorCode::ZAP5057,
+                format!(
+                    "@derivable generator for '{name}' must be generic, e.g. \
+                     `def {}[T](...)`",
+                    f.name
+                ),
+                d.span,
+            );
+            return;
+        }
+        // A built-in derivable name cannot be redefined by a library in v1.
+        if DERIVABLE_TRAITS.contains(&name.as_str()) {
+            self.error(
+                ErrorCode::ZAP5057,
+                format!(
+                    "'{name}' is a built-in derivable trait and cannot be \
+                     redefined with @derivable"
+                ),
+                d.span,
+            );
+            return;
+        }
+        // A trait name may be registered at most once.
+        if matches!(
+            self.derivable.get(&name),
+            Some(DerivableEntry::Library { .. })
+        ) {
+            self.error(
+                ErrorCode::ZAP5057,
+                format!(
+                    "derivable trait '{name}' is already registered by another \
+                     @derivable"
+                ),
+                d.span,
+            );
+            return;
+        }
+        self.derivable.insert(
+            name,
+            DerivableEntry::Library {
+                generator: f.name.clone(),
+                span: d.span,
+            },
+        );
+    }
+
     fn collect_types(&mut self, module: &Module) {
         // The compiler-known capability interfaces (D-0139/#806) exist before any
         // user item, so a `[K: Hashable]` bound or a conformance check resolves
@@ -1493,6 +1621,12 @@ impl Checker {
                 }
                 Item::Decorator(d) => {
                     self.user_decorators.insert(d.name.clone());
+                }
+                Item::Function(f) => {
+                    // Register `@derivable(Trait)` generators (#1290, E3a) in
+                    // pass 1 so `@derive(Trait)` resolves regardless of which is
+                    // declared first (whole-module).
+                    self.collect_derivable(f);
                 }
                 _ => {}
             }
@@ -3463,12 +3597,16 @@ impl Checker {
                             d.span,
                         );
                     } else if let Expr::Name(t, _) = &a.value {
-                        if !DERIVABLE_TRAITS.contains(&t.as_str()) {
+                        // Resolve against the derivable registry (#1290, E3a):
+                        // a built-in (`DERIVABLE_TRAITS`) or a library trait
+                        // registered with `@derivable(...)`, in any declaration
+                        // order (the registry is built in pass 1).
+                        if !self.derivable.contains_key(t.as_str()) {
                             self.error(
                                 ErrorCode::ZAP5035,
                                 format!(
-                                    "unknown derivable trait '{t}' (expected one of \
-                                     Eq, Ord, Json, Repr, Hash)"
+                                    "unknown derivable trait '{t}' (not a built-in \
+                                     derivable, and not registered with @derivable)"
                                 ),
                                 d.span,
                             );
@@ -3480,6 +3618,27 @@ impl Checker {
                             d.span,
                         );
                     }
+                }
+            }
+            "derivable" => {
+                // `@derivable(Trait)` registers a library derive generator
+                // (#1290, E3a). It applies to a (generic) free function and takes
+                // exactly one positional trait-name identifier. The registration
+                // itself — and the generic/collision/duplicate checks — happen in
+                // `collect_derivable` (pass 1); here we validate the application's
+                // target and argument shape.
+                self.require_target(d, target, DecoTarget::Function);
+                let well_formed = matches!(
+                    d.args.as_slice(),
+                    [a] if a.name.is_none() && matches!(&a.value, Expr::Name(_, _))
+                );
+                if !well_formed {
+                    self.error(
+                        ErrorCode::ZAP5057,
+                        "@derivable takes exactly one positional trait name, \
+                         e.g. @derivable(Serialize)",
+                        d.span,
+                    );
                 }
             }
             "json" => {

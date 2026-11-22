@@ -41,6 +41,7 @@ listed here (see [`README.md`](README.md)).
 | [1262](lang/1262-optional-scalar-coercion.md) | Bare payload `T` auto-wraps to `Some(T)` in every `Optional[T]` position sema accepts | Locked | 2026-11-22 |
 | [1265](lang/1265-optional-implicit-widening.md) | A bare value of type `T` implicitly widens to `Optional[T]` in every position | Locked | 2026-11-22 |
 | [1278](lang/1278-exception-families.md) | Package-defined exception families via a single @exception marker | Locked | 2026-11-22 |
+| [1290](lang/1290-derivable-registration.md) | "@derivable(Trait) registration model (E3a)" | Accepted | 2026-11-22 |
 
 ## stdlib
 
