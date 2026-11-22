@@ -9507,6 +9507,44 @@ impl<'a> FnLower<'a> {
         ))
     }
 
+    /// Does a value of ZIR type `it` denote a bare **payload** for an
+    /// `Optional[T]` whose payload type is `payload` — i.e. a `T` that must be
+    /// wrapped as `Some(T)` (#1262)? True for an exact payload match (a
+    /// reference struct, a `str`/`bytes` pointer, a nested `Optional`, or the
+    /// same scalar), the numeric widenings/narrowings `coerce` performs (an
+    /// `int` literal into `Optional[int32]`, into `Optional[float]`, or into
+    /// `Optional[bigint]`/`Optional[complex]`), and a concrete struct / tier-1
+    /// enum flowing into an `Optional[SomeInterface]` (where `coerce` builds the
+    /// fat pointer). It is deliberately conservative: an unrelated source — or
+    /// one that is already a *different* `Optional` — returns false and is left
+    /// to the caller's `coerce` / sema (a genuine mismatch is rejected there,
+    /// never silently wrapped). The already-`Optional[T]` self case (an explicit
+    /// `Optional.Some(...)`, an Optional-typed binding) is handled separately by
+    /// the `it == target` guard at the wrap site, so it is never reached here.
+    fn opt_payload_source(&self, it: &Ty, payload: Ty) -> bool {
+        if *it == payload {
+            return true;
+        }
+        let it_num = it.int_width().is_some() || it.is_float();
+        let payload_num = payload.int_width().is_some()
+            || payload.is_float()
+            || payload == Ty::Bigint
+            || payload == Ty::Complex;
+        if it_num && payload_num {
+            return true;
+        }
+        // A concrete struct / tier-1 enum into an interface-typed payload: the
+        // inner `coerce` builds the `{data, itable}` fat pointer (D-0016), so the
+        // boxed interface value is a valid `Some` payload.
+        if let Ty::Struct(psid) = payload {
+            if self.ctx.iid_of_fat_sid(psid).is_some() && matches!(it, Ty::Struct(_) | Ty::Enum(_))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Collection literals take their element kinds from the destination when
     /// known (#637). In particular, an empty `{}` must not default to
     /// dict[int64, int64] when appended to list[dict[str, bool]]. Recurse through
@@ -9520,6 +9558,46 @@ impl<'a> FnLower<'a> {
         // index/key assignment, so `list[Optional[T]] = [None]` no longer bails.
         if matches!(e, Expr::None(_)) {
             return Ok((self.lower_none_expr(target)?, target));
+        }
+        // A bare payload value in an `Optional[T]` position auto-wraps to
+        // `Some(payload)` (#1262) — the symmetric partner of the bare-`None`
+        // lowering above (`lower_none_expr`). Without it a scalar keyword such as
+        // `Delta(day=1)` stored the raw `int` straight into the Optional field
+        // (`iconst` + `fieldset`, no tag or allocation), so a later `.unwrap()`
+        // dereferenced the integer as an Optional object and segfaulted (a
+        // memory-safety violation in a checked program). This is the single
+        // chokepoint every type-contextual position flows through: constructor
+        // fields, field assignment, call arguments and returns reach it via
+        // `expr_coerced`; collection elements (`list[Optional[T]]`, dict values,
+        // `.append`, index/key assignment) reach it directly. Sema currently
+        // accepts a bare payload only in the constructor-field, field/index/key
+        // assignment, and `.append` positions (the ones that crashed); it still
+        // rejects `return` / parameter / typed-binding / list-literal payloads
+        // with a clean type error, so the wrap there is defensive and inert until
+        // that implicit-widening design decision (#1265) is taken. See
+        // `decisions/lang/1262-optional-scalar-coercion.md`.
+        //
+        // The value is lowered against the *payload* type (so a nested
+        // collection payload still inherits its element kinds), then tagged via
+        // the shared `gen_opt_some` — the same already-GC-rooted
+        // `StructNew`/`FieldSet` construction an explicit `Optional.Some(...)`
+        // emits, so no new rooted `Inst` and no raising runtime call are
+        // introduced. An already-`Optional[T]` source (an Optional-typed binding,
+        // `Optional.Some(...)`, a ternary of Optionals) lowers to the Optional
+        // type itself and is returned unwrapped, so it is never double-wrapped;
+        // an incompatible source passes through unchanged for the caller's
+        // `coerce` / sema to reject (never silently wrapped).
+        if let Some(opt) = optional_layout(self.ctx, target) {
+            let (iv, it) = self.expr_collection_context(e, opt.payload_ty)?;
+            if it == target {
+                return Ok((iv, target));
+            }
+            if self.opt_payload_source(&it, opt.payload_ty) {
+                let inner = self.coerce(iv, it, opt.payload_ty);
+                let some = gen_opt_some(self, &opt, inner);
+                return Ok((some, target));
+            }
+            return Ok((iv, it));
         }
         match (e, target) {
             (Expr::List(items, _), Ty::List(elem)) => {
