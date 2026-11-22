@@ -594,6 +594,12 @@ impl<'a> Evaluator<'a> {
                 ));
             }
         }
+        // Shared leaf table (#1254): an impure leaf call (e.g. `print(...)`,
+        // `time.now()`) is refused here with its leaf kind — the same table the
+        // static reject-lint consults, so the two layers agree on membership.
+        if let Some(kind) = crate::leaf::classify_call(callee) {
+            return Err(CtError::not_available(kind.as_str(), span));
+        }
         match callee {
             Expr::Attr { base, name, .. } => {
                 // `reflect.<fn>(...)` module builtins (#1253 override hook).
@@ -1118,7 +1124,7 @@ pub(crate) fn expr_span(e: &Expr) -> Span {
 }
 
 /// The source span of a statement.
-fn stmt_span(s: &Stmt) -> Span {
+pub(crate) fn stmt_span(s: &Stmt) -> Span {
     match s {
         Stmt::Let { span, .. }
         | Stmt::Assign { span, .. }
