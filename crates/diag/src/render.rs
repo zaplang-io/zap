@@ -141,10 +141,46 @@ pub fn render_diagnostic_sev(
     message: &str,
     span: Option<(u32, u32)>,
 ) -> String {
-    let sev = severity.label();
+    render_labeled(
+        src,
+        file,
+        &format!("{}[{code}]", severity.label()),
+        message,
+        span,
+    )
+}
+
+/// Render a secondary **note** with a location and caret, for a multi-part
+/// diagnostic — the `required because of …` frames of a derive/instantiation
+/// backtrace, or a dual-span "instantiated here" (#1256). Unlike a primary
+/// diagnostic a note carries **no error code**: it annotates another location in
+/// support of the primary error. With a span and source it is the three-line
+/// `file:line:column: note: message` / source-line / caret form; without, it
+/// degrades to the single `file: note: message` line.
+pub fn render_note(
+    src: Option<&str>,
+    file: &str,
+    message: &str,
+    span: Option<(u32, u32)>,
+) -> String {
+    render_labeled(src, file, "note", message, span)
+}
+
+/// Shared body of [`render_diagnostic_sev`] and [`render_note`]: emit
+/// `file:line:column: <label>: message` with the offending source line and a
+/// caret underlining the span (clipped to the first line). `label` is the fully
+/// formatted severity+code (`error[ZAP0001]`) or a bare note label (`note`).
+/// Degrades to `file: <label>: message` when the span or source is absent.
+fn render_labeled(
+    src: Option<&str>,
+    file: &str,
+    label: &str,
+    message: &str,
+    span: Option<(u32, u32)>,
+) -> String {
     let (src, (start, end)) = match (src, span) {
         (Some(src), Some(span)) => (src, span),
-        _ => return format!("{file}: {sev}[{code}]: {message}"),
+        _ => return format!("{file}: {label}: {message}"),
     };
 
     let index = LineIndex::new(src);
@@ -152,7 +188,7 @@ pub fn render_diagnostic_sev(
     let end = clamp_to_boundary(src, end.min(index.len)).max(start);
     let (line, col) = index.line_col(src, start);
 
-    let mut out = format!("{file}:{line}:{col}: {sev}[{code}]: {message}");
+    let mut out = format!("{file}:{line}:{col}: {label}: {message}");
 
     // Underneath the header, echo the offending line and underline the span,
     // clipped to that line (a span that runs onto later lines underlines only

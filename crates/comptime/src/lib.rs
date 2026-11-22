@@ -97,6 +97,7 @@ mod unroll;
 mod value;
 mod walk;
 
+pub mod diagnostics;
 pub mod error;
 
 use std::collections::HashMap;
@@ -104,6 +105,13 @@ use std::collections::HashMap;
 use zapc_syntax::ast::{Expr, Function};
 use zapc_syntax::span::Span;
 
+pub use diagnostics::{
+    error_code, render_ct_error, render_derive_error, render_generator_fault, DeriveBacktrace,
+    Frame,
+};
+// Re-export the stable error-code type (#239) so a consumer of the #1256
+// diagnostics API (`error_code`) can name a `ZAP7001`/`7002`/`7003` without a
+// second dependency edge on `zapc_diag`.
 pub use error::{CtError, CtErrorKind};
 pub use leaf::{classify_call, LeafKind, ALL_LEAF_KINDS};
 pub use lint::lint_comptime_callable;
@@ -112,6 +120,7 @@ pub use reflect_field::{desugar_reflect_field, field_decl_type, reflect_field};
 pub use specialize::SpecializationCache;
 pub use unroll::{materialize, unroll};
 pub use value::Value;
+pub use zapc_diag::ErrorCode;
 
 // Re-export the E1 reflection records so a consumer can build comptime inputs
 // without a second dependency edge.

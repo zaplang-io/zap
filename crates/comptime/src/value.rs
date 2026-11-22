@@ -19,6 +19,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use zapc_sema_types::{AttrArg, AttrInfo, FieldInfo, TypeInfo, TypeKind, VariantInfo};
+use zapc_syntax::span::Span;
 
 /// A compile-time value in the Tier-B1 fragment (#1250).
 #[derive(Clone)]
@@ -51,6 +52,12 @@ pub enum Value {
     AttrArg(Rc<AttrArg>),
     /// A `TypeKind` tag (the `kind` of a [`Value::Type`]).
     Kind(TypeKind),
+    /// A source [`Span`] — the `.span` of a reflection record (a field,
+    /// variant, or attribute). Its one use is as the `at` argument of
+    /// `comptime.error(at, msg)` (#1256), so a generator can point a
+    /// library-authored diagnostic at the user's offending declaration. It has
+    /// no runtime representation (it never materializes into emitted code).
+    Span(Span),
 }
 
 impl Value {
@@ -69,6 +76,15 @@ impl Value {
             Value::Attr(_) => "AttrInfo",
             Value::AttrArg(_) => "AttrArg",
             Value::Kind(_) => "TypeKind",
+            Value::Span(_) => "Span",
+        }
+    }
+
+    /// The source span this value holds, if it is a [`Value::Span`].
+    pub fn as_span(&self) -> Option<Span> {
+        match self {
+            Value::Span(s) => Some(*s),
+            _ => None,
         }
     }
 
@@ -129,6 +145,7 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Tuple(a), Value::Tuple(b)) => a == b,
             (Value::Kind(a), Value::Kind(b)) => a == b,
+            (Value::Span(a), Value::Span(b)) => a == b,
             (Value::Type(a), Value::Type(b)) => Rc::ptr_eq(a, b),
             (Value::Field(a), Value::Field(b)) => Rc::ptr_eq(a, b),
             (Value::Variant(a), Value::Variant(b)) => Rc::ptr_eq(a, b),
@@ -154,6 +171,7 @@ impl fmt::Debug for Value {
             Value::Attr(x) => write!(f, "Attr({:?})", x.name),
             Value::AttrArg(x) => write!(f, "AttrArg({:?}={:?})", x.name, x.value),
             Value::Kind(k) => write!(f, "Kind({})", k.as_str()),
+            Value::Span(s) => write!(f, "Span({}..{})", s.start, s.end),
         }
     }
 }

@@ -20,7 +20,8 @@
 //! | `ZAP4xxx`        | type        | sema (type checking) |
 //! | `ZAP5xxx`        | semantic    | sema (declaration / rule validation) |
 //! | `ZAP6xxx`        | backend     | lowering / IR / codegen |
-//! | `ZAP7xxx`–`9xxx` | *reserved*  | future phases (linker, const-eval, …) |
+//! | `ZAP7xxx`        | const-eval  | comptime evaluation / `@derive` (#1256) |
+//! | `ZAP8xxx`–`9xxx` | *reserved*  | future phases (linker, …) |
 //!
 //! Severity (error vs warning) is **orthogonal** and is carried by the
 //! diagnostic, not encoded in the code: a code names a *condition*, which could
@@ -78,7 +79,10 @@ pub enum Category {
     Semantic,
     /// `ZAP6xxx` — lowering, IR, and codegen.
     Backend,
-    /// `ZAP7xxx`–`ZAP9xxx` — reserved for future phases.
+    /// `ZAP7xxx` — compile-time evaluation (the comptime engine, `@derive`),
+    /// the const-eval phase (#1256, epic #1249).
+    ConstEval,
+    /// `ZAP8xxx`–`ZAP9xxx` — reserved for future phases.
     Reserved,
 }
 
@@ -93,6 +97,7 @@ impl Category {
             Category::Type => "type",
             Category::Semantic => "semantic",
             Category::Backend => "backend",
+            Category::ConstEval => "const-eval",
             Category::Reserved => "reserved",
         }
     }
@@ -131,6 +136,7 @@ impl ErrorCode {
             4 => Category::Type,
             5 => Category::Semantic,
             6 => Category::Backend,
+            7 => Category::ConstEval,
             _ => Category::Reserved,
         }
     }
@@ -904,6 +910,35 @@ define_codes! {
          the stored token is empty/unreadable. Tokens live outside the repo in \
          `$ZAP_CACHE/credentials` and are only consumed by the hosted write \
          API; a local/`file://` index needs none.";
+
+    // ---- ZAP7xxx — const-eval / comptime engine (Experimental; #1256, #1249) --
+    // The compile-time evaluation engine (`crates/comptime`, epic #1249) runs a
+    // pure, bounded subset of Zap at compile time. Its failures carry stable
+    // codes so a tool/agent can key off the condition without parsing prose, and
+    // so the `@derive` diagnostics (#1256, HQ4) read like any other front-end
+    // error. Severity is on the diagnostic, not the code.
+    ZAP7001 = 7001 : "comptime evaluation error",
+        "The compile-time evaluator rejected a construct or hit a fault while \
+         folding comptime code (epic #1249): a construct outside the pure \
+         comptime fragment (I/O, FFI, spawn, channels, recursion, floats/bigint, \
+         `match`, …, reported as `not available at comptime`), a value fault \
+         (division by zero, an out-of-range index), or a resource cap (the fixed \
+         step/recursion budget). The message names the specific construct and \
+         the span points at it.";
+    ZAP7002 = 7002 : "error raised by comptime code",
+        "A library's compile-time generator deliberately aborted compilation \
+         with `comptime.error(at, msg)` (the Zig `@compileError` model, #1256) — \
+         for example a codec that does not support a particular field type. The \
+         message is the library author's own text and the span points at the \
+         offending declaration (typically the user's field). This is a \
+         library-authored diagnostic, not a compiler fault.";
+    ZAP7003 = 7003 : "cannot derive trait for type",
+        "A `@derive(X)` could not be applied to a type (#1256, epic #1249): the \
+         derived trait's generator cannot handle one of the type's fields or \
+         variants. The diagnostic points at the user's own offending field and, \
+         for a nested cause, renders the `required because of …` instantiation \
+         backtrace down to the failing point. It is always consumer-grade — it \
+         names your declaration, never a comptime-internal symbol.";
 }
 
 #[cfg(test)]
@@ -946,6 +981,7 @@ mod tests {
         assert_eq!(ErrorCode::ZAP4001.category(), Category::Type);
         assert_eq!(ErrorCode::ZAP5001.category(), Category::Semantic);
         assert_eq!(ErrorCode::ZAP6001.category(), Category::Backend);
+        assert_eq!(ErrorCode::ZAP7001.category(), Category::ConstEval);
     }
 
     #[test]
