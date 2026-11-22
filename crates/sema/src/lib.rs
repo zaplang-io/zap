@@ -648,6 +648,11 @@ const BUILTINS: &[&str] = &[
     // (#1064); the same mixing `@derive(Hash)` uses, so the two agree in-run.
     "hash_combine",
     "sum",
+    // Exact scalar min/max of two numeric arguments (#1279). Integer-preserving:
+    // never routed through float, so adjacent int64 values above 2^53 stay
+    // distinct. Variadic/iterable/key=/default= forms tracked in #1284.
+    "min",
+    "max",
     "dot",
     "concatenate",
     "stack",
@@ -7886,6 +7891,103 @@ impl Checker {
                         self.infer(&a.value);
                     }
                     return Ty::Unknown;
+                }
+                // Exact scalar `min`/`max` (#1279): the lesser / greater of two
+                // numeric scalars, typed as the numeric join of the operand
+                // types. Integer operands are compared and returned at integer
+                // width (never routed through `f64`), so adjacent `int64` values
+                // above 2^53 stay distinct — the exactness the DNS per-attempt
+                // deadline math (zaplang-io/dns#6) needs. The variadic
+                // `min(a, b, c)`, iterable `min(xs)`, `key=`, and `default=`
+                // forms, and `str`/`bigint` support, are tracked in #1284.
+                "min" | "max" => {
+                    // No keyword arguments in this release (key=/default= are
+                    // #1284). Reject them explicitly rather than silently drop.
+                    if let Some(a) = args.iter().find(|a| a.name.is_some()) {
+                        self.error(
+                            ErrorCode::ZAP4023,
+                            format!(
+                                "{fname}() takes no keyword arguments yet \
+                                 (key= and default= are tracked in #1284); \
+                                 unexpected '{}'",
+                                a.name.as_deref().unwrap_or_default()
+                            ),
+                            span,
+                        );
+                    }
+                    if args.len() != 2 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!(
+                                "{fname}() takes exactly two arguments in this \
+                                 release (the variadic and iterable forms are \
+                                 tracked in #1284), got {}",
+                                args.len()
+                            ),
+                            span,
+                        );
+                        for a in args {
+                            self.infer(&a.value);
+                        }
+                        return Ty::Unknown;
+                    }
+                    let ta = self.infer(&args[0].value);
+                    let tb = self.infer(&args[1].value);
+                    // Only fixed-width numeric scalars (int / uint / float) in
+                    // this slice. `bigint` (arbitrary precision, pointer-backed),
+                    // `complex` (not ordered), and the non-numeric orderables
+                    // (`str`/`char`/`bool`) are deferred follow-ups (#1284).
+                    let numeric_scalar = |t: &Ty| {
+                        matches!(t, Ty::Unknown)
+                            || matches!(t, Ty::Float64 | Ty::Float32 | Ty::UntypedFloat)
+                            || (t.is_int() && !matches!(t, Ty::Bigint))
+                    };
+                    if !numeric_scalar(&ta) || !numeric_scalar(&tb) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "{fname}() takes two numeric scalar arguments \
+                                 (int, uint, or float), got {} and {} \
+                                 (str/bigint and the iterable form are tracked \
+                                 in #1284)",
+                                ta.display(),
+                                tb.display()
+                            ),
+                            span,
+                        );
+                        return Ty::Unknown;
+                    }
+                    // No implicit signed<->unsigned mixing (#552, D-0019): the
+                    // same rule the comparison operators enforce (ZAP4015). An
+                    // untyped-int literal or `Unknown` partners either sign.
+                    let mix = |a: &Ty, b: &Ty| {
+                        a.is_unsigned()
+                            && b.is_numeric()
+                            && !b.is_unsigned()
+                            && !matches!(b, Ty::UntypedInt | Ty::Unknown)
+                    };
+                    if mix(&ta, &tb) || mix(&tb, &ta) {
+                        self.error(
+                            ErrorCode::ZAP4015,
+                            format!(
+                                "cannot {fname}() a signed and an unsigned operand \
+                                 ({} and {}); convert one side explicitly \
+                                 (e.g. uint64(x) or int64(x))",
+                                ta.display(),
+                                tb.display()
+                            ),
+                            span,
+                        );
+                        return Ty::Unknown;
+                    }
+                    if matches!(ta, Ty::Unknown) || matches!(tb, Ty::Unknown) {
+                        return Ty::Unknown;
+                    }
+                    // `num_join` yields `int64` for two signed ints, `uint64`
+                    // for unsigned, and `float64` when either side is a float
+                    // (an explicit int/float mix promotes to `f64` exactly as
+                    // the `<`/`<=` operators do; pure-integer stays exact).
+                    return num_join(&ta, &tb);
                 }
                 "dot" => {
                     // `dot(a, b)` — matrix multiply / dot product (#509), the
@@ -18384,6 +18486,134 @@ def main():
         ok("def main():\n    int64 s = -1\n    uint64 u = uint64(s)\n    int64 back = int64(u)\n    print(u)\n    print(back)\n");
         // Short spellings resolve identically.
         ok("def main():\n    u8 a = 1\n    u16 b = 2\n    u32 c = 3\n    u64 d = 4\n    print(a)\n");
+    }
+
+    // --- scalar min/max (#1279) ------------------------------------------------
+
+    #[test]
+    fn min_max_two_ints_type_check_and_preserve_int() {
+        // Two int64 operands -> int64 (the DNS deadline use case). The result
+        // binds into an int64 slot, is usable in int arithmetic, and works for
+        // both min and max and for a direct literal call.
+        ok(
+            "def earlier(int64 a, int64 b) -> int64:\n    return min(a, b)\n\
+            def main():\n    print(earlier(9007199254740993, 9007199254740992))\n",
+        );
+        ok("def main():\n    int64 a = 10\n    int64 b = 20\n    \
+            int64 lo = min(a, b)\n    int64 hi = max(a, b)\n    \
+            print(lo + hi)\n");
+        ok("def main():\n    print(min(3, 7))\n    print(max(3, 7))\n");
+        // Narrower / mixed-width signed ints and untyped literals join to int64.
+        ok("def main():\n    int32 a = 1\n    int64 b = 2\n    \
+            int64 r = min(a, b)\n    print(r)\n");
+        ok("def main():\n    int32 a = 1\n    int64 r = max(a, 5)\n    print(r)\n");
+        // Negative operands are fine (signed comparison).
+        ok("def main():\n    int64 a = -5\n    int64 b = -9\n    \
+            int64 r = min(a, b)\n    print(r)\n");
+    }
+
+    #[test]
+    fn min_max_result_is_numeric_not_str() {
+        // The result of an integer min/max is an int, not a str: assigning it
+        // into a `str` slot is rejected (ZAP4001), which pins the result type.
+        assert!(has_code(
+            "def main():\n    str r = min(1, 2)\n    print(r)\n",
+            ErrorCode::ZAP4001
+        ));
+        assert!(has_code(
+            "def main():\n    str r = max(1, 2)\n    print(r)\n",
+            ErrorCode::ZAP4001
+        ));
+    }
+
+    #[test]
+    fn min_max_two_floats_type_check() {
+        // Two float operands -> float64, bindable into a float slot.
+        ok(
+            "def main():\n    float64 x = 1.5\n    float64 y = 2.5\n    \
+            float64 r = min(x, y)\n    print(r)\n",
+        );
+        ok("def main():\n    float32 x = 1.5\n    float64 r = max(x, 2.5)\n    print(r)\n");
+        // An explicit int/float mix promotes to float64 (same as the `<`
+        // operator); it binds into a float slot, not an int slot.
+        ok("def main():\n    float64 r = min(1, 2.0)\n    print(r)\n");
+    }
+
+    #[test]
+    fn min_max_unsigned_ints_type_check() {
+        // Two unsigned operands -> uint64; an unsigned slot accepts the result.
+        ok("def main():\n    uint64 a = 10\n    uint64 b = 20\n    \
+            uint64 r = min(a, b)\n    print(r)\n");
+        ok("def main():\n    uint32 a = 1\n    uint64 r = max(a, 5)\n    print(r)\n");
+    }
+
+    #[test]
+    fn min_max_wrong_arity_is_rejected() {
+        // One arg and three args both rejected (two-arg only in this slice).
+        assert!(has_code(
+            "def main():\n    print(min(1))\n",
+            ErrorCode::ZAP4025
+        ));
+        assert!(has_code(
+            "def main():\n    print(max(1, 2, 3))\n",
+            ErrorCode::ZAP4025
+        ));
+        assert!(has_code(
+            "def main():\n    print(min(1, 2, 3, 4))\n",
+            ErrorCode::ZAP4025
+        ));
+    }
+
+    #[test]
+    fn min_max_keyword_arguments_are_rejected() {
+        // key= / default= are #1284; any keyword is rejected now (ZAP4023),
+        // never silently dropped.
+        assert!(has_code(
+            "def main():\n    print(min(1, 2, key=3))\n",
+            ErrorCode::ZAP4023
+        ));
+        assert!(has_code(
+            "def main():\n    print(max(1, 2, default=0))\n",
+            ErrorCode::ZAP4023
+        ));
+    }
+
+    #[test]
+    fn min_max_non_numeric_arguments_are_rejected() {
+        // str / char / bool / bigint / complex are not supported in this slice.
+        assert!(has_code(
+            "def main():\n    print(min(\"a\", \"b\"))\n",
+            ErrorCode::ZAP4024
+        ));
+        assert!(has_code(
+            "def main():\n    bigint a = bigint(5)\n    bigint b = bigint(7)\n    print(min(a, b))\n",
+            ErrorCode::ZAP4024
+        ));
+        assert!(has_code(
+            "def main():\n    complex a = 1j\n    complex b = 2j\n    print(max(a, b))\n",
+            ErrorCode::ZAP4024
+        ));
+        // A list operand is not a scalar.
+        assert!(has_code(
+            "def main():\n    print(min([1, 2], [3, 4]))\n",
+            ErrorCode::ZAP4024
+        ));
+    }
+
+    #[test]
+    fn min_max_mixed_signed_unsigned_is_rejected() {
+        // No implicit signed<->unsigned conversion (ZAP4015), the same rule the
+        // comparison operators enforce; an untyped literal still partners either.
+        assert!(has_code(
+            "def main():\n    uint64 u = 5\n    int64 s = 3\n    print(min(u, s))\n",
+            ErrorCode::ZAP4015
+        ));
+        assert!(has_code(
+            "def main():\n    uint64 u = 5\n    int64 s = 3\n    print(max(s, u))\n",
+            ErrorCode::ZAP4015
+        ));
+        // uint64 against an untyped int literal is fine (the literal adapts).
+        ok("def main():\n    uint64 u = 5\n    uint64 r = min(u, 3)\n    print(r)\n");
     }
 
     #[test]
