@@ -31,6 +31,7 @@ listed here (see [`README.md`](README.md)).
 | [1251](lang/1251-comptime-for-unroller.md) | comptime for loop unroller wired to mono (E2) | Accepted | 2026-11-22 |
 | [1252](lang/1252-reflect-field.md) | Typed reflect.field(value, i) access (E2) | Accepted | 2026-11-22 |
 | [1253](lang/1253-kind-switch.md) | type_info(T).kind switch + container recursion (E2) | Accepted | 2026-11-22 |
+| [1254](lang/1254-comptime-purity-lint.md) | Comptime purity — leaf-table reject-lint + interpreter backstop + cap (E2) | Accepted | 2026-11-22 |
 | [1257](lang/1257-type-info.md) | Compile-time type introspection — reflect.type_info(T) (read-only, E1) | Accepted | 2026-11-22 |
 | [1260](lang/1260-associated-functions.md) | A receiverless def on a struct/enum is an associated function, called as Type.func(...) | Locked | 2026-11-22 |
 | [1262](lang/1262-optional-scalar-coercion.md) | Bare payload `T` auto-wraps to `Some(T)` in every `Optional[T]` position sema accepts | Locked | 2026-11-22 |
