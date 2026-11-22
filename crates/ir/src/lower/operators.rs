@@ -122,20 +122,47 @@ impl<'a> FnLower<'a> {
                     Shr => "__rshift__",
                     _ => unreachable!(),
                 };
-                // Left wins when it defines the forward dunder by name (D-0047).
-                if self.struct_has_dunder(sid, dunder) {
+                // Forward on the left, parameter-aware (#1200). The left owns the
+                // operator only when it defines the forward dunder AND that
+                // dunder's monomorphized parameter accepts the right operand's
+                // type. This is where the erased-generic left is resolved
+                // concretely: sema could not test a type-variable parameter
+                // (`Unknown`, permissive), so it kept the forward commit and left
+                // the real accept/reject decision to here, where `self.sigs`
+                // holds the monomorphized signature.
+                let forward_ok = self.struct_has_dunder(sid, dunder)
+                    && self.forward_param_accepts(sid, dunder, rt);
+                if forward_ok {
                     return self.call_dunder(sid, dunder, vec![(l, lt), (r, rt)]);
                 }
-                // Reflected fallback (#1180): the right operand's reflected
-                // dunder (`a + b` -> `b.__radd__(a)`), when the left struct has
-                // no forward dunder. `self` is the right operand.
+                // Reflected fallback (#1180/#1200): the right operand's reflected
+                // dunder (`a + b` -> `b.__radd__(a)`), reached when the left
+                // struct defines no forward dunder OR its forward dunder provably
+                // rejects this RHS. `self` is the right operand.
                 if let (Some(rdunder), Ty::Struct(rsid)) = (reflected_op_dunder(op), rt) {
                     if self.struct_has_dunder(rsid, rdunder) {
                         return self.call_dunder(rsid, rdunder, vec![(r, rt), (l, lt)]);
                     }
                 }
-                // Neither side handles it: preserve the original clean
-                // "missing forward dunder" error from `call_dunder`.
+                // The left's forward dunder rejects the RHS and no reflected
+                // handler applies (#1200). In the normal pipeline sema has
+                // already reported this (ZAP4071); the ir crate is also exercised
+                // without sema, so emit a clean mismatch error here rather than
+                // forming a forward call whose argument `coerce` would reinterpret
+                // (the arithmetic dunders are outside `call_dunder`'s index-only
+                // representation gate).
+                if self.struct_has_dunder(sid, dunder) {
+                    return Err(err(format!(
+                        "type '{}' does not support operator with operand type '{}': \
+                         its '{dunder}' does not accept this operand and no reflected \
+                         handler is defined (D-0047/#1200)",
+                        self.ctx.names[sid as usize],
+                        self.render_ty(&rt),
+                    )));
+                }
+                // The left defines no forward dunder and nothing reflected
+                // applies: preserve the original clean "missing forward dunder"
+                // error from `call_dunder`.
                 self.call_dunder(sid, dunder, vec![(l, lt), (r, rt)])
             }
         }

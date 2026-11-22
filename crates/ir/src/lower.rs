@@ -15762,6 +15762,80 @@ impl<'a> FnLower<'a> {
         self.sigs.contains_key(&mangled)
     }
 
+    /// Whether struct `sid`'s forward operator dunder accepts an operand of type
+    /// `arg` as its right operand (#1200), using the **monomorphized** signature
+    /// (`self.sigs`). Parameter 0 is `self` (the left operand); parameter 1 is
+    /// the right operand. This is the concrete accept/reject test sema could not
+    /// perform for a generic left whose forward parameter is a type variable: by
+    /// here the type variable has been substituted, so `self.sigs` holds the
+    /// real parameter type. An arity-short (malformed) signature accepts nothing.
+    fn forward_param_accepts(&self, sid: u32, dunder: &str, arg: Ty) -> bool {
+        let mangled = format!("{}__{}", self.ctx.names[sid as usize], dunder);
+        match self.sigs.get(&mangled) {
+            Some((ptys, _)) => match ptys.get(1) {
+                Some(param) => self.op_param_accepts(arg, *param),
+                None => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Whether a value of type `arg` may be passed where the operator parameter
+    /// type `param` is expected (#1200). Deliberately asymmetric with
+    /// [`arg_repr_compatible`](Self::arg_repr_compatible): this drives operator
+    /// *selection*, so it must return `false` precisely when the forward dunder
+    /// genuinely cannot take the operand — otherwise the fall-through to the
+    /// reflected dunder (or the clean error) would be missed, and a mismatched
+    /// same-representation operand would be silently reinterpreted (the latent
+    /// bug #1200 closes). It therefore rejects two *distinct* struct types even
+    /// though both are pointers.
+    ///
+    /// It returns `false` only on a provable mismatch — a scalar/pointer boundary
+    /// crossing, or two unrelated non-interface pointer types (distinct structs).
+    /// Everywhere it is unsure (a dynamic `py` operand, a legitimate numeric
+    /// widening, a concrete value where an interface parameter is expected, or
+    /// any shape not enumerated) it returns `true`, keeping the forward commit so
+    /// no sound dispatch is ever rerouted away.
+    fn op_param_accepts(&self, arg: Ty, param: Ty) -> bool {
+        if arg == param {
+            return true;
+        }
+        // Dynamically-typed values stay permissive (keep forward).
+        if matches!(arg, Ty::Py) || matches!(param, Ty::Py) {
+            return true;
+        }
+        // Legitimate numeric widenings (the set `coerce` performs between
+        // numbers, including boxing into `bigint`/`complex`): forward accepts.
+        let numeric = |t: Ty| {
+            t.int_width().is_some() || t.is_float() || matches!(t, Ty::Bigint | Ty::Complex)
+        };
+        if numeric(arg) && numeric(param) {
+            return true;
+        }
+        // A concrete struct/enum where an interface parameter is expected: the
+        // `struct -> interface` fat-pointer coercion (D-0016) is legitimate, so
+        // keep the forward commit (conformance was validated upstream).
+        if let Ty::Struct(psid) = param {
+            if self.ctx.iid_of_fat_sid(psid).is_some() && matches!(arg, Ty::Struct(_) | Ty::Enum(_))
+            {
+                return true;
+            }
+        }
+        // Provable mismatches → reject (reroute to reflected / clean error):
+        //  - a scalar fed into a pointer parameter, or the reverse;
+        //  - two *distinct* struct types (same representation, different identity
+        //    — the `Duration + Delta` reinterpret).
+        if arg.is_ptr() != param.is_ptr() {
+            return false;
+        }
+        if matches!((arg, param), (Ty::Struct(_), Ty::Struct(_))) {
+            return false;
+        }
+        // Anything else (e.g. two different collection shapes) is not something
+        // we can prove the forward dunder rejects: keep the forward commit.
+        true
+    }
+
     /// Array reduction methods (#507, D-0170): `a.sum()`, `a.min()`, `a.max()`,
     /// `a.mean()`, `a.prod()`, each with an optional `axis=` keyword.
     ///

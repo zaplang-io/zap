@@ -399,20 +399,26 @@ unary (`__neg__`/`__pos__`/`__invert__`), `__eq__` (with `!=` derived),
 `__eq__`/`__cmp__`/`__hash__`/`__repr__` field-wise. Decisions made while
 implementing, consistent with D-0047:
 
-- **Dispatch prefers the left operand, with a reflected fallback on the right**
-  (reflected operators, I#1180 / epic I#1189, see
-  [lang/1180-reflected-operators](../decisions/lang/1180-reflected-operators.md)).
+- **Dispatch prefers the left operand, with a parameter-aware reflected fallback
+  on the right** (reflected operators, I#1180 / epic I#1189, made parameter-aware
+  by I#1200, see
+  [lang/1180-reflected-operators](../decisions/lang/1180-reflected-operators.md)
+  and [lang/1200-param-aware-fallthrough](../decisions/lang/1200-param-aware-fallthrough.md)).
   `a OP b` resolves statically as: (1) if the built-in rules type the operator,
   or the **left** type is a struct that defines the forward dunder (`__add__` …)
-  **by name**, use it — `a.__add__(b)`, exactly as before; (2) otherwise, if the
-  **right** type is a struct whose reflected dunder (`__radd__` …) accepts the
-  left operand's type, use `b.__radd__(a)` (`self` is the right operand); (3)
-  otherwise `ZAP4071`. The left wins when both could apply, and a left type that
-  defines the forward dunder **commits** the operator to the left — a RHS its
-  parameter does not accept is an ordinary type error, **not** a reflected
-  reroute (Zap is statically typed and has no Python `NotImplemented` retry; the
-  param-aware fall-through would need overload resolution sema does not have for
-  generics). The reflected set mirrors the binary dunder table one-for-one:
+  **and that dunder's parameter accepts the RHS**, use it — `a.__add__(b)`; (2)
+  otherwise, if the **right** type is a struct whose reflected dunder (`__radd__`
+  …) accepts the left operand's type, use `b.__radd__(a)` (`self` is the right
+  operand); (3) otherwise `ZAP4071`. The left still wins when **both** could
+  apply (its forward parameter accepts the RHS); the Python-style fall-through
+  (`left.__add__` → `NotImplemented` → `right.__radd__`) happens only when the
+  left's forward parameter does **not** accept the RHS (I#1200 reverses the
+  earlier name-level "commit" rule). The accept test is resolved in sema for a
+  left whose forward parameter is concrete; for a **generic** left whose forward
+  parameter is a type variable (erased in sema), sema keeps the forward commit
+  and the concrete accept/reject decision is deferred to lowering, which has the
+  monomorphized signature — so the generic case resolves correctly without a
+  function-type model in sema. The reflected set mirrors the binary dunder table one-for-one:
   `__radd__ __rsub__ __rmul__ __rtruediv__ __rfloordiv__ __rmod__ __rpow__`,
   `__rand__ __ror__ __rxor__ __rlshift__ __rrshift__`, and `__rmatmul__`.
   Conformance is **implicit/structural** (defining the dunder is satisfying the
