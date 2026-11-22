@@ -99,6 +99,35 @@ fn unroll_enum_variants_over_concrete_declaration() {
     assert!(r[2].contains("BLUE") && r[2].contains('2'), "{r:?}");
 }
 
+// --- #1252: typed reflect.field access ---------------------------------------
+
+#[test]
+fn reflect_field_access_resolves_to_typed_field() {
+    let def = first_struct("struct Rec:\n    int64 n\n    str name\n    bool flag\n");
+    let value =
+        zapc_syntax::ast::Expr::Name("value".to_string(), zapc_syntax::span::Span::new(0, 0));
+    for (i, name) in ["n", "name", "flag"].iter().enumerate() {
+        let acc = zapc_mono::reflect_field_access(&def, &value, i as i64).unwrap();
+        assert_eq!(render_expr(&acc), format!("value.{name}"));
+    }
+}
+
+#[test]
+fn reflect_field_access_out_of_range_errors() {
+    let def = first_struct("struct S:\n    int64 a\n");
+    let value = zapc_syntax::ast::Expr::Name("v".to_string(), zapc_syntax::span::Span::new(0, 0));
+    assert!(zapc_mono::reflect_field_access(&def, &value, 3).is_err());
+}
+
+#[test]
+fn unroll_with_reflect_field_access_end_to_end() {
+    // The combined #1251 + #1252 pipeline a derive codec drives.
+    let def = first_struct("struct Rec:\n    int64 n\n    str name\n");
+    let b = body("emit(reflect.field(value, f.index))");
+    let stmts = zapc_mono::unroll_struct_fields_with_access(&def, "f", &b, &[]).unwrap();
+    assert_eq!(render(&stmts), vec!["emit(value.n)", "emit(value.name)"]);
+}
+
 #[test]
 fn unroll_with_comptime_library_function() {
     // HQ9: a registered comptime function folds per field to its constant.

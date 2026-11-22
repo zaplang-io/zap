@@ -22,7 +22,9 @@
 
 use std::rc::Rc;
 
-use zapc_comptime::{unroll, Env, Evaluator, TypeInfo, Value};
+use zapc_comptime::{
+    desugar_reflect_field, reflect_field, unroll, Env, Evaluator, TypeInfo, Value,
+};
 use zapc_syntax::ast::{Block, EnumDef, Expr, Stmt, StructDef};
 use zapc_syntax::span::Span;
 
@@ -52,6 +54,67 @@ pub fn unroll_enum_variants(
 ) -> Result<Vec<Stmt>, LowerError> {
     let info = zapc_comptime::type_info_of_enum(def);
     unroll_member(info, loop_var, "variants", body, funcs)
+}
+
+/// Typed `reflect.field(value, index)` for the concrete struct `def` (#1252):
+/// the comptime `index` resolves to the field at that declaration position and
+/// becomes the ordinary typed field access `value.<name>`, which the existing
+/// per-layout field-access lowering (value-struct / heap-struct / `@scoped`)
+/// compiles unchanged — a direct, unboxed field load, not an `any`. An
+/// out-of-range index is a compile error here, never a runtime out-of-bounds.
+/// Read access (v1); field *write* is deferred until a codec consumer needs it.
+pub fn reflect_field_access(def: &StructDef, value: &Expr, index: i64) -> Result<Expr, LowerError> {
+    let info = zapc_comptime::type_info_of_struct(def);
+    reflect_field(value, index, &info, Span::new(0, 0)).map_err(|e| err(e.message))
+}
+
+/// Unroll `comptime for <loop_var> in info.fields:` over `def` **and** desugar
+/// every `reflect.field(value, f.index)` in the emitted body to its typed field
+/// access — the combined #1251 + #1252 pipeline a derive codec drives. Each
+/// emitted statement's expression is desugared (the forms a comptime-for body
+/// uses to emit per-field code: expression statements, `return`, `let`); the
+/// full statement-position wiring lands with the parser surface.
+pub fn unroll_struct_fields_with_access(
+    def: &StructDef,
+    loop_var: &str,
+    body: &Block,
+    funcs: &[zapc_syntax::ast::Function],
+) -> Result<Vec<Stmt>, LowerError> {
+    let info = zapc_comptime::type_info_of_struct(def);
+    let stmts = unroll_struct_fields(def, loop_var, body, funcs)?;
+    stmts
+        .iter()
+        .map(|st| desugar_stmt_fields(st, &info))
+        .collect()
+}
+
+/// Desugar `reflect.field` in the expression(s) of one emitted statement.
+fn desugar_stmt_fields(st: &Stmt, info: &TypeInfo) -> Result<Stmt, LowerError> {
+    let d = |e: &Expr| desugar_reflect_field(e, info).map_err(|e| err(e.message));
+    Ok(match st {
+        Stmt::Expr(e) => Stmt::Expr(d(e)?),
+        Stmt::Return { value, span } => Stmt::Return {
+            value: match value {
+                Some(e) => Some(d(e)?),
+                None => None,
+            },
+            span: *span,
+        },
+        Stmt::Let {
+            is_const,
+            ty,
+            name,
+            value,
+            span,
+        } => Stmt::Let {
+            is_const: *is_const,
+            ty: ty.clone(),
+            name: name.clone(),
+            value: d(value)?,
+            span: *span,
+        },
+        other => other.clone(),
+    })
 }
 
 /// Shared driver: bind `info` to the reflected type, build the `info.<member>`
