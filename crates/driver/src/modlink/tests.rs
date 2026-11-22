@@ -707,6 +707,218 @@ fn imported_generic_bound_capability_name_is_not_mangled() {
     }
 }
 
+// ---- #1258: struct/enum method names are not mangled across imports --------
+//
+// A struct or enum *method* is not a module member — it lives in its type's
+// namespace and is resolved by the `{Struct}__{method}` mangling in lowering,
+// built from the type's own (already-prefixed) name. The module linker must
+// therefore leave a method's own name alone. It used to run methods through the
+// same rewrite as a top-level function, which mangled the method name whenever
+// it collided with one of the declaring module's top-level symbols (a free
+// function, struct, enum, … of the same name). The definition was then emitted
+// under `{Struct}__{prefix}{method}` while every call site resolved it to
+// `{Struct}__{method}`, so an imported module's call to that method failed with
+// the generic `ZAP6001` ("no method '…' on that value"). Standalone the prefix
+// is empty, so the mangle was a no-op and the gap stayed hidden.
+
+/// The method names declared on the first struct whose (possibly mangled) name
+/// ends with `suffix`.
+fn struct_method_names(m: &Module, suffix: &str) -> Vec<String> {
+    m.items
+        .iter()
+        .find_map(|it| match it {
+            Item::Struct(s) if s.name.ends_with(suffix) => {
+                Some(s.methods.iter().map(|f| f.name.clone()).collect())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no struct ending in {suffix:?} in merged module"))
+}
+
+/// The method names declared on the first enum whose (possibly mangled) name
+/// ends with `suffix`.
+fn enum_method_names(m: &Module, suffix: &str) -> Vec<String> {
+    m.items
+        .iter()
+        .find_map(|it| match it {
+            Item::Enum(e) if e.name.ends_with(suffix) => {
+                Some(e.methods.iter().map(|f| f.name.clone()).collect())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no enum ending in {suffix:?} in merged module"))
+}
+
+#[test]
+fn imported_struct_method_colliding_with_free_fn_keeps_bare_name() {
+    // The exact #1258 shape: a method `result` whose name also names a free
+    // function `result` in the same module. The struct and the free function are
+    // module members and so are mangled; the method is not, and must keep its
+    // bare name.
+    let p = Project::new("method_vs_free_fn");
+    p.write(
+        "src/provider.zap",
+        "struct Provider:\n\
+         \x20   int64 id\n\n\
+         \x20   def result(self) -> int64:\n\
+         \x20       return self.id\n\n\
+         const Provider _default = Provider(42)\n\n\
+         def result() -> int64:\n\
+         \x20   return _default.result()\n",
+    );
+    p.write(
+        "src/main.zap",
+        "import provider\n\n\
+         def main():\n\
+         \x20   print(provider.result())\n",
+    );
+    let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
+
+    // The struct is a module member → mangled.
+    let struct_name = m
+        .items
+        .iter()
+        .find_map(|it| match it {
+            Item::Struct(s) if s.name.ends_with("Provider") => Some(s.name.clone()),
+            _ => None,
+        })
+        .expect("Provider struct in merged module");
+    assert_ne!(struct_name, "Provider", "imported struct must be mangled");
+
+    // The free function `result` is a module member → mangled away.
+    let fns = fn_names(&m);
+    assert!(
+        !fns.contains(&"result".to_string()),
+        "the free `result` must be mangled, got {fns:?}"
+    );
+    assert!(
+        fns.iter().any(|n| n.ends_with("result") && n != "result"),
+        "a mangled free `result` must be present, got {fns:?}"
+    );
+
+    // The method, however, keeps its bare name — this is the fix.
+    assert_eq!(
+        struct_method_names(&m, "Provider"),
+        vec!["result".to_string()],
+        "the method name must not be mangled across the import boundary"
+    );
+}
+
+#[test]
+fn imported_enum_method_colliding_with_free_fn_keeps_bare_name() {
+    // The enum arm of the same bug: an enum `self` method whose name collides
+    // with a free function.
+    let p = Project::new("enum_method_vs_free_fn");
+    p.write(
+        "src/lib.zap",
+        "enum Level:\n\
+         \x20   LOW\n\
+         \x20   HIGH\n\n\
+         \x20   def weight(self) -> int64:\n\
+         \x20       match self:\n\
+         \x20           case Level.LOW:\n\
+         \x20               return 1\n\
+         \x20           case Level.HIGH:\n\
+         \x20               return 10\n\n\
+         const Level _lvl = Level.HIGH\n\n\
+         def weight() -> int64:\n\
+         \x20   return _lvl.weight()\n",
+    );
+    p.write(
+        "src/main.zap",
+        "import lib\n\n\
+         def main():\n\
+         \x20   print(lib.weight())\n",
+    );
+    let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
+
+    let fns = fn_names(&m);
+    assert!(
+        !fns.contains(&"weight".to_string()),
+        "the free `weight` must be mangled, got {fns:?}"
+    );
+    assert_eq!(
+        enum_method_names(&m, "Level"),
+        vec!["weight".to_string()],
+        "the enum method name must not be mangled across the import boundary"
+    );
+}
+
+#[test]
+fn imported_struct_method_colliding_with_type_name_keeps_bare_name() {
+    // The collision need not be with a free function: any top-level symbol of the
+    // same name triggered the mangle. Here a method is named `Tag`, which also
+    // names a top-level struct in the same module. The method must still keep its
+    // bare name.
+    let p = Project::new("method_vs_type_name");
+    p.write(
+        "src/lib.zap",
+        "struct Tag:\n\
+         \x20   int64 v\n\n\
+         struct Holder:\n\
+         \x20   int64 n\n\n\
+         \x20   def Tag(self) -> int64:\n\
+         \x20       return self.n\n\n\
+         const Holder _h = Holder(9)\n\n\
+         def get() -> int64:\n\
+         \x20   return _h.Tag()\n",
+    );
+    p.write(
+        "src/main.zap",
+        "import lib\n\n\
+         def main():\n\
+         \x20   print(lib.get())\n",
+    );
+    let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
+
+    // The `Tag` struct is mangled (a module member)…
+    let tag_struct = m
+        .items
+        .iter()
+        .find_map(|it| match it {
+            Item::Struct(s) if s.name.ends_with("Tag") => Some(s.name.clone()),
+            _ => None,
+        })
+        .expect("Tag struct present");
+    assert_ne!(tag_struct, "Tag", "the Tag struct must be mangled");
+    // …but `Holder`'s method named `Tag` is not.
+    assert_eq!(
+        struct_method_names(&m, "Holder"),
+        vec!["Tag".to_string()],
+        "a method whose name collides with a type name must not be mangled"
+    );
+}
+
+#[test]
+fn imported_struct_method_without_collision_keeps_bare_name() {
+    // Consistency pin: a method whose name collides with nothing was always left
+    // bare (the mangle only fires on `own` members). This guards the general
+    // behavior so a future change cannot start mangling method names wholesale.
+    let p = Project::new("method_no_collision");
+    p.write(
+        "src/lib.zap",
+        "struct Box:\n\
+         \x20   int64 v\n\n\
+         \x20   def unwrap(self) -> int64:\n\
+         \x20       return self.v\n\n\
+         const Box _b = Box(5)\n\n\
+         def get() -> int64:\n\
+         \x20   return _b.unwrap()\n",
+    );
+    p.write(
+        "src/main.zap",
+        "import lib\n\n\
+         def main():\n\
+         \x20   print(lib.get())\n",
+    );
+    let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
+    assert_eq!(
+        struct_method_names(&m, "Box"),
+        vec!["unwrap".to_string()],
+        "a non-colliding method name stays bare"
+    );
+}
+
 #[test]
 fn arch_import_guarded_by_cfg_compiles_on_both_targets() {
     // The intended portable pattern: a `when target.arch` guard keeps only the
