@@ -89,8 +89,10 @@
 mod eval;
 mod ops;
 mod reflect_ast;
+mod reflect_field;
 mod unroll;
 mod value;
+mod walk;
 
 pub mod error;
 
@@ -101,6 +103,7 @@ use zapc_syntax::span::Span;
 
 pub use error::{CtError, CtErrorKind};
 pub use reflect_ast::{type_info_of_enum, type_info_of_struct};
+pub use reflect_field::{desugar_reflect_field, field_decl_type, reflect_field};
 pub use unroll::{materialize, unroll};
 pub use value::Value;
 
