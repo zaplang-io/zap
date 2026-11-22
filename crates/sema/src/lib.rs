@@ -6564,33 +6564,52 @@ impl Checker {
             return None;
         }
         // Arithmetic / bitwise / shift / matmul (the operators with a reflected
-        // form, D-0047/#1180). The left operand owns the operator; the RIGHT
-        // operand's reflected dunder (`__radd__` etc.) is a FALLBACK consulted
-        // only where the expression would otherwise error, so this is purely
-        // additive and never changes an already-resolving operator.
+        // form, D-0047/#1180, parameter-aware since #1200). The left operand owns
+        // the operator when it defines the forward dunder AND that dunder's
+        // parameter accepts the right operand; otherwise the RIGHT operand's
+        // reflected dunder (`__radd__` etc.) is consulted. Where the forward
+        // parameter is erased (a generic left's type variable -> `Unknown`,
+        // which `coercible` treats permissively) the forward commit is kept and
+        // the concrete accept/reject decision is deferred to lowering, which has
+        // the monomorphized signatures (`self.sigs`); see the #1200 ADR.
         if let (Some((dunder, iface)), Some(rdunder)) =
             (binary_op_dunder(op), reflected_op_dunder(op))
         {
             let left_is_struct = self.struct_info(l).is_some();
-            // 1. Left wins: a struct left that defines the forward dunder by
-            //    name. The RHS type is not re-checked against the parameter —
-            //    selecting the forward dunder by name is the existing D-0047
-            //    rule, and keeping it unchanged is what makes this additive.
-            if left_is_struct && self.lookup_dunder(l, dunder).is_some() {
-                return Some(self.op_result(l, dunder, iface, binop_symbol(op), span));
+            // 1. Forward on the left, parameter-aware (#1200). A struct left that
+            //    defines the forward dunder by name owns the operator only when
+            //    its parameter accepts the RHS. An erased/`Unknown` parameter is
+            //    accepted (permissive), so an existing single-forward-dunder
+            //    program whose RHS matches is unchanged; the fall-through below
+            //    is reached only when the forward parameter provably rejects the
+            //    RHS — a case that previously errored or silently reinterpreted.
+            let mut forward_rejected = false;
+            if left_is_struct {
+                if let Some(fsig) = self.lookup_dunder(l, dunder) {
+                    if self.forward_accepts(&fsig, r) {
+                        return Some(fsig.ret);
+                    }
+                    forward_rejected = true;
+                }
             }
             // 1b. Left-via-bound (#1199): the left operand is a value of a type
             //     parameter whose bound provides the forward dunder, e.g. `a + b`
             //     with `a: T, T: Add[R, Out]`. The result is the bound's
             //     (substituted) `Out`, provided its `R` accepts the right operand.
             //     This is the "left owns the operator" case for bounded generics,
-            //     so it sits with the forward/struct path, ahead of reflected.
-            if let Some(sig) = self.bound_dunder_sig(l, r, dunder) {
-                return Some(sig.ret);
+            //     so it sits with the forward/struct path, ahead of reflected. It
+            //     is only reachable when the left did not already define the
+            //     forward dunder by name (a struct left is never a bound tyvar).
+            if !forward_rejected {
+                if let Some(sig) = self.bound_dunder_sig(l, r, dunder) {
+                    return Some(sig.ret);
+                }
             }
             // 2. Reflected fallback: the right operand is a struct whose
             //    reflected dunder accepts the left operand's type. The result is
-            //    that dunder's declared return type.
+            //    that dunder's declared return type. Reached either when the left
+            //    defines no forward dunder, or (since #1200) when the left's
+            //    forward dunder provably rejects this RHS.
             if self.struct_info(r).is_some() {
                 if let Some(sig) = self.lookup_dunder(r, rdunder) {
                     if self.reflected_accepts(&sig, l) {
@@ -6605,11 +6624,35 @@ impl Checker {
             if let Some(sig) = self.bound_dunder_sig(r, l, rdunder) {
                 return Some(sig.ret);
             }
-            // 3. A struct left with neither a forward dunder nor a reflected
-            //    handler on the right: the original "operator not supported"
-            //    (ZAP4071). A left that DOES define the forward dunder but whose
-            //    parameter does not accept this RHS is NOT rerouted here — it was
-            //    taken in step 1 (left commits by name; see #1180 RFC §3.3).
+            // 3. The left's forward dunder provably rejects this RHS and no
+            //    reflected handler applies (#1200): a clear "operator not
+            //    supported with this operand" error naming both escape hatches.
+            //    This replaces the former silent commit-by-name (which typed the
+            //    expression at the forward return and let lowering reinterpret a
+            //    mismatched pointer operand).
+            if forward_rejected {
+                self.error(
+                    ErrorCode::ZAP4071,
+                    format!(
+                        "type '{}' does not support operator '{}' with operand \
+                         type '{}': its '{}' does not accept this operand, and \
+                         '{}' defines no '{}' that accepts '{}' \
+                         (D-0047 reflected operators, #1200)",
+                        l.display(),
+                        binop_symbol(op),
+                        r.display(),
+                        dunder,
+                        r.display(),
+                        rdunder,
+                        l.display(),
+                    ),
+                    span,
+                );
+                return Some(Ty::Unknown);
+            }
+            // 3b. A struct left with no forward dunder and no reflected handler
+            //     on the right: the original "operator not supported" (ZAP4071),
+            //     naming the forward dunder/interface.
             if left_is_struct {
                 self.require_dunder(l, dunder, iface, binop_symbol(op), span);
                 return Some(Ty::Unknown);
@@ -6687,6 +6730,25 @@ impl Checker {
         sig.params
             .get(1)
             .is_some_and(|p| self.coercible(left, &p.ty))
+    }
+
+    /// Whether a forward operator dunder (`__add__` etc.) accepts `right` as the
+    /// right operand (#1200). Its `self` (`params[0]`) is the left operand, so
+    /// the right operand's type must be assignable to the first non-`self`
+    /// parameter (`params[1]`). An arity-short signature accepts nothing, so the
+    /// operator falls through to the reflected dunder (or errors) rather than
+    /// resolving against a malformed forward method.
+    ///
+    /// When the parameter type is erased — a generic left's type variable lowers
+    /// to `Ty::Unknown`, which `coercible` treats permissively in both
+    /// directions — this returns `true`, so the forward dunder keeps the commit
+    /// and the concrete accept/reject decision is deferred to lowering, where the
+    /// monomorphized parameter type is known. This is what keeps the rule sound
+    /// for generic left types without a function-type model in sema.
+    fn forward_accepts(&self, sig: &FnSig, right: &Ty) -> bool {
+        sig.params
+            .get(1)
+            .is_some_and(|p| self.coercible(right, &p.ty))
     }
 
     /// Resolve an operator through a bounded type parameter (#1199). If
@@ -15276,22 +15338,80 @@ def main():
     }
 
     #[test]
-    fn left_forward_dunder_commits_by_name_no_fallthrough() {
-        // A left struct that DEFINES the forward dunder commits the operator to
-        // the left even when its parameter does not accept the RHS; dispatch
-        // does NOT reroute to the right operand's reflected dunder (#1180 §3.3).
-        // The left `__add__` takes a `V`, so `a + rd` is typed `V`; the reflected
-        // `__radd__` returning `str` is never consulted. Binding to `str` errors.
+    fn left_forward_rejects_rhs_falls_through_to_reflected() {
+        // #1200 (reverses the former name-level commit): a left struct that
+        // defines the forward dunder whose parameter does NOT accept the RHS
+        // falls through to the right operand's reflected dunder. The left
+        // `__add__` takes a `V`; `a + Rd(..)` cannot use it (an `Rd` is not a
+        // `V`), so `Rd.__radd__(self, V) -> str` resolves and the result is
+        // `str`. Binding the result to `str` now succeeds.
+        ok("struct V:\n    int64 x\n\n    \
+            def __add__(self, V other) -> V:\n        return V(x=self.x)\n\n\
+            struct Rd:\n    int64 n\n\n    \
+            def __radd__(self, V v) -> str:\n        return \"x\"\n\n\
+            def main():\n    auto a = V(x=1)\n    str good = a + Rd(n=2)\n    print(good)\n");
+    }
+
+    #[test]
+    fn left_forward_rejects_rhs_result_is_reflected_return() {
+        // The fall-through result is the reflected dunder's declared return type,
+        // not the forward dunder's. Here the forward `__add__` returns `V` but
+        // the reflected `__radd__` returns `str`; binding `a + Rd(..)` to a `V`
+        // must therefore be a real error (proving the reflected path was taken,
+        // not the forward one).
         let e = errors(
             "struct V:\n    int64 x\n\n    \
              def __add__(self, V other) -> V:\n        return V(x=self.x)\n\n\
              struct Rd:\n    int64 n\n\n    \
              def __radd__(self, V v) -> str:\n        return \"x\"\n\n\
-             def main():\n    auto a = V(x=1)\n    str bad = a + Rd(n=2)\n    print(bad)\n",
+             def main():\n    auto a = V(x=1)\n    V bad = a + Rd(n=2)\n    print(bad.x)\n",
         );
         assert!(
             !e.is_empty(),
-            "left committed by name; reflected must not be used: {e:?}"
+            "result of the fall-through is `str` (the reflected return), not `V`: {e:?}"
+        );
+    }
+
+    #[test]
+    fn left_forward_rejects_rhs_no_reflected_is_clean_error() {
+        // #1200: a left struct whose forward dunder rejects the RHS and a right
+        // with no matching reflected handler is a clean ZAP4071 naming both the
+        // forward and the reflected escape hatches — NOT a silent commit that
+        // would (in lowering) reinterpret a mismatched same-representation
+        // pointer operand. `Duration`-style `__add__(self, V)` + an unrelated
+        // `Rd` is exactly the latent-miscompile shape this closes.
+        let e = errors(
+            "struct V:\n    int64 x\n\n    \
+             def __add__(self, V other) -> V:\n        return V(x=self.x)\n\n\
+             struct Rd:\n    int64 n\n\n\
+             def main():\n    auto a = V(x=1)\n    auto bad = a + Rd(n=2)\n    print(bad)\n",
+        );
+        assert_eq!(e.len(), 1, "got {e:?}");
+        assert_eq!(e[0].code, ErrorCode::ZAP4071, "{e:?}");
+        assert!(
+            e[0].message.contains("__add__") && e[0].message.contains("__radd__"),
+            "error should name both escape hatches: {e:?}"
+        );
+    }
+
+    #[test]
+    fn left_forward_accepts_rhs_still_wins_over_reflected() {
+        // Regression guard for #1200's additivity: when the left forward dunder's
+        // parameter DOES accept the RHS, the left still wins over any reflected
+        // dunder on the right (name-level precedence for the matching case is
+        // unchanged). `L.__add__(self, R) -> L` accepts an `R`, so `a + b` is
+        // `L`; binding it to `R` errors, proving the forward path won.
+        let e = errors(
+            "struct L:\n    int64 n\n\n    \
+             def __add__(self, R other) -> L:\n        return L(n=self.n)\n\n\
+             struct R:\n    int64 m\n\n    \
+             def __radd__(self, L other) -> R:\n        return R(m=self.m)\n\n\
+             def main():\n    auto a = L(n=1)\n    auto b = R(m=2)\n    \
+             R bad = a + b\n    print(bad.m)\n",
+        );
+        assert!(
+            !e.is_empty(),
+            "forward accepts the RHS, so left wins: {e:?}"
         );
     }
 

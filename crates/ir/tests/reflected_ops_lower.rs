@@ -113,6 +113,58 @@ fn left_forward_dunder_lowers_even_when_right_has_reflected() {
     );
 }
 
+// ----- parameter-aware fall-through (#1200) -----
+
+#[test]
+fn left_forward_rejects_rhs_lowers_via_reflected() {
+    // #1200: the left `V` defines `__add__(self, V)`, but the RHS is an unrelated
+    // `Rd`. The forward parameter (`V`) does not accept an `Rd`, so lowering must
+    // fall through to `Rd.__radd__(self, V) -> str` rather than forming a forward
+    // call that would reinterpret the `Rd` pointer as a `V`. (The ir crate runs
+    // without sema, so this exercises lowering's own parameter-aware selection.)
+    lower_ok(
+        "struct V:\n    int64 x\n\n    \
+         def __add__(self, V other) -> V:\n        return V(x=self.x)\n\n\
+         struct Rd:\n    int64 n\n\n    \
+         def __radd__(self, V v) -> str:\n        return \"x\"\n\n\
+         def main():\n    auto a = V(x=1)\n    str s = a + Rd(n=2)\n    print(s)\n",
+    );
+}
+
+#[test]
+fn generic_left_forward_rejects_mono_rhs_lowers_via_reflected() {
+    // The crux case #1200 exists for: a GENERIC left whose forward parameter is a
+    // type variable. Sema erases `T` to `Unknown` (permissive) and keeps the
+    // forward commit; the real decision is made here on the monomorphized
+    // signature. `Box[int64].__add__(self, int64)` is instantiated by `b + 5`
+    // (forward, accepted). `b + Delta(..)` has a monomorphized forward parameter
+    // of `int64`, which cannot accept a `Delta` pointer, so it must reroute to
+    // `Delta.__radd__(self, Box[int64])`.
+    lower_ok(
+        "struct Box[T]:\n    T val\n\n    \
+         def __add__(self, T other) -> Box[T]:\n        return Box[T](val=other)\n\n\
+         struct Delta:\n    int64 k\n\n    \
+         def __radd__(self, Box[int64] b) -> Delta:\n        return self\n\n\
+         def main():\n    auto b = Box[int64](val=1)\n    \
+         auto hit = b + 5\n    auto x = b + Delta(k=2)\n    print(hit.val + x.k)\n",
+    );
+}
+
+#[test]
+fn left_forward_rejects_rhs_no_reflected_is_clean_error() {
+    // #1200: the left `V` defines `__add__(self, V)` but the RHS `Rd` is neither
+    // a `V` nor equipped with a matching `__radd__`. Lowering must emit a clean
+    // mismatch error (naming the forward dunder), NOT silently reinterpret the
+    // `Rd` pointer as a `V` through `coerce`.
+    lower_err_contains(
+        "struct V:\n    int64 x\n\n    \
+         def __add__(self, V other) -> V:\n        return V(x=self.x)\n\n\
+         struct Rd:\n    int64 n\n\n\
+         def main():\n    auto a = V(x=1)\n    auto bad = a + Rd(n=2)\n    print(bad.x)\n",
+        "__add__",
+    );
+}
+
 // ----- the error path is preserved -----
 
 #[test]
