@@ -514,6 +514,12 @@ struct StructCtx {
     /// this lowering. When `false` (the default) lowering emits ZERO race hooks,
     /// so the output is byte-identical to a non-`--race` build (golden-safe).
     race: bool,
+    /// Mangled names (`Type__func`) of user-defined **associated functions**
+    /// (receiverless `def`s on a struct/enum, #1260). A call `Type.func(args)`
+    /// lowers like a namespaced free function with no receiver, so the call site
+    /// dispatches here; registered alongside `sigs`/`call_params`, whose entries
+    /// for these names carry the full parameter list (no implicit `self` dropped).
+    associated_fns: HashSet<String>,
 }
 
 /// One classified axis of an array subscript (#510). `Slice`'s pairs are the
@@ -643,9 +649,25 @@ enum PosSrc<'e> {
 /// exactly as it does for free functions; the method-call lowering re-adds
 /// `self` when it emits the call.
 fn method_param_info(m: &ast::Function) -> Vec<ParamInfo> {
+    fn_param_info(m, true)
+}
+
+/// True when `m` is a **receiverless** `def` — an associated function (#1260):
+/// its first parameter is not `self`, or it declares no parameters at all. An
+/// instance method's first parameter is always the `self` receiver.
+fn is_receiverless(m: &ast::Function) -> bool {
+    !m.params.first().is_some_and(|p| p.name == "self")
+}
+
+/// Per-parameter call-site metadata for a `def`. For an instance method,
+/// `skip_self` drops the implicit `self` receiver so the result lines up with the
+/// call site's explicit arguments (the method-call lowering re-adds `self`). For
+/// an associated function (#1260) `skip_self` is `false`: every parameter is a
+/// real argument, exactly like a free function.
+fn fn_param_info(m: &ast::Function, skip_self: bool) -> Vec<ParamInfo> {
     m.params
         .iter()
-        .skip(1)
+        .skip(usize::from(skip_self))
         .map(|p| ParamInfo {
             name: p.name.clone(),
             default: p.default.clone(),
@@ -1593,6 +1615,7 @@ pub fn lower_module_opts_with_types(
         global_racy: RefCell::new(Vec::new()),
         shareable_types,
         race,
+        associated_fns: HashSet::new(),
     };
 
     // Signatures: top-level functions and struct methods (mangled `S__m`).
@@ -1601,6 +1624,9 @@ pub fn lower_module_opts_with_types(
     // (D-0038, I#298). Collected for free functions, whose calls go through the
     // name-dispatch path that honors defaults and keyword reordering.
     let mut call_params: HashMap<String, Vec<ParamInfo>> = HashMap::new();
+    // Mangled names of receiverless associated functions (#1260), so the call
+    // site can dispatch `Type.func(args)` as a no-receiver free call.
+    let mut associated_fns: HashSet<String> = HashSet::new();
     for item in &module.items {
         match item {
             ast::Item::Function(f) => {
@@ -1655,8 +1681,16 @@ pub fn lower_module_opts_with_types(
                     // parity with free functions I#298). The implicit `self`
                     // receiver is dropped so the recorded params line up with the
                     // call site's explicit arguments; the method-call path re-adds
-                    // `self` when it assembles the call.
-                    call_params.insert(mangled.clone(), method_param_info(m));
+                    // `self` when it assembles the call. A receiverless `def` is an
+                    // associated function (#1260): it keeps its full parameter list
+                    // and is recorded so the call site dispatches it with no
+                    // receiver.
+                    if is_receiverless(m) {
+                        associated_fns.insert(mangled.clone());
+                        call_params.insert(mangled.clone(), fn_param_info(m, false));
+                    } else {
+                        call_params.insert(mangled.clone(), method_param_info(m));
+                    }
                     sigs.insert(mangled, (params, ret));
                 }
             }
@@ -1687,8 +1721,14 @@ pub fn lower_module_opts_with_types(
                                 .unwrap_or(Ty::Void)
                         };
                         // Method default/keyword argument metadata (I#481), as
-                        // for struct methods above — `self` dropped.
-                        call_params.insert(mangled.clone(), method_param_info(m));
+                        // for struct methods above — `self` dropped, unless this is
+                        // a receiverless associated function (#1260).
+                        if is_receiverless(m) {
+                            associated_fns.insert(mangled.clone());
+                            call_params.insert(mangled.clone(), fn_param_info(m, false));
+                        } else {
+                            call_params.insert(mangled.clone(), method_param_info(m));
+                        }
                         sigs.insert(mangled, (params, ret));
                     }
                 } else if !e.methods.is_empty() {
@@ -1719,11 +1759,19 @@ pub fn lower_module_opts_with_types(
                                 }
                             })
                             .collect();
-                        call_params.insert(mangled.clone(), method_param_info(m));
-                        if let Some(bsid) = box_sid {
-                            let mut tparams = vec![Ty::Struct(bsid)];
-                            tparams.extend_from_slice(&params[1..]);
-                            sigs.insert(format!("{}$box__{}", e.name, m.name), (tparams, ret));
+                        // A receiverless associated function (#1260) keeps its full
+                        // parameter list and is never placed in an itable (it has no
+                        // `self`), so it needs no box thunk.
+                        if is_receiverless(m) {
+                            associated_fns.insert(mangled.clone());
+                            call_params.insert(mangled.clone(), fn_param_info(m, false));
+                        } else {
+                            call_params.insert(mangled.clone(), method_param_info(m));
+                            if let Some(bsid) = box_sid {
+                                let mut tparams = vec![Ty::Struct(bsid)];
+                                tparams.extend_from_slice(&params[1..]);
+                                sigs.insert(format!("{}$box__{}", e.name, m.name), (tparams, ret));
+                            }
                         }
                         sigs.insert(mangled, (params, ret));
                     }
@@ -1868,6 +1916,7 @@ pub fn lower_module_opts_with_types(
     }
     ctx.generators = gen_map;
     ctx.call_params = call_params;
+    ctx.associated_fns = associated_fns;
 
     let mut out = Module::default();
     for sid in 0..ctx.names.len() {
@@ -1969,7 +2018,13 @@ pub fn lower_module_opts_with_types(
                         }
                         continue;
                     }
-                    match lower_fn(m, name, Some(sid), &sigs, &ctx, &[], &[], &[]) {
+                    // A receiverless associated function (#1260) has no `self`
+                    // receiver, so it lowers with `self_param = false` (`self_sid`
+                    // `None`): its first parameter is an ordinary by-value argument,
+                    // not a by-reference receiver — the ABI must match the no-
+                    // receiver call site.
+                    let recv_sid = if is_receiverless(m) { None } else { Some(sid) };
+                    match lower_fn(m, name, recv_sid, &sigs, &ctx, &[], &[], &[]) {
                         Ok(func) => out.funcs.push(func),
                         Err(e) => errors.push(e),
                     }
@@ -1994,7 +2049,10 @@ pub fn lower_module_opts_with_types(
                             }
                             continue;
                         }
-                        match lower_fn(m, name, Some(sid), &sigs, &ctx, &[], &[], &[]) {
+                        // A receiverless associated function (#1260) lowers with
+                        // `self_param = false` — no by-reference `self` receiver.
+                        let recv_sid = if is_receiverless(m) { None } else { Some(sid) };
+                        match lower_fn(m, name, recv_sid, &sigs, &ctx, &[], &[], &[]) {
                             Ok(func) => out.funcs.push(func),
                             Err(e) => errors.push(e),
                         }
@@ -2015,10 +2073,15 @@ pub fn lower_module_opts_with_types(
                             Ok(func) => out.funcs.push(func),
                             Err(e) => errors.push(e),
                         }
+                        // A receiverless associated function (#1260) is never in an
+                        // itable (it has no `self`), so it needs no box thunk — and
+                        // the thunk builder assumes a `self` receiver, so skip it.
                         if let Some(bsid) = box_sid {
-                            match build_tier1_box_thunk(&e.name, &m.name, bsid, &sigs, &ctx) {
-                                Ok(func) => out.funcs.push(func),
-                                Err(e) => errors.push(e),
+                            if !is_receiverless(m) {
+                                match build_tier1_box_thunk(&e.name, &m.name, bsid, &sigs, &ctx) {
+                                    Ok(func) => out.funcs.push(func),
+                                    Err(e) => errors.push(e),
+                                }
                             }
                         }
                     }
@@ -8118,7 +8181,22 @@ impl<'a> FnLower<'a> {
         // the callee is `Enum.Variant`, intercepted before the plain-name and
         // method-call dispatch.
         if let Expr::Attr { base, name, .. } = callee {
-            if let Expr::Name(tyname, _) = base.as_ref() {
+            if let Expr::Name(tyname, sp) = base.as_ref() {
+                // User-defined associated function `Type.func(args)` (#1260): a
+                // receiverless `def` on a user struct/enum lowers like a namespaced
+                // free function `Type__func`, with NO receiver. Sema type-checked
+                // the call and rejected instance/associated misuse. Dispatched
+                // before variant construction / the derived decoders / the module
+                // path by delegating to the free-function call path on the mangled
+                // name, which assembles defaults, keyword and variadic arguments
+                // exactly as for any free function. `pkg.Type.func(...)` arrives
+                // here with `tyname` already modlink-rewritten to the imported
+                // struct's mangled name, so its `Type__func` is the one registered.
+                let mangled = format!("{tyname}__{name}");
+                if self.ctx.associated_fns.contains(&mangled) && self.lookup(tyname).is_none() {
+                    let synthetic = Expr::Name(mangled, *sp);
+                    return self.call(&synthetic, args);
+                }
                 // `bytes.maketrans(frm, to)` → bytes (ticket #1099): an associated
                 // constructor building a 256-byte table. Raises on unequal lengths,
                 // so a `throwing_call` (invoke) that `try/except` can catch.

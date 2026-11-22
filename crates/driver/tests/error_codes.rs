@@ -82,6 +82,32 @@ fn type_codes() {
          def main():\n    auto r = P(5)\n",
         "ZAP4071",
     );
+    // Associated functions (#1260). A receiverless `def` is called on the type;
+    // calling it on an instance, or calling an instance method on the type, or
+    // naming an unknown associated function, each has a dedicated code.
+    const MSG: &str = concat!(
+        "struct Message:\n",
+        "    int64 id\n",
+        "    def query(int64 id) -> Message:\n",
+        "        return Message(id)\n",
+        "    def to_wire(self) -> int64:\n",
+        "        return self.id\n",
+    );
+    // Associated function called on an instance.
+    assert_code(
+        &format!("{MSG}def main():\n    auto m = Message.query(1)\n    auto b = m.query(2)\n"),
+        "ZAP4085",
+    );
+    // Instance method called without a receiver.
+    assert_code(
+        &format!("{MSG}def main():\n    auto b = Message.to_wire()\n"),
+        "ZAP4086",
+    );
+    // Unknown associated function on a known type (not "unknown name").
+    assert_code(
+        &format!("{MSG}def main():\n    auto b = Message.nope()\n"),
+        "ZAP4087",
+    );
 }
 
 #[test]

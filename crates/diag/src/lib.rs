@@ -501,6 +501,18 @@ define_codes! {
         "A type parameter's bound names a generic interface with the wrong number \
          of type arguments (#1206). A bound `[T: Iface[A, …]]` must supply exactly \
          as many arguments as the interface declares type parameters.";
+    ZAP4085 = 4085 : "associated function called on an instance",
+        "A receiverless `def` on a struct/enum is an associated function (#1260): \
+         it takes no `self` receiver and is called only as `Type.func(...)`, never \
+         on a value. Call it on the type, not on an instance.";
+    ZAP4086 = 4086 : "instance method called without a receiver",
+        "A `def` whose first parameter is `self` is an instance method (#1260): it \
+         needs a receiver and is called as `value.method(...)`, not as \
+         `Type.method(...)`.";
+    ZAP4087 = 4087 : "unknown associated function",
+        "The named type has no associated function (a receiverless `def`, #1260) \
+         with this name, nor a derived decoder (`from_json`/`from_csv`/`from_yaml`). \
+         Check the spelling against the type's declaration.";
 
     ZAP4090 = 4090 : "cyclic type alias",
         "A transparent type alias (`type X = …`) expands, directly or through \

@@ -28,6 +28,7 @@ listed here (see [`README.md`](README.md)).
 | [1239](lang/1239-list-structural-equality.md) | List == / != is a structural element-wise compare, not pointer identity | Locked | 2026-11-21 |
 | [1241](lang/1241-bool-char-element-read-back-narrows.md) | A bool/char collection element reads back as its narrow scalar type | Locked | 2026-11-21 |
 | [1257](lang/1257-type-info.md) | Compile-time type introspection — reflect.type_info(T) (read-only, E1) | Accepted | 2026-11-22 |
+| [1260](lang/1260-associated-functions.md) | A receiverless def on a struct/enum is an associated function, called as Type.func(...) | Locked | 2026-11-22 |
 
 ## stdlib
 
