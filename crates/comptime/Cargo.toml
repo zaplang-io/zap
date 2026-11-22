@@ -1,0 +1,36 @@
+# Zap compile-time evaluation engine (#1250, epic #1249, phase E2 of #1248).
+#
+# A pure-Rust, host-side (no LLVM) tree-walking evaluator over a restricted,
+# deterministic subset of Zap — the "comptime" fragment. It is the greenfield
+# core that `comptime for` unrolling (#1251), typed `reflect.field` lowering
+# (#1252), the kind-switch (#1253), the purity lint (#1254), memoization (#1255)
+# and the diagnostics backtrace (#1256) all build on.
+#
+# It depends only on `zapc_syntax` (the AST it walks) and `zapc_sema_types` (the
+# read-only E1 reflection records — `TypeInfo`/`FieldInfo`/… — reused, never
+# redefined). It deliberately does NOT depend on the sema `Checker` or on
+# codegen/LLVM, so monomorphization (`crates/mono`, itself a leaf over
+# `zapc_syntax` + `zapc_sema_types`) can drive it later without a dependency
+# cycle or an LLVM toolchain.
+[package]
+name = "zapc_comptime"
+description = "Zap compile-time evaluation engine: a pure tree-walking evaluator over the comptime fragment (E2)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "zapc_comptime"
+path = "src/lib.rs"
+
+[dependencies]
+zapc_syntax = { path = "../syntax" }
+zapc_sema_types = { path = "../sema_types" }
+
+[dev-dependencies]
+# Tests drive the real E1 resolver (`analyze_reflect` ⇒ `Reflector`) to build
+# genuine `TypeInfo` values from parsed source for the end-to-end reflection /
+# `rename_all` cases — the way #1251 will feed the evaluator. A test-only edge;
+# the library itself never depends on the sema checker.
+zapc_sema = { path = "../sema" }
