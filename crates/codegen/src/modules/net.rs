@@ -55,6 +55,11 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_net_lookup_ipv6", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_net_lookup_addr", &[p.into()], Some(p.into()));
 
+    // ---- IP presentation <-> wire conversion (ticket #1261) ----
+    // (family: str, text: str) -> bytes ; (family: str, packed: bytes) -> str.
+    cg.declare_rt("zap_net_inet_pton", &[p.into(), p.into()], Some(p.into()));
+    cg.declare_rt("zap_net_inet_ntop", &[p.into(), p.into()], Some(p.into()));
+
     // ---- Unix domain sockets (ticket #993, epic #985) ----
     cg.declare_rt("zap_net_listen_unix", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_net_connect_unix", &[p.into()], Some(p.into()));

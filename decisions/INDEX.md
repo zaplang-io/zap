@@ -27,8 +27,10 @@ listed here (see [`README.md`](README.md)).
 | [1237](lang/1237-coroutine-local-context.md) | Coroutine-local execution context (ContextVar[T] / ContextToken) | Proposed | 2026-11-21 |
 | [1239](lang/1239-list-structural-equality.md) | List == / != is a structural element-wise compare, not pointer identity | Locked | 2026-11-21 |
 | [1241](lang/1241-bool-char-element-read-back-narrows.md) | A bool/char collection element reads back as its narrow scalar type | Locked | 2026-11-21 |
+| [1250](lang/1250-comptime-evaluator.md) | Comptime value model + pure tree-walking evaluator (Tier B1, E2) | Accepted | 2026-11-22 |
 | [1257](lang/1257-type-info.md) | Compile-time type introspection — reflect.type_info(T) (read-only, E1) | Accepted | 2026-11-22 |
 | [1260](lang/1260-associated-functions.md) | A receiverless def on a struct/enum is an associated function, called as Type.func(...) | Locked | 2026-11-22 |
+| [1262](lang/1262-optional-scalar-coercion.md) | Bare payload `T` auto-wraps to `Some(T)` in every `Optional[T]` position sema accepts | Locked | 2026-11-22 |
 
 ## stdlib
 
@@ -55,6 +57,7 @@ listed here (see [`README.md`](README.md)).
 | [1159](stdlib/1159-netport-unix.md) | net.port raises ValueError on a Unix-domain socket | Locked | 2026-11-20 |
 | [1171](stdlib/1171-system-local-zone.md) | stdlib datetime — expose the system local zone as a reusable TimeZone | Accepted | 2026-11-20 |
 | [1242](stdlib/1242-url-unquote-errors.md) | url.unquote errors mode — replace (default) | strict, over a UTF-8 replacement decode path | Accepted | 2026-11-21 |
+| [1261](stdlib/1261-ip-presentation-wire.md) | net IP presentation↔wire conversion — inet_pton / inet_ntop | Locked | 2026-11-22 |
 
 ## runtime
 

@@ -453,6 +453,33 @@ differs in a few places:
 - **No service-name resolution.** There is no `getaddrinfo(host, "http")`
   service→port form; ports are plain integers.
 
+### `net` IP presentation ↔ wire conversion (#1261, decisions/stdlib/1261-ip-presentation-wire.md)
+
+- **Address family is a portable string, not an `AF_*` integer.** CPython's
+  `socket.inet_pton(family, s)` / `inet_ntop(family, packed)` take the
+  platform-specific integer constants `socket.AF_INET` / `AF_INET6` (`AF_INET6`
+  is `10` on Linux, `30` on macOS, `23` on Windows). Zap exposes no `AF_*`
+  constants, so `net.inet_pton(family, text)` / `net.inet_ntop(family, packed)`
+  take the string `"ipv4"` or `"ipv6"` (exactly those two spellings;
+  case-sensitive), matching the explicit-family style of `net.lookup_ipv4` /
+  `lookup_ipv6` and `net.udp_socket6`.
+- **One typed error: `ValueError`.** CPython raises `OSError` for malformed
+  address text and `ValueError` for a bad family. Zap raises a catchable
+  `ValueError` for every rejection — unknown family, malformed text, a family /
+  text mismatch (IPv6 text with `"ipv4"` and vice-versa), and an `inet_ntop`
+  `packed` whose width is not 4 (`"ipv4"`) or 16 (`"ipv6"`).
+- **Canonical RFC 5952 IPv6 output, with a narrow IPv4-mapped rule.** `inet_ntop`
+  always emits the canonical form — lowercase, no leading zeros, the longest
+  zero run (≥ 2 groups, leftmost on a tie) compressed to `::`, a single zero
+  group never shortened. Only the IPv4-mapped prefix (`::ffff:a.b.c.d`) renders
+  with an embedded dotted-decimal tail; the deprecated IPv4-compatible form
+  (`::a.b.c.d`) renders as pure hex groups. (CPython delegates to the platform
+  `inet_ntop`, whose compression and v4-mapped behaviour varies; Zap's formatter
+  is hand-written for byte-identical output across platforms.)
+- **`inet_pton` returns `bytes`, `inet_ntop` takes `bytes`.** As in CPython, the
+  packed form is a `bytes` value (4 octets for IPv4, 16 for IPv6) in network byte
+  order; no `netaddr`/`ipaddress`-style object is involved.
+
 ### `net` Unix domain sockets (#993, decisions/stdlib/993-unix-domain-sockets.md)
 
 - **Two-step `socket()` + `bind`/`connect` is folded into combined

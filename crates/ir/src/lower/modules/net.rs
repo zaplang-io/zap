@@ -207,6 +207,14 @@ fn lower(
         "lookup_ipv6" => call_ret(lowerer, "zap_net_lookup_ipv6", a, Ty::List(Elem::Ptr), true),
         "lookup_addr" => call_ret(lowerer, "zap_net_lookup_addr", a, Ty::List(Elem::Ptr), true),
 
+        // ---- IP presentation <-> wire conversion (ticket #1261) ----
+        // Pure parse/format over str/bytes words; malformed input, an unknown
+        // family, or a bad packed width raises ValueError, so both are throwing
+        // calls (invoke) to be catchable inside `try`. inet_pton returns a
+        // `bytes` result (Ty::Bytes), inet_ntop a `str` (Ty::Ptr).
+        "inet_pton" => call_ret(lowerer, "zap_net_inet_pton", a, Ty::Bytes, true),
+        "inet_ntop" => call_ret(lowerer, "zap_net_inet_ntop", a, Ty::Ptr, true),
+
         // ---- Unix domain sockets (ticket #993, epic #985) ----
         "listen_unix" => call_ret(lowerer, "zap_net_listen_unix", a, Ty::Bytes, true),
         "connect_unix" => call_ret(lowerer, "zap_net_connect_unix", a, Ty::Bytes, true),
