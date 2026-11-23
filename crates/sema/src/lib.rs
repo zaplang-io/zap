@@ -6637,6 +6637,22 @@ impl Checker {
             // itself loose (#510), so it stays `Unknown` to combine with
             // `& | ~` and to index; a concrete scalar comparison is `bool`.
             Eq | Ne => {
+                // `heap` has no value equality (#1328): a heap's internal array
+                // order is implementation-defined, so `==` / `!=` is undefined.
+                // Diagnose here (identity via `is` / `is not` is still allowed);
+                // dict/set/list/deque/oset all have well-defined structural
+                // equality and fall through to `Ty::Bool`.
+                if matches!(l, Ty::Heap(_)) || matches!(r, Ty::Heap(_)) {
+                    self.error(
+                        ErrorCode::ZAP4012,
+                        "a heap has no value equality: its internal order is \
+                         implementation-defined, so `==` / `!=` is undefined; compare \
+                         a snapshot (e.g. `sorted(h.items())`) or use `is` / `is not` \
+                         for identity"
+                            .to_string(),
+                        span,
+                    );
+                }
                 if matches!(l, Ty::Unknown) || matches!(r, Ty::Unknown) {
                     Ty::Unknown
                 } else {
