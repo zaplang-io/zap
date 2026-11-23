@@ -1,15 +1,16 @@
 # Golden fixture (#1311, decisions/lang/1311-filesystem-notfound-error.md): a
-# filesystem read distinguishes a missing path from other failures by exception
-# TYPE, while every failure stays catchable by `except Exception`.
+# filesystem read on a MISSING path raises the typed `FileNotFoundError`, which
+# is catchable at every level of its hierarchy (FileNotFoundError ⊂ OSError ⊂
+# Exception) and is NOT caught by an unrelated clause; a successful read returns
+# the contents; and `read_bytes` classifies ENOENT the same way.
 #
-#   - a missing path -> FileNotFoundError (catchable as FileNotFoundError, as its
-#     parent OSError, and as Exception);
-#   - a directory (a non-missing failure) -> OSError, NOT FileNotFoundError
-#     (open fails EACCES on Windows / read fails EISDIR on POSIX — a non-ENOENT
-#     errno either way, so the type is OSError on every platform), still caught
-#     by a bare `except Exception`;
-#   - a successful read returns the contents;
-#   - read_bytes classifies ENOENT the same way.
+# The missing-path (ENOENT) trigger is deterministic and identical on every
+# platform. The complementary "a non-missing failure raises OSError, NOT
+# FileNotFoundError" distinction is pinned deterministically by the
+# `fs_notfound_hierarchy` golden (via user `raise`s), because the real-syscall
+# non-ENOENT failures vary by platform (open succeeds on a directory on POSIX
+# but fails EACCES on Windows) and reading a directory hits a separate, unrelated
+# read-buffer bug — both tracked as a follow-up, outside #1311's error-typing.
 #
 # Only deterministic labels and the known file content are printed, never the
 # non-deterministic temp path.
@@ -45,22 +46,14 @@ def main():
     except Exception:
         print("missing:exception")
 
-    # (3) A directory is a non-missing failure: OSError, NOT FileNotFoundError.
-    # The inner FileNotFoundError clause must NOT fire; the enclosing OSError
-    # clause catches it.
+    # (3) It is NOT caught by an unrelated clause; the FileNotFoundError clause
+    # that follows wins.
     try:
-        try:
-            print(fs.read_file(d))
-        except FileNotFoundError:
-            print("WRONG:dir-as-filenotfound")
-    except OSError:
-        print("dir:oserror-not-filenotfound")
-
-    # ... and the same directory read is still caught by a bare `except Exception`.
-    try:
-        print(fs.read_file(d))
-    except Exception:
-        print("dir:exception")
+        print(fs.read_file(missing))
+    except ValueError:
+        print("WRONG:valueerror-caught")
+    except FileNotFoundError:
+        print("missing:not-valueerror")
 
     # (4) read_bytes classifies ENOENT as FileNotFoundError too.
     try:

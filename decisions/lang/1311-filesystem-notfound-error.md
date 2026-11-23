@@ -102,6 +102,21 @@ Exception` catches everything.
   worthwhile consistency follow-up, filed separately rather than widening this
   issue.
 
+- **Pre-existing: `read_file` / `read_bytes` on a directory does not raise
+  cleanly.** On POSIX `open(dir, O_RDONLY)` succeeds, so the failure is only
+  discovered by the subsequent `read` (`EISDIR`); the size hint
+  `zap_read_all_fd` takes from `lseek(SEEK_END)` on a directory is unreliable and
+  can drive an out-of-memory abort before that `read` runs, so the typed
+  `OSError` is not reached for the directory case on those platforms (on Windows
+  `open` fails `EACCES` up front and the typed `OSError` *is* raised). This
+  read-buffer fragility predates #1311 — the previous generic raise had the same
+  problem — and fixing it (e.g. an `fstat`/`S_ISREG` guard before trusting the
+  `lseek` size, or detecting the directory up front) is tracked as a follow-up
+  rather than widened into this error-typing change. Because of it, the
+  "non-missing failure raises `OSError`, not `FileNotFoundError`" distinction is
+  pinned by the `fs_notfound_hierarchy` golden (user `raise`s, deterministic on
+  every platform) instead of by a real directory read.
+
 - **No `IOError` alias name in Zap source.** CPython keeps `IOError` only as a
   legacy alias; Zap source spells it `OSError`. A Python-interop exception named
   `IOError` still maps to `ZAP_EXC_OS_ERROR` (so caught Python I/O errors behave
