@@ -1150,3 +1150,59 @@ def main():
     );
     assert!(!out.stdout.is_empty(), "expected ZIR on stdout");
 }
+
+// --- E3d (#1293): a @derive that cannot apply is an average-programmer-grade
+// compile error pointing at the user's field, not an internal symbol. ---
+
+#[test]
+fn an_inapplicable_derive_is_a_consumer_zap7003_at_the_users_field() {
+    // `User` derives `Ser`, but its `Widget` field is a struct the generator
+    // rejects via `comptime.error`. The error must name the user's type and
+    // point at the user's field `w` — never the generator symbol or evaluator
+    // internals — and carry the `required because of …` frame and the library's
+    // own message.
+    let src = "\
+@derivable(Ser)
+def _derive_ser[T](T value):
+    comptime for f in reflect.type_info(T).fields:
+        if f.ty.kind.name == \"struct\":
+            comptime.error(f.span, \"`Ser` is not implemented for this field's type\")
+
+interface Ser:
+    def ser(self)
+
+@derive(Ser)
+struct Widget:
+    int64 w
+@derive(Ser)
+struct User:
+    int64 id
+    Widget w
+
+def main():
+    auto u = User(1, Widget(2))
+    u.ser()
+";
+    let f = write_zap("e3d-inapplicable", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(!out.status.success(), "the derive must fail to compile");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error[ZAP7003]: cannot derive `Ser` for `User`"),
+        "consumer header naming the user's type: {stderr}"
+    );
+    assert!(
+        stderr.contains("required because of field `w` of `User`"),
+        "backtrace frame at the user's field: {stderr}"
+    );
+    assert!(
+        stderr.contains("the generator reported: `Ser` is not implemented"),
+        "the library's own message as the root cause: {stderr}"
+    );
+    // The diagnostic must NOT leak the generator symbol or a mangled internal
+    // name (the `$`-mangled specialization, e.g. `_derive_ser$User`).
+    assert!(
+        !stderr.contains("_derive_ser") && !stderr.contains('$'),
+        "no comptime-internal symbol in the diagnostic: {stderr}"
+    );
+}

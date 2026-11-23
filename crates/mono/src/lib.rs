@@ -70,6 +70,39 @@ pub struct LowerError {
     /// `ZAP6xxx` (Experimental, per `docs/STABILITY.md`).
     pub code: zapc_diag::ErrorCode,
     pub message: String,
+    /// Present when this error is a comptime `@derive` failure (E3d, #1293): the
+    /// data the driver needs to render it through the #1256 renderers (the
+    /// `ZAP7003` consumer header at the user's field, the `required because of …`
+    /// backtrace, and the root cause). `None` for an ordinary lowering error,
+    /// which renders as the location-free `ZAP6xxx` header exactly as before.
+    /// Boxed so an ordinary `LowerError` stays small.
+    pub derive: Option<Box<DeriveErrorInfo>>,
+}
+
+/// The data a comptime `@derive` failure carries up to the driver, where source
+/// text is available to render it (E3d, #1293). Plain data (no `zapc_comptime`
+/// types) so it crosses the mono → driver boundary cleanly; the driver
+/// reconstructs the `CtError`/`DeriveBacktrace` and calls the #1256 renderers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeriveErrorInfo {
+    /// The derived trait and the type it is derived for, when the failure is
+    /// inside a registered `@derivable` generator's descent (the consumer
+    /// `ZAP7003` "cannot derive `trait` for `type`" form). `None` when the
+    /// comptime failure is not under a derive (rendered as a plain comptime
+    /// error at its own span).
+    pub trait_and_type: Option<(String, String)>,
+    /// The root cause's message (the library's own words for a `comptime.error`,
+    /// or the engine's for a fault) and the span it points at (the user's field
+    /// / element, via span fidelity through #1251/#1252).
+    pub cause_message: String,
+    pub cause_span: zapc_syntax::span::Span,
+    /// `true` for a library-authored `comptime.error` abort (`ZAP7002`), `false`
+    /// for an engine fault (`ZAP7001`); selects the root-cause lead-in and, for a
+    /// fault, the dual-span generator-fault form.
+    pub cause_is_user: bool,
+    /// Backtrace frames (outermost first): `(label, span)` per context the
+    /// descent unwound through, e.g. `("field `b` of `Outer`", <field span>)`.
+    pub frames: Vec<(String, zapc_syntax::span::Span)>,
 }
 
 /// Monomorphize a module: produce an equivalent AST with all user generics
@@ -232,6 +265,17 @@ struct Mono<'a> {
     interfaces: HashMap<String, &'a InterfaceDef>,
     /// Free-function return types, for inference of `f(...)` results.
     func_ret: HashMap<String, Option<Type>>,
+    /// Library-registered derivable generators (E3a, #1290): generator function
+    /// name -> the trait it derives (from `@derivable(Trait)`). Used to recover
+    /// the `@derive` context (trait + type) when a `comptime.error` or engine
+    /// fault is raised inside a generator's descent, so the failure renders as a
+    /// consumer `ZAP7003` (E3d, #1293).
+    derivable_generators: HashMap<String, String>,
+    /// The derive context of the generic function body currently being
+    /// specialized, when it is a derivable generator: `(trait, concrete type)`.
+    /// Set around the body rewrite in `emit_func_instance`; read when a comptime
+    /// failure surfaces during that body's `comptime for` unroll (E3d, #1293).
+    cur_derive: Option<(String, String)>,
     /// The comptime [`TypeRegistry`] for this module (built once), attached to the
     /// evaluator that unrolls a `comptime for` so a generator's `f.ty.kind` /
     /// container recursion resolves user types (#1253, #1330). Without it a
@@ -343,6 +387,17 @@ fn err(m: impl Into<String>) -> LowerError {
     LowerError {
         code: zapc_diag::ErrorCode::ZAP6001,
         message: m.into(),
+        derive: None,
+    }
+}
+
+/// The trait a free function registers via `@derivable(Trait)` (one positional
+/// identifier), or `None` (E3a, #1290). Mirrors the driver's synthesis scan.
+fn derivable_trait(f: &Function) -> Option<String> {
+    let d = f.decorators.iter().find(|d| d.name == "derivable")?;
+    match d.args.first().map(|a| &a.value) {
+        Some(Expr::Name(t, _)) if d.args.len() == 1 => Some(t.clone()),
+        _ => None,
     }
 }
 
@@ -721,6 +776,8 @@ impl<'a> Mono<'a> {
             enums: HashMap::new(),
             interfaces: HashMap::new(),
             func_ret: HashMap::new(),
+            derivable_generators: HashMap::new(),
+            cur_derive: None,
             comptime_registry: type_registry(module),
             globals: HashMap::new(),
             aliases: HashMap::new(),
@@ -768,6 +825,12 @@ impl<'a> Mono<'a> {
                     m.func_ret.insert(f.name.clone(), f.ret.clone());
                     if !f.generics.is_empty() {
                         m.gfuncs.insert(f.name.clone(), f);
+                    }
+                    // `@derivable(Trait)` registers this generator for `Trait`
+                    // (E3a, #1290); record name -> trait so a comptime failure in
+                    // its descent can be rendered as a derive error (E3d, #1293).
+                    if let Some(tr) = derivable_trait(f) {
+                        m.derivable_generators.insert(f.name.clone(), tr);
                     }
                 }
                 Item::Interface(i) => {
@@ -2104,10 +2167,19 @@ impl<'a> Mono<'a> {
         let saved_subst = std::mem::replace(&mut self.cur_subst, subst);
         let saved_proj = std::mem::replace(&mut self.cur_proj, proj);
         let saved_self = self.cur_self.take();
+        // If this is a `@derivable` generator being specialized at a concrete
+        // type, record the derive context (trait + type) so a comptime failure in
+        // its `comptime for` descent renders as a consumer `ZAP7003` (E3d, #1293).
+        let derive_ctx = self
+            .derivable_generators
+            .get(func)
+            .and_then(|tr| args.first().map(|ty| (tr.clone(), type_name(ty))));
+        let saved_derive = std::mem::replace(&mut self.cur_derive, derive_ctx);
         let spec = self.rewrite_fn_inner(f, None, Some(mangled));
         self.cur_subst = saved_subst;
         self.cur_proj = saved_proj;
         self.cur_self = saved_self;
+        self.cur_derive = saved_derive;
         self.spec_funcs.push(spec?);
         Ok(())
     }
@@ -2252,7 +2324,8 @@ impl Mono<'_> {
                         body,
                         &[],
                         Some(&self.comptime_registry),
-                    )?;
+                    )
+                    .map_err(|e| self.enrich_derive_error(e, &def.fields))?;
                     Ok(Some(out))
                 }
                 None => Ok(None),
@@ -2265,7 +2338,8 @@ impl Mono<'_> {
                         body,
                         &[],
                         Some(&self.comptime_registry),
-                    )?;
+                    )
+                    .map_err(|e| self.enrich_derive_error(e, &[]))?;
                     Ok(Some(out))
                 }
                 None => Ok(None),
@@ -2274,6 +2348,27 @@ impl Mono<'_> {
             // for` iterates; anything else is left for a later pass.
             _ => Ok(None),
         }
+    }
+
+    /// Attach the active `@derive` context (trait + type) to a comptime failure
+    /// raised during a generator's `comptime for` descent, so the driver renders
+    /// it as a consumer `ZAP7003` "cannot derive `trait` for `type`" (E3d, #1293).
+    /// A no-op when there is no derive context (a plain `comptime for` outside a
+    /// derive) or the error carries no derive payload. `fields` are the enclosing
+    /// type's fields, used to label the backtrace frame at the offending field
+    /// (matched by the cause span).
+    fn enrich_derive_error(&self, mut le: LowerError, fields: &[ast::Field]) -> LowerError {
+        if let (Some(di), Some((tr, ty))) = (le.derive.as_mut(), self.cur_derive.as_ref()) {
+            di.trait_and_type = Some((tr.clone(), ty.clone()));
+            le.code = zapc_diag::ErrorCode::ZAP7003;
+            if di.frames.is_empty() {
+                if let Some(f) = fields.iter().find(|f| f.span == di.cause_span) {
+                    di.frames
+                        .push((format!("field `{}` of `{}`", f.name, ty), f.span));
+                }
+            }
+        }
+        le
     }
 
     /// Rewrite an expression, returning the rewritten node only.

@@ -22,7 +22,7 @@ pub use zapc_ir_core::{
 };
 // `LowerError` moved to `zapc_mono` with monomorphization (#129); re-export it
 // here (and at `zapc_ir::lower::LowerError`, via `lower.rs`) unchanged.
-pub use zapc_mono::LowerError;
+pub use zapc_mono::{DeriveErrorInfo, LowerError};
 // The sema inferred-type carrier (#1167): re-exported so `zapc_codegen` (which
 // depends on `zapc_ir`, not on the sema checker) can name the `TypeMap` it
 // passes to `lower_module_opts_with_types`.

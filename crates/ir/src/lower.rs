@@ -2870,6 +2870,7 @@ fn err(m: impl Into<String>) -> LowerError {
     LowerError {
         code: zapc_diag::ErrorCode::ZAP6001,
         message: m.into(),
+        derive: None,
     }
 }
 
@@ -2880,6 +2881,7 @@ fn err_code(code: zapc_diag::ErrorCode, m: impl Into<String>) -> LowerError {
     LowerError {
         code,
         message: m.into(),
+        derive: None,
     }
 }
 
@@ -10313,6 +10315,7 @@ impl<'a> FnLower<'a> {
                     "value of type `{}` is not a function, but `{want}` is expected",
                     self.render_ty(from)
                 ),
+                derive: None,
             });
         };
         if *from_idx == to_idx {
@@ -10352,7 +10355,11 @@ impl<'a> FnLower<'a> {
             "function value of type `{got}` is not compatible with the \
              expected type `{want}`: {detail}"
         );
-        Err(LowerError { code, message })
+        Err(LowerError {
+            code,
+            message,
+            derive: None,
+        })
     }
 
     /// Render a ZIR type as a readable source-ish type for a diagnostic: a

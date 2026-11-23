@@ -178,6 +178,7 @@ impl<'a> FnLower<'a> {
                         self.render_ty(&vt),
                         self.render_ty(&target),
                     ),
+                    derive: None,
                 });
             }
             argvals.push(self.coerce(v, vt, target));
