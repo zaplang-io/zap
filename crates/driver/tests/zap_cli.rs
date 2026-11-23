@@ -524,6 +524,106 @@ fn test_assert_nullable_field_vs_none_1184() {
     assert!(stdout.contains("0 failed"), "stdout:\n{stdout}");
 }
 
+/// `Optional.Some` built from an explicit integer conversion — the #1308
+/// reproducer — runs green under `zap test`, in both the standalone and the
+/// typed keyword-argument forms. Before the fix the native harness lowered its
+/// transformed module with an empty `TypeMap`, so the monomorphizer could not
+/// pin `T` and the run failed with `ZAP6001` ("cannot infer type argument 'T'
+/// of generic 'Optional'") even though the identical program compiled under
+/// `zap run`. Pins the test-mode path (the sema `TypeMap` is now threaded into
+/// the harness build); the `harness_infers_*` host tests pin the mechanism.
+#[cfg(feature = "codegen")]
+#[test]
+fn test_optional_some_explicit_cast_1308() {
+    let dir = scratch("test_optional_cast_1308");
+    write_file(
+        &dir,
+        "tests/optional_cast_test.zap",
+        "@test\ndef explicit_integer_cast():\n\
+         \x20   auto value = Optional.Some(int64(0))\n    assert value.is_some()\n\n\
+         @test\ndef explicit_integer_cast_kwarg():\n\
+         \x20   auto value = Optional.Some(value=int64(0))\n    assert value.is_some()\n\n\
+         @test\ndef zero_is_present():\n\
+         \x20   Optional[int64] value = Optional.Some(int64(0))\n\
+         \x20   assert value.unwrap() == 0\n",
+    );
+
+    let out = zap().arg("test").current_dir(&dir).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "zap test should pass; exit {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        out.status.code()
+    );
+    assert!(
+        stdout.contains("[PASS] explicit_integer_cast"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[PASS] explicit_integer_cast_kwarg"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[PASS] zero_is_present"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("0 failed"), "stdout:\n{stdout}");
+}
+
+/// A generic reflected operator whose operand type sema inferred — the #1310
+/// reproducer — runs green under `zap test`. The native harness used to pass an
+/// empty `TypeMap` to codegen, so a `__radd__[T]` over a built-in / seam result
+/// fell back to pre-#1167 inference and failed with `ZAP6001` ("cannot infer
+/// type argument 'T' of operator method '__radd__'"), though `zap ir` compiled
+/// the same body. Covers a built-in result (`len`) and an inline `datetime`
+/// seam call with the annotation omitted, exercising reflected `+` and `-` with
+/// a core Date operand.
+#[cfg(feature = "codegen")]
+#[test]
+fn test_reflected_operator_sema_inference_1310() {
+    let dir = scratch("test_reflected_op_1310");
+    write_file(
+        &dir,
+        "tests/reflected_test.zap",
+        "import datetime\n\n\
+         value struct Delta:\n    int64 n\n\n\
+         \x20   def __radd__[T](self, T x) -> T:\n        return x\n\n\
+         \x20   def __rsub__[T](self, T x) -> T:\n        return x\n\n\
+         @test\ndef inferred_from_builtin_result():\n\
+         \x20   list[int64] xs = [1, 2, 3]\n\
+         \x20   auto result = len(xs) + Delta(1)\n    assert result == 3\n\n\
+         @test\ndef inferred_date_operand():\n\
+         \x20   auto day = datetime.date(2024, 2, 29)\n\
+         \x20   auto result = day + Delta(1)\n    assert result.day == 29\n\n\
+         @test\ndef inferred_date_operand_sub():\n\
+         \x20   auto day = datetime.date(2024, 2, 29)\n\
+         \x20   auto result = day - Delta(1)\n    assert result.day == 29\n",
+    );
+
+    let out = zap().arg("test").current_dir(&dir).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "zap test should pass; exit {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        out.status.code()
+    );
+    assert!(
+        stdout.contains("[PASS] inferred_from_builtin_result"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[PASS] inferred_date_operand"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[PASS] inferred_date_operand_sub"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("0 failed"), "stdout:\n{stdout}");
+}
+
 // --- `zap mcp` end-to-end (issue #72, D-0055) ---------------------------------
 
 /// Drive the real `zap mcp` server over stdio: spawn it rooted at `root`, feed

@@ -52,6 +52,7 @@ listed here (see [`README.md`](README.md)).
 | [1298](lang/1298-comptime-surface-sema-acceptance.md) | comptime/reflect surface — sema acceptance + end-to-end (S2b) | Accepted | 2026-11-23 |
 | [1299](lang/1299-iterable-minmax-sum.md) | Iterable min/max (key=/default=) and sum start | Locked | 2026-11-23 |
 | [1302](lang/1302-enumerate-zip.md) | enumerate and zip for-loop built-ins | Locked | 2026-11-23 |
+| [1308](lang/1308-test-harness-threads-sema-types.md) | The native `@test` harness lowers with sema's inferred types | Locked | 2026-11-23 |
 | [1309](lang/1309-interface-signature-monomorphization.md) | Monomorphization rewrites interface method signatures | Locked | 2026-11-23 |
 
 ## stdlib
