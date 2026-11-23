@@ -165,3 +165,41 @@ fn an_unresolvable_comptime_for_type_is_left_for_the_backstop() {
         body.stmts
     );
 }
+
+// --- #1324: a generic free function parameter named `self` is an ordinary
+// parameter (not a method receiver) — its type is substituted per instantiation,
+// and type-argument inference matches the call argument against it. ---
+
+#[test]
+fn a_generic_free_fn_self_param_is_substituted_and_inferred() {
+    // `g[T](T self)` called as `g(Point(..))` must specialize with `self: Point`
+    // (T substituted) and infer T from the argument — not keep `self: T` or fail
+    // with "cannot infer type argument". Reflect is not involved; this isolates
+    // the self-param handling in `rewrite_fn_inner` + `infer_fn_targs`.
+    let src = "\
+struct Point:
+    int64 x
+    int64 y
+def g[T](T self) -> T:
+    return self
+def main():
+    auto p = g(Point(1, 2))
+";
+    let items = mono(src);
+    // The specialized `g$Point` must have its single parameter typed `Point`.
+    let f = items
+        .iter()
+        .find_map(|i| match i {
+            Item::Function(f) if f.name.contains("g") && f.name != "main" => Some(f),
+            _ => None,
+        })
+        .expect("a specialized `g` instantiation");
+    assert_eq!(f.params.len(), 1);
+    assert_eq!(f.params[0].name, "self");
+    match f.params[0].ty.as_ref().expect("self has a type") {
+        zapc_syntax::ast::Type::Named { name, .. } => {
+            assert_eq!(name, "Point", "self's type is substituted T -> Point");
+        }
+        other => panic!("expected Named Point, got {other:?}"),
+    }
+}
