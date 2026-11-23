@@ -2727,7 +2727,14 @@ fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError
         // pointer to `str`; without it, `len(rows[i])` counted codepoints
         // (`zap_str_len_cp`) rather than bytes (`zap_str_len`).
         Ty::Bytes => Ok(Elem::Bytes),
-        Ty::Ptr | Ty::Array(..) | Ty::Match | Ty::Func(_) | Ty::Py | Ty::CtxToken => Ok(Elem::Ptr),
+        // A first-class function value (I#163) is physically a closure-record
+        // pointer word, but its signature is retained in a dedicated `Elem::Func`
+        // (#1348) so read-back (`callbacks[i]`, `for cb in callbacks`, a
+        // list/dict/set/channel field) recovers `Ty::Func` and the call site
+        // lowers to an indirect closure call instead of a failed top-level name
+        // lookup (`ZAP6001`). The `u32` is the signature index, stable module-wide.
+        Ty::Func(idx) => Ok(Elem::Func(idx)),
+        Ty::Ptr | Ty::Array(..) | Ty::Match | Ty::Py | Ty::CtxToken => Ok(Elem::Ptr),
         Ty::Bigint | Ty::Complex => Err(err(
             "collections of bigint or complex values are not supported yet",
         )),
@@ -17065,10 +17072,14 @@ impl<'a> FnLower<'a> {
                 // A nested collection (#625) is not directly orderable (the
                 // runtime compares elements as `i64`/str words), like `f64` and
                 // structs; sort it via a `key=` projection.
-                Elem::F64 | Elem::Struct(_) | Elem::Nested(_) | Elem::Complex => Err(err(format!(
-                    "{what} is not orderable; pass key= to sort by an orderable \
-                     projection (an int or str)"
-                ))),
+                // A function value (#1348) has no runtime ordering, like a
+                // struct / nested collection / complex; sort via a `key=`.
+                Elem::F64 | Elem::Struct(_) | Elem::Nested(_) | Elem::Complex | Elem::Func(_) => {
+                    Err(err(format!(
+                        "{what} is not orderable; pass key= to sort by an orderable \
+                         projection (an int or str)"
+                    )))
+                }
             }
         };
         let (keys, kind) = match key_expr {

@@ -93,6 +93,21 @@ pub enum Elem {
     /// `str` is (value element, dict key/value, set member), since `bytes` is a
     /// `ZapStr` with the same word, suffix, and hashing.
     Bytes,
+    /// A **first-class function value** element (`fn(..) -> R`) stored inside a
+    /// collection (#1348). Physically a pointer word to the single-pointer
+    /// closure record (I#163) — exactly like [`Elem::Ptr`], so it pushes/reads
+    /// through the `_ptr` runtime entry points and GC-traces as a pointer — but
+    /// it retains the function *signature* so read-back (`callbacks[i]`,
+    /// `for cb in callbacks`) recovers [`Ty::Func`] rather than defaulting the
+    /// bare pointer to `str`. Without it, a function value read from a
+    /// `list[fn() -> int64]` came back as [`Ty::Ptr`], so the call site could
+    /// not tell it was a callable value and fell back to top-level name lookup,
+    /// which failed with `ZAP6001 "call to unknown function"`. The `u32` is the
+    /// [`Ty::Func`] signature index (into `Module::fn_sigs`), carried directly so
+    /// [`Elem::ty`] rebuilds the exact `Ty::Func(idx)` with no side interner. A
+    /// function value is not [`Hashable`], so this never appears in a dict/set
+    /// *key* position.
+    Func(u32),
 }
 
 impl Elem {
@@ -117,6 +132,11 @@ impl Elem {
             // physical `ZapStr` pointer word retains `bytes` identity, so
             // `len`/indexing/slicing/Display use byte (not codepoint) semantics.
             Elem::Bytes => Ty::Bytes,
+            // A function-value element reads back as the scalar `fn(..) -> R`
+            // (#1348): its physical closure-record pointer word retains the
+            // function signature so a call through it lowers to an indirect
+            // closure call instead of a failed top-level name lookup.
+            Elem::Func(idx) => Ty::Func(idx),
         }
     }
     /// The runtime-entry-point suffix for an element/value of this kind. Struct
@@ -127,8 +147,15 @@ impl Elem {
             Elem::I64 | Elem::Bool | Elem::Char | Elem::Enum(_) => "i64",
             Elem::F64 => "f64",
             // `complex` and `bytes` are heap pointer words (`ZapComplex` /
-            // `ZapStr`), stored/read through the `_ptr` path like `str`.
-            Elem::Ptr | Elem::Struct(_) | Elem::Nested(_) | Elem::Complex | Elem::Bytes => "ptr",
+            // `ZapStr`), stored/read through the `_ptr` path like `str`; a
+            // function value (#1348) is a closure-record pointer word, likewise
+            // stored/read through the `_ptr` path.
+            Elem::Ptr
+            | Elem::Struct(_)
+            | Elem::Nested(_)
+            | Elem::Complex
+            | Elem::Bytes
+            | Elem::Func(_) => "ptr",
         }
     }
     /// The runtime-entry-point suffix for a *key* of this kind. Pointer keys are
@@ -152,6 +179,10 @@ impl Elem {
             // `complex` is admitted only in value positions (not as a key), so this
             // is never reached; share the pointer-key path for a defined value.
             Elem::Complex => "str",
+            // A function value is not `Hashable`, so a `fn(..) -> R` element is
+            // never admitted in a dict/set key position (#1348); share the
+            // pointer-key path for a defined value rather than panicking.
+            Elem::Func(_) => "str",
         }
     }
 }
