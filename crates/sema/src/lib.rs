@@ -687,6 +687,10 @@ const BUILTINS: &[&str] = &[
     "any",
     "all",
     "reversed",
+    // enumerate(xs[, start]) / zip(a, b, …) (#1302) — iterator-shaped built-ins,
+    // supported directly in a for-loop header.
+    "enumerate",
+    "zip",
     "dot",
     "concatenate",
     "stack",
@@ -8092,55 +8096,140 @@ impl Checker {
                     for a in args {
                         self.infer(&a.value);
                     }
-                    if argc != 1 {
+                    if args.iter().any(|a| a.name.is_some()) {
+                        self.error(
+                            ErrorCode::ZAP4023,
+                            "sum() takes no keyword arguments (the start value is \
+                             positional: sum(xs, start))"
+                                .to_string(),
+                            span,
+                        );
+                    }
+                    if !(1..=2).contains(&argc) {
                         self.error(
                             ErrorCode::ZAP4025,
-                            format!("sum() takes exactly one argument, got {argc}"),
+                            format!(
+                                "sum() takes one or two arguments (the iterable and an \
+                                 optional start), got {argc}"
+                            ),
                             span,
                         );
                         return Ty::Unknown;
                     }
                     let t = self.infer(&args[0].value);
-                    match self.iterable_elem(&t) {
+                    let elem = match self.iterable_elem(&t) {
                         Some(e) if e.is_numeric() && !matches!(e, Ty::Bigint | Ty::Complex) => {
-                            return default_type(e);
+                            default_type(e)
                         }
-                        _ => return Ty::Unknown,
+                        _ => Ty::Unknown,
+                    };
+                    // `sum(xs, start)` (#1299): the optional start value seeds the
+                    // accumulator; it must be numeric and compatible with the
+                    // element type (the result stays the element type).
+                    if argc == 2 {
+                        let st = self.infer(&args[1].value);
+                        if !st.is_numeric() && !matches!(st, Ty::Unknown) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!("sum() start value must be numeric, got {}", st.display()),
+                                span,
+                            );
+                        }
                     }
+                    return elem;
                 }
-                // Exact scalar `min`/`max`: the lesser / greater of two or more
-                // numeric scalar arguments (#1279 the two-arg form; #1284 the
-                // variadic `min(a, b, c, …)` form). The result is the numeric
-                // join of all operands. Integer operands are compared and
-                // returned at integer width (never routed through `f64`), so
-                // adjacent `int64` values above 2^53 stay distinct — the
-                // exactness the DNS per-attempt deadline math (zaplang-io/dns#6)
-                // needs. The iterable `min(xs)` form, `key=`, and `default=`
-                // remain follow-ups, as does `str`/`bigint` support.
+                // `min`/`max` in two shapes: the **variadic scalar** form
+                // `min(a, b, c, …)` (#1279/#1284) and the **iterable** form
+                // `min(xs)` / `min(xs, key=f)` / `min(xs, default=d)` (#1299).
+                // Integer comparisons never route through `f64`, so exactness
+                // holds. `key=`/`default=` apply only to the iterable form.
                 "min" | "max" => {
-                    // key= / default= (the iterable form) are not supported yet,
-                    // so no keyword arguments; reject rather than silently drop.
-                    if let Some(a) = args.iter().find(|a| a.name.is_some()) {
-                        self.error(
-                            ErrorCode::ZAP4023,
-                            format!(
-                                "{fname}() takes no keyword arguments yet \
-                                 (key= and default=, with the iterable form, are \
-                                 a follow-up); unexpected '{}'",
-                                a.name.as_deref().unwrap_or_default()
+                    let positionals: Vec<&Arg> = args.iter().filter(|a| a.name.is_none()).collect();
+                    let mut key_arg: Option<&Arg> = None;
+                    let mut default_arg: Option<&Arg> = None;
+                    for a in args.iter().filter(|a| a.name.is_some()) {
+                        match a.name.as_deref() {
+                            Some("key") => key_arg = Some(a),
+                            Some("default") => default_arg = Some(a),
+                            other => self.error(
+                                ErrorCode::ZAP4023,
+                                format!(
+                                    "{fname}() got an unexpected keyword argument '{}' \
+                                     (only 'key' and 'default')",
+                                    other.unwrap_or_default()
+                                ),
+                                span,
                             ),
-                            span,
-                        );
+                        }
                     }
-                    // Two-or-more positional scalars. A single argument would be
-                    // the iterable form `min(xs)`, which is a follow-up.
-                    if args.len() < 2 {
+
+                    // --- Variadic scalar form: two or more positional args. ---
+                    if positionals.len() >= 2 {
+                        if key_arg.is_some() || default_arg.is_some() {
+                            self.error(
+                                ErrorCode::ZAP4025,
+                                format!(
+                                    "{fname}() key=/default= apply only to the iterable \
+                                     form {fname}(xs), not the multi-argument form"
+                                ),
+                                span,
+                            );
+                        }
+                        let numeric_scalar = |t: &Ty| {
+                            matches!(t, Ty::Unknown)
+                                || matches!(t, Ty::Float64 | Ty::Float32 | Ty::UntypedFloat)
+                                || (t.is_int() && !matches!(t, Ty::Bigint))
+                        };
+                        let tys: Vec<Ty> =
+                            positionals.iter().map(|a| self.infer(&a.value)).collect();
+                        if let Some(bad) = tys.iter().find(|t| !numeric_scalar(t)) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "{fname}() takes numeric scalar arguments (int, \
+                                     uint, or float), got {} (str/bigint are follow-ups)",
+                                    bad.display()
+                                ),
+                                span,
+                            );
+                            return Ty::Unknown;
+                        }
+                        let any_unsigned = tys.iter().any(|t| t.is_unsigned());
+                        let any_concrete_signed = tys.iter().any(|t| {
+                            t.is_numeric()
+                                && !t.is_unsigned()
+                                && !matches!(t, Ty::UntypedInt | Ty::Unknown)
+                        });
+                        if any_unsigned && any_concrete_signed {
+                            self.error(
+                                ErrorCode::ZAP4015,
+                                format!(
+                                    "cannot {fname}() signed and unsigned operands \
+                                     together; convert explicitly (e.g. uint64(x) or \
+                                     int64(x))"
+                                ),
+                                span,
+                            );
+                            return Ty::Unknown;
+                        }
+                        if tys.iter().any(|t| matches!(t, Ty::Unknown)) {
+                            return Ty::Unknown;
+                        }
+                        let mut joined = tys[0].clone();
+                        for t in &tys[1..] {
+                            joined = num_join(&joined, t);
+                        }
+                        return joined;
+                    }
+
+                    // --- Iterable form: exactly one positional (a list). ---
+                    if positionals.len() != 1 {
                         self.error(
                             ErrorCode::ZAP4025,
                             format!(
-                                "{fname}() takes two or more scalar arguments, got \
-                                 {} (the iterable form {fname}(xs) is a follow-up)",
-                                args.len()
+                                "{fname}() takes one iterable, or two or more scalar \
+                                 arguments, got {} positional",
+                                positionals.len()
                             ),
                             span,
                         );
@@ -8149,63 +8238,75 @@ impl Checker {
                         }
                         return Ty::Unknown;
                     }
-                    // Only fixed-width numeric scalars (int / uint / float).
-                    // `bigint`, `complex`, and the non-numeric orderables
-                    // (`str`/`char`/`bool`) are deferred follow-ups.
-                    let numeric_scalar = |t: &Ty| {
-                        matches!(t, Ty::Unknown)
-                            || matches!(t, Ty::Float64 | Ty::Float32 | Ty::UntypedFloat)
-                            || (t.is_int() && !matches!(t, Ty::Bigint))
+                    let seq_ty = self.infer(&positionals[0].value);
+                    let elem_ty = match &seq_ty {
+                        Ty::List(e) => (**e).clone(),
+                        Ty::Unknown => Ty::Unknown,
+                        other => {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "{fname}() of a single argument needs a list (the \
+                                     iterable form), got {} (a single scalar has no \
+                                     {fname}; pass two or more, or a list)",
+                                    other.display()
+                                ),
+                                span,
+                            );
+                            return Ty::Unknown;
+                        }
                     };
-                    let tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.value)).collect();
-                    if let Some(bad) = tys.iter().find(|t| !numeric_scalar(t)) {
+                    // orderable element (no key=): int/float/str/char/bool.
+                    let orderable = |t: &Ty| {
+                        matches!(t, Ty::Unknown)
+                            || t.is_int()
+                            || matches!(
+                                t,
+                                Ty::Float64
+                                    | Ty::Float32
+                                    | Ty::UntypedFloat
+                                    | Ty::Str
+                                    | Ty::Char
+                                    | Ty::Bool
+                            )
+                    };
+                    if let Some(ka) = key_arg {
+                        // key= projects each element to an orderable key; the
+                        // result is still the element type. The function value is
+                        // inferred (so it is checked); its precise fn(T)->K shape
+                        // is validated in lowering.
+                        self.infer(&ka.value);
+                    } else if !orderable(&elem_ty) {
                         self.error(
                             ErrorCode::ZAP4024,
                             format!(
-                                "{fname}() takes numeric scalar arguments (int, \
-                                 uint, or float), got {} (str/bigint and the \
-                                 iterable form are follow-ups)",
-                                bad.display()
+                                "{fname}() over a list of {} needs a key= projection \
+                                 to an orderable key (int, float, str, char, or bool)",
+                                elem_ty.display()
                             ),
                             span,
                         );
-                        return Ty::Unknown;
                     }
-                    // No implicit signed<->unsigned mixing (#552, D-0019), the
-                    // same rule the comparison operators enforce (ZAP4015): an
-                    // unsigned operand may not share the call with a concrete
-                    // signed or float operand (an untyped-int literal or
-                    // `Unknown` partners either sign).
-                    let any_unsigned = tys.iter().any(|t| t.is_unsigned());
-                    let any_concrete_signed = tys.iter().any(|t| {
-                        t.is_numeric()
-                            && !t.is_unsigned()
-                            && !matches!(t, Ty::UntypedInt | Ty::Unknown)
-                    });
-                    if any_unsigned && any_concrete_signed {
-                        self.error(
-                            ErrorCode::ZAP4015,
-                            format!(
-                                "cannot {fname}() signed and unsigned operands \
-                                 together; convert explicitly (e.g. uint64(x) or \
-                                 int64(x))"
-                            ),
-                            span,
-                        );
-                        return Ty::Unknown;
+                    if let Some(da) = default_arg {
+                        // The default (returned for an empty list) must be
+                        // assignable to the element type.
+                        let dt = self.infer(&da.value);
+                        if !matches!(elem_ty, Ty::Unknown)
+                            && !assignable(&dt, &elem_ty)
+                            && !matches!(dt, Ty::Unknown)
+                        {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "{fname}() default= has type {}, but the list holds {}",
+                                    dt.display(),
+                                    elem_ty.display()
+                                ),
+                                span,
+                            );
+                        }
                     }
-                    if tys.iter().any(|t| matches!(t, Ty::Unknown)) {
-                        return Ty::Unknown;
-                    }
-                    // Fold `num_join` across every operand: `int64` for signed
-                    // ints, `uint64` for unsigned, `float64` when any operand is
-                    // a float (an explicit int/float mix promotes to `f64` as the
-                    // `<`/`<=` operators do; pure-integer stays exact).
-                    let mut joined = tys[0].clone();
-                    for t in &tys[1..] {
-                        joined = num_join(&joined, t);
-                    }
-                    return joined;
+                    return elem_ty;
                 }
                 // Scalar integer-preserving `abs` (#1283): the magnitude of one
                 // numeric scalar. A signed integer stays an integer (`int64`),
@@ -8541,6 +8642,91 @@ impl Checker {
                         }
                     }
                     return Ty::Range;
+                }
+                // `enumerate(xs[, start])` (#1302): an iterable of `(int64, T)`
+                // pairs, used as `for i, x in enumerate(xs)`. Typed as a
+                // `list[(int64, T)]` so the for-loop tuple target binds; the
+                // lowering special-cases the for-loop and does not materialize a
+                // list (a standalone value is a follow-up).
+                "enumerate" => {
+                    if args.is_empty() || args.len() > 2 || args.iter().any(|a| a.name.is_some()) {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "enumerate(xs[, start]) takes one or two positional arguments"
+                                .to_string(),
+                            span,
+                        );
+                        for a in args {
+                            self.infer(&a.value);
+                        }
+                        return Ty::Unknown;
+                    }
+                    let t = self.infer(&args[0].value);
+                    if args.len() == 2 {
+                        let st = self.infer(&args[1].value);
+                        if !st.is_int() && !matches!(st, Ty::Unknown) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!("enumerate() start must be an int, got {}", st.display()),
+                                span,
+                            );
+                        }
+                    }
+                    let elem = match &t {
+                        Ty::List(e) => (**e).clone(),
+                        Ty::Unknown => Ty::Unknown,
+                        other => {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "enumerate() expects a list, got {} (other iterables \
+                                     are a follow-up)",
+                                    other.display()
+                                ),
+                                span,
+                            );
+                            Ty::Unknown
+                        }
+                    };
+                    return Ty::List(Box::new(Ty::Tuple(vec![Ty::Int64, elem])));
+                }
+                // `zip(a, b, …)` (#1302): an iterable of tuples, truncating to the
+                // shortest input, used as `for a, b in zip(p, q)`. Typed as a
+                // `list[(A, B, …)]`; the lowering special-cases the for-loop.
+                "zip" => {
+                    if args.len() < 2 || args.iter().any(|a| a.name.is_some()) {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "zip(a, b, …) takes two or more positional list arguments".to_string(),
+                            span,
+                        );
+                        for a in args {
+                            self.infer(&a.value);
+                        }
+                        return Ty::Unknown;
+                    }
+                    let mut parts = Vec::with_capacity(args.len());
+                    for a in args {
+                        let t = self.infer(&a.value);
+                        let e = match &t {
+                            Ty::List(e) => (**e).clone(),
+                            Ty::Unknown => Ty::Unknown,
+                            other => {
+                                self.error(
+                                    ErrorCode::ZAP4024,
+                                    format!(
+                                        "zip() expects list arguments, got {} (other \
+                                         iterables are a follow-up)",
+                                        other.display()
+                                    ),
+                                    span,
+                                );
+                                Ty::Unknown
+                            }
+                        };
+                        parts.push(e);
+                    }
+                    return Ty::List(Box::new(Ty::Tuple(parts)));
                 }
                 "len" => {
                     for a in args {
@@ -18990,13 +19176,16 @@ def main():
         ok("def main():\n    int64 r = max(5, 2, 8, 1)\n    print(r)\n");
         ok("def main():\n    float64 r = min(1.5, 2.5, 0.5)\n    print(r)\n");
         ok("def main():\n    int32 a = 1\n    int64 r = max(a, 2, 3)\n    print(r)\n");
-        // A single argument is the iterable form, a follow-up: rejected now.
+        // A single list argument is the iterable form (#1299): valid.
+        ok("def main():\n    auto xs = [3, 1, 2]\n    int64 r = min(xs)\n    print(r)\n");
+        // A single *scalar* argument is not a sequence: rejected (needs a list).
         assert!(has_code(
             "def main():\n    print(min(1))\n",
-            ErrorCode::ZAP4025
+            ErrorCode::ZAP4024
         ));
+        // Zero positional arguments is an arity error.
         assert!(has_code(
-            "def main():\n    print(min([1, 2, 3]))\n",
+            "def main():\n    print(min())\n",
             ErrorCode::ZAP4025
         ));
         // Mixing signed and unsigned is still rejected across any arity.
@@ -19024,9 +19213,16 @@ def main():
             "def main():\n    str s = sum([1, 2, 3])\n    print(s)\n",
             ErrorCode::ZAP4001
         ));
-        // Wrong arity is rejected.
+        // sum(xs, start) seeds the accumulator (#1299).
+        ok("def main():\n    int64 s = sum([1, 2, 3], 10)\n    print(s)\n");
+        // A non-numeric start is rejected.
         assert!(has_code(
             "def main():\n    print(sum([1], [2]))\n",
+            ErrorCode::ZAP4024
+        ));
+        // Too many arguments is an arity error.
+        assert!(has_code(
+            "def main():\n    print(sum([1], 2, 3))\n",
             ErrorCode::ZAP4025
         ));
     }
@@ -19080,18 +19276,95 @@ def main():
         ));
     }
 
+    // --- iterable min/max + key= + default= (#1299) ----------------------------
+
     #[test]
-    fn min_max_keyword_arguments_are_rejected() {
-        // key= / default= are #1284; any keyword is rejected now (ZAP4023),
-        // never silently dropped.
+    fn iterable_min_max_over_list() {
+        // min(xs)/max(xs) return the element type.
+        ok(
+            "def main():\n    auto xs = [5, 2, 8]\n    int64 lo = min(xs)\n    \
+            int64 hi = max(xs)\n    print(lo + hi)\n",
+        );
+        // Over a str list.
+        ok("def main():\n    str s = min([\"b\", \"a\", \"c\"])\n    print(s)\n");
+        // default= seeds an empty list; its type must match the element type.
+        ok("def main():\n    int64 r = min([], default=-1)\n    print(r)\n");
+        assert!(has_code(
+            "def main():\n    int64 r = min([1, 2], default=\"x\")\n    print(r)\n",
+            ErrorCode::ZAP4024
+        ));
+        // A non-orderable element without key= is rejected.
+        assert!(has_code(
+            "def main():\n    print(min([[1], [2]]))\n",
+            ErrorCode::ZAP4024
+        ));
+    }
+
+    #[test]
+    fn iterable_min_max_key_projection() {
+        // key= projects to an orderable key; the result is the element type.
+        ok("def klen(str s) -> int64:\n    return len(s)\n\
+            def main():\n    str s = min([\"bb\", \"a\", \"ccc\"], key=klen)\n    print(s)\n");
+    }
+
+    // --- enumerate / zip in for-loops (#1302) ----------------------------------
+
+    #[test]
+    fn enumerate_in_for_loop() {
+        ok(
+            "def main():\n    for i, x in enumerate([10, 20, 30]):\n        \
+            print(i)\n        print(x)\n",
+        );
+        ok("def main():\n    for i, x in enumerate([\"a\", \"b\"], 1):\n        print(i)\n");
+        // Wrong arity / keyword rejected.
+        assert!(has_code(
+            "def main():\n    for i, x in enumerate([1], 2, 3):\n        print(i)\n",
+            ErrorCode::ZAP4025
+        ));
+        // A non-list is rejected.
+        assert!(has_code(
+            "def main():\n    for i, x in enumerate(5):\n        print(i)\n",
+            ErrorCode::ZAP4024
+        ));
+    }
+
+    #[test]
+    fn zip_in_for_loop() {
+        ok(
+            "def main():\n    for a, b in zip([1, 2, 3], [\"x\", \"y\"]):\n        \
+            print(a)\n        print(b)\n",
+        );
+        // Three-way zip.
+        ok("def main():\n    for a, b, c in zip([1], [2], [3]):\n        print(a + b + c)\n");
+        // Fewer than two iterables is an arity error.
+        assert!(has_code(
+            "def main():\n    for a in zip([1]):\n        print(a)\n",
+            ErrorCode::ZAP4025
+        ));
+    }
+
+    #[test]
+    fn min_max_keyword_arguments() {
+        // key= / default= apply only to the iterable form, not the multi-arg
+        // scalar form (ZAP4025).
         assert!(has_code(
             "def main():\n    print(min(1, 2, key=3))\n",
-            ErrorCode::ZAP4023
+            ErrorCode::ZAP4025
         ));
         assert!(has_code(
             "def main():\n    print(max(1, 2, default=0))\n",
+            ErrorCode::ZAP4025
+        ));
+        // An unknown keyword is rejected (ZAP4023).
+        assert!(has_code(
+            "def keyfn(int64 x) -> int64:\n    return x\n\
+             def main():\n    print(min([1, 2], bogus=3))\n",
             ErrorCode::ZAP4023
         ));
+        // key= and default= on the iterable form are accepted.
+        ok("def keyfn(int64 x) -> int64:\n    return x\n\
+            def main():\n    int64 r = min([3, 1, 2], key=keyfn)\n    print(r)\n");
+        ok("def main():\n    int64 r = max([], default=-1)\n    print(r)\n");
     }
 
     #[test]

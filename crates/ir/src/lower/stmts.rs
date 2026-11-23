@@ -2300,7 +2300,7 @@ impl<'a> FnLower<'a> {
         &mut self,
         v: Value,
         vt: Ty,
-        _arg: &Expr,
+        start: Option<(Value, Ty)>,
     ) -> Result<(Value, Ty), LowerError> {
         let elem_ty = match vt {
             Ty::Struct(sid) => match self.next_form(sid)? {
@@ -2315,12 +2315,19 @@ impl<'a> FnLower<'a> {
             }
         };
         let acc = self.alloca(elem_ty);
-        let zero = if elem_ty.is_float() {
-            self.fconst(elem_ty, 0.0)
-        } else {
-            self.iconst(elem_ty, 0)
+        // Seed the accumulator with the start value (coerced to the element
+        // type) when given (#1299), else the additive identity 0.
+        let init = match start {
+            Some((sv, st)) => self.coerce(sv, st, elem_ty),
+            None => {
+                if elem_ty.is_float() {
+                    self.fconst(elem_ty, 0.0)
+                } else {
+                    self.iconst(elem_ty, 0)
+                }
+            }
         };
-        self.store(acc, zero);
+        self.store(acc, init);
         let add = move |s: &mut FnLower<'a>, ev: Value, et: Ty| -> Result<(), LowerError> {
             let cur = s.load(acc, elem_ty);
             let ev = s.coerce(ev, et, elem_ty);
@@ -3095,6 +3102,17 @@ impl<'a> FnLower<'a> {
                 }
             }
             _ => {
+                // `for i, x in enumerate(xs)` / `for a, b in zip(p, q)` (#1302):
+                // special-cased here (like `range`) so no intermediate list of
+                // tuples is materialized.
+                if let Expr::Call { callee, args, .. } = iter {
+                    if is_name(callee, "enumerate") {
+                        return self.lower_for_enumerate(target, args, body);
+                    }
+                    if is_name(callee, "zip") {
+                        return self.lower_for_zip(target, args, body);
+                    }
+                }
                 if let Expr::Name(n, _) = iter {
                     if let Some(info) = self.ctx.enums.get(n).cloned() {
                         if !info.is_sum {
@@ -3537,6 +3555,386 @@ impl<'a> FnLower<'a> {
             self.store(slot, fv);
             self.declare(n, slot, fty);
         }
+        Ok(())
+    }
+
+    /// `for i, x in enumerate(xs[, start])` (#1302): iterate a list by index,
+    /// binding the running index (`start` + position, default 0) and the element.
+    /// A `i, x` tuple target binds the two names directly; a single-name target
+    /// binds the `(int64, T)` pair as a tuple. No intermediate list is built.
+    fn lower_for_enumerate(
+        &mut self,
+        target: &Expr,
+        args: &[ast::Arg],
+        body: &ast::Block,
+    ) -> Result<(), LowerError> {
+        if args.is_empty() || args.len() > 2 || args.iter().any(|a| a.name.is_some()) {
+            return Err(err(
+                "enumerate(xs[, start]) takes one or two positional arguments",
+            ));
+        }
+        let (lst, lty) = self.expr(&args[0].value)?;
+        let Ty::List(elem) = lty else {
+            return Err(err("enumerate() expects a list"));
+        };
+        let start = if args.len() == 2 {
+            let (sv, st) = self.expr(&args[1].value)?;
+            self.coerce(sv, st, Ty::I64)
+        } else {
+            self.iconst(Ty::I64, 0)
+        };
+        // Target: a two-name tuple `(i, x)` or a single name.
+        let pair = match target {
+            Expr::Tuple(elems, _) if elems.len() == 2 => match (&elems[0], &elems[1]) {
+                (Expr::Name(a, _), Expr::Name(b, _)) => Some((a.clone(), b.clone())),
+                _ => return Err(err("enumerate() loop target must be two simple names")),
+            },
+            Expr::Name(n, _) => {
+                return self.lower_for_enumerate_single(n.clone(), lst, elem, start, body)
+            }
+            _ => {
+                return Err(err(
+                    "enumerate() loop target must be `i, x` or a single name",
+                ))
+            }
+        };
+        let (iname, xname) = pair.expect("pair target");
+
+        self.push_scope();
+        let idx = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        let ety = self.elem_ty(elem);
+
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let end_bb = self.new_block();
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let len = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(len),
+            func: "zap_list_len".to_string(),
+            args: vec![lst],
+        });
+        let c = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: c,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: len,
+        });
+        self.set_term(Term::BrIf {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let e = self.new_value(ety);
+        self.emit(Inst::Call {
+            dest: Some(e),
+            func: format!("zap_list_get_{}", elem.val_suffix()),
+            args: vec![lst, i],
+        });
+        let (e, read_ty) = self.narrow_read_elem(e, elem);
+        // index = start + position.
+        let counter = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: counter,
+            op: BinOp::Add,
+            lhs: start,
+            rhs: i,
+        });
+        let islot = self.alloca(Ty::I64);
+        self.store(islot, counter);
+        self.declare(&iname, islot, Ty::I64);
+        let xslot = self.alloca(read_ty);
+        self.store(xslot, e);
+        self.declare(&xname, xslot, read_ty);
+        self.push_loop(incr_bb, end_bb);
+        for st in &body.stmts {
+            self.stmt(st)?;
+        }
+        self.loops.pop();
+        self.ensure_br(incr_bb);
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+        self.position(end_bb);
+        self.pop_scope();
+        Ok(())
+    }
+
+    /// `for e in enumerate(xs)` with a single loop variable: `e` binds the
+    /// `(int64, T)` pair as a tuple each iteration.
+    fn lower_for_enumerate_single(
+        &mut self,
+        name: String,
+        lst: Value,
+        elem: Elem,
+        start: Value,
+        body: &ast::Block,
+    ) -> Result<(), LowerError> {
+        self.push_scope();
+        let idx = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        let ety = self.elem_ty(elem);
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let end_bb = self.new_block();
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let len = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(len),
+            func: "zap_list_len".to_string(),
+            args: vec![lst],
+        });
+        let c = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: c,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: len,
+        });
+        self.set_term(Term::BrIf {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let e = self.new_value(ety);
+        self.emit(Inst::Call {
+            dest: Some(e),
+            func: format!("zap_list_get_{}", elem.val_suffix()),
+            args: vec![lst, i],
+        });
+        let (e, read_ty) = self.narrow_read_elem(e, elem);
+        let counter = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: counter,
+            op: BinOp::Add,
+            lhs: start,
+            rhs: i,
+        });
+        let sid = self.ctx.tuples.borrow_mut().intern(vec![Ty::I64, read_ty]);
+        let tup = self.new_value(Ty::Struct(sid));
+        self.emit(Inst::StructNew { dest: tup, sid });
+        self.emit(Inst::FieldSet {
+            base: tup,
+            sid,
+            idx: 0,
+            val: counter,
+        });
+        self.emit(Inst::FieldSet {
+            base: tup,
+            sid,
+            idx: 1,
+            val: e,
+        });
+        let slot = self.alloca(Ty::Struct(sid));
+        self.store(slot, tup);
+        self.declare(&name, slot, Ty::Struct(sid));
+        self.push_loop(incr_bb, end_bb);
+        for st in &body.stmts {
+            self.stmt(st)?;
+        }
+        self.loops.pop();
+        self.ensure_br(incr_bb);
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+        self.position(end_bb);
+        self.pop_scope();
+        Ok(())
+    }
+
+    /// `for a, b in zip(p, q, …)` (#1302): iterate up to the SHORTEST input's
+    /// length (Python's default `zip`), binding one element from each list per
+    /// iteration. A tuple target binds the names directly; a single-name target
+    /// binds the tuple. No intermediate list is built.
+    fn lower_for_zip(
+        &mut self,
+        target: &Expr,
+        args: &[ast::Arg],
+        body: &ast::Block,
+    ) -> Result<(), LowerError> {
+        if args.len() < 2 || args.iter().any(|a| a.name.is_some()) {
+            return Err(err(
+                "zip(a, b, …) takes two or more positional list arguments",
+            ));
+        }
+        let mut lists: Vec<(Value, Elem)> = Vec::with_capacity(args.len());
+        for a in args {
+            let (v, t) = self.expr(&a.value)?;
+            let Ty::List(e) = t else {
+                return Err(err("zip() expects list arguments"));
+            };
+            lists.push((v, e));
+        }
+        // Loop-variable names: a tuple of N names, or a single name (tuple bind).
+        let names: Option<Vec<String>> = match target {
+            Expr::Tuple(elems, _) if elems.len() == lists.len() => {
+                let mut ns = Vec::with_capacity(elems.len());
+                for e in elems {
+                    let Expr::Name(n, _) = e else {
+                        return Err(err("zip() loop target must be simple names"));
+                    };
+                    ns.push(n.clone());
+                }
+                Some(ns)
+            }
+            Expr::Tuple(..) => {
+                return Err(err(
+                    "zip() loop target arity does not match the number of iterables",
+                ))
+            }
+            Expr::Name(_, _) => None,
+            _ => return Err(err("zip() loop target must be names or a single name")),
+        };
+
+        self.push_scope();
+        let idx = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        // Minimum length across all inputs (computed once).
+        let mut minlen = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(minlen),
+            func: "zap_list_len".to_string(),
+            args: vec![lists[0].0],
+        });
+        for (v, _) in &lists[1..] {
+            let l = self.new_value(Ty::I64);
+            self.emit(Inst::Call {
+                dest: Some(l),
+                func: "zap_list_len".to_string(),
+                args: vec![*v],
+            });
+            let lt = self.new_value(Ty::I1);
+            self.emit(Inst::ICmp {
+                dest: lt,
+                pred: CmpPred::Le,
+                lhs: minlen,
+                rhs: l,
+            });
+            let m = self.new_value(Ty::I64);
+            self.emit(Inst::Select {
+                dest: m,
+                cond: lt,
+                a: minlen,
+                b: l,
+            });
+            minlen = m;
+        }
+
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let end_bb = self.new_block();
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let c = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: c,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: minlen,
+        });
+        self.set_term(Term::BrIf {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        // Read one element from each list; collect (value, read_ty).
+        let mut elems: Vec<(Value, Ty)> = Vec::with_capacity(lists.len());
+        for (v, e) in &lists {
+            let ev = self.new_value(self.elem_ty(*e));
+            self.emit(Inst::Call {
+                dest: Some(ev),
+                func: format!("zap_list_get_{}", e.val_suffix()),
+                args: vec![*v, i],
+            });
+            let (ev, rty) = self.narrow_read_elem(ev, *e);
+            elems.push((ev, rty));
+        }
+        match &names {
+            Some(ns) => {
+                for (n, (ev, rty)) in ns.iter().zip(elems.iter()) {
+                    let slot = self.alloca(*rty);
+                    self.store(slot, *ev);
+                    self.declare(n, slot, *rty);
+                }
+            }
+            None => {
+                let Expr::Name(n, _) = target else {
+                    unreachable!()
+                };
+                let tys: Vec<Ty> = elems.iter().map(|(_, t)| *t).collect();
+                let sid = self.ctx.tuples.borrow_mut().intern(tys);
+                let tup = self.new_value(Ty::Struct(sid));
+                self.emit(Inst::StructNew { dest: tup, sid });
+                for (k, (ev, _)) in elems.iter().enumerate() {
+                    self.emit(Inst::FieldSet {
+                        base: tup,
+                        sid,
+                        idx: k as u32,
+                        val: *ev,
+                    });
+                }
+                let slot = self.alloca(Ty::Struct(sid));
+                self.store(slot, tup);
+                self.declare(n, slot, Ty::Struct(sid));
+            }
+        }
+        self.push_loop(incr_bb, end_bb);
+        for st in &body.stmts {
+            self.stmt(st)?;
+        }
+        self.loops.pop();
+        self.ensure_br(incr_bb);
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+        self.position(end_bb);
+        self.pop_scope();
         Ok(())
     }
 
