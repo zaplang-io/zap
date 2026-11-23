@@ -1092,6 +1092,11 @@ static int64_t zap_py_exception_type_id(const char *name) {
     if (strcmp(name, "AssertionError") == 0) return ZAP_EXC_ASSERTION_ERROR;
     if (strcmp(name, "EOFError") == 0) return ZAP_EXC_EOF_ERROR;
     if (strcmp(name, "MemoryError") == 0) return ZAP_EXC_MEMORY_ERROR;
+    /* #1311: CPython's `FileNotFoundError` ⊂ `OSError`; `IOError` is a legacy
+     * alias of `OSError`, so a Python-interop `IOError` maps to the same id. */
+    if (strcmp(name, "FileNotFoundError") == 0) return ZAP_EXC_FILE_NOT_FOUND_ERROR;
+    if (strcmp(name, "OSError") == 0) return ZAP_EXC_OS_ERROR;
+    if (strcmp(name, "IOError") == 0) return ZAP_EXC_OS_ERROR;
     if (strcmp(name, "BaseException") == 0) return ZAP_EXC_BASE;
     return ZAP_EXC_EXCEPTION;
 }

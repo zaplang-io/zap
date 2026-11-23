@@ -522,6 +522,29 @@ differs in a few places:
   (`TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT` on Linux, `TCP_KEEPALIVE` on
   macOS) and multicast membership are not yet exposed.
 
+### `fs` read errors (#1311, decisions/lang/1311-filesystem-notfound-error.md)
+
+- **`FileNotFoundError` ⊂ `OSError`, matching CPython — but a narrow subtree.**
+  `fs.read_file` / `fs.read_bytes` raise `FileNotFoundError` for a missing path
+  (`open` → `ENOENT`) and the generic `OSError` for any other failure
+  (permission, a directory where a file was expected, a post-open read error).
+  Both descend from `Exception`, so `except Exception` catches every read
+  failure, exactly as before this surface existed. The hierarchy edge is the
+  same as CPython (`FileNotFoundError` ⊂ `OSError` ⊂ `Exception`), so Python
+  code reads across unchanged.
+- **No `IOError` spelling in Zap source.** CPython keeps `IOError` as a legacy
+  alias of `OSError`; Zap source spells it `OSError`. (A Python-interop
+  exception named `IOError` still maps to Zap's `OSError`.)
+- **The finer `OSError` errno subtree is not exposed yet.** CPython has
+  `PermissionError`, `IsADirectoryError`, `FileExistsError`, `NotADirectoryError`,
+  and the rest; Zap currently distinguishes only the missing-path case
+  (`FileNotFoundError`) from everything else (`OSError`). Match on `OSError` for
+  the non-missing failures.
+- **Only filesystem *reads* are typed.** The mutating / metadata fs calls
+  (`fs.write_file`, `fs.append`, `fs.mkdir`, `fs.rename`, `fs.stat*`, …) still
+  raise the generic `Exception`; giving them `OSError` treatment is a tracked
+  follow-up.
+
 ---
 
 ## Parity backlog

@@ -17583,6 +17583,8 @@ fn exception_type_id_name(name: &str) -> Option<i64> {
         "AssertionError" => 16,
         "EOFError" => 17,
         "MemoryError" => 18,
+        "OSError" => 19,
+        "FileNotFoundError" => 20,
         _ => return None,
     })
 }

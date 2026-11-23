@@ -788,6 +788,24 @@ enum {
      * matching CPython's `MemoryError`. Replaces the arena v1 stopgap, which
      * raised a `RuntimeError` whose message merely named it a memory error. */
     ZAP_EXC_MEMORY_ERROR = 18,
+    /* The generic operating-system / I/O error base (#1311,
+     * decisions/lang/1311-filesystem-notfound-error.md). Parent of
+     * `FileNotFoundError`; an ordinary catchable exception directly under
+     * `Exception`, matching CPython's `OSError` (of which `IOError` is a legacy
+     * alias). A filesystem read that fails for any reason other than a missing
+     * path — permission denied, a directory where a file was expected, or any
+     * other I/O error — raises this type; `except OSError` and `except
+     * Exception` both catch it. */
+    ZAP_EXC_OS_ERROR = 19,
+    /* Raised by a filesystem read whose path does not exist, i.e. `open(2)`
+     * fails with `ENOENT` (#1311). A subtype of `OSError` (CPython parity:
+     * `FileNotFoundError` ⊂ `OSError` ⊂ `Exception`), so `except
+     * FileNotFoundError`, `except OSError`, and `except Exception` all catch it,
+     * while a non-missing failure caught by `except OSError` is NOT caught by
+     * `except FileNotFoundError`. Lets a caller select defaults for an absent
+     * file (e.g. a missing `resolv.conf`) without racing a prior existence
+     * check or parsing a localized `strerror` string. */
+    ZAP_EXC_FILE_NOT_FOUND_ERROR = 20,
 };
 
 void *zap_exception_new(int64_t type_id, void *message) {
@@ -883,9 +901,10 @@ static int64_t zap_exception_parent(int64_t type_id) {
     case ZAP_EXC_STOP_ITERATION: case ZAP_EXC_EXCEPTION_GROUP:
     case ZAP_EXC_SCOPE_TIMEOUT: case ZAP_EXC_TIMEOUT_ERROR:
     case ZAP_EXC_ASSERTION_ERROR: case ZAP_EXC_EOF_ERROR:
-    case ZAP_EXC_MEMORY_ERROR:
+    case ZAP_EXC_MEMORY_ERROR: case ZAP_EXC_OS_ERROR:
         return ZAP_EXC_EXCEPTION;
     case ZAP_EXC_INDEX_ERROR: case ZAP_EXC_KEY_ERROR: return ZAP_EXC_LOOKUP_ERROR;
+    case ZAP_EXC_FILE_NOT_FOUND_ERROR: return ZAP_EXC_OS_ERROR;
     case ZAP_EXC_ZERO_DIVISION_ERROR: return ZAP_EXC_ARITHMETIC_ERROR;
     case ZAP_EXC_CANCELLED: return ZAP_EXC_BASE;
     default:

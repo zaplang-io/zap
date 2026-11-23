@@ -87,6 +87,27 @@ static void zap_sys_fail(const char *op, const char *detail) {
     zap_panic(zap_str_new(buf, (int64_t)n));
 }
 
+/* Raise a TYPED filesystem error "<op>: <strerror(err)>" from a read (#1311,
+ * decisions/lang/1311-filesystem-notfound-error.md). `ENOENT` maps to
+ * `FileNotFoundError`; every other errno maps to the generic `OSError`. Both
+ * descend from `Exception`, so `except Exception` catches either, while a caller
+ * can select `except FileNotFoundError` to handle only a missing path (e.g.
+ * falling back to defaults for an absent config file). Never returns. The errno
+ * is passed in by the caller, captured at the failing syscall, so an intervening
+ * library call cannot clobber it before the message is built. */
+static void zap_fs_read_fail(const char *op, int err) {
+    char buf[512];
+    int n = snprintf(buf, sizeof buf, "%s: %s", op, strerror(err));
+    if (n < 0) {
+        n = 0;
+    }
+    if (n >= (int)sizeof buf) {
+        n = (int)sizeof buf - 1;
+    }
+    int64_t type_id = (err == ENOENT) ? ZAP_EXC_FILE_NOT_FOUND_ERROR : ZAP_EXC_OS_ERROR;
+    zap_panic_typed(type_id, zap_str_new(buf, (int64_t)n));
+}
+
 /* --- os: environment -------------------------------------------------------- */
 
 /* os.getenv(name) -> str: the variable's value, or "" when unset (use
@@ -504,7 +525,9 @@ static void *zap_read_all_fd(int fd) {
             if (errno == EINTR) {
                 continue;
             }
-            zap_sys_fail("fs.read_file", strerror(errno));
+            /* Post-open read error (the fd is already valid, so never ENOENT):
+             * a generic OSError (#1311). */
+            zap_fs_read_fail("fs.read_file", errno);
         }
         if (r == 0) {
             break;
@@ -518,7 +541,8 @@ static void *zap_read_all_fd(int fd) {
 void *zap_fs_read_file(void *path_) {
     int fd = open(zap_sys_cstr((ZapStr *)path_), O_RDONLY | ZAP_O_BINARY);
     if (fd < 0) {
-        zap_sys_fail("fs.read_file", strerror(errno));
+        /* ENOENT -> FileNotFoundError, every other errno -> OSError (#1311). */
+        zap_fs_read_fail("fs.read_file", errno);
     }
     void *s = zap_read_all_fd(fd);
     close(fd);
@@ -1357,7 +1381,8 @@ void *zap_fs_walk_files(void *h, int64_t i) { return zap_list_get_ptr(((ZapWalk 
 void *zap_fs_read_bytes(void *path_) {
     int fd = open(zap_sys_cstr((ZapStr *)path_), O_RDONLY | ZAP_O_BINARY);
     if (fd < 0) {
-        zap_sys_fail("fs.read_bytes", strerror(errno));
+        /* ENOENT -> FileNotFoundError, every other errno -> OSError (#1311). */
+        zap_fs_read_fail("fs.read_bytes", errno);
     }
     void *s = zap_read_all_fd(fd);
     close(fd);
