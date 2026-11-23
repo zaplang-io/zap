@@ -742,6 +742,8 @@ const BUILTINS: &[&str] = &[
     "AssertionError",
     "EOFError",
     "MemoryError",
+    "OSError",
+    "FileNotFoundError",
     // REPL session-binding slot intrinsics (I#159): synthesized by the `zap repl`
     // driver to persist `let` values across entries, never written by users.
     "__repl_load_i64",
@@ -796,6 +798,8 @@ fn is_exception_type(name: &str) -> bool {
             | "AssertionError"
             | "EOFError"
             | "MemoryError"
+            | "OSError"
+            | "FileNotFoundError"
     )
 }
 

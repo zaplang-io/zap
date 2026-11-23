@@ -1091,9 +1091,11 @@ finally:
 - Built-in exception types are `BaseException`, `Exception`, `ValueError`,
   `TypeError`, `LookupError`, `IndexError`, `KeyError`, `ArithmeticError`,
   `ZeroDivisionError`, `RuntimeError`, `StopIteration`, `Cancelled`,
-  `ScopeTimeout`, `ExceptionGroup`, `TimeoutError`, and `AssertionError`.
+  `ScopeTimeout`, `ExceptionGroup`, `TimeoutError`, `AssertionError`, `EOFError`,
+  `MemoryError`, `OSError`, and `FileNotFoundError`.
   `IndexError` and `KeyError`
-  derive from `LookupError`; `ZeroDivisionError` derives from `ArithmeticError`; those
+  derive from `LookupError`; `ZeroDivisionError` derives from `ArithmeticError`;
+  `FileNotFoundError` derives from `OSError`; those
   intermediate types derive from `Exception`. `Cancelled` derives directly from
   `BaseException`, so `except Exception` does not suppress cancellation.
   `ScopeTimeout` (raised to the caller when a `scope(timeout=…)` deadline expires)
@@ -1102,8 +1104,12 @@ finally:
   `net.set_read_timeout` or the whole-operation budget set by
   `net.set_read_deadline`) likewise derives from `Exception`, and is distinct from
   a clean EOF (an empty `net.recv` result) so a server can tell an idle/read
-  timeout apart from a peer close. The remaining listed leaf types derive from `Exception`; `Exception`
-  derives from `BaseException`.
+  timeout apart from a peer close. `OSError` is the generic operating-system / I/O
+  error base and derives from `Exception`; a filesystem read (`fs.read_file`,
+  `fs.read_bytes`) raises `FileNotFoundError` when the path does not exist and
+  `OSError` for any other failure, so a caller can select defaults for an absent
+  file without a prior existence check. The remaining listed leaf types derive
+  from `Exception`; `Exception` derives from `BaseException`.
 - `raise E(message)` constructs a typed built-in exception. Raising a string is
   shorthand for raising `Exception(message)`. A typed `except E` catches `E`
   and its subclasses; clauses are tested in source order. A bare `except` is a
