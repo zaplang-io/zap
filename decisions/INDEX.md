@@ -93,4 +93,5 @@ listed here (see [`README.md`](README.md)).
 | [1232](tooling/1232-zap-test-module-resolution.md) | zap test resolves imports through the same module pipeline as builds | Accepted | 2026-11-21 |
 | [1236](tooling/1236-zap-test-harness-module-constants.md) | The zap test harness keeps module-level const/mutable bindings | Accepted | 2026-11-21 |
 | [1268](tooling/1268-merge-queue-failure-reporting.md) | Surface merge-queue failures on the PR via a merge_group failure-reporter job | Accepted | 2026-11-22 |
+| [1305](tooling/1305-widen-e2e-pool-in-ci.md) | Widen the end-to-end test pool in CI via a two-pass sensitivity-aware worker pool | Accepted | 2026-11-23 |
 

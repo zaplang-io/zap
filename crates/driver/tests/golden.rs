@@ -12,14 +12,22 @@
 //! (and an LLVM toolchain); run it in the dev container with
 //! `--features zapc/llvm`. The `fixtures_are_paired` check runs everywhere.
 //!
-//! The end-to-end runs compile+link+run independent fixtures concurrently on a
-//! bounded worker pool (see `run_goldens_parallel`). The pool width defaults to
-//! 2 and is tunable without recompiling via the `ZAP_GOLDEN_JOBS` env var; set
-//! it to `1` to restore fully serial execution. Per-fixture outcomes are
-//! collected and reported in sorted fixture order, so a failure prints the same
-//! regardless of scheduling.
+//! The end-to-end runs compile+link+run independent fixtures concurrently on the
+//! shared two-pass bounded pool (`common::run_e2e_parallel`, zaplang-io/zap#1305):
+//! ordinary fixtures run wide at `ZAP_GOLDEN_JOBS` workers (default 2; CI exports
+//! `$(nproc)`) and the concurrency/GC/scheduler-sensitive subset — including the
+//! whole `tests/race/*` corpus — runs conservatively at `ZAP_GOLDEN_SENSITIVE_JOBS`
+//! (default `min(2, wide)`). `ZAP_GOLDEN_JOBS=1` restores fully serial execution.
+//! Per-fixture outcomes are reported in sorted fixture order, so a failure prints
+//! the same regardless of scheduling. See `common/mod.rs` for the policy.
 
 use std::path::PathBuf;
+
+// Shared end-to-end harness: the two-pass bounded pool, the compile/run deadline
+// split, and the width/sensitivity policy (zaplang-io/zap#1305, #1113).
+mod common;
+#[cfg(feature = "codegen")]
+use common::{compile_then_run, parse_env_sidecar, run_e2e_parallel, run_with_timeout, Outcome};
 
 /// `<repo>/tests/golden` — this crate lives at `<repo>/crates/driver`.
 fn golden_dir() -> PathBuf {
@@ -104,161 +112,6 @@ fn fixtures_are_paired() {
     }
 }
 
-/// Run `cmd`, capturing stdout/stderr, but FAIL FAST if it does not finish
-/// within `timeout` — a hung golden (e.g. a wait on a signal/channel that never
-/// fires) then fails this test deterministically instead of stalling the whole
-/// CI run until the job's global timeout. stdout/stderr are drained on threads
-/// so the child never blocks on a full pipe buffer.
-#[cfg(feature = "codegen")]
-fn run_with_timeout(
-    mut cmd: std::process::Command,
-    timeout: std::time::Duration,
-    label: &str,
-) -> std::process::Output {
-    use std::io::Read;
-    let mut child = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn zapc");
-    let mut out = child.stdout.take().expect("stdout pipe");
-    let mut err = child.stderr.take().expect("stderr pipe");
-    let out_t = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = out.read_to_end(&mut b);
-        b
-    });
-    let err_t = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = err.read_to_end(&mut b);
-        b
-    });
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait().expect("try_wait") {
-            Some(s) => break s,
-            None => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!(
-                        "golden {label} did not finish within {timeout:?} — timed out and \
-                         was killed. A `[run]` timeout means the compiled program hung \
-                         (deadlock/livelock); a `[build]` timeout means the compiler/linker \
-                         stalled — usually CPU starvation on an overloaded runner, not a \
-                         program bug (see zaplang-io/zap#1113)."
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-        }
-    };
-    let stdout = out_t.join().unwrap_or_default();
-    let stderr = err_t.join().unwrap_or_default();
-    std::process::Output {
-        status,
-        stdout,
-        stderr,
-    }
-}
-
-/// A unique, per-invocation output path for a fixture's compiled binary, so the
-/// parallel pool never collides on `-o`. Derived from the fixture stem, this
-/// process id, and a monotonic counter.
-#[cfg(feature = "codegen")]
-fn unique_out_path(source: &std::path::Path) -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static CTR: AtomicUsize = AtomicUsize::new(0);
-    let n = CTR.fetch_add(1, Ordering::Relaxed);
-    let stem = source
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("fixture");
-    std::env::temp_dir().join(format!("zap-golden-{stem}-{}-{n}", std::process::id()))
-}
-
-/// Compile a fixture with `zapc build -o <tmp>` under a GENEROUS ceiling, then
-/// run the produced binary under the TIGHT `run_timeout`. This is the whole
-/// point of the split (zaplang-io/zap#1113): the tight per-fixture deadline must
-/// cover only the compiled program's execution, never `cc`/`ld` — otherwise a
-/// linker starved of CPU on an overloaded runner trips the deadline and is
-/// misreported as a "hang in the compiled program". The build still has its own
-/// (large) ceiling so a genuine compiler/linker *deadlock* still fails, just not
-/// on mere slowness. `envs` are applied to BOTH phases: some are build-time
-/// (e.g. `ZAP_ZENV` for project dependency resolution), others run-time (e.g.
-/// scheduler knobs like `MAXPROCS`).
-///
-/// Returns `(status, stdout, stderr)` matching what `zapc run` used to produce:
-/// on a build failure, the build's own output (so a compile-diagnostic fixture
-/// still works); on success, the run's exit status and stdout, with build and
-/// run stderr concatenated (so a compile *warning* a fixture asserts on is still
-/// present).
-#[cfg(feature = "codegen")]
-fn compile_then_run(
-    bin: &str,
-    source: &std::path::Path,
-    envs: &[(String, String)],
-    run_timeout: std::time::Duration,
-) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
-    use std::process::Command;
-    // Large enough that normal compile+link, even on a saturated runner, never
-    // reaches it, but a true compiler/linker deadlock still fails deterministically.
-    let build_ceiling = std::time::Duration::from_secs(300);
-    let out = unique_out_path(source);
-
-    let mut build = Command::new(bin);
-    build.arg("build").arg(source).arg("-o").arg(&out);
-    for (k, v) in envs {
-        build.env(k, v);
-    }
-    let build_out = run_with_timeout(
-        build,
-        build_ceiling,
-        &format!("{} [build]", source.display()),
-    );
-    if !build_out.status.success() {
-        // Compile/link failed (or a diagnostic fixture that expects a nonzero
-        // exit): surface the build output verbatim, exactly as `zapc run` would
-        // have on a compile failure.
-        return (build_out.status, build_out.stdout, build_out.stderr);
-    }
-
-    let mut run = Command::new(&out);
-    for (k, v) in envs {
-        run.env(k, v);
-    }
-    let run_out = run_with_timeout(run, run_timeout, &format!("{} [run]", source.display()));
-    let _ = std::fs::remove_file(&out);
-
-    let mut stderr = build_out.stderr;
-    stderr.extend_from_slice(&run_out.stderr);
-    (run_out.status, run_out.stdout, stderr)
-}
-
-/// Parse an optional `KEY=VALUE` env sidecar into pairs, skipping blanks and
-/// `#` comments. `$PROJDIR` in a value is replaced with `projdir` when given
-/// (used by project fixtures to point `ZAP_ZENV` at a prebuilt `zenv/`).
-#[cfg(feature = "codegen")]
-fn parse_env_sidecar(path: &std::path::Path, projdir: Option<&str>) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    if let Ok(contents) = std::fs::read_to_string(path) {
-        for line in contents.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some((k, v)) = line.split_once('=') {
-                let v = match projdir {
-                    Some(p) => v.trim().replace("$PROJDIR", p),
-                    None => v.trim().to_string(),
-                };
-                out.push((k.trim().to_string(), v));
-            }
-        }
-    }
-    out
-}
-
 /// Optional `*.skip_arch` sidecar: whitespace/newline-separated architecture
 /// names (matched against `std::env::consts::ARCH`; `#` starts a comment). A
 /// fixture whose sidecar names the architecture this test binary runs on is
@@ -286,113 +139,6 @@ fn skipped_on_this_arch(zap: &std::path::Path) -> bool {
     })
 }
 
-/// Outcome of running a single golden fixture. `Skipped` covers an
-/// architecture-quarantined fixture (see `skipped_on_this_arch`); `Failed`
-/// carries the human-readable mismatch/exit/stderr message to surface.
-#[cfg(feature = "codegen")]
-enum Outcome {
-    Pass,
-    Skipped,
-    Failed(String),
-}
-
-/// Number of fixtures to run concurrently. Defaults to 2 (the conservative
-/// starting width for the concurrency/GC-sensitive suite); `ZAP_GOLDEN_JOBS=1`
-/// restores serial execution, and a higher value widens the pool without a
-/// recompile. A missing/garbage/zero value falls back to the default.
-#[cfg(feature = "codegen")]
-fn golden_jobs() -> usize {
-    std::env::var("ZAP_GOLDEN_JOBS")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or(2)
-}
-
-/// Run `work` over `items` on a bounded pool of `golden_jobs()` worker threads,
-/// then assert the aggregated outcome. Workers pull fixtures off a shared index
-/// so the pool stays bounded (no thread-per-fixture fan-out); each fixture's
-/// work is independent (spawn `zapc`, link, run, diff), so this parallelizes
-/// cleanly. Outcomes are collected and, after the pool drains, reported in the
-/// original (sorted) `items` order, so a failure prints identically regardless
-/// of scheduling and concurrent fixtures never interleave into unreadable
-/// output. A hang still panics loudly from inside `run_with_timeout`, failing
-/// the test fast rather than being silenced.
-#[cfg(feature = "codegen")]
-fn run_goldens_parallel<F>(items: Vec<PathBuf>, work: F)
-where
-    F: Fn(&std::path::Path) -> Outcome + Sync,
-{
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
-
-    // Optional `ZAP_GOLDEN_ONLY` allowlist: a comma-separated list of
-    // substrings matched against each fixture's path. When set (non-empty),
-    // only the matching fixtures run; when unset/blank the whole corpus runs,
-    // as always. CI's "Test under LTO" step sets this to a small,
-    // representative slice so the LTO build is exercised end-to-end without
-    // re-linking the entire program corpus under `-O2 -flto` on every push
-    // (the full corpus still runs under the default, fast build in the step
-    // above). Patterns that match nothing simply contribute nothing — this
-    // runner is shared by the golden/project/race corpora, so an allowlist of
-    // golden stems is expected to filter the project and race corpora to zero.
-    let items: Vec<PathBuf> = match std::env::var("ZAP_GOLDEN_ONLY") {
-        Ok(list) if !list.trim().is_empty() => {
-            let pats: Vec<String> = list
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            items
-                .into_iter()
-                .filter(|p| {
-                    let s = p.to_string_lossy();
-                    pats.iter().any(|pat| s.contains(pat.as_str()))
-                })
-                .collect()
-        }
-        _ => items,
-    };
-
-    if items.is_empty() {
-        return;
-    }
-    let jobs = golden_jobs().min(items.len());
-    let next = AtomicUsize::new(0);
-    let results: Mutex<Vec<(usize, Outcome)>> = Mutex::new(Vec::with_capacity(items.len()));
-
-    std::thread::scope(|scope| {
-        for _ in 0..jobs {
-            let (next, results, items, work) = (&next, &results, &items, &work);
-            scope.spawn(move || loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= items.len() {
-                    break;
-                }
-                let outcome = work(&items[i]);
-                results.lock().expect("results lock").push((i, outcome));
-            });
-        }
-    });
-
-    let mut results = results.into_inner().expect("results lock");
-    results.sort_by_key(|(i, _)| *i);
-
-    let mut failures = Vec::new();
-    for (i, outcome) in results {
-        match outcome {
-            Outcome::Pass | Outcome::Skipped => {}
-            Outcome::Failed(msg) => failures.push(format!("{}:\n{msg}", items[i].display())),
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "{} golden fixture(s) failed:\n\n{}",
-        failures.len(),
-        failures.join("\n\n")
-    );
-}
-
 /// Compile + run each fixture and compare stdout. Requires the `llvm` feature.
 #[cfg(feature = "codegen")]
 #[test]
@@ -404,7 +150,7 @@ fn golden_programs_match() {
     // (zaplang-io/zap#1113).
     let per_test = std::time::Duration::from_secs(60);
     let bin = env!("CARGO_BIN_EXE_zapc");
-    run_goldens_parallel(zap_fixtures(), |zap| {
+    run_e2e_parallel(zap_fixtures(), |zap| {
         // A fixture quarantined on this architecture (see `skipped_on_this_arch`)
         // is skipped loudly rather than run — e.g. the concurrent stress goldens
         // on aarch64, pending the parked #223 GC race.
@@ -469,7 +215,7 @@ fn golden_projects_match() {
     // generously in `compile_then_run` (zaplang-io/zap#1113).
     let per_test = std::time::Duration::from_secs(60);
     let bin = env!("CARGO_BIN_EXE_zapc");
-    run_goldens_parallel(project_fixtures(), |main| {
+    run_e2e_parallel(project_fixtures(), |main| {
         let proj = main.parent().expect("project dir");
         let expected =
             std::fs::read_to_string(proj.join("expected")).expect("expected output present");
@@ -796,7 +542,7 @@ fn check_race_fixture(bin: &str, zap: &std::path::Path, maxprocs: Option<&str>) 
 #[test]
 fn race_detector_reports_races_and_clears_clean_programs() {
     let bin = env!("CARGO_BIN_EXE_zapc");
-    run_goldens_parallel(race_fixtures(), |zap| check_race_fixture(bin, zap, None));
+    run_e2e_parallel(race_fixtures(), |zap| check_race_fixture(bin, zap, None));
 }
 
 /// Hardening (#679): the same fixture set under `ZAP_MAXPROCS>1` — true OS-thread
@@ -811,7 +557,7 @@ fn race_detector_reports_races_and_clears_clean_programs() {
 #[test]
 fn race_detector_correct_under_parallelism() {
     let bin = env!("CARGO_BIN_EXE_zapc");
-    run_goldens_parallel(race_fixtures(), |zap| {
+    run_e2e_parallel(race_fixtures(), |zap| {
         check_race_fixture(bin, zap, Some("4"))
     });
 }

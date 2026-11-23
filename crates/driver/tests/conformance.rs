@@ -38,6 +38,12 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+// Shared end-to-end harness: the two-pass bounded pool + compile/run deadline
+// split (zaplang-io/zap#1305, #1113).
+mod common;
+#[cfg(feature = "codegen")]
+use common::{compile_then_run, parse_env_sidecar, run_e2e_parallel, Outcome};
+
 /// `<repo>/tests/conformance` — this crate lives at `<repo>/crates/driver`.
 fn conformance_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -287,54 +293,6 @@ fn every_covered_claim_points_at_its_case() {
 // End-to-end conformance run (codegen + LLVM required)
 // ---------------------------------------------------------------------------
 
-/// Run `cmd` with a per-case timeout, draining stdout/stderr on threads so the
-/// child never blocks on a full pipe and a hung program fails fast rather than
-/// stalling the whole CI job. Mirrors the golden harness helper.
-#[cfg(feature = "codegen")]
-fn run_with_timeout(
-    mut cmd: std::process::Command,
-    timeout: std::time::Duration,
-    label: &str,
-) -> std::process::Output {
-    use std::io::Read;
-    let mut child = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn zapc");
-    let mut out = child.stdout.take().expect("stdout pipe");
-    let mut err = child.stderr.take().expect("stderr pipe");
-    let out_t = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = out.read_to_end(&mut b);
-        b
-    });
-    let err_t = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = err.read_to_end(&mut b);
-        b
-    });
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait().expect("try_wait") {
-            Some(s) => break s,
-            None => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("conformance {label} did not finish within {timeout:?} (hang?)");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-        }
-    };
-    std::process::Output {
-        status,
-        stdout: out_t.join().unwrap_or_default(),
-        stderr: err_t.join().unwrap_or_default(),
-    }
-}
-
 /// Compile + run each conformance program and check its stdout, exit code
 /// (optional `.exit` sidecar, default 0) and, when present, an expected-stderr
 /// substring (`.stderr` sidecar) — the same contract as the golden suite, so a
@@ -348,15 +306,23 @@ fn run_with_timeout(
 #[cfg(feature = "codegen")]
 #[test]
 fn conformance_programs_match() {
-    use std::fmt::Write as _;
-    use std::process::Command;
+    // Tight RUN-phase-only ceiling; compile/link is timed separately and
+    // generously in `compile_then_run` (zaplang-io/zap#1113). The shared two-pass
+    // pool runs the corpus wide (zaplang-io/zap#1305) — conformance programs are
+    // fast, deterministic spec cases with no concurrency/timing sensitivity, so
+    // none classify into the conservative lane. A `.zap` program paired with its
+    // `.expected` (plus optional `.exit`/`.stderr`/`.env` sidecars) is run exactly
+    // like a golden; one CI run still reports the complete set of divergences
+    // (one per failing fixture), important since this path only runs in CI.
     let per_test = std::time::Duration::from_secs(60);
     let bin = env!("CARGO_BIN_EXE_zapc");
-    let mut ran = 0usize;
-    let mut failures = String::new();
-
-    for zap in zap_fixtures() {
-        let name = fixture_stem(&zap);
+    let fixtures = zap_fixtures();
+    eprintln!(
+        "conformance: running {} programs end-to-end",
+        fixtures.len()
+    );
+    run_e2e_parallel(fixtures, |zap| {
+        let name = fixture_stem(zap);
         let expected = std::fs::read_to_string(zap.with_extension("expected"))
             .expect("expected output present");
         let expected_exit: i32 = std::fs::read_to_string(zap.with_extension("exit"))
@@ -365,52 +331,36 @@ fn conformance_programs_match() {
             .unwrap_or(0);
         let expected_stderr = std::fs::read_to_string(zap.with_extension("stderr")).ok();
 
-        let mut cmd = Command::new(bin);
-        cmd.arg("run").arg(&zap);
-        // Like goldens, conformance fixtures can pin scheduler settings.
-        if let Ok(env) = std::fs::read_to_string(zap.with_extension("env")) {
-            for line in env.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some((key, value)) = line.split_once('=') {
-                    cmd.env(key.trim(), value.trim());
-                }
-            }
-        }
-        let output = run_with_timeout(cmd, per_test, &zap.display().to_string());
+        // Conformance fixtures can pin scheduler settings via an `.env` sidecar;
+        // `compile_then_run` applies it to both the build and run phases.
+        let envs = parse_env_sidecar(&zap.with_extension("env"), None);
+        let (status, stdout, stderr) = compile_then_run(bin, zap, &envs, per_test);
 
-        let got = String::from_utf8_lossy(&output.stdout);
-        let got_err = String::from_utf8_lossy(&output.stderr);
-        if output.status.code() != Some(expected_exit) {
-            let _ = write!(
-                failures,
-                "\n[{name}] exit code: want {expected_exit}, got {:?}\n  stderr: {got_err}",
-                output.status.code()
-            );
+        let got = String::from_utf8_lossy(&stdout);
+        let got_err = String::from_utf8_lossy(&stderr);
+        if status.code() != Some(expected_exit) {
+            return Outcome::Failed(format!(
+                "[{name}] exit code: want {expected_exit}, got {:?}\n  stderr: {got_err}",
+                status.code()
+            ));
         }
         if got.trim_end() != expected.trim_end() {
-            let _ = write!(
-                failures,
-                "\n[{name}] stdout mismatch:\n  want: {:?}\n  got:  {:?}\n  stderr: {got_err}",
+            return Outcome::Failed(format!(
+                "[{name}] stdout mismatch:\n  want: {:?}\n  got:  {:?}\n  stderr: {got_err}",
                 expected.trim_end(),
                 got.trim_end()
-            );
+            ));
         }
         if let Some(want_err) = expected_stderr {
             let want_err = want_err.trim_end();
             if !got_err.contains(want_err) {
-                let _ = write!(
-                    failures,
-                    "\n[{name}] stderr should contain {want_err:?}, got:\n{got_err}"
-                );
+                return Outcome::Failed(format!(
+                    "[{name}] stderr should contain {want_err:?}, got:\n{got_err}"
+                ));
             }
         }
-        ran += 1;
-    }
-    eprintln!("conformance: ran {ran} programs end-to-end");
-    assert!(failures.is_empty(), "conformance mismatches:{failures}");
+        Outcome::Pass
+    });
 }
 
 // ---------------------------------------------------------------------------

@@ -328,8 +328,16 @@ jobs:
       # (the disassembly inlining assertion) and `perf.rs`'s LTO trend each build
       # their probes with `ZAP_LTO=1` on the child, so the LTO link + the runtime
       # fast-path inlining are validated here without a separate rebuild.
+      #
+      # `ZAP_GOLDEN_JOBS=$(nproc)` widens the end-to-end worker pool from its
+      # conservative default of 2 to the runner's core count (zaplang-io/zap#1305):
+      # the golden/conformance/diff corpora compile→link→run one program per
+      # fixture and are embarrassingly parallel, so this is ~90% of this leg. The
+      # concurrency/GC/scheduler-sensitive subset (incl. the whole `tests/race/*`
+      # corpus) stays at the conservative `ZAP_GOLDEN_SENSITIVE_JOBS` default
+      # (min(2, wide)), so the width increase never destabilizes it.
       - name: "Test (${{ matrix.gc }})"
-        run: cargo test --workspace --features zapc/${{ matrix.gc }}
+        run: ZAP_GOLDEN_JOBS=$(nproc) cargo test --workspace --features zapc/${{ matrix.gc }}
 
       # Smoke-test the LTO build END TO END (I#841, D-0149) over a SMALL,
       # representative slice of the golden corpus, on BOTH collectors. The
@@ -353,7 +361,7 @@ jobs:
           ZAP_LLVM_LINK: /usr/lib/llvm-18/bin/llvm-link
           ZAP_OPT: /usr/lib/llvm-18/bin/opt
           ZAP_GOLDEN_ONLY: dict_word_count,coroutines,concurrent_counter_coro_stress,except_star_routing
-        run: cargo test --workspace --features zapc/${{ matrix.gc }} --test golden
+        run: ZAP_GOLDEN_JOBS=$(nproc) cargo test --workspace --features zapc/${{ matrix.gc }} --test golden
 
   # ARM-Linux (aarch64) validation (ticket #204, platform epic #158 / C2). The
   # same codegen + golden end-to-end suite as `full`, run natively on a GitHub-
@@ -425,8 +433,12 @@ jobs:
         with:
           shared-key: arm64-${{ matrix.gc }}
 
+      # `ZAP_GOLDEN_JOBS=$(nproc)` widens the end-to-end worker pool to this
+      # aarch64 runner's core count (zaplang-io/zap#1305), mirroring `full`; the
+      # sensitive subset stays conservative via the `ZAP_GOLDEN_SENSITIVE_JOBS`
+      # default.
       - name: "Test (${{ matrix.gc }})"
-        run: cargo test --workspace --features zapc/${{ matrix.gc }}
+        run: ZAP_GOLDEN_JOBS=$(nproc) cargo test --workspace --features zapc/${{ matrix.gc }}
 
   # Windows coroutine context switch (ticket #195, platform epic #158 / Area A1).
   # REQUIRED (no `continue-on-error`): unlike the broader `windows` job below —
