@@ -15,7 +15,7 @@ metaprogramming system for keeping business logic free of boilerplate.
 
 - [`docs/REPO_ARCHITECTURE.md`](docs/REPO_ARCHITECTURE.md) — "where to find what": the compiler pipeline, crate map, runtime/GC, stdlib, tooling, and tests.
 - [`SPEC.md`](SPEC.md) — the language specification (the source of truth).
-- [`decisions/`](decisions/) — the going-forward decision log: one ADR file per decision, keyed to its issue/PR number (index: [`decisions/INDEX.md`](decisions/INDEX.md)).
+- [`decisions/`](decisions/) — the going-forward decision log: one ADR file per decision, keyed to its issue/PR number (a browsable index is generated on demand by `scripts/gen-decisions-index.sh`; see [`decisions/README.md`](decisions/README.md)).
 - [`DECISIONS.md`](DECISIONS.md) — the frozen historical decision log (`D-0001…D-0243`); new decisions live in [`decisions/`](decisions/).
 - [`docs/STABILITY.md`](docs/STABILITY.md) — versioning & stability policy (the 1.0 contract).
 - [`CHANGELOG.md`](CHANGELOG.md) — notable changes, per [Keep a Changelog](https://keepachangelog.com/) (pre-1.0 / editorial 0.x); PRs add fragments under [`changelog.d/`](changelog.d/).

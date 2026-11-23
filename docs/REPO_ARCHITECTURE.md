@@ -238,7 +238,7 @@ changes are gated in review.
 | [`design/RUNTIME-ABI.md`](../design/RUNTIME-ABI.md) | Compiled-code ↔ runtime contract |
 | [`docs/FORMAT.md`](FORMAT.md) | The canonical `zap fmt` style |
 | [`design/NNNN-*.md`](../design/) | Per-feature design docs, from [`design/TEMPLATE.md`](../design/TEMPLATE.md) |
-| [`decisions/`](../decisions/) | Going-forward decision log: one ADR file per decision, keyed to its issue/PR number, sharded by domain; CI-generated [`decisions/INDEX.md`](../decisions/INDEX.md) |
+| [`decisions/`](../decisions/) | Going-forward decision log: one ADR file per decision, keyed to its issue/PR number, sharded by domain; the index is a derived view generated on demand by `scripts/gen-decisions-index.sh` (not committed — zaplang-io/zap#1321) |
 | [`DECISIONS.md`](../DECISIONS.md) | **Frozen** historical decision log — `D-0001…D-0243`; never deleted, only superseded. New decisions live in [`decisions/`](../decisions/) |
 | [`OPEN-QUESTIONS.md`](../OPEN-QUESTIONS.md) | Tracked backlog of unresolved questions |
 | [`ROADMAP.md`](../ROADMAP.md) | Phased build plan |

@@ -3,3 +3,6 @@
 /target-docker
 **/*.rs.bk
 Cargo.lock
+
+# Decision index is a derived view, generated on demand (zaplang-io/zap#1321)
+/decisions/INDEX.md
