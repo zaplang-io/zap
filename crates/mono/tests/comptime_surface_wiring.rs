@@ -103,6 +103,53 @@ def each():
 }
 
 #[test]
+fn a_generic_generator_unrolls_per_instantiation_via_cur_subst() {
+    // The real `@derive` shape: a generator generic over `T` with a
+    // `comptime for … in reflect.type_info(T).fields:` body, called at a concrete
+    // type. Mono specializes `ser[Point]`, and `T` in `reflect.type_info(T)`
+    // resolves through the active substitution to `Point`, so the loop unrolls
+    // per instantiation (#1291, E3b generic-T resolution).
+    let src = "\
+struct Point:
+    int64 x
+    int64 y
+def emit(int64 v):
+    pass
+def ser[T](T p):
+    comptime for f in reflect.type_info(T).fields:
+        emit(reflect.field(p, comptime f.index))
+def main():
+    ser(Point(1, 2))
+";
+    let items = mono(src);
+    // The specialized `ser[Point]` body must be unrolled (no ComptimeFor left),
+    // with one `emit(p.<field>)` per field. Find it among the functions.
+    let specialized = items.iter().find_map(|i| match i {
+        Item::Function(f) if f.name.contains("ser") && f.name != "main" => Some(f.body.clone()),
+        _ => None,
+    });
+    let body = specialized.expect("a specialized `ser` instantiation");
+    assert!(
+        !body
+            .stmts
+            .iter()
+            .any(|s| matches!(s, Stmt::ComptimeFor { .. })),
+        "generic generator's comptime for should be unrolled: {:?}",
+        body.stmts
+    );
+    assert_eq!(body.stmts.len(), 2, "one emit per field: {:?}", body.stmts);
+    for (i, want) in ["x", "y"].iter().enumerate() {
+        let Stmt::Expr(Expr::Call { args, .. }) = &body.stmts[i] else {
+            panic!("expected emit(...) call, got {:?}", body.stmts[i]);
+        };
+        let Expr::Attr { name, .. } = &args[0].value else {
+            panic!("expected p.<field>, got {:?}", args[0].value);
+        };
+        assert_eq!(name, want);
+    }
+}
+
+#[test]
 fn an_unresolvable_comptime_for_type_is_left_for_the_backstop() {
     // `reflect.type_info(Unknown)` — no such declaration. Mono leaves the node
     // (the lowering backstop / sema deferral reports it); mono itself does not
