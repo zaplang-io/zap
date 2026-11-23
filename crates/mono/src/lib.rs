@@ -2499,10 +2499,19 @@ impl Mono<'_> {
                 body,
                 span,
             } => {
-                let iter = self.rw(iter, env)?;
+                // Rewrite the iterable keeping its best-effort concrete type, so
+                // the loop variable can be declared with the iterable's element
+                // type (#1329; see [`Mono::iter_elem`]) instead of `Unknown` —
+                // the same binding a comprehension clause gets (#1131,
+                // [`Mono::rw_comp_clauses`]). Without it, a generic call on the
+                // loop variable (e.g. `item.collect() -> Optional[T]`) could not
+                // be inferred, and a `match` on that result failed to pin the
+                // generic enum instance (ZAP6001). A non-iterable or opaque
+                // iterable leaves the variable `Unknown`, exactly as before.
+                let (iter, iter_cty) = self.rewrite_expr(iter, env, None)?;
                 env.push();
                 if let Expr::Name(n, _) = target {
-                    env.declare(n, CTy::Unknown);
+                    env.declare(n, self.iter_elem(&iter_cty));
                 }
                 let target = self.rw(target, env)?;
                 let body = self.rewrite_block(body, env)?;
