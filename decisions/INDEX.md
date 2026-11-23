@@ -46,6 +46,7 @@ listed here (see [`README.md`](README.md)).
 | [1284](lang/1284-variadic-minmax-sum.md) | Variadic min/max and element-typed sum | Locked | 2026-11-23 |
 | [1285](lang/1285-any-all-reversed.md) | any / all / reversed built-ins | Locked | 2026-11-23 |
 | [1290](lang/1290-derivable-registration.md) | "@derivable(Trait) registration model (E3a)" | Accepted | 2026-11-22 |
+| [1291](lang/1291-comptime-generic-t-resolution.md) | Generic reflect.type_info(T) resolution — comptime-for unrolls per instantiation (E3b part 1) | Accepted | 2026-11-23 |
 | [1297](lang/1297-comptime-surface-parser.md) | comptime/reflect parser surface — comptime keyword + comptime-for / comptime-expr (S1) | Accepted | 2026-11-23 |
 | [1298](lang/1298-comptime-surface-engine-wiring.md) | comptime/reflect surface wired to the E2 engine in mono (S2) | Accepted | 2026-11-23 |
 | [1298](lang/1298-comptime-surface-sema-acceptance.md) | comptime/reflect surface — sema acceptance + end-to-end (S2b) | Accepted | 2026-11-23 |

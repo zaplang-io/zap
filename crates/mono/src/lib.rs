@@ -2148,6 +2148,17 @@ impl Mono<'_> {
         let Some(type_name) = reflect_type_info_arg(base) else {
             return Ok(None);
         };
+        // Resolve a generic type parameter to its concrete type (#1291, E3b):
+        // inside a specialized generic generator — e.g. `def ser[T](...)` with a
+        // `comptime for f in reflect.type_info(T).fields:` body — `T` is a type
+        // parameter that the active substitution (`cur_subst`) maps to the
+        // concrete type of this instantiation. A bare concrete type name is left
+        // as-is. This is what makes a real generic `@derive` generator unroll
+        // per instantiation rather than only a hand-written concrete type.
+        let type_name = match self.cur_subst.get(&type_name) {
+            Some(Type::Named { name, .. }) => name.clone(),
+            _ => type_name,
+        };
         match member.as_str() {
             "fields" => match self.structs.get(type_name.as_str()) {
                 Some(def) => {
