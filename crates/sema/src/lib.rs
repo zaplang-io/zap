@@ -6667,6 +6667,27 @@ impl Checker {
                         span,
                     );
                 }
+                // Ordering on the core collections (#1334). `set` (subset/superset)
+                // and `deque` (lexicographic) have well-defined Python orderings
+                // and type as `bool`. `dict`, `heap`, and `oset` have no ordering,
+                // so reject `< <= > >=` here (identity via `is` / `is not` stays
+                // allowed); otherwise they would lower to a meaningless pointer
+                // compare.
+                let not_orderable =
+                    |t: &Ty| matches!(t, Ty::Dict(_, _) | Ty::Heap(_) | Ty::OSet(_));
+                if not_orderable(l) || not_orderable(r) {
+                    let who = if not_orderable(l) { l } else { r };
+                    self.error(
+                        ErrorCode::ZAP4012,
+                        format!(
+                            "'{}' is not orderable: `< <= > >=` are undefined for it; \
+                             a set supports subset/superset and a deque supports \
+                             lexicographic ordering, but dict/heap/oset do not",
+                            who.display()
+                        ),
+                        span,
+                    );
+                }
                 if matches!(l, Ty::Unknown) || matches!(r, Ty::Unknown) {
                     Ty::Unknown
                 } else {

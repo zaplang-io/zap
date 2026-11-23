@@ -14947,6 +14947,425 @@ impl<'a> FnLower<'a> {
         Ok((eq, Ty::I1))
     }
 
+    /// Whether every member of set `x` is also a member of set `y` (`x ⊆ y`),
+    /// as an `i1`. Walks `x`'s members (`zap_set_items`) and probes each in `y`
+    /// (`zap_set_contains_*`), short-circuiting to False on the first member of
+    /// `x` that `y` lacks. The empty set is a subset of everything, so the result
+    /// starts True. Used by [`FnLower::set_order_cmp`] (#1334). Leaves the builder
+    /// positioned at the join block, with the result loaded from a slot.
+    fn set_subset(&mut self, x: Value, xelem: Elem, y: Value) -> Result<Value, LowerError> {
+        let result = self.alloca(Ty::I1);
+        let t = self.new_value(Ty::I1);
+        self.emit(Inst::BConst { dest: t, val: true });
+        self.store(result, t);
+        let idx = self.alloca(Ty::I64);
+        let xlen = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(xlen),
+            func: "zap_set_len".to_string(),
+            args: vec![x],
+        });
+        let items = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(items),
+            func: "zap_set_items".to_string(),
+            args: vec![x],
+        });
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let miss_bb = self.new_block();
+        let end_bb = self.new_block();
+        self.set_term(Term::Br(cond_bb));
+
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let in_range = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: in_range,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: xlen,
+        });
+        self.set_term(Term::BrIf {
+            cond: in_range,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let ety = self.elem_ty(xelem);
+        let e = self.new_value(ety);
+        self.emit(Inst::Call {
+            dest: Some(e),
+            func: format!("zap_list_get_{}", xelem.val_suffix()),
+            args: vec![items, i],
+        });
+        let kfns = self.key_fn_args(xelem)?;
+        let present_word = self.new_value(Ty::I64);
+        let mut cargs = vec![y, e];
+        cargs.extend_from_slice(&kfns);
+        self.key_rt_call(
+            Some(present_word),
+            format!("zap_set_contains_{}", xelem.key_suffix()),
+            cargs,
+            xelem,
+        );
+        let present = self.new_value(Ty::I1);
+        let zc = self.iconst(Ty::I64, 0);
+        self.emit(Inst::ICmp {
+            dest: present,
+            pred: CmpPred::Ne,
+            lhs: present_word,
+            rhs: zc,
+        });
+        self.set_term(Term::BrIf {
+            cond: present,
+            then_bb: incr_bb,
+            else_bb: miss_bb,
+        });
+
+        self.position(miss_bb);
+        let f = self.new_value(Ty::I1);
+        self.emit(Inst::BConst {
+            dest: f,
+            val: false,
+        });
+        self.store(result, f);
+        self.set_term(Term::Br(end_bb));
+
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+
+        self.position(end_bb);
+        Ok(self.load(result, Ty::I1))
+    }
+
+    /// Ordering comparison on two sets (#1334): Python's subset/superset partial
+    /// order, not a pointer compare.
+    ///
+    /// - `a <= b` — `a` is a subset of `b`.
+    /// - `a <  b` — `a` is a *proper* subset (`a ⊆ b` and `len(a) < len(b)`).
+    /// - `a >= b` — `b` is a subset of `a`.
+    /// - `a >  b` — `a` is a *proper* superset (`b ⊆ a` and `len(a) > len(b)`).
+    ///
+    /// This is a partial order: two sets can be incomparable (both `<` and `>`
+    /// False). Membership reuses [`FnLower::set_subset`]; strictness ANDs in a
+    /// length inequality. Unlike equality, the operation is **not** symmetric, so
+    /// the operands are never swapped (the caller passes the left operand as `l`).
+    fn set_order_cmp(
+        &mut self,
+        op: AstBin,
+        l: Value,
+        lelem: Elem,
+        r: Value,
+        rt: Ty,
+    ) -> Result<(Value, Ty), LowerError> {
+        let Ty::Set(relem) = rt else {
+            return Err(err("a set's `< <= > >=` compares only with another set"));
+        };
+        if lelem != relem {
+            return Err(err(
+                "cannot order-compare sets with different element types",
+            ));
+        }
+        let llen = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(llen),
+            func: "zap_set_len".to_string(),
+            args: vec![l],
+        });
+        let rlen = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(rlen),
+            func: "zap_set_len".to_string(),
+            args: vec![r],
+        });
+        // Subset in the direction the operator needs; `<`/`<=` ask `l ⊆ r`,
+        // `>`/`>=` ask `r ⊆ l`.
+        let subset = match op {
+            AstBin::Le | AstBin::Lt => self.set_subset(l, lelem, r)?,
+            AstBin::Ge | AstBin::Gt => self.set_subset(r, relem, l)?,
+            _ => unreachable!("set_order_cmp only handles < <= > >="),
+        };
+        // Non-strict operators are the subset test alone; strict operators AND in
+        // the proper length inequality (a proper subset/superset differs in size).
+        let result = match op {
+            AstBin::Le | AstBin::Ge => subset,
+            AstBin::Lt | AstBin::Gt => {
+                let len_lt = self.new_value(Ty::I1);
+                let (a, b) = if matches!(op, AstBin::Lt) {
+                    (llen, rlen)
+                } else {
+                    (rlen, llen)
+                };
+                self.emit(Inst::ICmp {
+                    dest: len_lt,
+                    pred: CmpPred::Lt,
+                    lhs: a,
+                    rhs: b,
+                });
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::Bin {
+                    dest: d,
+                    op: BinOp::And,
+                    lhs: subset,
+                    rhs: len_lt,
+                });
+                d
+            }
+            _ => unreachable!(),
+        };
+        Ok((result, Ty::I1))
+    }
+
+    /// Ordering comparison on two deques (#1334): Python `collections.deque` is
+    /// orderable **lexicographically** — compare elements left to right; the first
+    /// differing pair decides (via element `<`), and if one deque is a prefix of
+    /// the other the shorter one is smaller. Computed as a 3-way sign in a slot
+    /// (`-1`/`0`/`1`), like `zap_str_cmp` / `zap_bigint_cmp`, then mapped to the
+    /// operator by comparing the sign against 0. Element ordering routes through
+    /// `binop(Lt/Gt, ..)`, so non-orderable elements raise a clear error there.
+    fn deque_order_cmp(
+        &mut self,
+        op: AstBin,
+        l: Value,
+        lelem: Elem,
+        r: Value,
+        relem: Elem,
+    ) -> Result<(Value, Ty), LowerError> {
+        let cmp = self.alloca(Ty::I64);
+        let idx = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(cmp, zero);
+        self.store(idx, zero);
+        let llen = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(llen),
+            func: "zap_deque_len".to_string(),
+            args: vec![l],
+        });
+        let rlen = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(rlen),
+            func: "zap_deque_len".to_string(),
+            args: vec![r],
+        });
+
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let set_neg_bb = self.new_block();
+        let check_gt_bb = self.new_block();
+        let set_pos_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let after_bb = self.new_block();
+        let lencmp_bb = self.new_block();
+        let final_bb = self.new_block();
+        self.set_term(Term::Br(cond_bb));
+
+        // Loop while both indices are in range AND no decision has been made yet.
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let in_l = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: in_l,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: llen,
+        });
+        let in_r = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: in_r,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: rlen,
+        });
+        let in_range = self.new_value(Ty::I1);
+        self.emit(Inst::Bin {
+            dest: in_range,
+            op: BinOp::And,
+            lhs: in_l,
+            rhs: in_r,
+        });
+        let cur_cmp = self.load(cmp, Ty::I64);
+        let still_zero = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: still_zero,
+            pred: CmpPred::Eq,
+            lhs: cur_cmp,
+            rhs: zero,
+        });
+        let go = self.new_value(Ty::I1);
+        self.emit(Inst::Bin {
+            dest: go,
+            op: BinOp::And,
+            lhs: in_range,
+            rhs: still_zero,
+        });
+        self.set_term(Term::BrIf {
+            cond: go,
+            then_bb: body_bb,
+            else_bb: after_bb,
+        });
+
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let lety = self.elem_ty(lelem);
+        let le = self.new_value(lety);
+        self.emit(Inst::Call {
+            dest: Some(le),
+            func: format!("zap_deque_get_{}", lelem.val_suffix()),
+            args: vec![l, i],
+        });
+        let rety = self.elem_ty(relem);
+        let re = self.new_value(rety);
+        self.emit(Inst::Call {
+            dest: Some(re),
+            func: format!("zap_deque_get_{}", relem.val_suffix()),
+            args: vec![r, i],
+        });
+        let (lt_bit, _) = self.binop(AstBin::Lt, le, lety, re, rety)?;
+        self.set_term(Term::BrIf {
+            cond: lt_bit,
+            then_bb: set_neg_bb,
+            else_bb: check_gt_bb,
+        });
+
+        self.position(set_neg_bb);
+        let neg = self.iconst(Ty::I64, -1);
+        self.store(cmp, neg);
+        self.set_term(Term::Br(incr_bb));
+
+        self.position(check_gt_bb);
+        // Read the elements again for the `>` test: SSA values from `body_bb` do
+        // not dominate this block (it is reached from `body_bb`, so they would —
+        // but re-emitting keeps each block self-contained and matches the get ABI).
+        let i2 = self.load(idx, Ty::I64);
+        let le2 = self.new_value(lety);
+        self.emit(Inst::Call {
+            dest: Some(le2),
+            func: format!("zap_deque_get_{}", lelem.val_suffix()),
+            args: vec![l, i2],
+        });
+        let re2 = self.new_value(rety);
+        self.emit(Inst::Call {
+            dest: Some(re2),
+            func: format!("zap_deque_get_{}", relem.val_suffix()),
+            args: vec![r, i2],
+        });
+        let (gt_bit, _) = self.binop(AstBin::Gt, le2, lety, re2, rety)?;
+        self.set_term(Term::BrIf {
+            cond: gt_bit,
+            then_bb: set_pos_bb,
+            else_bb: incr_bb,
+        });
+
+        self.position(set_pos_bb);
+        let pos = self.iconst(Ty::I64, 1);
+        self.store(cmp, pos);
+        self.set_term(Term::Br(incr_bb));
+
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+
+        // All compared elements were equal: the shorter deque is the smaller.
+        self.position(after_bb);
+        let cur_cmp2 = self.load(cmp, Ty::I64);
+        let is_zero = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: is_zero,
+            pred: CmpPred::Eq,
+            lhs: cur_cmp2,
+            rhs: zero,
+        });
+        self.set_term(Term::BrIf {
+            cond: is_zero,
+            then_bb: lencmp_bb,
+            else_bb: final_bb,
+        });
+
+        self.position(lencmp_bb);
+        let len_lt = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: len_lt,
+            pred: CmpPred::Lt,
+            lhs: llen,
+            rhs: rlen,
+        });
+        let len_gt = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: len_gt,
+            pred: CmpPred::Gt,
+            lhs: llen,
+            rhs: rlen,
+        });
+        // cmp = (llen<rlen) ? -1 : (llen>rlen ? 1 : 0). Build it branchlessly from
+        // the two bits: (-1 * len_lt) + (1 * len_gt), widened to i64.
+        let neg_l = self.new_value(Ty::I64);
+        self.emit(Inst::Cast {
+            dest: neg_l,
+            kind: CastKind::ZExt,
+            val: len_lt,
+        });
+        let pos_g = self.new_value(Ty::I64);
+        self.emit(Inst::Cast {
+            dest: pos_g,
+            kind: CastKind::ZExt,
+            val: len_gt,
+        });
+        let len_cmp = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: len_cmp,
+            op: BinOp::Sub,
+            lhs: pos_g,
+            rhs: neg_l,
+        });
+        self.store(cmp, len_cmp);
+        self.set_term(Term::Br(final_bb));
+
+        self.position(final_bb);
+        let c = self.load(cmp, Ty::I64);
+        let pred = match op {
+            AstBin::Lt => CmpPred::Lt,
+            AstBin::Le => CmpPred::Le,
+            AstBin::Gt => CmpPred::Gt,
+            AstBin::Ge => CmpPred::Ge,
+            _ => unreachable!("deque_order_cmp only handles < <= > >="),
+        };
+        let d = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: d,
+            pred,
+            lhs: c,
+            rhs: zero,
+        });
+        Ok((d, Ty::I1))
+    }
+
     /// The full ZIR type a collection element of kind `e` flows as. Identical to
     /// [`Elem::ty`] except for [`Elem::Nested`] (#625), whose precise
     /// `list`/`dict`/`set`/... type is recovered from the lowering interner so a
