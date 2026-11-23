@@ -622,6 +622,58 @@ impl<'a> FnLower<'a> {
             ));
         }
 
+        // Ordering (`< <= > >=`) on the core collections (#1328 sibling, #1334).
+        // These are reference values but not `Ty::Ptr`, so without an explicit arm
+        // they would fall through to the generic numeric path below, which
+        // `ptrtoint`-compares the two container headers — a meaningless
+        // allocation-address comparison. `set` and `deque` have well-defined
+        // Python orderings (subset/superset and lexicographic); `dict`, `heap`,
+        // and `oset` have none and are rejected. Sema (`arith_result`) reports the
+        // rejections in the normal pipeline; the lowering guards here also serve
+        // the ir crate, which is exercised without sema. Ordering is NOT
+        // symmetric, so operands are never swapped: the collection must be the
+        // left operand for a valid comparison.
+        if matches!(op, Lt | Le | Gt | Ge) {
+            if matches!(lt, Ty::Dict(..)) || matches!(rt, Ty::Dict(..)) {
+                return Err(err(
+                    "a dict is not orderable: `< <= > >=` are undefined for dicts \
+                     (as in Python); compare values explicitly",
+                ));
+            }
+            if matches!(lt, Ty::Heap(_)) || matches!(rt, Ty::Heap(_)) {
+                return Err(err("a heap is not orderable: its internal order is \
+                     implementation-defined, so `< <= > >=` are undefined; compare \
+                     a snapshot (e.g. `sorted(h.items())`)"));
+            }
+            if matches!(lt, Ty::OSet(_)) || matches!(rt, Ty::OSet(_)) {
+                return Err(err(
+                    "an oset is not orderable: `< <= > >=` are undefined for osets; \
+                     use a set for subset/superset or a list/deque for sequence ordering",
+                ));
+            }
+            if matches!(lt, Ty::Set(_)) || matches!(rt, Ty::Set(_)) {
+                let Ty::Set(lelem) = lt else {
+                    return Err(err(
+                        "a set's `< <= > >=` (subset/superset) compares only with another set",
+                    ));
+                };
+                return self.set_order_cmp(op, l, lelem, r, rt);
+            }
+            if matches!(lt, Ty::Deque(_)) || matches!(rt, Ty::Deque(_)) {
+                let Ty::Deque(lelem) = lt else {
+                    return Err(err(
+                        "a deque's `< <= > >=` (lexicographic) compares only with another deque",
+                    ));
+                };
+                let Ty::Deque(relem) = rt else {
+                    return Err(err(
+                        "a deque's `< <= > >=` (lexicographic) compares only with another deque",
+                    ));
+                };
+                return self.deque_order_cmp(op, l, lelem, r, relem);
+            }
+        }
+
         // Operator overloading on user structs (D-0047): `a op b` desugars to the
         // matching dunder method, resolved like any struct method call. `in`
         // dispatches on the right operand (`x in a` -> `a.__contains__(x)`); every
