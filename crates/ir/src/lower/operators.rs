@@ -982,6 +982,125 @@ impl<'a> FnLower<'a> {
             }
         }
 
+        // Membership: `x in <bytes>` (#1355). An `int` left operand tests
+        // byte-value membership — the byte values `for b in data` yields,
+        // 0..=255 — via a linear scan reading each byte with `zap_bytes_index`
+        // (so `85 in b"UTC"` is true, `0 in b"UTC"` false). A `bytes` left
+        // operand tests subsequence membership via `zap_str_contains`, a
+        // byte-level search (bytes share `str`'s buffer). `not in` reuses this
+        // and negates.
+        if matches!(op, In) && rt == Ty::Bytes {
+            if lt == Ty::Bytes {
+                let raw = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(raw),
+                    func: "zap_str_contains".to_string(),
+                    args: vec![r, l],
+                });
+                let zero = self.iconst(Ty::I64, 0);
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred: CmpPred::Ne,
+                    lhs: raw,
+                    rhs: zero,
+                });
+                return Ok((d, Ty::I1));
+            }
+            if !matches!(
+                lt,
+                Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64
+            ) {
+                return Err(err(
+                    "'in' on bytes expects an int (a byte value) or bytes (a subsequence) \
+                     on the left",
+                ));
+            }
+            let needle = self.coerce(l, lt, Ty::I64);
+            let result = self.alloca(Ty::I1);
+            let f = self.new_value(Ty::I1);
+            self.emit(Inst::BConst {
+                dest: f,
+                val: false,
+            });
+            self.store(result, f);
+            let idx = self.alloca(Ty::I64);
+            let zero = self.iconst(Ty::I64, 0);
+            self.store(idx, zero);
+
+            let cond_bb = self.new_block();
+            let body_bb = self.new_block();
+            let incr_bb = self.new_block();
+            let end_bb = self.new_block();
+
+            self.set_term(Term::Br(cond_bb));
+            self.position(cond_bb);
+            let cur = self.load(idx, Ty::I64);
+            let len = self.new_value(Ty::I64);
+            self.emit(Inst::Call {
+                dest: Some(len),
+                func: "zap_str_len".to_string(),
+                args: vec![r],
+            });
+            let c = self.new_value(Ty::I1);
+            self.emit(Inst::ICmp {
+                dest: c,
+                pred: CmpPred::Lt,
+                lhs: cur,
+                rhs: len,
+            });
+            self.set_term(Term::BrIf {
+                cond: c,
+                then_bb: body_bb,
+                else_bb: end_bb,
+            });
+
+            self.position(body_bb);
+            let i = self.load(idx, Ty::I64);
+            let byte = self.new_value(Ty::I64);
+            self.emit(Inst::Call {
+                dest: Some(byte),
+                func: "zap_bytes_index".to_string(),
+                args: vec![r, i],
+            });
+            let eq = self.new_value(Ty::I1);
+            self.emit(Inst::ICmp {
+                dest: eq,
+                pred: CmpPred::Eq,
+                lhs: byte,
+                rhs: needle,
+            });
+            let found_bb = self.new_block();
+            self.set_term(Term::BrIf {
+                cond: eq,
+                then_bb: found_bb,
+                else_bb: incr_bb,
+            });
+
+            self.position(found_bb);
+            let t = self.new_value(Ty::I1);
+            self.emit(Inst::BConst { dest: t, val: true });
+            self.store(result, t);
+            self.set_term(Term::Br(end_bb));
+
+            self.position(incr_bb);
+            let cur2 = self.load(idx, Ty::I64);
+            let one = self.iconst(Ty::I64, 1);
+            let next = self.new_value(Ty::I64);
+            self.emit(Inst::Bin {
+                dest: next,
+                op: BinOp::Add,
+                lhs: cur2,
+                rhs: one,
+            });
+            self.store(idx, next);
+            self.set_term(Term::Br(cond_bb));
+
+            self.position(end_bb);
+            let d = self.load(result, Ty::I1);
+            return Ok((d, Ty::I1));
+        }
+
         // Membership: `x in <set>` -> `zap_set_contains_*`, normalized to a bool.
         if matches!(op, In) {
             let Ty::Set(elem) = rt else {

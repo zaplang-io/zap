@@ -2308,9 +2308,12 @@ impl<'a> FnLower<'a> {
                 NextForm::StopIter { elem } => elem,
             },
             Ty::List(e) => e.ty(),
+            // `sum(bytes)` reduces the byte values as `int64`s (#1355), the same
+            // elements `for b in data` yields; iterated via `iterate_bytes`.
+            Ty::Bytes => Ty::I64,
             other => {
                 return Err(err(format!(
-                    "sum() expects an array, list, or iterator value, found {other:?}"
+                    "sum() expects an array, list, iterator, or bytes value, found {other:?}"
                 )))
             }
         };
@@ -2344,6 +2347,7 @@ impl<'a> FnLower<'a> {
         match vt {
             Ty::Struct(sid) => self.drive_iteration(v, sid, add)?,
             Ty::List(e) => self.iterate_list(v, e, add)?,
+            Ty::Bytes => self.iterate_bytes(v, add)?,
             _ => unreachable!("element type already classified above"),
         }
         let result = self.load(acc, elem_ty);
@@ -2630,7 +2634,7 @@ impl<'a> FnLower<'a> {
     /// for comprehensions, `sum(...)`, and the `set`/`list` constructors over a
     /// `bytes` operand. Byte-wise, not UTF-8-decoded — distinct from
     /// [`Self::iterate_str`].
-    fn iterate_bytes(
+    pub(super) fn iterate_bytes(
         &mut self,
         data: Value,
         mut body: impl FnMut(&mut FnLower<'a>, Value, Ty) -> Result<(), LowerError>,

@@ -8664,8 +8664,12 @@ impl Checker {
                     for a in args {
                         let at = self.infer(&a.value);
                         if a.name.is_none() {
-                            if let Ty::List(_) = &at {
-                                result = at.clone();
+                            match &at {
+                                Ty::List(_) => result = at.clone(),
+                                // `sorted(bytes)` sorts the byte values ascending
+                                // into a fresh `list[int64]` (#1355).
+                                Ty::Bytes => result = Ty::List(Box::new(Ty::Int64)),
+                                _ => {}
                             }
                         }
                     }
