@@ -32,6 +32,10 @@ zapc_sema = { path = "../sema" }
 # (`zap lsp`, I#229) runs for live diagnostics. Host-safe, no LLVM.
 zapc_analysis = { path = "../analysis" }
 zapc_ir = { path = "../ir" }
+# Comptime diagnostics renderers (#1256): the driver renders a `@derive` failure
+# (E3d, #1293) through these, with the entry source, from the structured info a
+# `LowerError` carries up. Host-safe, no LLVM.
+zapc_comptime = { path = "../comptime" }
 # Canonical formatter (`zap fmt`, D-0037). Host-safe, no LLVM.
 zapc_fmt = { path = "../fmt" }
 # API-doc model extraction (`zap doc`, I#232). Host-safe, no LLVM.

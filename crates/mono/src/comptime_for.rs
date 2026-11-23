@@ -23,12 +23,36 @@
 use std::rc::Rc;
 
 use zapc_comptime::{
-    desugar_reflect_field, reflect_field, unroll, Env, Evaluator, TypeInfo, TypeRegistry, Value,
+    desugar_reflect_field, error_code, reflect_field, unroll, CtError, CtErrorKind, Env, Evaluator,
+    TypeInfo, TypeRegistry, Value,
 };
 use zapc_syntax::ast::{Block, EnumDef, Expr, Module, Stmt, StructDef};
 use zapc_syntax::span::Span;
 
-use crate::{err, LowerError};
+use crate::{DeriveErrorInfo, LowerError};
+
+/// Convert a comptime [`CtError`] raised while unrolling a `@derive` generator
+/// into a [`LowerError`] carrying a [`DeriveErrorInfo`] (E3d, #1293). The trait
+/// and type are not known here (the unroll sees only the generator body), so
+/// `trait_and_type` is `None` and the backtrace is empty; monomorphization
+/// upgrades both once it knows which derive this descent belongs to. The code is
+/// routed by the cause kind — a library `comptime.error` is `ZAP7002`, an engine
+/// fault `ZAP7001` — so a plain (non-derive) comptime failure still renders with
+/// the right code and span.
+fn ct_lower_error(ce: CtError) -> LowerError {
+    let cause_is_user = ce.kind == CtErrorKind::UserError;
+    LowerError {
+        code: error_code(&ce),
+        message: ce.message.clone(),
+        derive: Some(Box::new(DeriveErrorInfo {
+            trait_and_type: None,
+            cause_message: ce.message,
+            cause_span: ce.span,
+            cause_is_user,
+            frames: Vec::new(),
+        })),
+    }
+}
 
 /// Unroll `comptime for <loop_var> in info.fields:` over the concrete struct
 /// `def`'s declared fields, returning the specialized statements to splice.
@@ -78,7 +102,7 @@ pub fn type_registry(module: &Module) -> TypeRegistry {
 /// Read access (v1); field *write* is deferred until a codec consumer needs it.
 pub fn reflect_field_access(def: &StructDef, value: &Expr, index: i64) -> Result<Expr, LowerError> {
     let info = zapc_comptime::type_info_of_struct(def);
-    reflect_field(value, index, &info, Span::new(0, 0)).map_err(|e| err(e.message))
+    reflect_field(value, index, &info, Span::new(0, 0)).map_err(ct_lower_error)
 }
 
 /// Unroll `comptime for <loop_var> in info.fields:` over `def` **and** desugar
@@ -104,7 +128,7 @@ pub fn unroll_struct_fields_with_access(
 
 /// Desugar `reflect.field` in the expression(s) of one emitted statement.
 fn desugar_stmt_fields(st: &Stmt, info: &TypeInfo) -> Result<Stmt, LowerError> {
-    let d = |e: &Expr| desugar_reflect_field(e, info).map_err(|e| err(e.message));
+    let d = |e: &Expr| desugar_reflect_field(e, info).map_err(ct_lower_error);
     Ok(match st {
         Stmt::Expr(e) => Stmt::Expr(d(e)?),
         Stmt::Return { value, span } => Stmt::Return {
@@ -153,5 +177,5 @@ fn unroll_member(
         name: member.to_string(),
         span: z,
     };
-    unroll(loop_var, &iterable, body, &base, &mut ev).map_err(|e| err(e.message))
+    unroll(loop_var, &iterable, body, &base, &mut ev).map_err(ct_lower_error)
 }

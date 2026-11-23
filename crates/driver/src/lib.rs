@@ -126,6 +126,63 @@ fn report(reports: Vec<Report>) {
     }
 }
 
+/// Render one comptime `@derive` failure (E3d, #1293) through the #1256
+/// renderers, with the entry `src` so it carries `file:line:col` and the source
+/// snippet. A failure under a derivable generator becomes the consumer
+/// `ZAP7003` "cannot derive `trait` for `type`" at the user's field, with the
+/// `required because of …` backtrace and the root cause; a comptime failure not
+/// under a derive renders as a plain comptime error at its own span. The
+/// `CtError`/`DeriveBacktrace` the renderers want are reconstructed from the
+/// plain data the [`DeriveErrorInfo`](zapc_ir::DeriveErrorInfo) carried up.
+fn render_derive_failure(file: &str, src: Option<&str>, di: &zapc_ir::DeriveErrorInfo) -> String {
+    let cause = if di.cause_is_user {
+        zapc_comptime::CtError::user(di.cause_message.clone(), di.cause_span)
+    } else {
+        zapc_comptime::CtError::value(di.cause_message.clone(), di.cause_span)
+    };
+    let mut backtrace = zapc_comptime::DeriveBacktrace::new();
+    for (label, span) in &di.frames {
+        backtrace = backtrace.with(zapc_comptime::Frame::new(label.clone(), *span));
+    }
+    let src = src.unwrap_or("");
+    match &di.trait_and_type {
+        Some((trait_name, type_name)) => zapc_comptime::render_derive_error(
+            src,
+            file,
+            trait_name,
+            type_name,
+            di.cause_span,
+            &cause,
+            &backtrace,
+        ),
+        None => zapc_comptime::render_ct_error(src, file, &cause, &backtrace),
+    }
+}
+
+/// Print lowering errors to stderr: a `@derive` failure through
+/// [`render_derive_failure`] (with the entry source), and any ordinary lowering
+/// error as the location-free `ZAP6xxx` header exactly as before (lowering errors
+/// carry no span of their own). Returns whether anything was printed.
+fn report_lower_errors(file: &str, errs: Vec<zapc_ir::LowerError>) {
+    let mut sources = SourceMap::default();
+    for e in errs {
+        if let Some(di) = e.derive {
+            // `render_derive_failure` only consults `src` when a span is present;
+            // the derive payload always carries one (the user's field).
+            let rendered = {
+                let src = sources.source(file);
+                render_derive_failure(file, src, &di)
+            };
+            eprintln!("{rendered}");
+        } else {
+            eprintln!(
+                "{}",
+                zapc_diag::render::render_diagnostic(None, file, e.code, &e.message, None)
+            );
+        }
+    }
+}
+
 /// Like [`format_reports`] but renders each diagnostic at warning severity
 /// (`warning[ZAPnnnn]`), for the non-fatal sema warnings surfaced by the build
 /// pipeline (I#472/D-0109).
@@ -330,18 +387,10 @@ pub fn emit_ir_for(
     // types (#1167).
     let (zir, errs) = zapc_ir::lower_module_opts_with_types(&module, race, &types);
     if !errs.is_empty() {
-        // Lowering errors carry no span, so they render as the location-free
-        // header (unchanged), but still through the one shared path (#571).
-        report(
-            errs.into_iter()
-                .map(|e| Report {
-                    file: file.to_string(),
-                    code: e.code,
-                    message: e.message,
-                    span: None,
-                })
-                .collect(),
-        );
+        // A `@derive` failure renders through the #1256 renderers with the entry
+        // source (E3d, #1293, `ZAP7003` at the user's field); an ordinary lowering
+        // error stays the location-free header (it carries no span).
+        report_lower_errors(file, errs);
         return ExitCode::from(1);
     }
     print!("{zir}");
@@ -692,5 +741,65 @@ mod out_path_tests {
         }
         // The per-run directories themselves are distinct.
         assert_ne!(same1.parent(), same2.parent());
+    }
+}
+
+#[cfg(test)]
+mod derive_render_tests {
+    use super::render_derive_failure;
+    use zapc_ir::DeriveErrorInfo;
+    use zapc_syntax::span::Span;
+
+    const SRC: &str = "struct User:\n    int64 id\n    Widget w\n";
+
+    // The span of `Widget w` (3rd line) in SRC, for the `at`/cause/frame.
+    fn field_span() -> Span {
+        let start = SRC.find("Widget w").unwrap() as u32;
+        Span::new(start, start + "Widget w".len() as u32)
+    }
+
+    #[test]
+    fn a_derive_failure_renders_the_consumer_header_and_backtrace() {
+        let sp = field_span();
+        let di = DeriveErrorInfo {
+            trait_and_type: Some(("Ser".into(), "User".into())),
+            cause_message: "`Ser` is not implemented for this type".into(),
+            cause_span: sp,
+            cause_is_user: true,
+            frames: vec![("field `w` of `User`".into(), sp)],
+        };
+        let out = render_derive_failure("user.zap", Some(SRC), &di);
+        assert!(
+            out.contains("error[ZAP7003]: cannot derive `Ser` for `User`"),
+            "{out}"
+        );
+        assert!(
+            out.contains("required because of field `w` of `User`"),
+            "{out}"
+        );
+        assert!(
+            out.contains("the generator reported: `Ser` is not implemented for this type"),
+            "{out}"
+        );
+        // Points at the user's field line, with a caret snippet.
+        assert!(out.contains("user.zap:3:5"), "located at the field: {out}");
+    }
+
+    #[test]
+    fn a_comptime_failure_without_a_derive_renders_as_a_plain_error() {
+        // No `trait_and_type` → a plain comptime error at its own span (ZAP7002
+        // for a library abort), not the "cannot derive" consumer header.
+        let sp = field_span();
+        let di = DeriveErrorInfo {
+            trait_and_type: None,
+            cause_message: "boom".into(),
+            cause_span: sp,
+            cause_is_user: true,
+            frames: vec![],
+        };
+        let out = render_derive_failure("user.zap", Some(SRC), &di);
+        assert!(!out.contains("cannot derive"), "no consumer header: {out}");
+        assert!(out.contains("ZAP7002"), "a user abort is ZAP7002: {out}");
+        assert!(out.contains("boom"), "{out}");
     }
 }
