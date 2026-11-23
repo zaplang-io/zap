@@ -84,7 +84,7 @@ pub fn sensitive_jobs() -> usize {
 /// Classify a fixture path string as sensitive (must run in the conservative
 /// lane) by name alone — the pure, host-testable core of [`is_sensitive`].
 ///
-/// Three independent signals, any of which qualifies:
+/// Several independent signals, any of which qualifies:
 ///
 /// * the fixture lives under `tests/race/` — that corpus still runs a single
 ///   `zap run` (compile+link+run) under one deadline, so at a wide width a
@@ -92,15 +92,32 @@ pub fn sensitive_jobs() -> usize {
 ///   its programs are also concurrency-heavy; and
 /// * the fixture name contains `stress` or `preempt` — the scheduler / GC /
 ///   concurrency stress + preemption programs that are timing-sensitive under
-///   load and have a flake history (`#223` family, `#295`).
+///   load and have a flake history (`#223` family, `#295`); and
+/// * the fixture name contains `timeout`, `deadline`, or `cancel` — the
+///   scope-deadline / cancellation / spawn-timeout programs assert on a *wall-
+///   clock* deadline enforced by the scheduler, so at the wide `$(nproc)` width
+///   CPU starvation makes the program itself miss its deadline and trip the 60s
+///   `[run]` ceiling (observed after the `#1305` widening: the `scope_timeout*`
+///   and `spawn_forms_timeout` conformance fixtures, and the net/TLS
+///   `*_deadline` / `*_timeout` / `*_cancel` goldens). These are genuinely
+///   timing-sensitive at *run* time, independent of the `#1113` build issue.
+///
+/// A sensitive fixture whose name matches none of these still has the explicit
+/// `<fixture>.serial` sidecar escape hatch (see [`is_sensitive`]) — used, e.g.,
+/// for `scope_cleanup`, which is scheduler-sensitive but carries no marker word.
 ///
 /// Erring toward classifying a borderline fixture as sensitive only costs it the
 /// wide lane's extra parallelism; it never risks correctness, so the rule is
-/// deliberately conservative.
+/// deliberately conservative. (`scope`/`scoped` is deliberately NOT a marker: it
+/// would pull in deterministic `scoped_*` drop-glue/`with` fixtures that are not
+/// timing-sensitive.)
 pub fn is_sensitive_name(path: &str) -> bool {
     let in_race_corpus = path.contains("/race/") || path.contains("\\race\\");
     let stress_or_preempt = path.contains("stress") || path.contains("preempt");
-    in_race_corpus || stress_or_preempt
+    // Wall-clock-deadline / cancellation programs: the scheduler enforces the
+    // deadline, so core starvation at the wide width makes them miss it (#1305).
+    let timing = path.contains("timeout") || path.contains("deadline") || path.contains("cancel");
+    in_race_corpus || stress_or_preempt || timing
 }
 
 /// Whether a fixture must run in the conservative (low-width) lane. Combines the
@@ -454,6 +471,23 @@ mod tests {
                 "{s} (race corpus) should be sensitive"
             );
         }
+        // Wall-clock-deadline / cancellation programs (zaplang-io/zap#1305): the
+        // scheduler enforces the deadline, so they starve + miss it at the wide
+        // width. Regression source: these starved after the pool widened.
+        for s in [
+            "tests/conformance/scope_timeout.zap",
+            "tests/conformance/scope_timeout_sever.zap",
+            "tests/conformance/spawn_forms_timeout.zap",
+            "tests/golden/net_connect_deadline.zap",
+            "tests/golden/tls_scope_read_cancel.zap",
+            "tests/golden/http_client_timeout.zap",
+            "tests/golden/process_check_timeout.zap",
+        ] {
+            assert!(
+                is_sensitive_name(s),
+                "{s} (timing/deadline) should be sensitive"
+            );
+        }
     }
 
     #[test]
@@ -472,9 +506,37 @@ mod tests {
             "tests/golden/coroutines.zap",
             "tests/conformance/truthiness.zap",
             "tests/diff/arithmetic.zap",
+            // `scope`/`scoped` is intentionally NOT a marker: these are
+            // deterministic structured-concurrency / drop-glue / `with` fixtures,
+            // not wall-clock-deadline tests, so they must stay in the wide lane.
+            "tests/golden/scope_join.zap",
+            "tests/golden/scope_group.zap",
+            "tests/golden/scoped_with_basic.zap",
+            "tests/golden/scoped_field_drop_glue.zap",
         ] {
             assert!(!is_sensitive_name(s), "{s} should NOT be sensitive");
         }
+    }
+
+    #[test]
+    fn serial_sidecar_routes_scope_cleanup_to_conservative_lane() {
+        // scope_cleanup carries no marker word, so is_sensitive_name is false …
+        assert!(
+            !is_sensitive_name("tests/conformance/scope_cleanup.zap"),
+            "scope_cleanup should not match a name marker (it uses the sidecar)"
+        );
+        // … but the committed `scope_cleanup.serial` sidecar must pin it sensitive
+        // through the full is_sensitive() path (the #1305 regression fix).
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/driver has a two-level parent")
+            .join("tests/conformance/scope_cleanup.zap");
+        assert!(
+            is_sensitive(&fixture),
+            "scope_cleanup.serial sidecar must route {} to the conservative lane",
+            fixture.display()
+        );
     }
 
     #[test]
