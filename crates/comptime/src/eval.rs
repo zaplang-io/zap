@@ -643,6 +643,24 @@ impl<'a> Evaluator<'a> {
         env: &mut Env,
     ) -> Result<Value, CtError> {
         match name {
+            // `reflect.type_info(T)` — introspect a type. Its argument names a
+            // TYPE, not a value, so it is not `eval_args`-evaluated: it is read as
+            // a type reference and resolved via the registry to a `Value::Type`
+            // (#1298 wiring; the registry is attached by the mono driver). This is
+            // what makes `reflect.type_info(T).fields` an evaluable comptime
+            // sequence the loop unroller consumes.
+            "type_info" => {
+                if args.len() != 1 || args[0].name.is_some() {
+                    return Err(CtError::value(
+                        "`reflect.type_info(T)` takes exactly one positional type argument",
+                        span,
+                    ));
+                }
+                let ty = expr_as_type(&args[0].value).ok_or_else(|| {
+                    CtError::value("`reflect.type_info(T)` expects a type name", span)
+                })?;
+                self.resolve_type_value(&ty, span)
+            }
             "has_override" => {
                 let argv = self.eval_args(args, env)?;
                 if argv.len() != 2 {
@@ -1111,6 +1129,20 @@ impl<'a> Evaluator<'a> {
 
 fn no_field_err(record: &str, name: &str, span: Span) -> CtError {
     CtError::value(format!("`{record}` has no comptime field `{name}`"), span)
+}
+
+/// Read an expression written in a *type* position — the argument of
+/// `reflect.type_info(T)` (#1298). A bare name is a nominal type reference; the
+/// generic/container spellings (`list[T]`, `T?`) in that position are deferred.
+fn expr_as_type(e: &zapc_syntax::ast::Expr) -> Option<zapc_syntax::ast::Type> {
+    match e {
+        zapc_syntax::ast::Expr::Name(n, s) => Some(zapc_syntax::ast::Type::Named {
+            name: n.clone(),
+            args: Vec::new(),
+            span: *s,
+        }),
+        _ => None,
+    }
 }
 
 /// A container element accessor used on the wrong kind (`.elem` on a non-list, …).

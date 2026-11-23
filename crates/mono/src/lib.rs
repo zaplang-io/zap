@@ -390,6 +390,32 @@ fn subst_method_sig(m: &MethodSig, subst: &HashMap<&str, &Type>) -> MethodSig {
     }
 }
 
+/// Extract the type name from a `reflect.type_info(<TypeName>)` call expression
+/// (#1298) — the base of a `comptime for … in reflect.type_info(T).<member>`
+/// iterable. Returns `None` for any other shape, or a non-bare-name type
+/// argument (generic/container spellings in that position are deferred).
+fn reflect_type_info_arg(base: &Expr) -> Option<String> {
+    let Expr::Call { callee, args, .. } = base else {
+        return None;
+    };
+    let Expr::Attr {
+        base: recv, name, ..
+    } = &**callee
+    else {
+        return None;
+    };
+    if name != "type_info" || !matches!(&**recv, Expr::Name(m, _) if m == "reflect") {
+        return None;
+    }
+    match args.as_slice() {
+        [a] if a.name.is_none() => match &a.value {
+            Expr::Name(t, _) => Some(t.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Collect the names of aliases referenced anywhere in `t` (#606 cycle
 /// detection); only names present in `aliases` are recorded.
 fn collect_alias_refs(
@@ -2070,12 +2096,78 @@ impl Mono<'_> {
     fn rewrite_block(&mut self, b: &Block, env: &mut Env) -> Result<Block, LowerError> {
         let mut stmts = Vec::with_capacity(b.stmts.len());
         for st in &b.stmts {
+            // `comptime for` (E2/E3 surface, #1298): unroll it in place, splicing
+            // the specialized per-field/variant statements (a block-level rewrite,
+            // since unrolling yields many statements from one). If the iterable's
+            // type cannot be resolved to a concrete declaration here (e.g. a
+            // still-generic `reflect.type_info(T)`), fall through to the ordinary
+            // rewrite, which leaves the node for the lowering backstop.
+            if let Stmt::ComptimeFor {
+                target, iter, body, ..
+            } = st
+            {
+                if let Some(unrolled) = self.try_unroll_comptime_for(target, iter, body)? {
+                    for u in &unrolled {
+                        stmts.push(self.rewrite_stmt(u, env)?);
+                    }
+                    continue;
+                }
+            }
             stmts.push(self.rewrite_stmt(st, env)?);
         }
         Ok(Block {
             stmts,
             span: b.span,
         })
+    }
+
+    /// Try to unroll a `comptime for <loop_var> in reflect.type_info(T).<member>:`
+    /// (#1298). Returns the specialized statements when `T` names a concrete
+    /// `struct`/`enum` in the (post-substitution) module and `member` is
+    /// `fields`/`variants`; `None` when the shape or the type is not resolvable
+    /// here (left for a later pass / the lowering backstop). Drives the E2
+    /// engine through the `comptime_for` bridge (unroll #1251 + `reflect.field`
+    /// desugar #1252).
+    fn try_unroll_comptime_for(
+        &self,
+        target: &Expr,
+        iter: &Expr,
+        body: &Block,
+    ) -> Result<Option<Vec<Stmt>>, LowerError> {
+        // `target` must be a single loop-variable name.
+        let Expr::Name(loop_var, _) = target else {
+            return Ok(None);
+        };
+        // `iter` must be `reflect.type_info(<TypeName>).<member>`.
+        let Expr::Attr {
+            base, name: member, ..
+        } = iter
+        else {
+            return Ok(None);
+        };
+        let Some(type_name) = reflect_type_info_arg(base) else {
+            return Ok(None);
+        };
+        match member.as_str() {
+            "fields" => match self.structs.get(type_name.as_str()) {
+                Some(def) => {
+                    let out =
+                        comptime_for::unroll_struct_fields_with_access(def, loop_var, body, &[])?;
+                    Ok(Some(out))
+                }
+                None => Ok(None),
+            },
+            "variants" => match self.enums.get(type_name.as_str()) {
+                Some(def) => {
+                    let out = comptime_for::unroll_enum_variants(def, loop_var, body, &[])?;
+                    Ok(Some(out))
+                }
+                None => Ok(None),
+            },
+            // `.fields`/`.variants` are the two comptime sequences a `comptime
+            // for` iterates; anything else is left for a later pass.
+            _ => Ok(None),
+        }
     }
 
     /// Rewrite an expression, returning the rewritten node only.
@@ -2843,20 +2935,14 @@ impl Mono<'_> {
                     cty,
                 ))
             }
-            // `comptime <expr>` (E2/E3 surface, #1297): transparent to type
-            // substitution — rewrite the inner and carry its type through the
-            // `comptime` wrapper. Compile-time folding of the value is the engine
-            // wiring (#1298), not this reference-rewrite pass.
-            Expr::Comptime { expr, span } => {
-                let (inner, inner_cty) = self.rewrite_expr(expr, env, expected)?;
-                Ok((
-                    Expr::Comptime {
-                        expr: Box::new(inner),
-                        span: *span,
-                    },
-                    inner_cty,
-                ))
-            }
+            // `comptime <expr>` (E2/E3 surface, #1298): the comptime operands a
+            // generator uses (`comptime f.index`, `comptime f.name`) are folded by
+            // the loop unroller before mono sees the body, so by here the wrapper
+            // is transparent — unwrap to the rewritten inner so the `comptime`
+            // marker never reaches lowering. (A standalone comptime binding that
+            // must be *folded* at mono — e.g. `comptime len(info.fields)` outside a
+            // loop — is a follow-up; v1 unwraps.)
+            Expr::Comptime { expr, .. } => self.rewrite_expr(expr, env, expected),
             Expr::Binary { op, lhs, rhs, span } => {
                 // Infer the operands so a binary expression carries a type into
                 // generic-argument unification (#1128), mirroring sema's binary

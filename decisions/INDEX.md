@@ -47,6 +47,7 @@ listed here (see [`README.md`](README.md)).
 | [1285](lang/1285-any-all-reversed.md) | any / all / reversed built-ins | Locked | 2026-11-23 |
 | [1290](lang/1290-derivable-registration.md) | "@derivable(Trait) registration model (E3a)" | Accepted | 2026-11-22 |
 | [1297](lang/1297-comptime-surface-parser.md) | comptime/reflect parser surface — comptime keyword + comptime-for / comptime-expr (S1) | Accepted | 2026-11-23 |
+| [1298](lang/1298-comptime-surface-engine-wiring.md) | comptime/reflect surface wired to the E2 engine in mono (S2) | Accepted | 2026-11-23 |
 | [1299](lang/1299-iterable-minmax-sum.md) | Iterable min/max (key=/default=) and sum start | Locked | 2026-11-23 |
 | [1302](lang/1302-enumerate-zip.md) | enumerate and zip for-loop built-ins | Locked | 2026-11-23 |
 
