@@ -62,10 +62,9 @@ def main():
     print(str(["a", "b"] < ["a", "b", "c"]))  # True: prefix
     print(str(["b"] > ["a", "z", "z"]))  # True: "b" > "a" at index 0
 
-    # bool-element ordering is intentionally not asserted here: scalar `bool`
-    # ordering is a separate question from list lexicographic ordering (which this
-    # fixture covers for int / float / str), so it is left out to keep this golden
-    # about the sequence semantics only.
+    # --- bool elements (False < True), restored after the bool zero-extend fix (#1344) ---
+    print(str([False, True] < [True, False]))  # True: False < True at index 0
+    print(str([True] > [False]))  # True
 
     # --- separately allocated (copy helper): ordering is value-based ---
     list[int64] isrc = [1, 2, 3]
