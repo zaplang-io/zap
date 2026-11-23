@@ -9143,6 +9143,68 @@ impl<'a> FnLower<'a> {
                 });
                 return Ok((dest, Ty::Struct(sid)));
             }
+            // Truth reductions `any(xs)` / `all(xs)` over a `list[bool]` (#1285):
+            // drain the list once, folding the `i1` accumulator with `or` (any)
+            // or `and` (all). The accumulator's initial value is the empty-list
+            // result — `any([])` is false, `all([])` is true. This drains fully
+            // (no short-circuit), which gives the same result for a finite list;
+            // sema restricts the argument to a `list[bool]`.
+            if fname == "any" || fname == "all" {
+                if args.len() != 1 || args.iter().any(|a| a.name.is_some()) {
+                    return Err(err(
+                        "any()/all() takes exactly one positional list argument",
+                    ));
+                }
+                let is_all = fname == "all";
+                let (v, vt) = self.expr(&args[0].value)?;
+                let Ty::List(elem) = vt else {
+                    return Err(err("any()/all() expects a list"));
+                };
+                let acc = self.alloca(Ty::I1);
+                let init = self.iconst(Ty::I1, if is_all { 1 } else { 0 });
+                self.store(acc, init);
+                let op = if is_all { BinOp::And } else { BinOp::Or };
+                self.iterate_list(v, elem, move |s, ev, et| {
+                    let t = s.truthy(ev, et);
+                    let cur = s.load(acc, Ty::I1);
+                    let next = s.new_value(Ty::I1);
+                    s.emit(Inst::Bin {
+                        dest: next,
+                        op,
+                        lhs: cur,
+                        rhs: t,
+                    });
+                    s.store(acc, next);
+                    Ok(())
+                })?;
+                let result = self.load(acc, Ty::I1);
+                return Ok((result, Ty::I1));
+            }
+            // `reversed(xs)` (#1285): a NEW list with `xs`'s elements reversed,
+            // leaving `xs` unchanged — a shallow copy (`zap_list_copy`) reversed
+            // in place (`zap_list_reverse`). `for x in reversed(xs)` then iterates
+            // the new list through the ordinary list path.
+            if fname == "reversed" {
+                if args.len() != 1 || args.iter().any(|a| a.name.is_some()) {
+                    return Err(err("reversed() takes exactly one positional list argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                let Ty::List(elem) = vt else {
+                    return Err(err("reversed() expects a list"));
+                };
+                let d = self.new_value(Ty::List(elem));
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_list_copy".to_string(),
+                    args: vec![v],
+                });
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_list_reverse".to_string(),
+                    args: vec![d],
+                });
+                return Ok((d, Ty::List(elem)));
+            }
             // String/char builtins (ticket #284, D-0025).
             if fname == "ord" {
                 // ord(c): the codepoint number of a `char`, as an `int`.

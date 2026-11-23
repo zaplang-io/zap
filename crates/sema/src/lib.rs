@@ -682,6 +682,11 @@ const BUILTINS: &[&str] = &[
     // forms never route through float; divmod agrees with floored `//` and `%`.
     "abs",
     "divmod",
+    // Idiomatic-loop built-ins (#1285): truth reductions and a non-mutating
+    // reverse. `enumerate`/`zip` remain follow-ups.
+    "any",
+    "all",
+    "reversed",
     "dot",
     "concatenate",
     "stack",
@@ -8351,6 +8356,90 @@ impl Checker {
                         self.infer(&a.value);
                     }
                     return Ty::Unknown;
+                }
+                // Truth reductions `any(xs)` / `all(xs)` over a `list[bool]`
+                // (#1285) -> `bool`. `any([])` is false, `all([])` is true. Other
+                // iterables (generators) and non-bool elements are follow-ups.
+                "any" | "all" => {
+                    if let Some(a) = args.iter().find(|a| a.name.is_some()) {
+                        self.error(
+                            ErrorCode::ZAP4023,
+                            format!(
+                                "{fname}() takes no keyword arguments; unexpected '{}'",
+                                a.name.as_deref().unwrap_or_default()
+                            ),
+                            span,
+                        );
+                    }
+                    if args.len() != 1 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!("{fname}() takes exactly one argument, got {}", args.len()),
+                            span,
+                        );
+                        for a in args {
+                            self.infer(&a.value);
+                        }
+                        return Ty::Bool;
+                    }
+                    let t = self.infer(&args[0].value);
+                    match &t {
+                        Ty::Unknown => {}
+                        Ty::List(e) if matches!(**e, Ty::Bool | Ty::Unknown) => {}
+                        _ => self.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "{fname}() expects a list[bool], got {} (other iterables \
+                                 and non-bool elements are follow-ups)",
+                                t.display()
+                            ),
+                            span,
+                        ),
+                    }
+                    return Ty::Bool;
+                }
+                // `reversed(xs)` (#1285): a NEW list with the elements of `xs` in
+                // reverse order (`xs` unchanged). A list only for now — reversing
+                // a str or other iterable is a follow-up.
+                "reversed" => {
+                    if let Some(a) = args.iter().find(|a| a.name.is_some()) {
+                        self.error(
+                            ErrorCode::ZAP4023,
+                            format!(
+                                "reversed() takes no keyword arguments; unexpected '{}'",
+                                a.name.as_deref().unwrap_or_default()
+                            ),
+                            span,
+                        );
+                    }
+                    if args.len() != 1 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!("reversed() takes exactly one argument, got {}", args.len()),
+                            span,
+                        );
+                        for a in args {
+                            self.infer(&a.value);
+                        }
+                        return Ty::Unknown;
+                    }
+                    let t = self.infer(&args[0].value);
+                    match t {
+                        Ty::List(e) => return Ty::List(e),
+                        Ty::Unknown => return Ty::Unknown,
+                        other => {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "reversed() expects a list, got {} (str and other \
+                                     iterables are follow-ups)",
+                                    other.display()
+                                ),
+                                span,
+                            );
+                            return Ty::Unknown;
+                        }
+                    }
                 }
                 // `sorted(xs, key=..., reverse=...)` -> a new list of the same
                 // element type, leaving `xs` unchanged (ticket #336). The element
@@ -18911,6 +19000,55 @@ def main():
         // Wrong arity is rejected.
         assert!(has_code(
             "def main():\n    print(sum([1], [2]))\n",
+            ErrorCode::ZAP4025
+        ));
+    }
+
+    // --- any / all / reversed (#1285) ------------------------------------------
+
+    #[test]
+    fn any_all_over_bool_list_return_bool() {
+        ok(
+            "def main():\n    auto fs = [True, False, True]\n    bool a = any(fs)\n    \
+            bool b = all(fs)\n    print(a)\n    print(b)\n",
+        );
+        ok("def main():\n    print(any([False, False]))\n    print(all([]))\n");
+        // The result is a bool, not an int (pins the result type).
+        assert!(has_code(
+            "def main():\n    int64 x = any([True])\n    print(x)\n",
+            ErrorCode::ZAP4001
+        ));
+        // A non-bool element list is rejected (follow-up).
+        assert!(has_code(
+            "def main():\n    print(all([1, 2, 3]))\n",
+            ErrorCode::ZAP4024
+        ));
+        // Arity and keywords.
+        assert!(has_code(
+            "def main():\n    print(any([True], [False]))\n",
+            ErrorCode::ZAP4025
+        ));
+        assert!(has_code(
+            "def main():\n    print(any([True], foo=1))\n",
+            ErrorCode::ZAP4023
+        ));
+    }
+
+    #[test]
+    fn reversed_returns_a_list_of_the_same_element_type() {
+        // reversed(list[T]) -> list[T], iterable and indexable.
+        ok(
+            "def main():\n    auto xs = [1, 2, 3]\n    list[int64] r = reversed(xs)\n    \
+            for x in r:\n        print(x)\n",
+        );
+        ok("def main():\n    for s in reversed([\"a\", \"b\"]):\n        print(s)\n");
+        // A non-list argument is rejected (str/other iterables are follow-ups).
+        assert!(has_code(
+            "def main():\n    print(reversed(5))\n",
+            ErrorCode::ZAP4024
+        ));
+        assert!(has_code(
+            "def main():\n    print(reversed([1], [2]))\n",
             ErrorCode::ZAP4025
         ));
     }
