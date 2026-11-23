@@ -291,23 +291,18 @@ impl<'a> FnLower<'a> {
         let (sv, sty) = self.expr(scrutinee)?;
         let merge = self.new_block();
         for arm in arms {
-            // A statically incompatible tuple shape cannot reach its bindings.
-            if let Pattern::Tuple(patterns, _) = &arm.pattern {
-                let fields = if let Ty::Struct(sid) = sty {
-                    self.ctx.tuples.borrow().fields(sid)
-                } else {
-                    None
-                };
-                let rest = patterns.iter().any(|p| matches!(p, Pattern::Rest { .. }));
-                if fields.map_or(true, |fields| {
-                    if rest {
-                        fields.len() + 1 < patterns.len()
-                    } else {
-                        fields.len() != patterns.len()
-                    }
-                }) {
-                    continue;
-                }
+            // Elide an arm whose pattern can never match this scrutinee type
+            // (#1326). The branch would be a compile-time-constant `false`, yet
+            // its body is still lowered — and in a generic specialization that
+            // body may read nominal-struct fields off a value of an unrelated
+            // type (e.g. `case Date() as day:` bound to an `i64` in
+            // `promote$int64`), emitting `FieldGet` instructions the backend
+            // cannot lower (it would GEP into a scalar) and crashing LLVM. A
+            // statically-dead arm never executes at runtime, so dropping it is
+            // behaviour-preserving and keeps the invalid field reads out of the
+            // IR entirely. This generalises the earlier tuple-only shape check.
+            if self.pattern_statically_dead(sty, &arm.pattern) {
+                continue;
             }
             let (cond, _catch_all) = self.pattern_cond(sv, sty, &arm.pattern)?;
             let then_bb = self.new_block();
@@ -343,6 +338,56 @@ impl<'a> FnLower<'a> {
         self.ensure_br(merge);
         self.position(merge);
         Ok(())
+    }
+
+    /// Whether `pat` can be statically proven never to match a scrutinee of
+    /// type `sty`, so the whole arm is dead at this specialization and must not
+    /// be lowered (#1326). This mirrors the compile-time-constant `false`
+    /// conditions `pattern_cond` already produces for type-incompatible
+    /// scrutinees, but decides it up front so the arm's bindings and body — and
+    /// any invalid `FieldGet`s they would emit against a mismatched value — are
+    /// never generated. It only reports `true` when the mismatch is certain;
+    /// anything runtime-decidable (literals, enum discriminants, nested
+    /// field/element tests) stays live and is handled by `pattern_cond`.
+    fn pattern_statically_dead(&self, sty: Ty, pat: &Pattern) -> bool {
+        match pat {
+            // `<pat> as name` matches exactly when its inner pattern does.
+            Pattern::As { pattern, .. } => self.pattern_statically_dead(sty, pattern),
+            // An or-pattern is dead only when every alternative is dead.
+            Pattern::Or(patterns, _) => {
+                !patterns.is_empty()
+                    && patterns
+                        .iter()
+                        .all(|p| self.pattern_statically_dead(sty, p))
+            }
+            // A nominal struct pattern `S(...)` matches only a value of struct
+            // `S`; against any other type (a scalar, a different struct) it is
+            // dead. An unknown name is left live so `variant_cond` reports it.
+            Pattern::Struct { path, .. } if path.len() == 1 => match self.ctx.ids.get(&path[0]) {
+                Some(&sid) => sty != Ty::Struct(sid),
+                None => false,
+            },
+            // A tuple pattern needs a tuple struct of compatible arity; this is
+            // the original tuple-shape check, now folded into the predicate.
+            Pattern::Tuple(patterns, _) => {
+                let fields = if let Ty::Struct(sid) = sty {
+                    self.ctx.tuples.borrow().fields(sid)
+                } else {
+                    None
+                };
+                let rest = patterns.iter().any(|p| matches!(p, Pattern::Rest { .. }));
+                fields.map_or(true, |fields| {
+                    if rest {
+                        fields.len() + 1 < patterns.len()
+                    } else {
+                        fields.len() != patterns.len()
+                    }
+                })
+            }
+            // A sequence pattern matches only a list value.
+            Pattern::Sequence(..) => !matches!(sty, Ty::List(_)),
+            _ => false,
+        }
     }
 
     /// Emit the test for one pattern against the scrutinee and return its `i1`
