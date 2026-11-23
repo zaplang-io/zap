@@ -145,8 +145,16 @@ fn render_derive_failure(file: &str, src: Option<&str>, di: &zapc_ir::DeriveErro
         backtrace = backtrace.with(zapc_comptime::Frame::new(label.clone(), *span));
     }
     let src = src.unwrap_or("");
-    match &di.trait_and_type {
-        Some((trait_name, type_name)) => zapc_comptime::render_derive_error(
+    match (&di.trait_and_type, di.cause_is_user, di.instantiation_span) {
+        // An engine fault *inside* a generator (not a `comptime.error`) is a
+        // library bug: cite the generator line and the user's derive site, so it
+        // is a clean dual-span error, never a panic (#1293, HQ).
+        (Some(_), false, Some(inst)) => {
+            zapc_comptime::render_generator_fault(src, file, &cause, di.cause_span, inst)
+        }
+        // A library `comptime.error` abort: the consumer `ZAP7003` form, at the
+        // user's field, with the backtrace and the author's message.
+        (Some((trait_name, type_name)), _, _) => zapc_comptime::render_derive_error(
             src,
             file,
             trait_name,
@@ -155,7 +163,8 @@ fn render_derive_failure(file: &str, src: Option<&str>, di: &zapc_ir::DeriveErro
             &cause,
             &backtrace,
         ),
-        None => zapc_comptime::render_ct_error(src, file, &cause, &backtrace),
+        // A comptime failure outside any derive: a plain comptime error.
+        (None, _, _) => zapc_comptime::render_ct_error(src, file, &cause, &backtrace),
     }
 }
 
@@ -766,6 +775,7 @@ mod derive_render_tests {
             cause_message: "`Ser` is not implemented for this type".into(),
             cause_span: sp,
             cause_is_user: true,
+            instantiation_span: Some(Span::new(0, 6)),
             frames: vec![("field `w` of `User`".into(), sp)],
         };
         let out = render_derive_failure("user.zap", Some(SRC), &di);
@@ -795,11 +805,41 @@ mod derive_render_tests {
             cause_message: "boom".into(),
             cause_span: sp,
             cause_is_user: true,
+            instantiation_span: None,
             frames: vec![],
         };
         let out = render_derive_failure("user.zap", Some(SRC), &di);
         assert!(!out.contains("cannot derive"), "no consumer header: {out}");
         assert!(out.contains("ZAP7002"), "a user abort is ZAP7002: {out}");
         assert!(out.contains("boom"), "{out}");
+    }
+
+    #[test]
+    fn an_engine_fault_inside_a_generator_renders_the_dual_span_form() {
+        // A non-user `CtError` (an engine fault, e.g. an out-of-range
+        // `reflect.field`) under a derive renders as the dual-span generator
+        // fault: the generator line AND "instantiated here", never the consumer
+        // "cannot derive" header (the bug is the library's, not the user's).
+        let sp = field_span();
+        let inst = Span::new(0, 6); // `struct` keyword of `struct User`
+        let di = DeriveErrorInfo {
+            trait_and_type: Some(("Ser".into(), "User".into())),
+            cause_message: "comptime field index 100 is out of range".into(),
+            cause_span: sp,
+            cause_is_user: false,
+            instantiation_span: Some(inst),
+            frames: vec![("field `w` of `User`".into(), sp)],
+        };
+        let out = render_derive_failure("user.zap", Some(SRC), &di);
+        assert!(
+            !out.contains("cannot derive"),
+            "an engine fault is not the consumer header: {out}"
+        );
+        assert!(
+            out.contains("error in comptime generator"),
+            "dual-span generator-fault header: {out}"
+        );
+        assert!(out.contains("instantiated here"), "second span: {out}");
+        assert!(out.contains("out of range"), "{out}");
     }
 }

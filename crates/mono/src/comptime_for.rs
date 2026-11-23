@@ -49,6 +49,7 @@ fn ct_lower_error(ce: CtError) -> LowerError {
             cause_message: ce.message,
             cause_span: ce.span,
             cause_is_user,
+            instantiation_span: None,
             frames: Vec::new(),
         })),
     }

@@ -1206,3 +1206,48 @@ def main():
         "no comptime-internal symbol in the diagnostic: {stderr}"
     );
 }
+
+#[test]
+fn a_generator_bug_is_a_dual_span_error_not_a_crash() {
+    // An engine fault inside a generator (here an out-of-range `reflect.field`)
+    // is the library author's bug, not the consumer's: it renders as the
+    // dual-span generator-fault form (the generator line AND "instantiated
+    // here"), and the compiler exits with a diagnostic, never a panic (E3d,
+    // #1293).
+    let src = "\
+@derivable(Ser)
+def _derive_ser[T](T value):
+    comptime for f in reflect.type_info(T).fields:
+        print(reflect.field(value, comptime f.index + 100))
+
+interface Ser:
+    def ser(self)
+
+@derive(Ser)
+struct User:
+    int64 id
+
+def main():
+    auto u = User(1)
+    u.ser()
+";
+    let f = write_zap("e3d-generator-bug", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "the generator fault must fail the compile"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error in comptime generator"),
+        "dual-span generator-fault header: {stderr}"
+    );
+    assert!(
+        stderr.contains("note: instantiated here"),
+        "the second span points at the derive site: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("cannot derive"),
+        "a generator bug is a clean dual-span diagnostic, not a panic or the consumer header: {stderr}"
+    );
+}
