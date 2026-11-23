@@ -273,7 +273,10 @@ fn front_end_tail(
     // from the `@derive(...)` so lowering's deferral backstop no longer fires.
     // Runs before sema so the synthesized methods are type-checked and
     // conformance-checked like any hand-written method.
-    let derive_diags = derive_synth::expand_library_derives(&mut module);
+    // `_derive_bounds` are the inferred serde bounds of each generic `@derive`
+    // (E3c, #1292); E3d (#1293) will render unsatisfied ones at the offending
+    // field, so the current pipeline does not consume them yet.
+    let (derive_diags, _derive_bounds) = derive_synth::expand_library_derives(&mut module);
     if !derive_diags.is_empty() {
         return Err(sema_reports(entry, derive_diags));
     }
