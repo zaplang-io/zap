@@ -25,9 +25,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      # The decisions/ index is generated; fail if the committed copy is stale.
-      - name: Decisions index is up to date
-        run: scripts/gen-decisions-index.sh --check
+      # The decisions index is a derived view, not committed (zaplang-io/zap#1321).
+      # Validate the ADR SOURCES instead: every ADR parses and carries the
+      # required frontmatter (title/status/date + issue|pr). Duplicate decision
+      # numbers are allowed (one issue can span several stage ADRs).
+      - name: Decision ADR sources are valid
+        run: scripts/gen-decisions-index.sh --validate
 
       # Changelog fragments must be named changelog.d/<number>.<kind>.md.
       - name: Changelog fragment names are valid
