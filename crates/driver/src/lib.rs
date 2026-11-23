@@ -22,6 +22,7 @@ use zapc_syntax::cfg::Target;
 mod behavioral_decorator;
 pub mod cli;
 mod decorator_desugar;
+mod derive_synth;
 mod modlink;
 // The JSON codec now lives in its own leaf crate (`zapc_json`, I#236) so the
 // lower-level `zapc_pkg` can share it; re-exported here as `crate::json` so the
@@ -264,6 +265,17 @@ fn front_end_tail(
     let beh_diags = behavioral_decorator::expand_behavioral_decorators(&mut module);
     if !beh_diags.is_empty() {
         return Err(sema_reports(entry, beh_diags));
+    }
+    // Synthesize `@derive(<library trait>)` forwarding stubs (E3b, #1291, epic
+    // #1289): for each type that derives a library-registered `@derivable` trait,
+    // add a thin method per the trait's `interface` that forwards to the
+    // registered generic generator specialized at the type, and strip that trait
+    // from the `@derive(...)` so lowering's deferral backstop no longer fires.
+    // Runs before sema so the synthesized methods are type-checked and
+    // conformance-checked like any hand-written method.
+    let derive_diags = derive_synth::expand_library_derives(&mut module);
+    if !derive_diags.is_empty() {
+        return Err(sema_reports(entry, derive_diags));
     }
     // Analysis mode (#1167): same diagnostics as `analyze`, plus the inferred
     // type of every expression (a `TypeMap`), which lowering hands to the
