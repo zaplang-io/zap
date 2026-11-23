@@ -100,6 +100,13 @@ pub struct DeriveErrorInfo {
     /// for an engine fault (`ZAP7001`); selects the root-cause lead-in and, for a
     /// fault, the dual-span generator-fault form.
     pub cause_is_user: bool,
+    /// The span to cite as "instantiated here" for an engine fault inside a
+    /// generator (the derived type's declaration), when under a derive. `None`
+    /// for a comptime failure outside a derive. Drives the dual-span
+    /// generator-fault diagnostic (E3d, #1293): a *bug* in a library generator is
+    /// reported at the generator line **and** at the user's derive site, never a
+    /// panic.
+    pub instantiation_span: Option<zapc_syntax::span::Span>,
     /// Backtrace frames (outermost first): `(label, span)` per context the
     /// descent unwound through, e.g. `("field `b` of `Outer`", <field span>)`.
     pub frames: Vec<(String, zapc_syntax::span::Span)>,
@@ -2325,7 +2332,7 @@ impl Mono<'_> {
                         &[],
                         Some(&self.comptime_registry),
                     )
-                    .map_err(|e| self.enrich_derive_error(e, &def.fields))?;
+                    .map_err(|e| self.enrich_derive_error(e, &def.fields, def.span))?;
                     Ok(Some(out))
                 }
                 None => Ok(None),
@@ -2339,7 +2346,7 @@ impl Mono<'_> {
                         &[],
                         Some(&self.comptime_registry),
                     )
-                    .map_err(|e| self.enrich_derive_error(e, &[]))?;
+                    .map_err(|e| self.enrich_derive_error(e, &[], def.span))?;
                     Ok(Some(out))
                 }
                 None => Ok(None),
@@ -2357,9 +2364,18 @@ impl Mono<'_> {
     /// derive) or the error carries no derive payload. `fields` are the enclosing
     /// type's fields, used to label the backtrace frame at the offending field
     /// (matched by the cause span).
-    fn enrich_derive_error(&self, mut le: LowerError, fields: &[ast::Field]) -> LowerError {
+    fn enrich_derive_error(
+        &self,
+        mut le: LowerError,
+        fields: &[ast::Field],
+        instantiation_span: Span,
+    ) -> LowerError {
         if let (Some(di), Some((tr, ty))) = (le.derive.as_mut(), self.cur_derive.as_ref()) {
             di.trait_and_type = Some((tr.clone(), ty.clone()));
+            // The derive site (the type's declaration) is where a generator fault
+            // is "instantiated" — cited as the second span of the dual-span
+            // generator-fault diagnostic (E3d, #1293).
+            di.instantiation_span = Some(instantiation_span);
             le.code = zapc_diag::ErrorCode::ZAP7003;
             if di.frames.is_empty() {
                 if let Some(f) = fields.iter().find(|f| f.span == di.cause_span) {
