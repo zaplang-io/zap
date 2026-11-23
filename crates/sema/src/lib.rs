@@ -678,6 +678,10 @@ const BUILTINS: &[&str] = &[
     // distinct. Variadic/iterable/key=/default= forms tracked in #1284.
     "min",
     "max",
+    // Scalar integer-preserving abs / divmod (#1283). Like min/max, the integer
+    // forms never route through float; divmod agrees with floored `//` and `%`.
+    "abs",
+    "divmod",
     "dot",
     "concatenate",
     "stack",
@@ -8147,6 +8151,138 @@ impl Checker {
                     // (an explicit int/float mix promotes to `f64` exactly as
                     // the `<`/`<=` operators do; pure-integer stays exact).
                     return num_join(&ta, &tb);
+                }
+                // Scalar integer-preserving `abs` (#1283): the magnitude of one
+                // numeric scalar. A signed integer stays an integer (`int64`),
+                // never routed through float; an unsigned value is returned
+                // unchanged (`uint64`); a float yields its `float64` magnitude.
+                // `abs(INT64_MIN)` has no `int64` result and raises
+                // ArithmeticError at run time (see lowering).
+                "abs" => {
+                    if let Some(a) = args.iter().find(|a| a.name.is_some()) {
+                        self.error(
+                            ErrorCode::ZAP4023,
+                            format!(
+                                "abs() takes no keyword arguments; unexpected '{}'",
+                                a.name.as_deref().unwrap_or_default()
+                            ),
+                            span,
+                        );
+                    }
+                    if args.len() != 1 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!("abs() takes exactly one argument, got {}", args.len()),
+                            span,
+                        );
+                        for a in args {
+                            self.infer(&a.value);
+                        }
+                        return Ty::Unknown;
+                    }
+                    let t = self.infer(&args[0].value);
+                    let numeric_scalar = matches!(t, Ty::Unknown)
+                        || matches!(t, Ty::Float64 | Ty::Float32 | Ty::UntypedFloat)
+                        || (t.is_int() && !matches!(t, Ty::Bigint));
+                    if !numeric_scalar {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "abs() takes a numeric scalar argument (int, uint, or \
+                                 float), got {} (bigint and complex are not supported yet)",
+                                t.display()
+                            ),
+                            span,
+                        );
+                        return Ty::Unknown;
+                    }
+                    if matches!(t, Ty::Unknown) {
+                        return Ty::Unknown;
+                    }
+                    return if matches!(t, Ty::Float64 | Ty::Float32 | Ty::UntypedFloat) {
+                        Ty::Float64
+                    } else if t.is_unsigned() {
+                        Ty::Uint64
+                    } else {
+                        Ty::Int64
+                    };
+                }
+                // Scalar `divmod(a, b)` (#1283): the `(quotient, remainder)` pair,
+                // typed as a 2-tuple of the numeric join of the operands. The
+                // integer form uses the same floored `//` and `%` the operators
+                // do, so `divmod(a, b) == (a // b, a % b)` for every sign; the
+                // division/modulo is never routed through float.
+                "divmod" => {
+                    if let Some(a) = args.iter().find(|a| a.name.is_some()) {
+                        self.error(
+                            ErrorCode::ZAP4023,
+                            format!(
+                                "divmod() takes no keyword arguments; unexpected '{}'",
+                                a.name.as_deref().unwrap_or_default()
+                            ),
+                            span,
+                        );
+                    }
+                    if args.len() != 2 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!("divmod() takes exactly two arguments, got {}", args.len()),
+                            span,
+                        );
+                        for a in args {
+                            self.infer(&a.value);
+                        }
+                        return Ty::Unknown;
+                    }
+                    let ta = self.infer(&args[0].value);
+                    let tb = self.infer(&args[1].value);
+                    let numeric_scalar = |t: &Ty| {
+                        matches!(t, Ty::Unknown)
+                            || matches!(t, Ty::Float64 | Ty::Float32 | Ty::UntypedFloat)
+                            || (t.is_int() && !matches!(t, Ty::Bigint))
+                    };
+                    if !numeric_scalar(&ta) || !numeric_scalar(&tb) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "divmod() takes two numeric scalar arguments (int, uint, \
+                                 or float), got {} and {} (bigint and complex are not \
+                                 supported yet)",
+                                ta.display(),
+                                tb.display()
+                            ),
+                            span,
+                        );
+                        return Ty::Unknown;
+                    }
+                    let mix = |a: &Ty, b: &Ty| {
+                        a.is_unsigned()
+                            && b.is_numeric()
+                            && !b.is_unsigned()
+                            && !matches!(b, Ty::UntypedInt | Ty::Unknown)
+                    };
+                    if mix(&ta, &tb) || mix(&tb, &ta) {
+                        self.error(
+                            ErrorCode::ZAP4015,
+                            format!(
+                                "cannot divmod() a signed and an unsigned operand ({} and \
+                                 {}); convert one side explicitly (e.g. uint64(x) or \
+                                 int64(x))",
+                                ta.display(),
+                                tb.display()
+                            ),
+                            span,
+                        );
+                        return Ty::Unknown;
+                    }
+                    if matches!(ta, Ty::Unknown) || matches!(tb, Ty::Unknown) {
+                        return Ty::Unknown;
+                    }
+                    // `(quotient, remainder)` share the operands' joined numeric
+                    // type: `(int64, int64)` for signed, `(uint64, uint64)` for
+                    // unsigned, `(float64, float64)` for floats.
+                    let j = num_join(&ta, &tb);
+                    return Ty::Tuple(vec![j.clone(), j]);
                 }
                 "dot" => {
                     // `dot(a, b)` — matrix multiply / dot product (#509), the
@@ -18773,6 +18909,97 @@ def main():
         ));
         // uint64 against an untyped int literal is fine (the literal adapts).
         ok("def main():\n    uint64 u = 5\n    uint64 r = min(u, 3)\n    print(r)\n");
+    }
+
+    // --- scalar abs / divmod (#1283) -------------------------------------------
+
+    #[test]
+    fn abs_types_and_preserves_int() {
+        // Signed int -> int64 (bindable into an int64 slot, usable in int math).
+        ok("def main():\n    int64 a = -5\n    int64 r = abs(a)\n    print(r)\n");
+        ok("def main():\n    int64 r = abs(-5) + abs(3)\n    print(r)\n");
+        // int32 widens to int64 like the rest of the numeric tower.
+        ok("def main():\n    int32 a = -1\n    int64 r = abs(a)\n    print(r)\n");
+        // The result is a numeric int, not a str (pins the result type).
+        assert!(has_code(
+            "def main():\n    str r = abs(-5)\n    print(r)\n",
+            ErrorCode::ZAP4001
+        ));
+    }
+
+    #[test]
+    fn abs_float_and_unsigned() {
+        // Float -> float64 magnitude.
+        ok("def main():\n    float64 f = -2.5\n    float64 r = abs(f)\n    print(r)\n");
+        ok("def main():\n    float32 f = -1.5\n    float64 r = abs(f)\n    print(r)\n");
+        // Unsigned -> uint64 (identity magnitude).
+        ok("def main():\n    uint64 u = 7\n    uint64 r = abs(u)\n    print(r)\n");
+    }
+
+    #[test]
+    fn abs_arity_keyword_and_non_numeric_rejected() {
+        assert!(has_code(
+            "def main():\n    print(abs())\n",
+            ErrorCode::ZAP4025
+        ));
+        assert!(has_code(
+            "def main():\n    print(abs(1, 2))\n",
+            ErrorCode::ZAP4025
+        ));
+        assert!(has_code(
+            "def main():\n    print(abs(1, foo=2))\n",
+            ErrorCode::ZAP4023
+        ));
+        assert!(has_code(
+            "def main():\n    print(abs(\"x\"))\n",
+            ErrorCode::ZAP4024
+        ));
+        assert!(has_code(
+            "def main():\n    bigint a = bigint(5)\n    print(abs(a))\n",
+            ErrorCode::ZAP4024
+        ));
+        assert!(has_code(
+            "def main():\n    complex c = 1j\n    print(abs(c))\n",
+            ErrorCode::ZAP4024
+        ));
+    }
+
+    #[test]
+    fn divmod_returns_tuple_of_operand_type() {
+        // Two ints -> (int64, int64), destructurable, each element an int.
+        ok("def main():\n    auto (q, r) = divmod(17, 5)\n    print(q)\n    print(r)\n");
+        ok("def main():\n    int64 a = 17\n    int64 b = 5\n    \
+            auto (q, r) = divmod(a, b)\n    int64 s = q + r\n    print(s)\n");
+        // Floats -> (float64, float64).
+        ok("def main():\n    auto (q, r) = divmod(7.5, 2.0)\n    \
+            float64 s = q + r\n    print(s)\n");
+        // Unsigned -> (uint64, uint64).
+        ok("def main():\n    uint64 a = 17\n    uint64 b = 5\n    \
+            auto (q, r) = divmod(a, b)\n    uint64 s = q + r\n    print(s)\n");
+    }
+
+    #[test]
+    fn divmod_arity_keyword_sign_and_non_numeric_rejected() {
+        assert!(has_code(
+            "def main():\n    print(divmod(1))\n",
+            ErrorCode::ZAP4025
+        ));
+        assert!(has_code(
+            "def main():\n    print(divmod(1, 2, 3))\n",
+            ErrorCode::ZAP4025
+        ));
+        assert!(has_code(
+            "def main():\n    print(divmod(1, 2, foo=3))\n",
+            ErrorCode::ZAP4023
+        ));
+        assert!(has_code(
+            "def main():\n    print(divmod(\"a\", \"b\"))\n",
+            ErrorCode::ZAP4024
+        ));
+        assert!(has_code(
+            "def main():\n    uint64 u = 5\n    int64 s = 3\n    print(divmod(u, s))\n",
+            ErrorCode::ZAP4015
+        ));
     }
 
     #[test]
