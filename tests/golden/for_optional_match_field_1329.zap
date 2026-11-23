@@ -32,6 +32,24 @@ struct Label:
             return Optional.None
         return Optional.Some(self.name)
 
+# #1339 (same root cause): `Optional.Some(<loop var>)` nested inside another
+# constructor and returned, with the loop iterating a `list` struct FIELD. The
+# loop variable's element type must flow into the nested variant call so its
+# type argument `T` is inferred. Present and absent cases both exercised.
+struct Record:
+    int64 value
+
+struct Reply:
+    list[Record] records
+
+struct Result:
+    Optional[Record] record
+
+def first_record(Reply reply) -> Result:
+    for record in reply.records:
+        return Result(Optional.Some(record))
+    return Result(None)
+
 struct Meter:
     list[Counter] counters
     list[Label] labels
@@ -93,3 +111,14 @@ def main():
     )
     print(empty.sum_points())  # 0
     print(empty.joined_labels())  # __
+
+    # #1339: nested `Optional.Some(record)` in a constructor, present case.
+    Result present = first_record(Reply(records=[Record(7), Record(8)]))
+    match present.record:
+        case Optional.Some(record):
+            print(record.value)  # 7  (the first element)
+        case Optional.None:
+            print(-1)
+    # #1339: absent case — an empty field list takes the `Result(None)` path.
+    Result absent = first_record(Reply(records=[]))
+    print(absent.record.is_some())  # False

@@ -27,7 +27,10 @@ the fail-closed behaviour.
 Consequently a generic call on the loop variable (`item.collect() ->
 Optional[T]`) is typed by mono's own inferer, so a `match` on that result pins
 the generic enum's instance and lowers, including when the iterable is a
-`list`-typed struct **field** (`for counter in self.counters:`).
+`list`-typed struct **field** (`for counter in self.counters:`). The same gap
+surfacing at the type-argument site — `Optional.Some(record)` built from a
+field-loop variable and nested in a constructor (#1339) — is closed by the same
+change: `record`'s element type now feeds the variant's `T` inference.
 
 ## Rationale
 

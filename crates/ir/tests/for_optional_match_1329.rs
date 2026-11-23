@@ -210,6 +210,55 @@ fn nested_field_list_loops_lower() {
     ));
 }
 
+// --- #1339 (same root cause): `Optional.Some(<loop var>)` nested inside
+//     another constructor, where the loop iterates a `list` struct field. The
+//     loop variable's element type must flow into the nested variant call's
+//     type-argument inference (a different ZAP6001 site — "cannot infer type
+//     argument 'T'" — than the match-pattern one, but the same gap). ---
+
+#[test]
+fn field_loop_optional_some_nested_in_constructor_lowers() {
+    // The #1339 reduction: `Optional.Some(record)` built inside `Result(...)`
+    // and returned, with `record` bound by a `list`-field loop. Both the
+    // present (`Some`) and absent (`None`) constructors appear.
+    lower_ok(
+        "struct Record:\n\
+        \x20   int64 value\n\
+        struct Reply:\n\
+        \x20   list[Record] records\n\
+        struct Result:\n\
+        \x20   Optional[Record] record\n\
+        def first(Reply reply) -> Result:\n\
+        \x20   for record in reply.records:\n\
+        \x20       return Result(Optional.Some(record))\n\
+        \x20   return Result(None)\n",
+    );
+}
+
+#[test]
+fn field_loop_optional_some_as_bare_argument_lowers() {
+    // The same inference, with `Optional.Some(<loop var>)` passed as a function
+    // argument rather than a struct-constructor field: the loop variable's
+    // element type must still pin the variant's `T`. (The None fallback uses a
+    // plain sentinel, not a bare `Optional.None` argument — a payload-less
+    // variant passed directly to a call is a separate, loop-independent
+    // inference gap, out of scope here.)
+    lower_ok(
+        "struct Record:\n\
+        \x20   int64 value\n\
+        struct Reply:\n\
+        \x20   list[Record] records\n\
+        def take(Optional[Record] o) -> int64:\n\
+        \x20   if o.is_some():\n\
+        \x20       return o.unwrap().value\n\
+        \x20   return -1\n\
+        def first(Reply reply) -> int64:\n\
+        \x20   for record in reply.records:\n\
+        \x20       return take(Optional.Some(record))\n\
+        \x20   return -1\n",
+    );
+}
+
 // --- Fail-closed: the diagnostic stays reachable for a genuinely
 //     un-annotatable loop element (#1190 boundary). ---
 
