@@ -8433,12 +8433,26 @@ impl<'a> FnLower<'a> {
         }
         if let Expr::Name(fname, fspan) = callee {
             if fname == "sum" {
-                if args.len() != 1 {
-                    return Err(err("sum() takes exactly one argument"));
+                if args.is_empty() || args.len() > 2 || args.iter().any(|a| a.name.is_some()) {
+                    return Err(err(
+                        "sum() takes one or two positional arguments (the iterable and \
+                         an optional start)",
+                    ));
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
-                // An `array[T]` sums through its dedicated runtime reduction.
+                // `sum(xs, start)` (#1299): the optional start value seeds the
+                // accumulator.
+                let start = if args.len() == 2 {
+                    Some(self.expr(&args[1].value)?)
+                } else {
+                    None
+                };
+                // An `array[T]` sums through its dedicated runtime reduction. A
+                // start value is not supported on the array path.
                 if let Ty::Array(d, _) = vt {
+                    if start.is_some() {
+                        return Err(err("sum(array, start) is not supported; sum(array)"));
+                    }
                     let dest = self.new_value(d.ty());
                     self.emit(Inst::Call {
                         dest: Some(dest),
@@ -8450,10 +8464,10 @@ impl<'a> FnLower<'a> {
                 // Any other iterable — a lazy generator / generator expression
                 // (#596), or a `list` — is summed by draining it once through the
                 // D-0048 protocol, accumulating into a running total (so a
-                // genexpr builds no intermediate list). The accumulator type is
-                // the element type; `+` is specialized by codegen per operand
-                // type, so this handles both integer and float elements.
-                return self.lower_sum_iterable(v, vt, &args[0].value);
+                // genexpr builds no intermediate list). The accumulator starts at
+                // `start` (or 0) and is the element type; `+` is specialized by
+                // codegen per operand type, so this handles int and float elements.
+                return self.lower_sum_iterable(v, vt, start);
             }
             // `dot(a, b)` — matrix multiply / dot product, the function spelling
             // of `a @ b` (#509). Same kernels, same NEP-50 result dtype.
@@ -8939,13 +8953,29 @@ impl<'a> FnLower<'a> {
             // Sema has already restricted this to numeric scalars of a single
             // signedness.
             if fname == "min" || fname == "max" {
-                if args.len() < 2 || args.iter().any(|a| a.name.is_some()) {
+                let is_max = fname == "max";
+                let positional: Vec<&ast::Arg> = args.iter().filter(|a| a.name.is_none()).collect();
+                // Iterable form `min(xs)` / `min(xs, key=f)` / `min(xs, default=d)`
+                // (#1299): exactly one positional (a list), plus optional key=/
+                // default= keywords.
+                if positional.len() == 1 {
+                    let key = args.iter().find(|a| a.name.as_deref() == Some("key"));
+                    let default = args.iter().find(|a| a.name.as_deref() == Some("default"));
+                    return self.lower_minmax_iterable(
+                        is_max,
+                        &positional[0].value,
+                        key.map(|a| &a.value),
+                        default.map(|a| &a.value),
+                    );
+                }
+                // Variadic scalar form: two or more positional numeric arguments.
+                if positional.len() < 2 || args.iter().any(|a| a.name.is_some()) {
                     return Err(err(
-                        "min()/max() takes two or more positional numeric arguments",
+                        "min()/max() takes one iterable, or two or more positional \
+                         numeric arguments",
                     ));
                 }
-                let is_max = fname == "max";
-                let operands: Vec<(Value, Ty)> = args
+                let operands: Vec<(Value, Ty)> = positional
                     .iter()
                     .map(|a| self.expr(&a.value))
                     .collect::<Result<_, _>>()?;
@@ -9204,6 +9234,16 @@ impl<'a> FnLower<'a> {
                     args: vec![d],
                 });
                 return Ok((d, Ty::List(elem)));
+            }
+            // `enumerate`/`zip` (#1302) are only supported directly in a for-loop
+            // header (`for i, x in enumerate(xs)`), where `lower_for` intercepts
+            // them; a standalone value is a follow-up.
+            if fname == "enumerate" || fname == "zip" {
+                return Err(err(format!(
+                    "{fname}() is only supported directly in a for-loop \
+                     (e.g. `for i, x in enumerate(xs)`); a standalone {fname}() value \
+                     is a follow-up"
+                )));
             }
             // String/char builtins (ticket #284, D-0025).
             if fname == "ord" {
@@ -15974,6 +16014,231 @@ impl<'a> FnLower<'a> {
 
         self.position(end_bb);
         Ok(keys)
+    }
+
+    /// Emit `a < b` (an `i1`) for two values of orderable kind `kind` (#1299):
+    /// floats via `FCmp`, strings/bytes via `zap_str_cmp` then `< 0`, and
+    /// integer-word kinds (int/bool/char/enum) via a signed `ICmp`.
+    fn emit_order_lt(&mut self, a: Value, b: Value, kind: Elem) -> Result<Value, LowerError> {
+        let d = self.new_value(Ty::I1);
+        match kind {
+            Elem::F64 => {
+                self.emit(Inst::FCmp {
+                    dest: d,
+                    pred: CmpPred::Lt,
+                    lhs: a,
+                    rhs: b,
+                });
+            }
+            Elem::Ptr | Elem::Bytes => {
+                let cmp = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(cmp),
+                    func: "zap_str_cmp".to_string(),
+                    args: vec![a, b],
+                });
+                let zero = self.iconst(Ty::I64, 0);
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred: CmpPred::Lt,
+                    lhs: cmp,
+                    rhs: zero,
+                });
+            }
+            Elem::I64 | Elem::Bool | Elem::Char | Elem::Enum(_) => {
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred: CmpPred::Lt,
+                    lhs: a,
+                    rhs: b,
+                });
+            }
+            other => {
+                return Err(err(format!(
+                    "min()/max() cannot order elements of kind {other:?}; pass key="
+                )))
+            }
+        }
+        Ok(d)
+    }
+
+    /// Iterable `min(xs)` / `max(xs)` (#1299), with optional `key=` projection
+    /// and `default=`. Drains the list once, keeping the best element (and, with
+    /// `key=`, its projected key). An empty list returns `default` when given,
+    /// else raises a catchable `ValueError`. The best element/key live in
+    /// allocas so they stay GC-reachable across the `key=` call's safepoint
+    /// (same reasoning as `build_key_list`). Integer keys compare with a signed
+    /// `icmp`, never through float.
+    fn lower_minmax_iterable(
+        &mut self,
+        is_max: bool,
+        seq: &Expr,
+        key: Option<&Expr>,
+        default: Option<&Expr>,
+    ) -> Result<(Value, Ty), LowerError> {
+        let (xs, xt) = self.expr(seq)?;
+        let Ty::List(elem) = xt else {
+            return Err(err("min()/max() iterable form expects a list"));
+        };
+        let elem_word = elem.ty();
+        // The comparison kind: the key function's return kind when `key=` is
+        // given, else the element kind.
+        let (keyfn, cmp_kind): (Option<(Value, u32)>, Elem) = match key {
+            Some(e) => {
+                let (kv, kt) = self.expr(e)?;
+                let Ty::Func(sig_idx) = kt else {
+                    return Err(err(
+                        "min()/max() key= must be a function value — a named function \
+                         or a fn(T)->R binding",
+                    ));
+                };
+                let ret = self.ctx.fn_sigs.borrow().get(sig_idx).ret;
+                (Some((kv, sig_idx)), elem_kind(ret, &self.ctx.nested)?)
+            }
+            None => (None, elem),
+        };
+
+        // best element slot (the result), and — with key= — its key slot.
+        let best = self.alloca(elem_word);
+        let best_key = keyfn.map(|(_, sig_idx)| {
+            let ret = self.ctx.fn_sigs.borrow().get(sig_idx).ret;
+            self.alloca(ret)
+        });
+
+        let len = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(len),
+            func: "zap_list_len".to_string(),
+            args: vec![xs],
+        });
+        let zero = self.iconst(Ty::I64, 0);
+        let is_empty = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: is_empty,
+            pred: CmpPred::Eq,
+            lhs: len,
+            rhs: zero,
+        });
+        let empty_bb = self.new_block();
+        let nonempty_bb = self.new_block();
+        let end_bb = self.new_block();
+        self.set_term(Term::BrIf {
+            cond: is_empty,
+            then_bb: empty_bb,
+            else_bb: nonempty_bb,
+        });
+
+        // Empty: return default, or raise ValueError.
+        self.position(empty_bb);
+        if let Some(de) = default {
+            let (dv, dt) = self.expr(de)?;
+            let dv = self.coerce(dv, dt, elem_word);
+            self.store(best, dv);
+            self.set_term(Term::Br(end_bb));
+        } else {
+            let msg = self.strconst("min()/max() of an empty sequence");
+            let verr = self.iconst(Ty::I64, 3); // ZAP_EXC_VALUE_ERROR
+            self.throwing_call(None, "zap_panic_typed", vec![verr, msg]);
+            if !self.terminated() {
+                self.set_term(Term::Unreachable);
+            }
+        }
+
+        // Non-empty: seed best from element 0, then fold elements 1..len.
+        self.position(nonempty_bb);
+        let get = format!("zap_list_get_{}", elem.val_suffix());
+        let e0 = self.new_value(elem_word);
+        self.emit(Inst::Call {
+            dest: Some(e0),
+            func: get.clone(),
+            args: vec![xs, zero],
+        });
+        self.store(best, e0);
+        if let (Some((kv, sig_idx)), Some(bk)) = (keyfn, best_key) {
+            let (k0, _) = self.emit_closure_call(kv, sig_idx, vec![e0])?;
+            self.store(bk, k0);
+        }
+        let idx = self.alloca(Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        self.store(idx, one);
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let loop_end_bb = self.new_block();
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let c = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: c,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: len,
+        });
+        self.set_term(Term::BrIf {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: loop_end_bb,
+        });
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let e = self.new_value(elem_word);
+        self.emit(Inst::Call {
+            dest: Some(e),
+            func: get,
+            args: vec![xs, i],
+        });
+        // Candidate key, and the current best key.
+        let (cand_key, best_key_val) = match (keyfn, best_key) {
+            (Some((kv, sig_idx)), Some(bk)) => {
+                let (ck, kt) = self.emit_closure_call(kv, sig_idx, vec![e])?;
+                (ck, self.load(bk, kt))
+            }
+            _ => {
+                let cur_best = self.load(best, elem_word);
+                (e, cur_best)
+            }
+        };
+        // Update when the candidate beats the best: for `min`, candidate key is
+        // less; for `max`, best key is less than the candidate key.
+        let better = if is_max {
+            self.emit_order_lt(best_key_val, cand_key, cmp_kind)?
+        } else {
+            self.emit_order_lt(cand_key, best_key_val, cmp_kind)?
+        };
+        let update_bb = self.new_block();
+        let skip_bb = self.new_block();
+        self.set_term(Term::BrIf {
+            cond: better,
+            then_bb: update_bb,
+            else_bb: skip_bb,
+        });
+        self.position(update_bb);
+        self.store(best, e);
+        if let Some(bk) = best_key {
+            self.store(bk, cand_key);
+        }
+        self.set_term(Term::Br(skip_bb));
+        self.position(skip_bb);
+        self.set_term(Term::Br(incr_bb));
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let onei = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: onei,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+        self.position(loop_end_bb);
+        self.set_term(Term::Br(end_bb));
+
+        self.position(end_bb);
+        let result = self.load(best, elem_word);
+        Ok((result, elem_word))
     }
 
     /// Call a first-class function value (I#163) with already-lowered argument
