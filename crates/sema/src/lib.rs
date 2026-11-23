@@ -6356,6 +6356,23 @@ impl Checker {
                 if matches!(&b, Ty::Named(n) if self.enums.contains_key(n)) && name == "name" {
                     return Ty::Str;
                 }
+                // A struct field read yields the field's declared type (#1337).
+                // Before this, a value-position field read fell through to
+                // `Unknown`, so a type mismatch flowing through a field —
+                // assignment, argument passing, an operator — was silently
+                // accepted, and the field-read span was never typed (leaving a
+                // hole in the `TypeMap` the monomorphizer consults, #1167). A
+                // generic struct's type-parameter-typed field (`T item`)
+                // resolves to `Unknown` in `StructInfo` (the `Ty` model carries
+                // no type arguments, so `resolve_type` maps a bare parameter
+                // name to `Unknown`), so this stays fail-closed for generics
+                // exactly as before. An unknown attribute still falls through to
+                // `Unknown` here (its reporting is unchanged).
+                if let Some(info) = self.struct_info(&b) {
+                    if let Some(f) = info.fields.iter().find(|f| f.name == *name) {
+                        return f.ty.clone();
+                    }
+                }
                 // Attribute access on a Python handle yields another Python
                 // handle (D-0012); everything else is modeled loosely for now.
                 if matches!(b, Ty::Py) {
