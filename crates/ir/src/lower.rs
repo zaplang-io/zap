@@ -2989,8 +2989,11 @@ const DEFERRED_BUILTINS: &[&str] = &["default", "validate", "range"];
 /// sema-only use-site warning; the decorated function/method body lowers
 /// unchanged. `@request_source` (#959, D-0198) is a pure marker consumed by the
 /// pre-sema handler-adapter desugar; the resolver function it marks lowers
-/// unchanged, so there is likewise nothing to generate here.
-const DECORATED_NO_CODE: &[&str] = &["deprecated", "request_source"];
+/// unchanged, so there is likewise nothing to generate here. `@derivable(Trait)`
+/// (#1290, E3a) is a compile-time registration marker on a generic generator: it
+/// is collected by sema and consumed by the `@derive` forwarding-stub synthesis
+/// (E3b, #1291); the generator body lowers unchanged, so it too emits no ZIR.
+const DECORATED_NO_CODE: &[&str] = &["deprecated", "request_source", "derivable"];
 
 /// A trait requested via `@derive(...)`.
 #[derive(Clone, Copy, PartialEq)]
