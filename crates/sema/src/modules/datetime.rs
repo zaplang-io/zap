@@ -666,6 +666,17 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect1(checker, method, args, span, "a DateTime", is_datetime);
             Some(Ty::Named(DATETIME.to_string()))
         }
+        // zone_abbreviation(dt) -> Optional[str] (#1345): the IANA abbreviation
+        // of dt's retained named zone at its instant (e.g. `EDT`/`EST`, `CET`/
+        // `CEST`), faithful to the bundled tz database — including numeric forms
+        // (`-04`, `+0530`) and `LMT` for pre-standard intervals, matching CPython
+        // `zoneinfo.tzname()`. A naive, fixed-offset, or unknown value carries no
+        // named zone (`zone_id == -1`) and yields `None`. Additive: `strftime`'s
+        // `%Z` still renders the numeric offset (`UTC-04:00`) unchanged.
+        "zone_abbreviation" => {
+            expect1(checker, method, args, span, "a DateTime", is_datetime);
+            Some(Ty::Named("Optional".to_string()))
+        }
         _ => None,
     }
 }

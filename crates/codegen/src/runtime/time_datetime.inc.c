@@ -1078,6 +1078,34 @@ int64_t zap_tz_offset_at_id(int64_t zone_id, int64_t inst, int64_t fixed_off) {
     return zap_tz_offset_for(z, inst);
 }
 
+/* The IANA abbreviation of zone `zone_id` at UTC instant `inst`, as a fresh
+ * `ZapStr*` — the `abbr` of the last interval whose `at <= inst` (the same
+ * binary search `zap_tz_offset_for` uses). Returns NULL when the value carries
+ * no named zone (`zone_id < 0`: naive, fixed-offset, or unknown); the caller
+ * (`datetime.zone_abbreviation`) maps NULL to `Optional.None` and a non-NULL
+ * pointer to `Optional.Some(str)` via the niche layout, so no abbreviation is
+ * ever derived from an offset alone. Faithful to the bundled tz database,
+ * including numeric forms (`-04`, `+0530`) and `LMT` for pre-standard intervals
+ * (CPython `zoneinfo.tzname()` parity). Non-raising; not a hot path (#1345). */
+void *zap_tz_abbr_at_id(int64_t zone_id, int64_t inst) {
+    const zap_tz_zone *z = zap_tz_zone_at(zone_id);
+    if (!z) {
+        return NULL;
+    }
+    int lo = 0, hi = z->n - 1, ans = 0;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (z->trans[mid].at <= inst) {
+            ans = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    const char *abbr = ZAP_TZ_ABBRS[z->trans[ans].abbr];
+    return zap_str_new(abbr, (int64_t)strlen(abbr));
+}
+
 /* Count the intervals that realise wall time `w`, recording the first match's
  * offset in `*off0` (the earlier instant / larger offset) and a second, if any,
  * in `*off1` (the later instant / smaller offset). Returns 0, 1 or 2. */

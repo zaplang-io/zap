@@ -115,6 +115,10 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
         &[i.into(), i.into(), i.into()],
         Some(i.into()),
     );
+    // (zone_id, instant) -> IANA abbreviation at the instant as a fresh ZapStr*,
+    // or NULL when the value carries no named zone (zone_id < 0). Backs
+    // datetime.zone_abbreviation(dt) -> Optional[str] (#1345).
+    cg.declare_rt("zap_tz_abbr_at_id", &[i.into(), i.into()], Some(p.into()));
     // (zone_id, y,mo,d,h,mi,s) -> civil kind: 0 unique / 1 gap / 2 overlap.
     let id_and_six = [
         i.into(),

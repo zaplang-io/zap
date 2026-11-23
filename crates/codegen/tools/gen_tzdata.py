@@ -45,6 +45,9 @@ _GMTOFF = re.compile(r"=\s.*\bgmtoff=(-?\d+)\b")
 _UTCIV = re.compile(
     r"^\S+\s+\w+\s+(\w+)\s+(\d+)\s+(\d+):(\d+):(\d+)\s+(-?\d+)\s+UT\s+="
 )
+# The zone abbreviation is the single token right before `isdst=` (e.g. `EST`,
+# `EDT`, `CET`, or a numeric form such as `-04` / `+0530`, or `LMT`). #1345.
+_ABBR = re.compile(r"\s(\S+)\s+isdst=")
 _MON = {
     m: i + 1
     for i, m in enumerate(
@@ -57,18 +60,27 @@ _YEAR1 = -62135596800  # 0001-01-01T00:00:00Z — zoneinfo's lower bound.
 
 
 def intervals(zone):
-    """Return [(start_epoch, offset_seconds)], sorted, start[0] == INT64_MIN."""
+    """Return [(start_epoch, offset_seconds, abbr)], sorted, start[0] == INT64_MIN.
+
+    A new interval begins when *either* the offset or the abbreviation changes
+    (#1345): abbreviation-only transitions — a zone that renames its zone but
+    keeps the same offset — must still be recorded so `zone_abbreviation` reports
+    the right name, and the extra split leaves the offset at every instant
+    unchanged (both halves carry the same offset).
+    """
     out = subprocess.run(
         ["zdump", "-v", zone], capture_output=True, text=True
     ).stdout
     ivals = []
-    prev = None
+    prev = None  # (offset, abbr)
     for line in out.splitlines():
         mo = _GMTOFF.search(line)
         mc = _UTCIV.match(line)
         if not mo or not mc:
             continue
         off = int(mo.group(1))
+        ma = _ABBR.search(line)
+        abbr = ma.group(1) if ma else ""
         mon = _MON.get(mc.group(1))
         if mon is None:
             continue
@@ -79,18 +91,21 @@ def intervals(zone):
             ep = calendar.timegm((yr, mon, day, hh, mm, ss, 0, 0, 0))
         except (ValueError, OverflowError):
             continue
+        cur = (off, abbr)
         if prev is None:
-            ivals.append((_NEG, off))
-            prev = off
-        if off != prev:
-            ivals.append((ep, off))
-            prev = off
-    ivals = [(a, o) for (a, o) in ivals if a < _CAP]
+            ivals.append((_NEG, off, abbr))
+            prev = cur
+        if cur != prev:
+            ivals.append((ep, off, abbr))
+            prev = cur
+    ivals = [(a, o, ab) for (a, o, ab) in ivals if a < _CAP]
     if not ivals:
-        # A fixed-offset zone (no transitions): take the constant offset.
+        # A fixed-offset zone (no transitions): take the constant offset and the
+        # abbreviation CPython reports for it at the epoch.
         z = zoneinfo.ZoneInfo(zone)
-        off = int(z.utcoffset(datetime.fromtimestamp(0, tz=z)).total_seconds())
-        ivals = [(_NEG, off)]
+        dt0 = datetime.fromtimestamp(0, tz=z)
+        off = int(z.utcoffset(dt0).total_seconds())
+        ivals = [(_NEG, off, z.tzname(dt0) or "")]
     return ivals
 
 
@@ -98,6 +113,12 @@ def ref_offset(zone, ep):
     """CPython zoneinfo's offset (seconds) at UTC instant `ep` — the oracle."""
     z = zoneinfo.ZoneInfo(zone)
     return int(z.utcoffset(datetime.fromtimestamp(ep, tz=z)).total_seconds())
+
+
+def ref_abbr(zone, ep):
+    """CPython zoneinfo's abbreviation at UTC instant `ep` — the abbr oracle."""
+    z = zoneinfo.ZoneInfo(zone)
+    return z.tzname(datetime.fromtimestamp(ep, tz=z)) or ""
 
 
 def main(argv):
@@ -113,7 +134,7 @@ def main(argv):
     for z in zones:
         iv = intervals(z)
         if validate:
-            for i, (a, o) in enumerate(iv):
+            for i, (a, o, ab) in enumerate(iv):
                 nxt = iv[i + 1][0] if i + 1 < len(iv) else a + 1
                 mid = (nxt - 1) if a == _NEG else (a + nxt) // 2
                 if mid < _YEAR1:
@@ -122,7 +143,18 @@ def main(argv):
                     if ref_offset(z, mid) != o:
                         mismatches += 1
                         print(f"MISMATCH {z} @ {mid}: {o}", file=sys.stderr)
-                except (ValueError, OverflowError, KeyError):
+                    if ref_abbr(z, mid) != ab:
+                        mismatches += 1
+                        print(
+                            f"ABBR-MISMATCH {z} @ {mid}: {ab!r} "
+                            f"!= {ref_abbr(z, mid)!r}",
+                            file=sys.stderr,
+                        )
+                except (ValueError, OverflowError, KeyError, OSError):
+                    # OSError (EOVERFLOW) is raised by the platform C library on
+                    # macOS for a `fromtimestamp` instant outside its `time_t`
+                    # range; such an extreme (pre-standard / far-future) instant
+                    # is simply skipped, as the other out-of-range errors are.
                     pass
         key = tuple(iv)
         if key not in tables:
@@ -141,28 +173,53 @@ def main(argv):
     except OSError:
         version = "unknown"
 
+    # Intern the abbreviations into a small, order-stable global pool; each
+    # transition stores an int index into it (#1345). The index fills the 4
+    # bytes the `zap_tz_trans` struct already padded for 8-byte alignment, so
+    # the transition array does not grow — only the pool (a few hundred short
+    # strings) is added.
+    abbr_idx = {}
+    abbr_order = []
+    for iv in order:
+        for (_a, _o, ab) in iv:
+            if ab not in abbr_idx:
+                abbr_idx[ab] = len(abbr_order)
+                abbr_order.append(ab)
+
     emit = sys.stdout.write
     emit(
         "/* GENERATED by crates/codegen/tools/gen_tzdata.py -- DO NOT EDIT.\n"
-        " * Bundled IANA timezone transition tables (#1045, D-0225).\n"
-        f" * {len(zones)} zones, {len(order)} unique tables, {total} transitions.\n"
+        " * Bundled IANA timezone transition tables (#1045, D-0225; abbreviations"
+        " #1345).\n"
+        f" * {len(zones)} zones, {len(order)} unique tables, {total} transitions,"
+        f" {len(abbr_order)} abbreviations.\n"
         f" * tz tooling: {version}\n"
         " * Regenerate: python3 crates/codegen/tools/gen_tzdata.py \\\n"
         " *     > crates/codegen/src/runtime/tzdata_generated.inc.c\n"
         " * A zone's offset at a UTC instant is the `off` of the last interval\n"
         " * whose `at` is <= the instant (binary search); interval 0 starts at\n"
         " * INT64_MIN, so every instant resolves. Offsets are seconds east of\n"
-        " * UTC; future transitions are expanded to year 2100. */\n"
+        " * UTC; future transitions are expanded to year 2100. Each interval's\n"
+        " * `abbr` indexes ZAP_TZ_ABBRS[] (the IANA zone abbreviation at that\n"
+        " * instant, e.g. EST/EDT, or a numeric form like -04, or LMT). */\n"
     )
-    emit("typedef struct { int64_t at; int32_t off; } zap_tz_trans;\n")
+    emit(
+        "typedef struct { int64_t at; int32_t off; int32_t abbr; }"
+        " zap_tz_trans;\n"
+    )
     emit(
         "typedef struct { const char *name; const zap_tz_trans *trans;"
         " int32_t n; } zap_tz_zone;\n"
     )
+    pool = ",".join('"%s"' % a for a in abbr_order)
+    emit("static const char *const ZAP_TZ_ABBRS[]={%s};\n" % pool)
+    emit("static const int ZAP_TZ_NABBRS=%d;\n" % len(abbr_order))
     for i, iv in enumerate(order):
         body = ",".join(
-            ("{INT64_MIN,%d}" % o) if a == _NEG else ("{%dLL,%d}" % (a, o))
-            for a, o in iv
+            ("{INT64_MIN,%d,%d}" % (o, abbr_idx[ab]))
+            if a == _NEG
+            else ("{%dLL,%d,%d}" % (a, o, abbr_idx[ab]))
+            for a, o, ab in iv
         )
         emit("static const zap_tz_trans ZAP_TZ_T%d[]={%s};\n" % (i, body))
     emit("static const zap_tz_zone ZAP_TZ_ZONES[]={\n")
