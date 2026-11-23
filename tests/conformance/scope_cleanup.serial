@@ -1,0 +1,5 @@
+# Pin this fixture to the conservative (low-width) e2e lane (zaplang-io/zap#1305).
+# scope_cleanup exercises scope-exit cleanup ordering under the scheduler and is
+# timing-sensitive, but its name carries no timeout/deadline/cancel marker that
+# is_sensitive_name() keys on, so this `.serial` sidecar is the explicit escape
+# hatch (same convention as .skip_arch). Content is ignored; existence is the signal.

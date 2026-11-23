@@ -192,11 +192,9 @@ const fn cov(production: &'static str, status: Status, src: &'static str) -> Cov
 /// (checked by [`tracked_gaps_are_documented`]).
 #[rustfmt::skip]
 const GAP_NOTES: &[(&str, &str)] = &[
-    // `comptime for` (E2/E3 surface) is parsed by S1 (#1297) but its comptime
-    // evaluation/unrolling is not wired until S2 (#1298); sema reports it as
-    // not-yet-implemented (ZAP0002), so the front end still rejects it. Graduates
-    // to `Compiles` when S2 lands.
-    ("comptime_for_stmt", "parsed by S1 (#1297); comptime evaluation not wired until S2 (#1298), sema reports ZAP0002"),
+    // None. `comptime_for_stmt` graduated to `Compiles` once S2 (#1298) wired the
+    // surface to the engine: a `comptime for` over a concrete
+    // `reflect.type_info(T).fields` now type-checks and unrolls through lowering.
 ];
 
 /// One entry per nonterminal reachable from `module`. The example is a complete,
@@ -441,9 +439,15 @@ def f():
     for x in range(3):
         print(str(x))
 "#),
-    cov("comptime_for_stmt", TrackedGap, r#"def f():
-    comptime for x in xs:
-        pass
+    cov("comptime_for_stmt", Compiles, r#"struct P:
+    int64 x
+    int64 y
+def emit(int64 v):
+    pass
+def main():
+    auto p = P(1, 2)
+    comptime for f in reflect.type_info(P).fields:
+        emit(reflect.field(p, comptime f.index))
 "#),
     cov("try_stmt",          Compiles , r#"def f():
     try:

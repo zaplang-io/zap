@@ -5078,18 +5078,24 @@ impl Checker {
                 self.check_block(body);
                 self.infer(cond);
             }
-            // `comptime for` (E2/E3 surface, #1297): parsed, but comptime
-            // evaluation/unrolling is not wired until S2 (#1298). Report it as
-            // not-yet-implemented so a program using it fails cleanly rather than
-            // silently type-checking as if it ran; the body is not checked here.
-            Stmt::ComptimeFor { span, .. } => {
-                self.error(
-                    ErrorCode::ZAP0002,
-                    "`comptime for` is parsed but comptime evaluation is not wired \
-                     yet (comptime/reflect surface epic #1296, wired in #1298)"
-                        .to_string(),
-                    *span,
-                );
+            // `comptime for` (E2/E3 surface, #1298): a compile-time-unrolled loop
+            // over a comptime reflection sequence (`reflect.type_info(T).fields`/
+            // `.variants`, typed `Unknown`). Monomorphization unrolls it away
+            // (#1298); here sema only checks the fragment is well-formed — infer
+            // the iterable, bind the loop variable (`Unknown`, a comptime
+            // reflection record), and check the body.
+            Stmt::ComptimeFor {
+                target, iter, body, ..
+            } => {
+                self.infer(iter);
+                self.push_scope();
+                if let Expr::Name(n, s) = target {
+                    self.declare(n, Ty::Unknown, *s);
+                }
+                for st in &body.stmts {
+                    self.check_stmt(st);
+                }
+                self.pop_scope();
             }
             Stmt::For {
                 target,
@@ -5914,19 +5920,12 @@ impl Checker {
             }
             Expr::Float(..) => Ty::UntypedFloat,
             Expr::Imaginary(..) => Ty::Complex,
-            // `comptime <expr>` (E2/E3 surface, #1297): parsed, but comptime
-            // evaluation is not wired until S2 (#1298). Report not-yet-implemented
-            // and yield `Unknown` (no inner inference, to avoid a cascade).
-            Expr::Comptime { span, .. } => {
-                self.error(
-                    ErrorCode::ZAP0002,
-                    "`comptime <expr>` is parsed but comptime evaluation is not \
-                     wired yet (comptime/reflect surface epic #1296, wired in #1298)"
-                        .to_string(),
-                    *span,
-                );
-                Ty::Unknown
-            }
+            // `comptime <expr>` (E2/E3 surface, #1298): force compile-time
+            // evaluation of the operand. Transparent to the type system — it has
+            // the inner expression's type. The comptime engine folds the value
+            // during monomorphization; a comptime-only operand (e.g. `f.index` on
+            // a reflection record, or `reflect.type_info(T)`) infers `Unknown`.
+            Expr::Comptime { expr, .. } => self.infer(expr),
             Expr::Str {
                 bytes,
                 fstring,
@@ -7359,6 +7358,20 @@ impl Checker {
         // monomorphizer applies the twin rewrite on the lowering path.
         let desugared = zapc_syntax::seam::desugar_seam_ctor_callee(callee);
         let callee = desugared.as_ref().unwrap_or(callee);
+        // `reflect.<fn>(...)` — a comptime reflection builtin (E2/E3 surface,
+        // #1298): `reflect.type_info(T)` (whose argument is a TYPE, not a value),
+        // `reflect.field(value, comptime i)`, `reflect.has_override(...)`. The
+        // comptime engine consumes/unrolls these during monomorphization; sema
+        // accepts them as comptime values of statically-unknown type and does
+        // **not** infer their arguments — `type_info`'s argument is a type name,
+        // which is not a value and would otherwise resolve as an unknown name.
+        if let Expr::Attr { base, name, .. } = callee {
+            if matches!(&**base, Expr::Name(m, _) if m == "reflect")
+                && matches!(name.as_str(), "type_info" | "field" | "has_override")
+            {
+                return Ty::Unknown;
+            }
+        }
         // Spread call arguments (`*expr` / `**expr`, #597) are supported in this
         // version only for a call to a named free function (the variadic /
         // `**kwargs` forwarding path). Any other callee — construction, a
