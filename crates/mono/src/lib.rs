@@ -2067,7 +2067,15 @@ impl Mono<'_> {
         let mut params = Vec::with_capacity(f.params.len());
         for p in &f.params {
             let mut np = p.clone();
-            if p.name != "self" {
+            // A *method* `self` receiver is bound above via `self_ty` and its type
+            // is implicit, so it is left untouched. But a **free function** may
+            // have an ordinary parameter literally named `self` (`self_ty` is
+            // `None`): it must be type-substituted and declared like any other
+            // parameter, or a generic `def g[T](T self)` keeps `self: T`
+            // unsubstituted and `reflect.field(self, …)` lowers against a
+            // non-struct value (#1324).
+            let is_method_receiver = p.name == "self" && self_ty.is_some();
+            if !is_method_receiver {
                 if let Some(t) = &p.ty {
                     env.declare(&p.name, CTy::Ty(self.apply_subst(t)));
                     np.ty = Some(self.rewrite_type(t));
@@ -3909,6 +3917,7 @@ impl Mono<'_> {
             &argpairs,
             expected,
             &format!("operator method '{dunder}' of '{owner}'"),
+            true,
         )?;
         let ret_cty = self.fn_ret_cty(method.ret.as_ref(), &owner_subst, &tparams, &targs);
         let method_spec = self.request_method(owner, owner_args, dunder, &targs);
@@ -3936,17 +3945,22 @@ impl Mono<'_> {
         argpairs: &[(Option<String>, CTy)],
         expected: Option<&Type>,
         what: &str,
+        // `true` for a method (the `self` receiver is passed separately, not among
+        // `argpairs`, so exclude it from the parameters inference matches against).
+        // `false` for a free function, where a parameter literally named `self` is
+        // an ordinary positional argument and must participate (#1324).
+        skip_self: bool,
     ) -> Result<Vec<Type>, LowerError> {
         let tparams: Vec<String> = f.generics.iter().map(|g| g.name.clone()).collect();
         let tparams = tparams.as_slice();
         let ret = f.ret.as_ref();
-        // Declared value parameters (the `self` receiver excluded), with the
-        // owner's type parameters substituted so only the fn/method's own type
+        // Declared value parameters (a method's `self` receiver excluded), with
+        // the owner's type parameters substituted so only the fn/method's own type
         // parameters remain free.
         let vparams: Vec<(String, Type)> = f
             .params
             .iter()
-            .filter(|p| p.name != "self")
+            .filter(|p| !(skip_self && p.name == "self"))
             .filter_map(|p| {
                 p.ty.as_ref()
                     .map(|t| (p.name.clone(), subst_with(t, owner_subst)))
@@ -4159,6 +4173,7 @@ impl Mono<'_> {
                             &argpairs,
                             expected,
                             &format!("method '{variant}' of '{owner}'"),
+                            true,
                         )?;
                         let ret_cty =
                             self.fn_ret_cty(method.ret.as_ref(), &owner_subst, &tparams, &targs);
@@ -4219,6 +4234,7 @@ impl Mono<'_> {
                     &argpairs,
                     expected,
                     &format!("function '{g}'"),
+                    false,
                 )?;
                 let ret_cty = self.fn_ret_cty(f.ret.as_ref(), &empty, &tparams, &targs);
                 let mangled = self.request_func(&g.clone(), &targs);
