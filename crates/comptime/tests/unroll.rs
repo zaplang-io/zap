@@ -282,3 +282,100 @@ fn reflector_enum_shape() {
     assert_eq!(vs[1].name, "Point");
     assert!(vs[1].fields.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// comptime-constant `if` pruning + `comptime.error` propagation (#1330)
+// ---------------------------------------------------------------------------
+
+/// Unroll over the first struct's fields, returning the raw `Result` so a
+/// `comptime.error` abort (or any `CtError`) can be asserted.
+fn try_over_fields(
+    struct_src: &str,
+    loop_var: &str,
+    body_src: &str,
+) -> Result<Vec<Stmt>, zapc_comptime::CtError> {
+    let defs = parse_structs(struct_src);
+    let info = type_info_of_struct(&defs[0]);
+    let body = parse_body(body_src);
+    let iterable = parse_expr("info.fields");
+    let mut base = Env::new();
+    base.define("info", Value::Type(Rc::new(info)));
+    let mut ev = Evaluator::new();
+    unroll(loop_var, &iterable, &body, &base, &mut ev)
+}
+
+#[test]
+fn comptime_true_if_keeps_only_the_taken_branch() {
+    // `if f.index == 0:` is a comptime-constant guard: it emits the body only for
+    // field 0, and the `else` only for the others — the dead arm is dropped.
+    let out = over_fields(
+        "struct P:\n    int64 a\n    int64 b\n",
+        "f",
+        "if f.index == 0:\n    emit(f.name)\nelse:\n    skip(f.name)\n",
+    );
+    assert_eq!(out, vec!["emit(\"a\")", "skip(\"b\")"]);
+}
+
+#[test]
+fn comptime_false_if_with_no_else_emits_nothing_for_that_field() {
+    // Only the matching field emits; the guard prunes the rest to nothing (not to
+    // a surviving runtime `if`).
+    let out = over_fields(
+        "struct P:\n    int64 a\n    int64 b\n    int64 c\n",
+        "f",
+        "if f.index == 1:\n    emit(f.name)\n",
+    );
+    assert_eq!(out, vec!["emit(\"b\")"], "only field 1 survives: {out:?}");
+}
+
+#[test]
+fn a_runtime_if_in_a_comptime_for_body_is_left_intact() {
+    // A condition that is not a comptime constant (`value.flag`) is a genuine
+    // runtime `if` — it must survive unrolling, once per field, not be pruned.
+    let out = over_fields(
+        "struct P:\n    int64 a\n    int64 b\n",
+        "f",
+        "if value.flag:\n    emit(f.name)\n",
+    );
+    assert_eq!(out.len(), 2, "one runtime if per field: {out:?}");
+    assert!(
+        out.iter().all(|s| s == "<stmt>"),
+        "kept as If stmts: {out:?}"
+    );
+}
+
+#[test]
+fn comptime_error_aborts_unrolling_with_the_authors_message() {
+    // An unconditional `comptime.error` aborts, surfacing the author's message as
+    // a `UserError` (#1256) rather than being emitted as runtime code.
+    let err = try_over_fields(
+        "struct P:\n    int64 a\n",
+        "f",
+        "comptime.error(f.span, \"Ser: unsupported\")\n",
+    )
+    .expect_err("comptime.error aborts");
+    assert_eq!(err.kind, zapc_comptime::CtErrorKind::UserError);
+    assert_eq!(err.message, "Ser: unsupported");
+}
+
+#[test]
+fn a_guarded_comptime_error_fires_only_when_its_branch_is_taken() {
+    // Guarded by a comptime-false condition over a single field → the abort is in
+    // the dead arm, so unrolling succeeds and emits nothing.
+    let ok = try_over_fields(
+        "struct P:\n    int64 a\n",
+        "f",
+        "if f.index == 1:\n    comptime.error(f.span, \"nope\")\n",
+    )
+    .expect("the abort is in an untaken branch");
+    assert!(ok.is_empty(), "nothing emitted: {ok:?}");
+
+    // Over two fields the guard is true for field 1 → the abort fires.
+    let err = try_over_fields(
+        "struct P:\n    int64 a\n    int64 b\n",
+        "f",
+        "if f.index == 1:\n    comptime.error(f.span, \"nope\")\n",
+    )
+    .expect_err("field 1 takes the branch");
+    assert_eq!(err.kind, zapc_comptime::CtErrorKind::UserError);
+}

@@ -65,7 +65,7 @@ fn render(stmts: &[Stmt]) -> Vec<String> {
 fn unroll_struct_fields_over_concrete_declaration() {
     let def = first_struct("struct P:\n    int64 a\n    int64 b\n    int64 c\n");
     let b = body("emit(f.index)");
-    let stmts = zapc_mono::unroll_struct_fields(&def, "f", &b, &[]).unwrap();
+    let stmts = zapc_mono::unroll_struct_fields(&def, "f", &b, &[], None).unwrap();
     assert_eq!(render(&stmts), vec!["emit(0)", "emit(1)", "emit(2)"]);
 }
 
@@ -73,7 +73,7 @@ fn unroll_struct_fields_over_concrete_declaration() {
 fn unroll_empty_struct_emits_nothing() {
     let def = first_struct("struct Empty:\n    pass\n");
     let b = body("emit(f.index)");
-    let stmts = zapc_mono::unroll_struct_fields(&def, "f", &b, &[]).unwrap();
+    let stmts = zapc_mono::unroll_struct_fields(&def, "f", &b, &[], None).unwrap();
     assert!(stmts.is_empty());
 }
 
@@ -81,7 +81,7 @@ fn unroll_empty_struct_emits_nothing() {
 fn unroll_struct_folds_field_names() {
     let def = first_struct("struct User:\n    int64 id\n    str name\n");
     let b = body("put(value, f.name)");
-    let stmts = zapc_mono::unroll_struct_fields(&def, "f", &b, &[]).unwrap();
+    let stmts = zapc_mono::unroll_struct_fields(&def, "f", &b, &[], None).unwrap();
     let r = render(&stmts);
     assert_eq!(r.len(), 2);
     assert!(r[0].contains("id") && r[0].contains("value"), "{r:?}");
@@ -92,7 +92,7 @@ fn unroll_struct_folds_field_names() {
 fn unroll_enum_variants_over_concrete_declaration() {
     let def = first_enum("enum Color:\n    RED\n    GREEN\n    BLUE\n");
     let b = body("register(v.name, v.index)");
-    let stmts = zapc_mono::unroll_enum_variants(&def, "v", &b, &[]).unwrap();
+    let stmts = zapc_mono::unroll_enum_variants(&def, "v", &b, &[], None).unwrap();
     let r = render(&stmts);
     assert_eq!(r.len(), 3);
     assert!(r[0].contains("RED") && r[0].contains('0'), "{r:?}");
@@ -124,7 +124,7 @@ fn unroll_with_reflect_field_access_end_to_end() {
     // The combined #1251 + #1252 pipeline a derive codec drives.
     let def = first_struct("struct Rec:\n    int64 n\n    str name\n");
     let b = body("emit(reflect.field(value, f.index))");
-    let stmts = zapc_mono::unroll_struct_fields_with_access(&def, "f", &b, &[]).unwrap();
+    let stmts = zapc_mono::unroll_struct_fields_with_access(&def, "f", &b, &[], None).unwrap();
     assert_eq!(render(&stmts), vec!["emit(value.n)", "emit(value.name)"]);
 }
 
@@ -174,7 +174,7 @@ fn unroll_with_comptime_library_function() {
     let def = first_struct("struct Row:\n    int64 id\n    str label\n");
     let fs = funcs("def serialized(str f):\n    return f.name.upper()\n");
     let b = body("emit(serialized(f))");
-    let stmts = zapc_mono::unroll_struct_fields(&def, "f", &b, &fs).unwrap();
+    let stmts = zapc_mono::unroll_struct_fields(&def, "f", &b, &fs, None).unwrap();
     let r = render(&stmts);
     assert_eq!(r.len(), 2);
     assert!(r[0].contains("ID"), "{r:?}");
