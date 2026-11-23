@@ -888,6 +888,23 @@ impl<'a> Mono<'a> {
                     }
                     out.push(Item::Stmt(self.rewrite_stmt(st, &mut env)?));
                 }
+                // An interface's method signatures carry type annotations that
+                // must be rewritten exactly like a struct field or a function
+                // signature (#1309): a return/parameter that names a generic
+                // instance (`Optional[int64]`) is renamed to its mangled concrete
+                // declaration (`Optional$int64`) and that instance is *requested*
+                // from the worklist. Without this the interface passed through
+                // verbatim, so IR lowering resolved the un-mangled `Optional[…]`
+                // head (ignoring its type arguments) and the interface call's
+                // result lost its `Optional` struct type — a later method call on
+                // it (`reader.end_time().is_some()`) failed to lower with ZAP6001
+                // "method call on a non-struct value". A plain interface (no
+                // generic-instance types in its signatures) rewrites to itself.
+                Item::Interface(i) => {
+                    self.cur_subst.clear();
+                    self.cur_self = None;
+                    out.push(Item::Interface(self.rewrite_interface_nongeneric(i)));
+                }
                 other => out.push(other.clone()),
             }
         }
@@ -1876,6 +1893,65 @@ impl Mono<'_> {
     /// receiver for a method, `None` for a free function. Generic functions and
     /// methods are instead specialized on demand through [`Self::rewrite_fn_inner`]
     /// (I#161).
+    /// Rewrite a non-generic interface's method signatures (#1309).
+    ///
+    /// An interface declaration carries type annotations in each method's
+    /// parameters and return, exactly like a struct's fields or a function's
+    /// signature — and they must be rewritten the same way, so a generic
+    /// instance named there (`Optional[int64]`) is renamed to its mangled
+    /// concrete declaration (`Optional$int64`) and that instance is requested
+    /// from the worklist. Before #1309 the interface was emitted verbatim, so IR
+    /// lowering resolved the un-mangled `Optional[…]` head while ignoring its
+    /// type arguments: the interface call's result lost its concrete `Optional`
+    /// struct type and a method call on it failed to lower (`ZAP6001`,
+    /// "method call on a non-struct value").
+    ///
+    /// Only a **non-generic** interface is rewritten. A generic interface's
+    /// method signatures mention the interface's own type parameters (`T`), which
+    /// `rewrite_type` cannot distinguish from a nullary generic to instantiate;
+    /// rewriting one would wrongly request a bogus `Optional$T`-style instance.
+    /// Generic interfaces are therefore passed through unchanged, preserving the
+    /// prior behavior (the caller clears the ambient substitution, so this never
+    /// runs under a type-parameter scope). The `self` parameter and the
+    /// supertype / associated-type lists need no renaming (an interface name is
+    /// never a generic instance, and an associated type carries no annotation).
+    fn rewrite_interface_nongeneric(&mut self, i: &InterfaceDef) -> InterfaceDef {
+        if !i.generics.is_empty() {
+            return i.clone();
+        }
+        let methods = i
+            .methods
+            .iter()
+            .map(|m| {
+                let params = m
+                    .params
+                    .iter()
+                    .map(|p| {
+                        let mut np = p.clone();
+                        if p.name != "self" {
+                            np.ty = p.ty.as_ref().map(|t| self.rewrite_type(t));
+                        }
+                        np
+                    })
+                    .collect();
+                MethodSig {
+                    name: m.name.clone(),
+                    params,
+                    ret: m.ret.as_ref().map(|t| self.rewrite_type(t)),
+                    span: m.span,
+                }
+            })
+            .collect();
+        InterfaceDef {
+            name: i.name.clone(),
+            generics: i.generics.clone(),
+            assoc_types: i.assoc_types.clone(),
+            supertypes: i.supertypes.clone(),
+            methods,
+            span: i.span,
+        }
+    }
+
     fn rewrite_fn(&mut self, f: &Function, self_ty: Option<Type>) -> Result<Function, LowerError> {
         self.rewrite_fn_inner(f, self_ty, None)
     }
@@ -5951,6 +6027,147 @@ mod tests {
         assert!(
             rendered.contains("Box$int64") && !rendered.contains("Box(0)"),
             "@default decorator generic ctor not mangled: {rendered}"
+        );
+    }
+
+    // ---- interface method signature rewriting (#1309) ---------------------
+
+    fn interface_named<'a>(m: &'a Module, name: &str) -> Option<&'a InterfaceDef> {
+        m.items.iter().find_map(|i| match i {
+            Item::Interface(iface) if iface.name == name => Some(iface),
+            _ => None,
+        })
+    }
+
+    /// The `(head-name, arg-count)` of a `Type::Named`; panics otherwise. A
+    /// mangled generic instance is a nullary `Named` whose name carries `$`.
+    fn named_head(t: &Type) -> (&str, usize) {
+        match t {
+            Type::Named { name, args, .. } => (name.as_str(), args.len()),
+            other => panic!("expected a named type, got {other:?}"),
+        }
+    }
+
+    fn method_sig<'a>(iface: &'a InterfaceDef, method: &str) -> &'a MethodSig {
+        iface
+            .methods
+            .iter()
+            .find(|m| m.name == method)
+            .expect("method present")
+    }
+
+    #[test]
+    fn interface_generic_return_type_is_mangled_and_requested() {
+        // #1309: an interface method returning a generic instance (`Optional[int64]`)
+        // must have that return renamed to the mangled concrete declaration
+        // (`Optional$int64`, a nullary named type) AND that instance emitted —
+        // exactly as a struct field or a function signature is. Before the fix the
+        // interface passed through verbatim, so lowering saw an un-mangled head
+        // with its type arguments ignored and lost the Optional type.
+        let m = mono_ok(&format!(
+            "{OPTIONAL}interface Reader:\n    def end_time(self) -> Optional[int64]\n\
+             def finished(Reader reader) -> bool:\n    return reader.end_time().is_some()\n"
+        ));
+        let iface = interface_named(&m, "Reader").expect("Reader interface emitted");
+        let ret = method_sig(iface, "end_time")
+            .ret
+            .as_ref()
+            .expect("has a return");
+        let (head, argc) = named_head(ret);
+        assert_eq!(head, "Optional$int64", "return head not mangled: {head}");
+        assert_eq!(argc, 0, "mangled instance must be nullary, got {argc} args");
+        // The instance it names must be emitted (requested onto the worklist), or
+        // lowering has no concrete declaration to resolve the head against.
+        let emitted_enum = m.items.iter().any(|i| match i {
+            Item::Enum(e) => e.name == "Optional$int64",
+            _ => false,
+        });
+        assert!(
+            emitted_enum,
+            "the Optional$int64 instance named by the interface return was not emitted"
+        );
+    }
+
+    #[test]
+    fn interface_generic_param_type_is_mangled() {
+        // The parameter side of a method signature must be rewritten identically:
+        // `def accept(self, Optional[int64] v)` → the mangled instance. The
+        // leading `self` is left untouched.
+        let m = mono_ok(&format!(
+            "{OPTIONAL}interface Sink:\n    def accept(self, Optional[int64] v) -> bool\n\
+             def main():\n    print(1)\n"
+        ));
+        let iface = interface_named(&m, "Sink").expect("Sink interface emitted");
+        let method = method_sig(iface, "accept");
+        let v = method
+            .params
+            .iter()
+            .find(|p| p.name == "v")
+            .expect("parameter v present");
+        let (head, argc) = named_head(v.ty.as_ref().expect("v annotated"));
+        assert_eq!(head, "Optional$int64", "param head not mangled: {head}");
+        assert_eq!(argc, 0, "mangled param instance must be nullary");
+        // `self` is never rewritten (it carries no spellable annotation).
+        assert_eq!(method.params.first().map(|p| p.name.as_str()), Some("self"));
+    }
+
+    #[test]
+    fn interface_nested_generic_return_is_mangled() {
+        // A compound generic return (`Optional[list[int64]]`) renames its outer
+        // head to a nullary mangled instance (the `list[int64]` argument is
+        // mangled into that single name), so no bracketed head survives.
+        let m = mono_ok(&format!(
+            "{OPTIONAL}interface Rows:\n    def head(self) -> Optional[list[int64]]\n\
+             def has(Rows r) -> bool:\n    return r.head().is_some()\n"
+        ));
+        let iface = interface_named(&m, "Rows").expect("Rows interface emitted");
+        let ret = method_sig(iface, "head")
+            .ret
+            .as_ref()
+            .expect("has a return");
+        let (head, argc) = named_head(ret);
+        assert!(
+            head.starts_with("Optional$") && argc == 0,
+            "nested generic interface return not mangled to a nullary instance: \
+             {head} ({argc} args)"
+        );
+    }
+
+    #[test]
+    fn plain_interface_passes_through_unchanged() {
+        // An interface whose signatures name no generic instance is emitted
+        // verbatim: the rewrite is a pure augmentation on the generic case.
+        let m = mono_ok(
+            "interface Named:\n    def name(self) -> int64\n\
+             def label(Named n) -> int64:\n    return n.name()\n",
+        );
+        let iface = interface_named(&m, "Named").expect("Named interface emitted");
+        let ret = method_sig(iface, "name")
+            .ret
+            .as_ref()
+            .expect("has a return");
+        assert_eq!(named_head(ret), ("int64", 0));
+    }
+
+    #[test]
+    fn generic_interface_is_left_untouched() {
+        // A *generic* interface's method signatures mention the interface's own
+        // type parameters, which must not be mistaken for instances to mangle, so
+        // a generic interface is passed through unchanged (its return stays the
+        // bare associated/parameter name, never a `$`-mangled instance).
+        let m = mono_ok(
+            "interface Producer[In]:\n    type Out\n    def make(self, In seed) -> Out\n\
+             def main():\n    print(1)\n",
+        );
+        let iface = interface_named(&m, "Producer").expect("Producer interface emitted");
+        let ret = method_sig(iface, "make")
+            .ret
+            .as_ref()
+            .expect("has a return");
+        assert_eq!(
+            named_head(ret),
+            ("Out", 0),
+            "generic interface return must be left as-is"
         );
     }
 }
