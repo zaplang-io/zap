@@ -14456,6 +14456,243 @@ impl<'a> FnLower<'a> {
         Ok((eq, Ty::I1))
     }
 
+    /// Lexicographic list ordering (#1334 sibling): `a < b` / `<=` / `>` / `>=`
+    /// compare two lists element by element — the first differing pair decides
+    /// (via element `<`), and if one list is a prefix of the other the shorter is
+    /// smaller — matching Python's sequence ordering. Without this the operands
+    /// fall through to the generic numeric path, which `ptrtoint`-compares the two
+    /// list headers (a meaningless allocation-address compare). `is` / `is not`
+    /// keep identity (handled at the top of `binop`).
+    ///
+    /// Computed as a 3-way sign in a slot (`-1`/`0`/`1`), like `zap_str_cmp` /
+    /// `zap_bigint_cmp`, then mapped to the operator by comparing the sign against
+    /// 0. Element ordering routes through `binop(Lt/Gt, ..)`, so each element type
+    /// reuses scalar `<`/`>` (numeric joins, `str`/`bytes` by contents, a nested
+    /// element's own ordering) and a non-orderable element type raises a clear
+    /// error there. The element's full ZIR type is recovered via
+    /// [`FnLower::elem_ty`] (#625) so a nested element reads back as its real type.
+    fn list_order_cmp(
+        &mut self,
+        op: AstBin,
+        l: Value,
+        lelem: Elem,
+        r: Value,
+        relem: Elem,
+    ) -> Result<(Value, Ty), LowerError> {
+        let cmp = self.alloca(Ty::I64);
+        let idx = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(cmp, zero);
+        self.store(idx, zero);
+        let llen = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(llen),
+            func: "zap_list_len".to_string(),
+            args: vec![l],
+        });
+        let rlen = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(rlen),
+            func: "zap_list_len".to_string(),
+            args: vec![r],
+        });
+
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let set_neg_bb = self.new_block();
+        let check_gt_bb = self.new_block();
+        let set_pos_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let after_bb = self.new_block();
+        let lencmp_bb = self.new_block();
+        let final_bb = self.new_block();
+        self.set_term(Term::Br(cond_bb));
+
+        // Loop while both indices are in range AND no decision has been made yet.
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let in_l = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: in_l,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: llen,
+        });
+        let in_r = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: in_r,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: rlen,
+        });
+        let in_range = self.new_value(Ty::I1);
+        self.emit(Inst::Bin {
+            dest: in_range,
+            op: BinOp::And,
+            lhs: in_l,
+            rhs: in_r,
+        });
+        let cur_cmp = self.load(cmp, Ty::I64);
+        let still_zero = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: still_zero,
+            pred: CmpPred::Eq,
+            lhs: cur_cmp,
+            rhs: zero,
+        });
+        let go = self.new_value(Ty::I1);
+        self.emit(Inst::Bin {
+            dest: go,
+            op: BinOp::And,
+            lhs: in_range,
+            rhs: still_zero,
+        });
+        self.set_term(Term::BrIf {
+            cond: go,
+            then_bb: body_bb,
+            else_bb: after_bb,
+        });
+
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let lety = self.elem_ty(lelem);
+        let le = self.new_value(lety);
+        self.emit(Inst::Call {
+            dest: Some(le),
+            func: format!("zap_list_get_{}", lelem.val_suffix()),
+            args: vec![l, i],
+        });
+        let rety = self.elem_ty(relem);
+        let re = self.new_value(rety);
+        self.emit(Inst::Call {
+            dest: Some(re),
+            func: format!("zap_list_get_{}", relem.val_suffix()),
+            args: vec![r, i],
+        });
+        let (lt_bit, _) = self.binop(AstBin::Lt, le, lety, re, rety)?;
+        self.set_term(Term::BrIf {
+            cond: lt_bit,
+            then_bb: set_neg_bb,
+            else_bb: check_gt_bb,
+        });
+
+        self.position(set_neg_bb);
+        let neg = self.iconst(Ty::I64, -1);
+        self.store(cmp, neg);
+        self.set_term(Term::Br(incr_bb));
+
+        self.position(check_gt_bb);
+        let i2 = self.load(idx, Ty::I64);
+        let le2 = self.new_value(lety);
+        self.emit(Inst::Call {
+            dest: Some(le2),
+            func: format!("zap_list_get_{}", lelem.val_suffix()),
+            args: vec![l, i2],
+        });
+        let re2 = self.new_value(rety);
+        self.emit(Inst::Call {
+            dest: Some(re2),
+            func: format!("zap_list_get_{}", relem.val_suffix()),
+            args: vec![r, i2],
+        });
+        let (gt_bit, _) = self.binop(AstBin::Gt, le2, lety, re2, rety)?;
+        self.set_term(Term::BrIf {
+            cond: gt_bit,
+            then_bb: set_pos_bb,
+            else_bb: incr_bb,
+        });
+
+        self.position(set_pos_bb);
+        let pos = self.iconst(Ty::I64, 1);
+        self.store(cmp, pos);
+        self.set_term(Term::Br(incr_bb));
+
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+
+        // All compared elements were equal: the shorter list is the smaller.
+        self.position(after_bb);
+        let cur_cmp2 = self.load(cmp, Ty::I64);
+        let is_zero = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: is_zero,
+            pred: CmpPred::Eq,
+            lhs: cur_cmp2,
+            rhs: zero,
+        });
+        self.set_term(Term::BrIf {
+            cond: is_zero,
+            then_bb: lencmp_bb,
+            else_bb: final_bb,
+        });
+
+        self.position(lencmp_bb);
+        let len_lt = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: len_lt,
+            pred: CmpPred::Lt,
+            lhs: llen,
+            rhs: rlen,
+        });
+        let len_gt = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: len_gt,
+            pred: CmpPred::Gt,
+            lhs: llen,
+            rhs: rlen,
+        });
+        // cmp = (llen>rlen) - (llen<rlen): -1 / 0 / 1, built from the two bits.
+        let neg_l = self.new_value(Ty::I64);
+        self.emit(Inst::Cast {
+            dest: neg_l,
+            kind: CastKind::ZExt,
+            val: len_lt,
+        });
+        let pos_g = self.new_value(Ty::I64);
+        self.emit(Inst::Cast {
+            dest: pos_g,
+            kind: CastKind::ZExt,
+            val: len_gt,
+        });
+        let len_cmp = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: len_cmp,
+            op: BinOp::Sub,
+            lhs: pos_g,
+            rhs: neg_l,
+        });
+        self.store(cmp, len_cmp);
+        self.set_term(Term::Br(final_bb));
+
+        self.position(final_bb);
+        let c = self.load(cmp, Ty::I64);
+        let pred = match op {
+            AstBin::Lt => CmpPred::Lt,
+            AstBin::Le => CmpPred::Le,
+            AstBin::Gt => CmpPred::Gt,
+            AstBin::Ge => CmpPred::Ge,
+            _ => unreachable!("list_order_cmp only handles < <= > >="),
+        };
+        let d = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: d,
+            pred,
+            lhs: c,
+            rhs: zero,
+        });
+        Ok((d, Ty::I1))
+    }
+
     /// Structural dict equality (#1328): `a == b` / `a != b` on two dicts is an
     /// **order-independent** comparison by entries — Python's value semantics for
     /// mappings — not a pointer-identity test (`is` / `is not` keep identity).
