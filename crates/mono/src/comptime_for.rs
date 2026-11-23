@@ -39,9 +39,10 @@ pub fn unroll_struct_fields(
     loop_var: &str,
     body: &Block,
     funcs: &[zapc_syntax::ast::Function],
+    registry: Option<&TypeRegistry>,
 ) -> Result<Vec<Stmt>, LowerError> {
     let info = zapc_comptime::type_info_of_struct(def);
-    unroll_member(info, loop_var, "fields", body, funcs)
+    unroll_member(info, loop_var, "fields", body, funcs, registry)
 }
 
 /// Unroll `comptime for v in info.variants:` over the concrete enum `def`'s
@@ -51,9 +52,10 @@ pub fn unroll_enum_variants(
     loop_var: &str,
     body: &Block,
     funcs: &[zapc_syntax::ast::Function],
+    registry: Option<&TypeRegistry>,
 ) -> Result<Vec<Stmt>, LowerError> {
     let info = zapc_comptime::type_info_of_enum(def);
-    unroll_member(info, loop_var, "variants", body, funcs)
+    unroll_member(info, loop_var, "variants", body, funcs, registry)
 }
 
 /// Build the comptime [`TypeRegistry`] for a module's user `struct`/`enum`
@@ -90,9 +92,10 @@ pub fn unroll_struct_fields_with_access(
     loop_var: &str,
     body: &Block,
     funcs: &[zapc_syntax::ast::Function],
+    registry: Option<&TypeRegistry>,
 ) -> Result<Vec<Stmt>, LowerError> {
     let info = zapc_comptime::type_info_of_struct(def);
-    let stmts = unroll_struct_fields(def, loop_var, body, funcs)?;
+    let stmts = unroll_struct_fields(def, loop_var, body, funcs, registry)?;
     stmts
         .iter()
         .map(|st| desugar_stmt_fields(st, &info))
@@ -136,9 +139,13 @@ fn unroll_member(
     member: &str,
     body: &Block,
     funcs: &[zapc_syntax::ast::Function],
+    registry: Option<&TypeRegistry>,
 ) -> Result<Vec<Stmt>, LowerError> {
     let z = Span::new(0, 0);
     let mut ev = Evaluator::with_functions(funcs);
+    if let Some(reg) = registry {
+        ev = ev.with_registry(reg);
+    }
     let mut base = Env::new();
     base.define("info", Value::Type(Rc::new(info)));
     let iterable = Expr::Attr {

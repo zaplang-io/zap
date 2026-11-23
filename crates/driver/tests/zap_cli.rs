@@ -1063,3 +1063,90 @@ fn sys_stdout_stderr_route_to_their_fds() {
     assert_eq!(stdout, "to-out\n");
     assert!(stderr.contains("to-err"), "stderr:\n{stderr}");
 }
+
+// --- comptime surface: a derive generator can guard with `.kind` and abort via
+// `comptime.error` (#1330). `zap ir` runs the full front-end + mono on the host,
+// so the compile-time abort is observable without LLVM. ---
+
+/// A library `Ser` generator that aborts on a nested-struct field and otherwise
+/// prints each field, plus the `Ser` interface it satisfies.
+const SER_LIB: &str = "\
+@derivable(Ser)
+def _derive_ser[T](T value):
+    comptime for f in reflect.type_info(T).fields:
+        if f.ty.kind.name == \"struct\":
+            comptime.error(f.span, \"Ser: nested struct field unsupported\")
+        print(reflect.field(value, comptime f.index))
+
+interface Ser:
+    def ser(self)
+";
+
+fn write_zap(tag: &str, src: &str) -> PathBuf {
+    let dir = scratch(tag);
+    let f = dir.join("prog.zap");
+    std::fs::write(&f, src).unwrap();
+    f
+}
+
+#[test]
+fn comptime_error_in_a_derive_generator_aborts_compilation() {
+    // `Outer` has a nested-struct field (`Inner`), so the guard fires and the
+    // generator aborts with the author's message — a clean compile error from
+    // `comptime.error`, not a `comptime`-unknown-name error and not a panic.
+    let src = format!(
+        "{SER_LIB}\
+@derive(Ser)
+struct Inner:
+    int64 x
+@derive(Ser)
+struct Outer:
+    int64 a
+    Inner b
+
+def main():
+    auto o = Outer(1, Inner(2))
+    o.ser()
+"
+    );
+    let f = write_zap("comptime-abort", &src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(!out.status.success(), "expected a compile abort");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Ser: nested struct field unsupported"),
+        "author's message should surface; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown name 'comptime'")
+            && !stderr.contains("unknown variable 'comptime'"),
+        "comptime.error must be wired through sema+mono, not an unknown-name error: {stderr}"
+    );
+}
+
+#[test]
+fn a_derive_generator_compiles_for_a_supported_type() {
+    // `Flat` has only primitive fields, so the `.kind == struct` guard prunes
+    // away for every field and the generator compiles cleanly (the guarded
+    // `comptime.error` is in a dead, comptime-false branch).
+    let src = format!(
+        "{SER_LIB}\
+@derive(Ser)
+struct Flat:
+    int64 a
+    int64 b
+
+def main():
+    auto x = Flat(10, 20)
+    x.ser()
+"
+    );
+    let f = write_zap("comptime-ok", &src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(
+        out.status.success(),
+        "a supported type should compile; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.stdout.is_empty(), "expected ZIR on stdout");
+}

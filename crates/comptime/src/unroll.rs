@@ -144,12 +144,56 @@ pub fn unroll(
 fn specialize_block(b: &Block, env: &mut Env, ev: &mut Evaluator) -> Result<Block, CtError> {
     let mut stmts = Vec::with_capacity(b.stmts.len());
     for st in &b.stmts {
+        // A comptime-constant `if` is resolved at specialization time: only the
+        // taken branch is kept, and the untaken branch(es) are dropped entirely
+        // (#1330). This is what makes a guarded `comptime.error` work — the abort
+        // in a branch whose condition is comptime-false must *not* fire, and a
+        // `.kind`/`f.index`-style dispatch must not emit the dead arms. An `if`
+        // whose condition is not a comptime constant is left as an ordinary
+        // runtime `if` (its branches still specialized).
+        if let Stmt::If {
+            branches,
+            else_block,
+            ..
+        } = st
+        {
+            if let Some(mut taken) = prune_comptime_if(branches, else_block, env, ev)? {
+                stmts.append(&mut taken);
+                continue;
+            }
+        }
         stmts.push(specialize_stmt(st, env, ev)?);
     }
     Ok(Block {
         stmts,
         span: b.span,
     })
+}
+
+/// Resolve a comptime-constant `if`/`elif`/`else` chain: evaluate each branch
+/// condition in order; the first that is a comptime `true` yields that branch's
+/// specialized statements, a comptime `false` moves on, and exhausting them
+/// yields the `else` branch (or nothing). Returns `None` — leaving an ordinary
+/// runtime `if` — as soon as a condition is **not** a comptime boolean (so a
+/// genuine runtime `if` in a comptime-for body is untouched). (#1330)
+fn prune_comptime_if(
+    branches: &[(Expr, Block)],
+    else_block: &Option<Block>,
+    env: &mut Env,
+    ev: &mut Evaluator,
+) -> Result<Option<Vec<Stmt>>, CtError> {
+    for (cond, body) in branches {
+        match ev.eval(cond, env) {
+            Ok(Value::Bool(true)) => return Ok(Some(specialize_block(body, env, ev)?.stmts)),
+            Ok(Value::Bool(false)) => continue,
+            // Not a comptime boolean → this is a runtime `if`; leave it whole.
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(match else_block {
+        Some(b) => specialize_block(b, env, ev)?.stmts,
+        None => Vec::new(),
+    }))
 }
 
 fn fold(e: &Expr, env: &mut Env, ev: &mut Evaluator) -> Result<Expr, CtError> {
@@ -436,10 +480,32 @@ fn fold_arg(a: &Arg, env: &mut Env, ev: &mut Evaluator) -> Result<Arg, CtError> 
 /// specialized (so a runtime expression keeps its structure while its comptime
 /// operands fold).
 fn specialize_expr(e: &Expr, env: &mut Env, ev: &mut Evaluator) -> Result<Expr, CtError> {
+    // `comptime.error(...)` is the library-author abort primitive (#1256, #1330):
+    // its evaluation *always* fails (a `UserError` `CtError`), and that failure is
+    // the intended compile error. Propagate it, rather than letting it fall
+    // through the `if let Ok(..)` below — which would swallow the abort and emit
+    // the call as ordinary (runtime) code, where `comptime` is an unknown name.
+    if is_comptime_error_call(e) {
+        ev.eval(e, env)?;
+        // `comptime.error` never evaluates to a value; if that ever changes, keep
+        // the call verbatim rather than silently dropping it.
+        return Ok(e.clone());
+    }
     if let Ok(v) = ev.eval(e, env) {
         if let Some(lit) = materialize(&v, crate::eval::expr_span(e)) {
             return Ok(lit);
         }
     }
     crate::walk::map_child_exprs(e, &mut |c| specialize_expr(c, env, ev))
+}
+
+/// `comptime.error(...)` — a call whose callee is the `error` attribute of the
+/// `comptime` name. Its abort must propagate out of specialization (#1330).
+fn is_comptime_error_call(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Call { callee, .. }
+            if matches!(&**callee, Expr::Attr { base, name, .. }
+                if name == "error" && matches!(&**base, Expr::Name(n, _) if n == "comptime"))
+    )
 }

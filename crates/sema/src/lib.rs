@@ -7376,6 +7376,18 @@ impl Checker {
                 return Ty::Unknown;
             }
         }
+        // `comptime.error(msg)` / `comptime.error(at, msg)` — the library-author
+        // abort primitive (#1256, #1330). The comptime engine evaluates it during
+        // monomorphization (it always aborts), surfacing a diagnostic at `at` (a
+        // `Span`, e.g. a comptime-for loop variable's `.span`). Sema accepts it as
+        // a comptime call of statically-unknown type and does **not** infer its
+        // arguments — `comptime` is not a value, and `f.span` resolves through the
+        // comptime loop variable — mirroring the `reflect.*` surface above.
+        if let Expr::Attr { base, name, .. } = callee {
+            if matches!(&**base, Expr::Name(m, _) if m == "comptime") && name == "error" {
+                return Ty::Unknown;
+            }
+        }
         // Spread call arguments (`*expr` / `**expr`, #597) are supported in this
         // version only for a call to a named free function (the variadic /
         // `**kwargs` forwarding path). Any other callee — construction, a

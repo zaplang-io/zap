@@ -58,6 +58,7 @@ pub use comptime_for::{
     reflect_field_access, type_registry, unroll_enum_variants, unroll_struct_fields,
     unroll_struct_fields_with_access,
 };
+use zapc_comptime::TypeRegistry;
 
 /// A lowering error: a human-readable message. Produced by monomorphization and
 /// by the main AST->ZIR lowering pass, which share this type (monomorphization
@@ -231,6 +232,12 @@ struct Mono<'a> {
     interfaces: HashMap<String, &'a InterfaceDef>,
     /// Free-function return types, for inference of `f(...)` results.
     func_ret: HashMap<String, Option<Type>>,
+    /// The comptime [`TypeRegistry`] for this module (built once), attached to the
+    /// evaluator that unrolls a `comptime for` so a generator's `f.ty.kind` /
+    /// container recursion resolves user types (#1253, #1330). Without it a
+    /// `.kind`-based guard in a derive generator cannot evaluate, so a guarded
+    /// `comptime.error` would mis-fire.
+    comptime_registry: TypeRegistry,
     /// Module-level global bindings (epic #661 / D-0112): a top-level
     /// `TYPE name = expr` (`const` or mutable) contributes its declared type
     /// here. These are seeded into every function body's type environment (as an
@@ -714,6 +721,7 @@ impl<'a> Mono<'a> {
             enums: HashMap::new(),
             interfaces: HashMap::new(),
             func_ret: HashMap::new(),
+            comptime_registry: type_registry(module),
             globals: HashMap::new(),
             aliases: HashMap::new(),
             cyclic_aliases: HashSet::new(),
@@ -2238,15 +2246,26 @@ impl Mono<'_> {
         match member.as_str() {
             "fields" => match self.structs.get(type_name.as_str()) {
                 Some(def) => {
-                    let out =
-                        comptime_for::unroll_struct_fields_with_access(def, loop_var, body, &[])?;
+                    let out = comptime_for::unroll_struct_fields_with_access(
+                        def,
+                        loop_var,
+                        body,
+                        &[],
+                        Some(&self.comptime_registry),
+                    )?;
                     Ok(Some(out))
                 }
                 None => Ok(None),
             },
             "variants" => match self.enums.get(type_name.as_str()) {
                 Some(def) => {
-                    let out = comptime_for::unroll_enum_variants(def, loop_var, body, &[])?;
+                    let out = comptime_for::unroll_enum_variants(
+                        def,
+                        loop_var,
+                        body,
+                        &[],
+                        Some(&self.comptime_registry),
+                    )?;
                     Ok(Some(out))
                 }
                 None => Ok(None),
