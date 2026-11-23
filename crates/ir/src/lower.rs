@@ -8927,68 +8927,78 @@ impl<'a> FnLower<'a> {
                 });
                 return Ok((d, Ty::I64));
             }
-            // Exact scalar `min`/`max` (#1279): compute the lesser / greater of
-            // two numeric scalars with a compare + `select`. Integer operands
-            // are widened to a common 64-bit width and compared with a signed
-            // (or unsigned, #552) `icmp` — never through `f64` — so adjacent
-            // `int64` values above 2^53 stay distinct. A tie returns the FIRST
-            // argument (Python `min`/`max` semantics): `min` selects the left
-            // operand on `l <= r`, `max` on `l >= r`. Float operands compare at
-            // `f64` (mirroring the `<`/`<=` operators). Sema (#1279) has already
-            // restricted this to two numeric scalars of a single signedness.
+            // Exact scalar `min`/`max` (#1279 two-arg, #1284 variadic): compute
+            // the lesser / greater of two or more numeric scalars by folding a
+            // compare + `select` left to right. Integer operands are widened to
+            // a common 64-bit width and compared with a signed (or unsigned,
+            // #552) `icmp` — never through `f64` — so adjacent `int64` values
+            // above 2^53 stay distinct. A tie keeps the current accumulator, so
+            // ties resolve to the FIRST argument (Python `min`/`max` semantics):
+            // `min` keeps the accumulator on `acc <= x`, `max` on `acc >= x`.
+            // Float operands compare at `f64` (mirroring the `<`/`<=` operators).
+            // Sema has already restricted this to numeric scalars of a single
+            // signedness.
             if fname == "min" || fname == "max" {
-                if args.len() != 2 || args.iter().any(|a| a.name.is_some()) {
+                if args.len() < 2 || args.iter().any(|a| a.name.is_some()) {
                     return Err(err(
-                        "min()/max() takes exactly two positional numeric arguments",
+                        "min()/max() takes two or more positional numeric arguments",
                     ));
                 }
                 let is_max = fname == "max";
-                let (l, lt) = self.expr(&args[0].value)?;
-                let (r, rt) = self.expr(&args[1].value)?;
-                let is_float = matches!(lt, Ty::F32 | Ty::F64) || matches!(rt, Ty::F32 | Ty::F64);
+                let operands: Vec<(Value, Ty)> = args
+                    .iter()
+                    .map(|a| self.expr(&a.value))
+                    .collect::<Result<_, _>>()?;
+                // The common type is uniform across the call (sema forbids mixing
+                // signed and unsigned): float if any operand is a float, else a
+                // 64-bit int whose signedness any unsigned operand selects.
+                let is_float = operands.iter().any(|(_, t)| matches!(t, Ty::F32 | Ty::F64));
                 if is_float {
-                    let lf = self.as_f64(l, lt);
-                    let rf = self.as_f64(r, rt);
+                    let pred = if is_max { CmpPred::Ge } else { CmpPred::Le };
+                    let mut acc = self.as_f64(operands[0].0, operands[0].1);
+                    for (v, t) in &operands[1..] {
+                        let x = self.as_f64(*v, *t);
+                        let cond = self.new_value(Ty::I1);
+                        self.emit(Inst::FCmp {
+                            dest: cond,
+                            pred,
+                            lhs: acc,
+                            rhs: x,
+                        });
+                        let d = self.new_value(Ty::F64);
+                        self.emit(Inst::Select {
+                            dest: d,
+                            cond,
+                            a: acc,
+                            b: x,
+                        });
+                        acc = d;
+                    }
+                    return Ok((acc, Ty::F64));
+                }
+                let unsigned = operands.iter().any(|(_, t)| t.is_unsigned());
+                let int_ty = if unsigned { Ty::U64 } else { Ty::I64 };
+                let pred = if is_max { CmpPred::Ge } else { CmpPred::Le };
+                let mut acc = self.coerce(operands[0].0, operands[0].1, int_ty);
+                for (v, t) in &operands[1..] {
+                    let x = self.coerce(*v, *t, int_ty);
                     let cond = self.new_value(Ty::I1);
-                    self.emit(Inst::FCmp {
+                    self.emit(Inst::ICmp {
                         dest: cond,
-                        pred: if is_max { CmpPred::Ge } else { CmpPred::Le },
-                        lhs: lf,
-                        rhs: rf,
+                        pred,
+                        lhs: acc,
+                        rhs: x,
                     });
-                    let d = self.new_value(Ty::F64);
+                    let d = self.new_value(int_ty);
                     self.emit(Inst::Select {
                         dest: d,
                         cond,
-                        a: lf,
-                        b: rf,
+                        a: acc,
+                        b: x,
                     });
-                    return Ok((d, Ty::F64));
+                    acc = d;
                 }
-                // Integer path: widen both operands to a common 64-bit width so
-                // mixed-width operands (e.g. `int32`, an untyped literal) share
-                // a type; codegen reads the operand type's sign to pick signed
-                // vs unsigned `icmp` (#552). The selected value and the result
-                // type are that common integer width.
-                let unsigned = lt.is_unsigned() || rt.is_unsigned();
-                let int_ty = if unsigned { Ty::U64 } else { Ty::I64 };
-                let li = self.coerce(l, lt, int_ty);
-                let ri = self.coerce(r, rt, int_ty);
-                let cond = self.new_value(Ty::I1);
-                self.emit(Inst::ICmp {
-                    dest: cond,
-                    pred: if is_max { CmpPred::Ge } else { CmpPred::Le },
-                    lhs: li,
-                    rhs: ri,
-                });
-                let d = self.new_value(int_ty);
-                self.emit(Inst::Select {
-                    dest: d,
-                    cond,
-                    a: li,
-                    b: ri,
-                });
-                return Ok((d, int_ty));
+                return Ok((acc, int_ty));
             }
             // Scalar integer-preserving `abs` (#1283). A float yields its f64
             // magnitude via `zap_math_fabs` (correct for -0.0 and NaN). An
