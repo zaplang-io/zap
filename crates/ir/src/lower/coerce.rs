@@ -164,13 +164,15 @@ impl<'a> FnLower<'a> {
                 return v;
             }
             let d = self.new_value(to);
-            // Widen by zero-extension when the *source* is unsigned (#552), by
-            // sign-extension otherwise; narrowing is a plain truncation for
-            // both. (Implicit widening only ever pairs same-sign types — sema's
-            // `assignable` forbids a sign crossing — so the source's sign is the
-            // right one to key on.)
+            // Widen by zero-extension when the *source* is unsigned (#552) or is
+            // `bool` (an unsigned 0/1, #1344 — sign-extending the i1 `True` would
+            // give -1, not +1, which inverted `bool` ordering comparisons, e.g.
+            // `False < True` promoted to `0 < -1`), by sign-extension otherwise;
+            // narrowing is a plain truncation for both. (Implicit widening
+            // otherwise only ever pairs same-sign types — sema's `assignable`
+            // forbids a sign crossing — so the source's sign is the right key.)
             let kind = if tw > fw {
-                if from.is_unsigned() {
+                if from.is_unsigned() || from == Ty::I1 {
                     CastKind::ZExt
                 } else {
                     CastKind::SExt
