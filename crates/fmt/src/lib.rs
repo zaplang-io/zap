@@ -822,6 +822,17 @@ impl<'a> Printer<'a> {
                 self.take_header_trailing(body.span.start);
                 self.emit_block(body);
             }
+            Stmt::ComptimeFor {
+                target, iter, body, ..
+            } => {
+                self.push_line(&format!(
+                    "comptime for {} in {}:",
+                    for_target_str(target),
+                    pexpr(iter, 0)
+                ));
+                self.take_header_trailing(body.span.start);
+                self.emit_block(body);
+            }
             Stmt::Match {
                 scrutinee,
                 arms,
@@ -1242,6 +1253,7 @@ fn stmt_span(s: &Stmt) -> Span {
         | Stmt::While { span, .. }
         | Stmt::DoWhile { span, .. }
         | Stmt::For { span, .. }
+        | Stmt::ComptimeFor { span, .. }
         | Stmt::Match { span, .. }
         | Stmt::Select { span, .. }
         | Stmt::Return { span, .. }
@@ -1279,6 +1291,7 @@ fn espan(e: &Expr) -> Span {
         | Expr::DictComp { span, .. }
         | Expr::SetComp { span, .. }
         | Expr::GenExp { span, .. }
+        | Expr::Comptime { span, .. }
         | Expr::Unary { span, .. }
         | Expr::Binary { span, .. }
         | Expr::Compare { span, .. }

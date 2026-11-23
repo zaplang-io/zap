@@ -51,6 +51,10 @@ where
             expr: Box::new(f(expr)?),
             span: *span,
         },
+        Expr::Comptime { expr, span } => Expr::Comptime {
+            expr: Box::new(f(expr)?),
+            span: *span,
+        },
         Expr::Binary { op, lhs, rhs, span } => Expr::Binary {
             op: *op,
             lhs: Box::new(f(lhs)?),

@@ -146,6 +146,10 @@ impl<'a> Evaluator<'a> {
             Expr::Named { span, .. } => {
                 Err(CtError::not_available("walrus assignment (`:=`)", *span))
             }
+            // `comptime <expr>` (#1297): a force-eval marker. The evaluator is
+            // already running at compile time, so it is transparent — evaluate
+            // the inner expression.
+            Expr::Comptime { expr, .. } => self.eval_expr(expr, env),
         }
     }
 
@@ -1047,6 +1051,13 @@ impl<'a> Evaluator<'a> {
                 "`for` loop (use `comptime for`, #1251)",
                 *span,
             )),
+            // A `comptime for` is unrolled by the loop unroller (`crate::unroll`,
+            // #1251), not tree-walked here; reaching it as a statement in the
+            // evaluator is out of fragment.
+            Stmt::ComptimeFor { span, .. } => Err(CtError::not_available(
+                "`comptime for` (unrolled by the loop unroller, #1251)",
+                *span,
+            )),
             Stmt::While { span, .. } | Stmt::DoWhile { span, .. } => {
                 Err(CtError::not_available("`while` loop", *span))
             }
@@ -1188,7 +1199,8 @@ pub(crate) fn expr_span(e: &Expr) -> Span {
         | Expr::ChanRecv { span, .. }
         | Expr::Yield { span, .. }
         | Expr::IfElse { span, .. }
-        | Expr::Named { span, .. } => *span,
+        | Expr::Named { span, .. }
+        | Expr::Comptime { span, .. } => *span,
     }
 }
 
@@ -1203,6 +1215,7 @@ pub(crate) fn stmt_span(s: &Stmt) -> Span {
         | Stmt::While { span, .. }
         | Stmt::DoWhile { span, .. }
         | Stmt::For { span, .. }
+        | Stmt::ComptimeFor { span, .. }
         | Stmt::Match { span, .. }
         | Stmt::Select { span, .. }
         | Stmt::Return { span, .. }

@@ -711,6 +711,7 @@ fn stmt_span(st: &Stmt) -> Span {
         | Stmt::While { span, .. }
         | Stmt::DoWhile { span, .. }
         | Stmt::For { span, .. }
+        | Stmt::ComptimeFor { span, .. }
         | Stmt::Match { span, .. }
         | Stmt::Select { span, .. }
         | Stmt::Return { span, .. }
@@ -742,6 +743,7 @@ fn expr_span(e: &Expr) -> Span {
         | DictComp { span, .. }
         | SetComp { span, .. }
         | GenExp { span, .. }
+        | Comptime { span, .. }
         | Unary { span, .. }
         | Binary { span, .. }
         | Compare { span, .. }

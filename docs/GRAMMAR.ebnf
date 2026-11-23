@@ -400,6 +400,7 @@ compound_stmt ::= if_stmt
                 | while_stmt
                 | do_while_stmt
                 | for_stmt
+                | comptime_for_stmt  (* `comptime for` compile-time-unrolled loop (E2/E3, #1297) *)
                 | match_stmt
                 | try_stmt
                 | with_stmt
@@ -415,6 +416,17 @@ if_stmt       ::= "if" expr block
 while_stmt    ::= "while" expr block ;
 
 do_while_stmt ::= "do" block "while" expr NEWLINE ;   (* D-0039 *)
+
+comptime_for_stmt ::= "comptime" "for" target "in" expr block ;
+                  (* A compile-time-unrolled loop over a comptime sequence
+                     (E2/E3 surface, #1297; locked decision 4 of epic #1249):
+                     the body is cloned and specialized once per element at
+                     compile time, not iterated at run time. Parsed by S1
+                     (#1297); its comptime evaluation/unrolling is wired by S2
+                     (#1298). The `comptime` keyword also forms `comptime <expr>`
+                     (force compile-time evaluation; see unary_expr) and the
+                     `comptime.<builtin>` qualified call (`comptime.error(...)`,
+                     #1256). The `comptime <expr>` prefix appears in `not_test`. *)
 
 for_stmt      ::= "for" target "in" expr block ;
                   (* Iteration is protocol-based, not grammatical (D-0048):
@@ -567,7 +579,9 @@ ternary       ::= or_test [ "if" or_test "else" expr ] ;
 
 or_test       ::= and_test { "or" and_test } ;
 and_test      ::= not_test { "and" not_test } ;
-not_test      ::= "not" not_test | comparison ;
+not_test      ::= "comptime" not_test    (* force compile-time evaluation (E2/E3, #1297) *)
+                | "not" not_test
+                | comparison ;
 comparison    ::= bit_or { comp_op bit_or }
                 | bit_or ( "=~" | "!~" ) match_regex
                 | bit_or "=~" subst_regex ;   (* A run of two or more comp_ops —

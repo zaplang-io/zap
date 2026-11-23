@@ -95,6 +95,12 @@ impl<'a> Linter<'a> {
                 self.visit_expr(iter);
                 self.visit_block(body);
             }
+            // `comptime for` iterates a comptime sequence (declaration-ordered,
+            // #1066) — not a Nondet leaf. Recurse into iterable and body.
+            Stmt::ComptimeFor { iter, body, .. } => {
+                self.visit_expr(iter);
+                self.visit_block(body);
+            }
             // Recurse into every branch — including a provably-dead one — so a
             // leaf mentioned anywhere is rejected (join over branches).
             Stmt::If {

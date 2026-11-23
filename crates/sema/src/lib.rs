@@ -5069,6 +5069,19 @@ impl Checker {
                 self.check_block(body);
                 self.infer(cond);
             }
+            // `comptime for` (E2/E3 surface, #1297): parsed, but comptime
+            // evaluation/unrolling is not wired until S2 (#1298). Report it as
+            // not-yet-implemented so a program using it fails cleanly rather than
+            // silently type-checking as if it ran; the body is not checked here.
+            Stmt::ComptimeFor { span, .. } => {
+                self.error(
+                    ErrorCode::ZAP0002,
+                    "`comptime for` is parsed but comptime evaluation is not wired \
+                     yet (comptime/reflect surface epic #1296, wired in #1298)"
+                        .to_string(),
+                    *span,
+                );
+            }
             Stmt::For {
                 target,
                 iter,
@@ -5892,6 +5905,19 @@ impl Checker {
             }
             Expr::Float(..) => Ty::UntypedFloat,
             Expr::Imaginary(..) => Ty::Complex,
+            // `comptime <expr>` (E2/E3 surface, #1297): parsed, but comptime
+            // evaluation is not wired until S2 (#1298). Report not-yet-implemented
+            // and yield `Unknown` (no inner inference, to avoid a cascade).
+            Expr::Comptime { span, .. } => {
+                self.error(
+                    ErrorCode::ZAP0002,
+                    "`comptime <expr>` is parsed but comptime evaluation is not \
+                     wired yet (comptime/reflect surface epic #1296, wired in #1298)"
+                        .to_string(),
+                    *span,
+                );
+                Ty::Unknown
+            }
             Expr::Str {
                 bytes,
                 fstring,
@@ -11700,7 +11726,8 @@ fn expr_span(e: &Expr) -> Span {
         | Expr::ChanRecv { span, .. }
         | Expr::Yield { span, .. }
         | Expr::IfElse { span, .. }
-        | Expr::Named { span, .. } => *span,
+        | Expr::Named { span, .. }
+        | Expr::Comptime { span, .. } => *span,
     }
 }
 

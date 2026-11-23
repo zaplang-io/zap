@@ -50,7 +50,7 @@ fn prec(e: &Expr) -> u8 {
     match e {
         Expr::Binary { op, .. } => binop_prec(*op).0,
         Expr::Compare { .. } => P_CMP,
-        Expr::Unary { op: UnOp::Not, .. } => P_NOT,
+        Expr::Unary { op: UnOp::Not, .. } | Expr::Comptime { .. } => P_NOT,
         Expr::Unary { .. } | Expr::ChanRecv { .. } => P_UNARY,
         Expr::IfElse { .. } => P_TERNARY,
         Expr::Lambda { .. } => P_LAMBDA,
@@ -122,6 +122,8 @@ pub fn render(e: &Expr) -> String {
             format!("{{{}}}", comp_body(&head, clauses))
         }
 
+        // `comptime <expr>` (#1297): a keyword prefix, formatted like `not`.
+        Expr::Comptime { expr, .. } => format!("comptime {}", pexpr(expr, P_NOT)),
         Expr::Unary { op, expr, .. } => match op {
             UnOp::Not => format!("not {}", pexpr(expr, P_NOT)),
             UnOp::Neg => format!("-{}", pexpr(expr, P_UNARY)),

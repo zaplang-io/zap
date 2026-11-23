@@ -250,6 +250,7 @@ fn resolve_in_stmt(stmt: &mut Stmt, target: &Target) {
         Stmt::While { body, .. }
         | Stmt::DoWhile { body, .. }
         | Stmt::For { body, .. }
+        | Stmt::ComptimeFor { body, .. }
         | Stmt::Scope { body, .. }
         | Stmt::Unsafe { body, .. }
         | Stmt::With { body, .. } => {

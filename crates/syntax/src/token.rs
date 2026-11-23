@@ -146,6 +146,10 @@ pub enum Keyword {
     Match,
     /// `when target.*:` — compile-time conditional compilation (I#139, D-0079).
     When,
+    /// `comptime` — the compile-time evaluation surface (E2/E3, epic #1296):
+    /// `comptime for f in …:` (a compile-time-unrolled loop) and `comptime <expr>`
+    /// (force compile-time evaluation). Locked decision 4 of epic #1249.
+    Comptime,
     Case,
     Break,
     Continue,
@@ -240,6 +244,7 @@ impl Keyword {
             "range" => Range,
             "match" => Match,
             "when" => When,
+            "comptime" => Comptime,
             "case" => Case,
             "break" => Break,
             "continue" => Continue,
@@ -364,6 +369,7 @@ impl Keyword {
             Range => "range",
             Match => "match",
             When => "when",
+            Comptime => "comptime",
             Case => "case",
             Break => "break",
             Continue => "continue",

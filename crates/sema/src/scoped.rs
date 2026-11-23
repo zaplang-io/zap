@@ -578,6 +578,9 @@ impl Checker {
             }
             Stmt::For {
                 target, iter, body, ..
+            }
+            | Stmt::ComptimeFor {
+                target, iter, body, ..
             } => {
                 self.scan_expr(target, aliases);
                 self.scan_expr(iter, aliases);
@@ -777,7 +780,7 @@ fn child_exprs<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
             out.push(value);
             push_clauses(clauses, out);
         }
-        Expr::Unary { expr, .. } => out.push(expr),
+        Expr::Comptime { expr, .. } | Expr::Unary { expr, .. } => out.push(expr),
         Expr::Binary { lhs, rhs, .. } => {
             out.push(lhs);
             out.push(rhs);
