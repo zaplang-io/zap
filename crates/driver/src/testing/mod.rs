@@ -43,16 +43,20 @@ use zapc_syntax::ast::{Item, Module};
 /// Gated to the paths that use it (the codegen-only runner and the tests) so the
 /// no-codegen, non-test build does not warn it dead — like [`temp_exe_path`].
 #[cfg(any(feature = "codegen", test))]
-fn front_end_test_module(path: &std::path::Path) -> Result<Module, String> {
+fn front_end_test_module(path: &std::path::Path) -> Result<(Module, zapc_sema::TypeMap), String> {
     let entry = path.display().to_string();
     // `zap test` takes no `--target-feature`s today, so the `when target.*` cfg is
     // resolved against the bare host target, exactly as a plain `zap build` would.
     let target = crate::build_target(&[]);
     match crate::front_end_reports(&entry, &target) {
-        // Warnings (the third tuple field) are intentionally not surfaced on the
-        // `zap test` path: the stdout sentinel protocol is the test report, and a
-        // warning is neither a test nor a failure. A hard error is returned below.
-        Ok((module, _types, _warns)) => Ok(module),
+        // The sema `TypeMap` is kept and threaded into the harness build (#1308,
+        // #1310): monomorphization consumes it to pin a generic argument its own
+        // best-effort inferer cannot derive (#1167), exactly as a plain `zap
+        // build`/`zap run` does. Warnings (the third tuple field) are still not
+        // surfaced on the `zap test` path: the stdout sentinel protocol is the
+        // test report, and a warning is neither a test nor a failure. A hard
+        // error is returned below.
+        Ok((module, types, _warns)) => Ok((module, types)),
         Err(reports) => Err(render_front_end_errors(&reports)),
     }
 }
@@ -245,7 +249,7 @@ mod run_impl {
         // dependency from the project `zenv`, a sibling source module, and their
         // qualified exception types are in scope — and surfaces any lex/parse/
         // resolution/sema error as a single failing file result (unchanged shape).
-        let module = match super::front_end_test_module(path) {
+        let (module, types) = match super::front_end_test_module(path) {
             Ok(m) => m,
             Err(msg) => {
                 results.push(file_error(&display, msg));
@@ -266,11 +270,22 @@ mod run_impl {
         // not `--debug` — since it is executed, not iterated on (I#867/D-0157).
         if let Err(e) = zapc_codegen::build_executable(
             &harness_module,
-            // The `@test` harness is a transformed module, not the one sema
-            // typed, so its spans would not key into the original `TypeMap`; the
-            // harness build keeps the monomorphizer's own inference (#1167),
-            // unchanged, via an empty map.
-            &zapc_ir::TypeMap::default(),
+            // Thread sema's `TypeMap` into the harness build (#1308, #1310). The
+            // `@test` harness is an AST→AST transform, but it *clones* the user's
+            // test/hook/helper function bodies verbatim (only shedding their
+            // decorators), so every user expression keeps its original span and
+            // still keys into this map. Monomorphization consumes those types to
+            // pin a generic argument its own best-effort inferer cannot derive
+            // (#1167) — e.g. `Optional.Some(int64(0))` (#1308) or a generic
+            // reflected operator over a built-in result like `date + Delta(1)`
+            // (#1310) — exactly as a plain `zap build`/`zap run` does. Before this
+            // the harness passed an empty map, so those forms fell back to the
+            // pre-#1167 inference and failed to lower with ZAP6001 in `zap test`
+            // even though the identical program compiled under `zap run`. The
+            // harness-synthesized `main`/wrappers carry no entries here (their
+            // spans are not in the map) and still fall back to mono inference, so
+            // this is a pure augmentation on the user-body expressions.
+            &types,
             &exe,
             false,
             race,
@@ -433,6 +448,116 @@ mod tests {
             "parse errors: {perrs:?} {lerrs:?}"
         );
         m
+    }
+
+    /// #1308 / #1310: the native `@test` harness must lower with sema's inferred
+    /// types so a generic argument the monomorphizer's own best-effort inferer
+    /// cannot pin (#1167) still resolves — exactly as `zap run`/`zap build` do.
+    ///
+    /// Asserts `src` (which must contain at least one `@test`) type-checks, that
+    /// the harness module built from it lowers cleanly **with** sema's `TypeMap`,
+    /// and that the identical harness module **without** it still fails to lower
+    /// with `ZAP6001` — proving the threaded `TypeMap` (not some other change) is
+    /// what closes the gap, and guarding against a regression to the old empty-map
+    /// behavior. Host-only (no LLVM): the harness build is an AST transform and
+    /// lowering runs the mono pass. The `build_harness` clone preserves the test
+    /// body's spans, so sema's types key into the harness module unchanged.
+    fn harness_needs_sema_types(src: &str) {
+        use zapc_ir::{lower_module, lower_module_opts_with_types};
+        use zapc_sema::analyze_types;
+
+        let m = module(src);
+        let (serrs, _warns, types) = analyze_types(&m);
+        assert!(serrs.is_empty(), "sema errors: {serrs:?}");
+
+        let (harness_module, n_tests) = super::harness::build_harness(&m);
+        assert!(n_tests >= 1, "fixture must contain at least one @test");
+
+        let (_zir, with_errs) = lower_module_opts_with_types(&harness_module, false, &types);
+        assert!(
+            with_errs.is_empty(),
+            "harness must lower WITH sema types (the #1308/#1310 fix): {with_errs:?}"
+        );
+
+        let (_zir, without_errs) = lower_module(&harness_module);
+        assert!(
+            !without_errs.is_empty(),
+            "harness lowered WITHOUT sema types unexpectedly — this fixture no \
+             longer guards the TypeMap-threading path (the monomorphizer's own \
+             inferer now pins the argument); pick a form it cannot infer"
+        );
+    }
+
+    #[test]
+    fn harness_infers_optional_some_from_explicit_int64_cast() {
+        // #1308's exact reproduction: `Optional.Some(int64(0))` in a @test body.
+        // `int64(0)` is an explicit conversion whose result type the mono inferer
+        // does not derive; sema's `TypeMap` pins it as `Optional[int64]`.
+        harness_needs_sema_types(
+            "@test\ndef explicit_integer_cast():\n\
+             \x20   auto value = Optional.Some(int64(0))\n\
+             \x20   assert value.is_some()\n",
+        );
+    }
+
+    #[test]
+    fn harness_infers_optional_some_from_explicit_cast_in_kwarg() {
+        // #1308 also calls out the typed keyword-argument form: the same explicit
+        // conversion flowing through a `Some(value=...)` keyword argument.
+        harness_needs_sema_types(
+            "@test\ndef explicit_integer_cast_kwarg():\n\
+             \x20   auto value = Optional.Some(value=int64(0))\n\
+             \x20   assert value.is_some()\n",
+        );
+    }
+
+    #[test]
+    fn harness_infers_generic_arg_from_builtin_len_result() {
+        // The #1310 family: a generic argument whose type is a built-in call's
+        // result (`len`), which the mono inferer loses but sema records. Covers
+        // the "built-in result" axis host-only (the reflected-operator / datetime
+        // shape #1310 cites needs an installed package, exercised by the golden
+        // `zap test` fixtures in CI).
+        harness_needs_sema_types(
+            "@test\ndef builtin_result():\n\
+             \x20   list[int64] xs = [1, 2, 3]\n\
+             \x20   auto value = Optional.Some(len(xs))\n\
+             \x20   assert value.is_some()\n",
+        );
+    }
+
+    #[test]
+    fn harness_infers_generic_reflected_operator_over_builtin_result() {
+        // #1310's shape, self-contained: a generic reflected operator
+        // (`Delta.__radd__[T]`) whose left operand is a built-in call's result
+        // (`len(xs)`). The mono inferer loses the built-in result type and bails
+        // with the issue's exact "cannot infer type argument 'T' of operator
+        // method '__radd__'"; sema's `TypeMap` pins `T = int64`. (The datetime
+        // `date + Delta(1)` form the issue cites is the same mechanism over an
+        // installed-package seam call, exercised end-to-end in `zap_cli`.)
+        harness_needs_sema_types(
+            "value struct Delta:\n\
+             \x20   int64 n\n\n\
+             \x20   def __radd__[T](self, T x) -> T:\n\
+             \x20       return x\n\n\
+             @test\ndef reflected_over_builtin():\n\
+             \x20   list[int64] xs = [1, 2, 3]\n\
+             \x20   auto result = len(xs) + Delta(1)\n\
+             \x20   assert result == 3\n",
+        );
+    }
+
+    #[test]
+    fn harness_infers_generic_arg_in_parametrized_test_case() {
+        // `@parametrize` reuses the case expression nodes directly in synthesized
+        // call sites; those nodes keep their original spans, so sema's type for a
+        // hard-to-infer argument still keys through the harness transform.
+        harness_needs_sema_types(
+            "@parametrize(cases=[[1], [2]])\n\
+             @test\ndef param_case(int64 k):\n\
+             \x20   auto value = Optional.Some(int64(k))\n\
+             \x20   assert value.is_some()\n",
+        );
     }
 
     #[test]
