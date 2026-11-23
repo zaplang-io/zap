@@ -1105,11 +1105,14 @@ finally:
   `net.set_read_deadline`) likewise derives from `Exception`, and is distinct from
   a clean EOF (an empty `net.recv` result) so a server can tell an idle/read
   timeout apart from a peer close. `OSError` is the generic operating-system / I/O
-  error base and derives from `Exception`; a filesystem read (`fs.read_file`,
-  `fs.read_bytes`) raises `FileNotFoundError` when the path does not exist and
-  `OSError` for any other failure, so a caller can select defaults for an absent
-  file without a prior existence check. The remaining listed leaf types derive
-  from `Exception`; `Exception` derives from `BaseException`.
+  error base and derives from `Exception`; across the `os` / `fs` / `io` surface an
+  errno-driven failure raises `OSError`, and a missing path raises
+  `FileNotFoundError`, so a caller can select defaults for an absent file without a
+  prior existence check (a missing executable passed to `process` likewise raises
+  `FileNotFoundError`). An allocation failure raises `MemoryError`, and bad caller
+  input (an invalid `io.open` mode, an empty path) raises `ValueError`. The
+  remaining listed leaf types derive from `Exception`; `Exception` derives from
+  `BaseException`.
 - `raise E(message)` constructs a typed built-in exception. Raising a string is
   shorthand for raising `Exception(message)`. A typed `except E` catches `E`
   and its subclasses; clauses are tested in source order. A bare `except` is a
