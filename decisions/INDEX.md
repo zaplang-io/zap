@@ -44,6 +44,7 @@ listed here (see [`README.md`](README.md)).
 | [1279](lang/1279-scalar-min-max.md) | Exact scalar min/max built-in free functions | Locked | 2026-11-22 |
 | [1283](lang/1283-scalar-abs-divmod.md) | Scalar integer-preserving abs and divmod built-ins | Locked | 2026-11-22 |
 | [1284](lang/1284-variadic-minmax-sum.md) | Variadic min/max and element-typed sum | Locked | 2026-11-23 |
+| [1285](lang/1285-any-all-reversed.md) | any / all / reversed built-ins | Locked | 2026-11-23 |
 | [1290](lang/1290-derivable-registration.md) | "@derivable(Trait) registration model (E3a)" | Accepted | 2026-11-22 |
 
 ## stdlib
