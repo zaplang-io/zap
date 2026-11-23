@@ -16,29 +16,76 @@
 //! It scans `@derivable`/`interface` declarations itself (sema's registry is not
 //! built yet at this point).
 //!
-//! First cut (#1291): a **non-generic** struct and a library trait whose
-//! `interface` declares one method — the Dump / Hash / Serialize shape — of any
-//! arity (`MethodSig` carries no type parameters of its own). One stub is
-//! synthesized per interface method, each forwarding to the trait's registered
-//! generator; a multi-method trait therefore forwards every method to that one
-//! generator, so distinct per-method generators are a follow-up. The `@derive`
-//! is stripped of the library trait once synthesized so the lowering backstop no
-//! longer reports it as deferred (built-in traits and any un-synthesized name are
-//! kept). A hand-written method of the same name wins (no stub synthesized). A
-//! generic struct is left for bound propagation (E3c #1292); enum deriving and
-//! derive-diagnostics wiring (E3d #1293) are later slices.
+//! One stub is synthesized per interface method, each forwarding to the trait's
+//! registered generator; a multi-method trait therefore forwards every method to
+//! that one generator, so distinct per-method generators are a follow-up. The
+//! `@derive` is stripped of the library trait once synthesized so the lowering
+//! backstop no longer reports it as deferred (built-in traits and any
+//! un-synthesized name are kept). A hand-written method of the same name wins (no
+//! stub synthesized).
+//!
+//! ## Generic types (E3c, #1292 — inferred bounds, structural)
+//!
+//! A **generic** type derives too: the stub forwards to the generator specialized
+//! at the type applied to its own parameters — `generator[Pair[A, B]](self)` on
+//! `struct Pair[A, B]`. Conformance and recursion termination are **structural**,
+//! per instantiation: monomorphization specializes the generator at each concrete
+//! `Pair[int64, str]` and its per-field recursion is checked by ordinary
+//! structural resolution, while the `SpecializationCache` makes a recursive type
+//! (`struct Node[T]: T val; Optional[Node[T]] next`) terminate — the merged-in
+//! instance stands in for the in-progress goal ("assume-the-goal").
+//!
+//! The spec's `impl[T_i: X]` framing does not map onto Zap: there is no `impl`
+//! construct, and a method's own type parameter *shadows* the enclosing struct's
+//! as a fresh **unbounded** variable (sema's `method_own_generic_shadows_enclosing_bound`),
+//! so a literal `[A: X]` cannot be attached to the synthesized method without
+//! breaking `self`'s type. The inferred bounds are instead realized structurally
+//! (above) and surfaced as data: [`expand_library_derives`] returns, per generic
+//! derive, the set of parameters each non-skipped field mentions together with
+//! those fields' spans ([`GenericDeriveBounds`]), for E3d (#1293) to render an
+//! unsatisfied bound at the offending field. A `@skip` field attribute does not
+//! exist yet, so every field counts for now (its exclusion is a follow-up).
+//! Enum deriving and the diagnostics rendering itself remain E3d.
 
 use std::collections::HashMap;
 
 use zapc_diag::ErrorCode;
 use zapc_sema::TypeError;
-use zapc_syntax::ast::{Arg, ArgSpread, Block, Expr, Function, Item, MethodSig, Module, Stmt};
+use zapc_syntax::ast::{
+    Arg, ArgSpread, Block, Expr, Function, Item, MethodSig, Module, Stmt, StructDef, Type,
+};
 use zapc_syntax::span::Span;
 
+/// One inferred serde-style bound for a generic `@derive` (E3c, #1292): the type
+/// parameter `param` is used by one or more non-skipped fields, so a concrete
+/// instantiation conforms only if the type bound to `param` conforms to the
+/// derived trait. `field_spans` are those fields' spans, so E3d (#1293) can land
+/// an unsatisfied-bound diagnostic at the offending field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InferredBound {
+    pub param: String,
+    pub field_spans: Vec<Span>,
+}
+
+/// The inferred bounds of one generic `@derive(Trait)` on one type (E3c, #1292).
+/// `params` holds exactly the type parameters that appear in a non-skipped field,
+/// in declaration order; a parameter used in no field (or only behind a concrete
+/// container) is absent. Conformance itself is checked structurally per
+/// instantiation — this is the data E3d renders, not a bound the synthesis emits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenericDeriveBounds {
+    pub struct_name: String,
+    pub trait_name: String,
+    pub params: Vec<InferredBound>,
+}
+
 /// Synthesize forwarding stubs for every `@derive(<library trait>)` on a type,
-/// in place. Returns diagnostics (a library trait with no interface, etc.).
-pub fn expand_library_derives(module: &mut Module) -> Vec<TypeError> {
+/// in place. Returns `(diagnostics, inferred-bounds)`: diagnostics for a library
+/// trait with no interface, and — for each generic derive — the inferred serde
+/// bounds (E3c, #1292) for E3d to consume (the current pipeline ignores them).
+pub fn expand_library_derives(module: &mut Module) -> (Vec<TypeError>, Vec<GenericDeriveBounds>) {
     let mut diags = Vec::new();
+    let mut bounds: Vec<GenericDeriveBounds> = Vec::new();
 
     // Pass 1: collect the library-registered derivable traits (`@derivable(T)`
     // on a free function) and the interfaces that supply their method sets. Both
@@ -59,7 +106,7 @@ pub fn expand_library_derives(module: &mut Module) -> Vec<TypeError> {
         }
     }
     if generators.is_empty() {
-        return diags; // no library derivables -> nothing to do
+        return (diags, bounds); // no library derivables -> nothing to do
     }
 
     // Pass 2: for each struct, synthesize stubs for its library-trait derives and
@@ -80,13 +127,13 @@ pub fn expand_library_derives(module: &mut Module) -> Vec<TypeError> {
         if derived.is_empty() {
             continue;
         }
-        // A generic struct needs bound propagation (E3c, #1292); defer it by
-        // leaving the derive in place (the lowering backstop reports it).
-        if !s.generics.is_empty() {
-            continue;
-        }
 
         let sp = s.span;
+        // The type the generator is specialized at: the bare name for a
+        // non-generic type, or the type applied to its own parameters for a
+        // generic one (`Pair[A, B]`), so each concrete `Pair[int64, str]`
+        // specializes the generator structurally (E3c, #1292).
+        let type_arg = self_type_arg_expr(s, sp);
         let mut synthesized: Vec<String> = Vec::new();
         for trait_name in &derived {
             let generator = &generators[trait_name];
@@ -107,10 +154,23 @@ pub fn expand_library_derives(module: &mut Module) -> Vec<TypeError> {
                 if s.methods.iter().any(|existing| existing.name == m.name) {
                     continue;
                 }
-                let stub = forwarding_stub(m, generator, &s.name, sp);
+                let stub = forwarding_stub(m, generator, &type_arg, sp);
                 s.methods.push(stub);
             }
             synthesized.push(trait_name.clone());
+            // Record the inferred serde bounds for a generic derive (E3c, #1292):
+            // which of the type's parameters appear in a field, and where. A
+            // non-generic type has none.
+            if !s.generics.is_empty() {
+                let params = inferred_bound_params(s);
+                if !params.is_empty() {
+                    bounds.push(GenericDeriveBounds {
+                        struct_name: s.name.clone(),
+                        trait_name: trait_name.clone(),
+                        params,
+                    });
+                }
+            }
         }
 
         // Strip the synthesized library traits from `@derive(...)` so the
@@ -119,17 +179,97 @@ pub fn expand_library_derives(module: &mut Module) -> Vec<TypeError> {
         strip_derived(s, &synthesized);
     }
 
-    diags
+    (diags, bounds)
+}
+
+/// The type the generator is specialized at for `s`: `Expr::Name(s.name)` for a
+/// non-generic type, or `s.name[p0, p1, …]` (an index/subscript expression that
+/// `expr_to_type` reads back as `Named { name, args }`) for a generic one — the
+/// same shape the parser produces for `generator[Pair[A, B]](…)`.
+fn self_type_arg_expr(s: &StructDef, sp: Span) -> Expr {
+    if s.generics.is_empty() {
+        return Expr::Name(s.name.clone(), sp);
+    }
+    let params: Vec<Expr> = s
+        .generics
+        .iter()
+        .map(|g| Expr::Name(g.name.clone(), sp))
+        .collect();
+    // One parameter is a bare subscript (`Node[T]`); several form a tuple
+    // (`Pair[A, B]`), matching `type_args_from_index` / `expr_to_type`.
+    let index = if params.len() == 1 {
+        params.into_iter().next().unwrap()
+    } else {
+        Expr::Tuple(params, sp)
+    };
+    Expr::Index {
+        base: Box::new(Expr::Name(s.name.clone(), sp)),
+        index: Box::new(index),
+        span: sp,
+    }
+}
+
+/// The inferred serde bounds (E3c, #1292) of a generic struct: each type
+/// parameter that appears in a field's type, with that/those fields' spans, in
+/// declaration order. A parameter used in no field (or only behind a concrete
+/// container such as `list[int64]`) is omitted; a parameter mentioned by several
+/// fields collects every such field's span. `@skip` does not exist yet, so every
+/// field counts.
+fn inferred_bound_params(s: &StructDef) -> Vec<InferredBound> {
+    let param_names: Vec<&str> = s.generics.iter().map(|g| g.name.as_str()).collect();
+    s.generics
+        .iter()
+        .filter_map(|g| {
+            let field_spans: Vec<Span> = s
+                .fields
+                .iter()
+                .filter(|f| type_mentions_param(&f.ty, &g.name, &param_names))
+                .map(|f| f.span)
+                .collect();
+            (!field_spans.is_empty()).then(|| InferredBound {
+                param: g.name.clone(),
+                field_spans,
+            })
+        })
+        .collect()
+}
+
+/// Whether `ty` mentions the type parameter `param`. A `Named` whose own name is
+/// `param` counts only when it is one of the type's parameters (`param_names`),
+/// i.e. a bare `A`, not a same-named concrete type; its arguments and the members
+/// of tuple/function types are searched recursively (so `list[A]`, `dict[A, A]`,
+/// `(A, int64)`, `fn(A) -> B` are all caught).
+fn type_mentions_param(ty: &Type, param: &str, param_names: &[&str]) -> bool {
+    match ty {
+        Type::Named { name, args, .. } => {
+            (name == param && param_names.contains(&name.as_str()))
+                || args
+                    .iter()
+                    .any(|a| type_mentions_param(a, param, param_names))
+        }
+        Type::Tuple { elems, .. } => elems
+            .iter()
+            .any(|e| type_mentions_param(e, param, param_names)),
+        Type::Func { params, ret, .. } => {
+            params
+                .iter()
+                .any(|p| type_mentions_param(p, param, param_names))
+                || ret
+                    .as_deref()
+                    .is_some_and(|r| type_mentions_param(r, param, param_names))
+        }
+    }
 }
 
 /// Build the thin forwarding stub for one interface method `m`, forwarding every
 /// parameter (including `self`) positionally to `generator` specialized at
-/// `type_name` — i.e. `generator[Type](self, …)`. The type argument is explicit
-/// (I#161) rather than inferred: synthesized nodes share the enclosing type's
-/// span, so sema's span-keyed type map cannot distinguish the `self` argument's
-/// type for monomorphization to pin `T` from, and the concrete type is known
-/// here anyway.
-fn forwarding_stub(m: &MethodSig, generator: &str, type_name: &str, sp: Span) -> Function {
+/// `type_arg` — i.e. `generator[Type](self, …)`, where `type_arg` is the type as
+/// an expression (`Point`, or `Pair[A, B]` for a generic type). The type argument
+/// is explicit (I#161) rather than inferred: synthesized nodes share the
+/// enclosing type's span, so sema's span-keyed type map cannot distinguish the
+/// `self` argument's type for monomorphization to pin `T` from, and the type is
+/// known here anyway.
+fn forwarding_stub(m: &MethodSig, generator: &str, type_arg: &Expr, sp: Span) -> Function {
     let args: Vec<Arg> = m
         .params
         .iter()
@@ -140,11 +280,11 @@ fn forwarding_stub(m: &MethodSig, generator: &str, type_name: &str, sp: Span) ->
             span: sp,
         })
         .collect();
-    // `generator[type_name]` — an explicit type-argument subscript on the callee
+    // `generator[type_arg]` — an explicit type-argument subscript on the callee
     // (mono's `f[args](...)` form, read back through `expr_to_type`).
     let callee = Expr::Index {
         base: Box::new(Expr::Name(generator.to_string(), sp)),
-        index: Box::new(Expr::Name(type_name.to_string(), sp)),
+        index: Box::new(type_arg.clone()),
         span: sp,
     };
     let call = Expr::Call {
@@ -259,7 +399,7 @@ interface Dump:
         let mut m = module(&format!(
             "{LIB}@derive(Dump)\nstruct Point:\n    int64 x\n    int64 y\n"
         ));
-        let diags = expand_library_derives(&mut m);
+        let (diags, _bounds) = expand_library_derives(&mut m);
         assert!(diags.is_empty(), "no diagnostics: {diags:?}");
 
         let point = get_struct(&m, "Point");
@@ -305,7 +445,7 @@ interface Dump:
         let mut m = module(&format!(
             "{LIB}@derive(Dump)\nstruct Point:\n    int64 x\n    int64 y\ndef main():\n    auto p = Point(1, 2)\n    p.dump()\n"
         ));
-        let diags = expand_library_derives(&mut m);
+        let (diags, _bounds) = expand_library_derives(&mut m);
         assert!(diags.is_empty(), "synth diagnostics: {diags:?}");
         // The synthesized stub, its generic forwarding target and the `p.dump()`
         // call site all type-check like hand-written code.
@@ -324,7 +464,7 @@ interface Dump:
         let mut m = module(&format!(
             "{LIB}@derive(Dump)\nstruct Point:\n    int64 x\n    def dump(self):\n        print(\"custom\")\n"
         ));
-        let diags = expand_library_derives(&mut m);
+        let (diags, _bounds) = expand_library_derives(&mut m);
         assert!(diags.is_empty(), "no diagnostics: {diags:?}");
 
         let point = get_struct(&m, "Point");
@@ -344,7 +484,7 @@ interface Dump:
         let mut m = module(
             "@derivable(Dump)\ndef _derive_dump[T](T self):\n    pass\n@derive(Dump)\nstruct Point:\n    int64 x\n",
         );
-        let diags = expand_library_derives(&mut m);
+        let (diags, _bounds) = expand_library_derives(&mut m);
         assert_eq!(diags.len(), 1, "one diagnostic");
         assert_eq!(diags[0].code, ErrorCode::ZAP5035);
         assert!(
@@ -361,7 +501,7 @@ interface Dump:
         let mut m = module(&format!(
             "{LIB}@derive(Dump, Eq)\nstruct Point:\n    int64 x\n"
         ));
-        let diags = expand_library_derives(&mut m);
+        let (diags, _bounds) = expand_library_derives(&mut m);
         assert!(diags.is_empty(), "no diagnostics: {diags:?}");
 
         let point = get_struct(&m, "Point");
@@ -370,25 +510,188 @@ interface Dump:
         assert_eq!(derive_args(point), vec!["Eq".to_string()]);
     }
 
+    // --- E3c (#1292): generic types derive, with inferred structural bounds ---
+
     #[test]
-    fn a_generic_struct_is_deferred_not_synthesized() {
-        // Bound propagation for a generic struct is E3c (#1292): leave the derive
-        // in place so the lowering backstop reports it, and synthesize nothing.
+    fn a_generic_struct_is_synthesized_with_a_self_applied_type_arg() {
+        // A generic type derives: the stub forwards to `_derive_dump[Pair[A, B]]`
+        // (the type applied to its own parameters), and the trait is stripped.
+        let mut m = module(&format!(
+            "{LIB}@derive(Dump)\nstruct Pair[A, B]:\n    A first\n    B second\n"
+        ));
+        let (diags, _bounds) = expand_library_derives(&mut m);
+        assert!(diags.is_empty(), "no diagnostics: {diags:?}");
+
+        let pair = get_struct(&m, "Pair");
+        let dump = method(pair, "dump").expect("stub synthesized on a generic struct");
+        let Stmt::Expr(Expr::Call { callee, .. }) = &dump.body.stmts[0] else {
+            panic!("expected a forwarding call, got {:?}", dump.body.stmts[0]);
+        };
+        // callee is `_derive_dump[Pair[A, B]]` — the type arg is `Pair` indexed by
+        // the two parameters (a tuple).
+        let Expr::Index { base, index, .. } = &**callee else {
+            panic!("expected `gen[Type]`, got {callee:?}");
+        };
+        assert!(matches!(&**base, Expr::Name(n, _) if n == "_derive_dump"));
+        let Expr::Index {
+            base: ta_base,
+            index: ta_index,
+            ..
+        } = &**index
+        else {
+            panic!("expected `Pair[...]` type arg, got {index:?}");
+        };
+        assert!(matches!(&**ta_base, Expr::Name(n, _) if n == "Pair"));
+        let Expr::Tuple(elems, _) = &**ta_index else {
+            panic!("expected a tuple of params, got {ta_index:?}");
+        };
+        assert!(matches!(&elems[0], Expr::Name(n, _) if n == "A"));
+        assert!(matches!(&elems[1], Expr::Name(n, _) if n == "B"));
+        assert!(derive_args(pair).is_empty(), "trait stripped");
+    }
+
+    #[test]
+    fn a_single_param_generic_uses_a_bare_subscript_type_arg() {
+        // One parameter → `Node[T]` (bare subscript, not a one-tuple).
         let mut m = module(&format!(
             "{LIB}@derive(Dump)\nstruct Box[T]:\n    T value\n"
         ));
-        let diags = expand_library_derives(&mut m);
+        let (diags, _bounds) = expand_library_derives(&mut m);
         assert!(diags.is_empty(), "no diagnostics: {diags:?}");
-
-        let boxed = get_struct(&m, "Box");
+        let dump = method(get_struct(&m, "Box"), "dump").expect("stub on generic struct");
+        let Stmt::Expr(Expr::Call { callee, .. }) = &dump.body.stmts[0] else {
+            panic!("expected a call");
+        };
+        let Expr::Index { index, .. } = &**callee else {
+            panic!("expected gen[Type]");
+        };
+        let Expr::Index {
+            index: ta_index, ..
+        } = &**index
+        else {
+            panic!("expected Box[...]");
+        };
         assert!(
-            method(boxed, "dump").is_none(),
-            "no stub on a generic struct"
+            matches!(&**ta_index, Expr::Name(n, _) if n == "T"),
+            "single param is a bare subscript, not a tuple: {ta_index:?}"
         );
+    }
+
+    #[test]
+    fn inferred_bounds_cover_exactly_the_params_used_in_fields() {
+        // `Pair[A, B]` — both params appear in a field → both bounded, in order.
+        let mut m = module(&format!(
+            "{LIB}@derive(Dump)\nstruct Pair[A, B]:\n    A first\n    B second\n"
+        ));
+        let (_diags, bounds) = expand_library_derives(&mut m);
+        assert_eq!(bounds.len(), 1);
+        assert_eq!(bounds[0].struct_name, "Pair");
+        assert_eq!(bounds[0].trait_name, "Dump");
+        let params: Vec<&str> = bounds[0].params.iter().map(|b| b.param.as_str()).collect();
+        assert_eq!(params, vec!["A", "B"]);
+        assert!(
+            bounds[0].params.iter().all(|b| b.field_spans.len() == 1),
+            "each param used by exactly one field here"
+        );
+    }
+
+    #[test]
+    fn a_param_used_in_no_field_contributes_no_bound() {
+        // `B` appears in no field → absent from the inferred bounds (only `A`).
+        let mut m = module(&format!(
+            "{LIB}@derive(Dump)\nstruct Phantom[A, B]:\n    A used\n    int64 tag\n"
+        ));
+        let (_diags, bounds) = expand_library_derives(&mut m);
+        let params: Vec<&str> = bounds[0].params.iter().map(|b| b.param.as_str()).collect();
         assert_eq!(
-            derive_args(boxed),
-            vec!["Dump".to_string()],
-            "derive left for backstop"
+            params,
+            vec!["A"],
+            "only the param used in a field is bounded"
+        );
+    }
+
+    #[test]
+    fn a_param_mentioned_twice_in_one_field_yields_one_bound() {
+        // `dict[A, A]` mentions `A` twice but yields a single `A` bound with that
+        // field's span once.
+        let mut m = module(&format!(
+            "{LIB}@derive(Dump)\nstruct Keyed[A]:\n    dict[A, A] m\n"
+        ));
+        let (_diags, bounds) = expand_library_derives(&mut m);
+        assert_eq!(bounds[0].params.len(), 1);
+        assert_eq!(bounds[0].params[0].param, "A");
+        assert_eq!(
+            bounds[0].params[0].field_spans.len(),
+            1,
+            "one field → one span, not one per mention"
+        );
+    }
+
+    #[test]
+    fn a_param_only_behind_a_concrete_container_contributes_no_bound() {
+        // `list[int64]` mentions no parameter → no spurious bound; the struct has
+        // a generic param `T` used nowhere, so the inferred set is empty and no
+        // record is emitted.
+        let mut m = module(&format!(
+            "{LIB}@derive(Dump)\nstruct Concrete[T]:\n    list[int64] xs\n"
+        ));
+        let (_diags, bounds) = expand_library_derives(&mut m);
+        assert!(
+            bounds.is_empty(),
+            "no param appears in a field → no bounds record: {bounds:?}"
+        );
+    }
+
+    #[test]
+    fn a_param_used_by_several_fields_collects_each_span() {
+        let mut m = module(&format!(
+            "{LIB}@derive(Dump)\nstruct TwoA[A]:\n    A first\n    A second\n"
+        ));
+        let (_diags, bounds) = expand_library_derives(&mut m);
+        assert_eq!(bounds[0].params.len(), 1);
+        assert_eq!(
+            bounds[0].params[0].field_spans.len(),
+            2,
+            "both fields mention A"
+        );
+    }
+
+    #[test]
+    fn a_recursive_generic_type_is_synthesized_and_its_param_is_bounded() {
+        // `Node[T]` with a `T val` and a self-referential `Optional[Node[T]] next`:
+        // the stub forwards to `_derive_dump[Node[T]]`, and `T` is inferred (it is
+        // mentioned by `val` directly and by `next` nested inside
+        // `Optional[Node[T]]`). Termination of a *recursing* generator is mono's
+        // SpecializationCache job (and needs the kind-switch #1253); this covers
+        // the synthesis + field-scan shape.
+        let mut m = module(&format!(
+            "{LIB}@derive(Dump)\nstruct Node[T]:\n    T val\n    Optional[Node[T]] next\n"
+        ));
+        let (diags, bounds) = expand_library_derives(&mut m);
+        assert!(diags.is_empty(), "no diagnostics: {diags:?}");
+        assert!(
+            method(get_struct(&m, "Node"), "dump").is_some(),
+            "stub on a recursive generic struct"
+        );
+        assert_eq!(bounds[0].params.len(), 1);
+        assert_eq!(bounds[0].params[0].param, "T");
+        assert_eq!(
+            bounds[0].params[0].field_spans.len(),
+            2,
+            "T is mentioned by `val` and (nested) by `next`"
+        );
+    }
+
+    #[test]
+    fn a_nongeneric_derive_produces_no_bounds_record() {
+        let mut m = module(&format!(
+            "{LIB}@derive(Dump)\nstruct Point:\n    int64 x\n    int64 y\n"
+        ));
+        let (diags, bounds) = expand_library_derives(&mut m);
+        assert!(diags.is_empty());
+        assert!(
+            bounds.is_empty(),
+            "non-generic derive has no inferred bounds"
         );
     }
 
@@ -405,7 +708,7 @@ interface Show:
     def show(self, int64 width) -> str
 ";
         let mut m = module(&format!("{lib}@derive(Show)\nstruct Point:\n    int64 x\n"));
-        let diags = expand_library_derives(&mut m);
+        let (diags, _bounds) = expand_library_derives(&mut m);
         assert!(diags.is_empty(), "no diagnostics: {diags:?}");
 
         let show = method(get_struct(&m, "Point"), "show").expect("show stub");
@@ -429,7 +732,7 @@ interface Show:
     fn a_program_with_no_library_derivable_is_unchanged() {
         let mut m = module("struct Point:\n    int64 x\ndef main():\n    auto p = Point(1)\n");
         let before = m.items.len();
-        let diags = expand_library_derives(&mut m);
+        let (diags, _bounds) = expand_library_derives(&mut m);
         assert!(diags.is_empty());
         assert_eq!(m.items.len(), before, "no items added or removed");
         assert!(get_struct(&m, "Point").methods.is_empty());
