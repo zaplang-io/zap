@@ -14449,6 +14449,504 @@ impl<'a> FnLower<'a> {
         Ok((eq, Ty::I1))
     }
 
+    /// Structural dict equality (#1328): `a == b` / `a != b` on two dicts is an
+    /// **order-independent** comparison by entries — Python's value semantics for
+    /// mappings — not a pointer-identity test (`is` / `is not` keep identity).
+    /// Without this the operands fall through to the generic numeric/reference
+    /// path, which `ptrtoint`-compares the two dict headers and so reports two
+    /// separately allocated but equal dicts (e.g. the same keys inserted in a
+    /// different order) as unequal.
+    ///
+    /// Equal lengths are checked first; if they differ the dicts are unequal and
+    /// no entries are read. Otherwise the left dict's keys are materialized
+    /// (`zap_dict_keys_*`) and each is probed in the right dict
+    /// (`zap_dict_contains_*`): a missing key is a mismatch, and a present key's
+    /// two values are compared through `binop(Eq, ..)`, so values reuse the exact
+    /// same equality as a scalar `==` — numeric joins, `str`/`bytes` by contents,
+    /// a struct value's `__eq__`, and a nested `list`/`dict`/... value recurses
+    /// (its full ZIR type recovered via [`FnLower::elem_ty`], #625). Equal length
+    /// plus "every left key maps to an equal right value" is sufficient for
+    /// equality (pigeonhole). Lowered entirely in-IR as a short-circuiting loop —
+    /// no runtime entry point and no new ZIR `Inst` variant. `!=` negates.
+    ///
+    /// The key kinds must match (the hashing/identity of a key is per key kind);
+    /// the two value kinds may differ in representation (e.g. `int64` vs
+    /// `float64`), since `binop(Eq, ..)` applies the numeric join, matching
+    /// Python's `{"x": 1} == {"x": 1.0}`.
+    #[allow(clippy::too_many_arguments)]
+    fn dict_cmp(
+        &mut self,
+        op: AstBin,
+        l: Value,
+        lkk: Elem,
+        lvk: Elem,
+        r: Value,
+        rt: Ty,
+    ) -> Result<(Value, Ty), LowerError> {
+        let Ty::Dict(rkk, rvk) = rt else {
+            return Err(err("a dict compares for equality only with another dict"));
+        };
+        if lkk != rkk {
+            return Err(err(
+                "cannot compare dicts with different key types for equality",
+            ));
+        }
+        let result = self.alloca(Ty::I1);
+        let idx = self.alloca(Ty::I64);
+        let llen = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(llen),
+            func: "zap_dict_len".to_string(),
+            args: vec![l],
+        });
+        let rlen = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(rlen),
+            func: "zap_dict_len".to_string(),
+            args: vec![r],
+        });
+        let len_eq = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: len_eq,
+            pred: CmpPred::Eq,
+            lhs: llen,
+            rhs: rlen,
+        });
+        self.store(result, len_eq);
+
+        let loop_bb = self.new_block();
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let cmp_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let neq_bb = self.new_block();
+        let end_bb = self.new_block();
+
+        self.set_term(Term::BrIf {
+            cond: len_eq,
+            then_bb: loop_bb,
+            else_bb: end_bb,
+        });
+
+        // Materialize the left dict's keys as a `list[K]` once, then walk it. The
+        // keys list has exactly `llen` entries, so that length also bounds the loop.
+        self.position(loop_bb);
+        let keys = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(keys),
+            func: format!("zap_dict_keys_{}", lkk.val_suffix()),
+            args: vec![l],
+        });
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        self.set_term(Term::Br(cond_bb));
+
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let in_range = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: in_range,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: llen,
+        });
+        self.set_term(Term::BrIf {
+            cond: in_range,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let kty = self.elem_ty(lkk);
+        let key = self.new_value(kty);
+        self.emit(Inst::Call {
+            dest: Some(key),
+            func: format!("zap_list_get_{}", lkk.val_suffix()),
+            args: vec![keys, i],
+        });
+        // Probe the right dict for this key. A struct key carries its
+        // `__hash__`/`__eq__` function pointers (`key_fn_args`); scalar/string keys
+        // pass none. The key comes from an existing dict, so a float key is never
+        // NaN — `key_rt_call` keeps the (here-inert) NaN guard for uniformity.
+        let kfns = self.key_fn_args(lkk)?;
+        let present_word = self.new_value(Ty::I64);
+        let mut cargs = vec![r, key];
+        cargs.extend_from_slice(&kfns);
+        self.key_rt_call(
+            Some(present_word),
+            format!("zap_dict_contains_{}", lkk.key_suffix()),
+            cargs,
+            lkk,
+        );
+        let present = self.new_value(Ty::I1);
+        let zc = self.iconst(Ty::I64, 0);
+        self.emit(Inst::ICmp {
+            dest: present,
+            pred: CmpPred::Ne,
+            lhs: present_word,
+            rhs: zc,
+        });
+        self.set_term(Term::BrIf {
+            cond: present,
+            then_bb: cmp_bb,
+            else_bb: neq_bb,
+        });
+
+        // Key present on both sides: compare the two values through `binop(Eq, ..)`
+        // so a nested/struct value reuses scalar equality (and recurses).
+        self.position(cmp_bb);
+        let lvty = self.elem_ty(lvk);
+        let lval = self.new_value(lvty);
+        let mut lget = vec![l, key];
+        lget.extend_from_slice(&kfns);
+        self.emit(Inst::Call {
+            dest: Some(lval),
+            func: format!("zap_dict_get_{}_{}", lkk.key_suffix(), lvk.val_suffix()),
+            args: lget,
+        });
+        let rvty = self.elem_ty(rvk);
+        let rval = self.new_value(rvty);
+        let mut rget = vec![r, key];
+        rget.extend_from_slice(&kfns);
+        self.emit(Inst::Call {
+            dest: Some(rval),
+            func: format!("zap_dict_get_{}_{}", rkk.key_suffix(), rvk.val_suffix()),
+            args: rget,
+        });
+        let (veq, _) = self.binop(AstBin::Eq, lval, lvty, rval, rvty)?;
+        self.set_term(Term::BrIf {
+            cond: veq,
+            then_bb: incr_bb,
+            else_bb: neq_bb,
+        });
+
+        self.position(neq_bb);
+        let f = self.new_value(Ty::I1);
+        self.emit(Inst::BConst {
+            dest: f,
+            val: false,
+        });
+        self.store(result, f);
+        self.set_term(Term::Br(end_bb));
+
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+
+        self.position(end_bb);
+        let eq = self.load(result, Ty::I1);
+        if matches!(op, AstBin::Ne) {
+            let d = self.new_value(Ty::I1);
+            self.emit(Inst::Un {
+                dest: d,
+                op: UnOp::Not,
+                val: eq,
+            });
+            return Ok((d, Ty::I1));
+        }
+        Ok((eq, Ty::I1))
+    }
+
+    /// Structural set equality (#1328): `a == b` / `a != b` on two sets is a
+    /// **membership-based, order-independent** comparison — Python's set value
+    /// semantics — not a pointer-identity test. Equal lengths plus "every member
+    /// of the left set is a member of the right set" is sufficient for equality
+    /// (pigeonhole). The left set's members are materialized (`zap_set_items`) and
+    /// each is probed in the right set (`zap_set_contains_*`); a missing member is
+    /// a mismatch. A struct member carries its `__hash__`/`__eq__` pointers.
+    /// Lowered in-IR as a short-circuiting loop; `!=` negates.
+    fn set_cmp(
+        &mut self,
+        op: AstBin,
+        l: Value,
+        lelem: Elem,
+        r: Value,
+        rt: Ty,
+    ) -> Result<(Value, Ty), LowerError> {
+        let Ty::Set(relem) = rt else {
+            return Err(err("a set compares for equality only with another set"));
+        };
+        if lelem != relem {
+            return Err(err(
+                "cannot compare sets with different element types for equality",
+            ));
+        }
+        let result = self.alloca(Ty::I1);
+        let idx = self.alloca(Ty::I64);
+        let llen = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(llen),
+            func: "zap_set_len".to_string(),
+            args: vec![l],
+        });
+        let rlen = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(rlen),
+            func: "zap_set_len".to_string(),
+            args: vec![r],
+        });
+        let len_eq = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: len_eq,
+            pred: CmpPred::Eq,
+            lhs: llen,
+            rhs: rlen,
+        });
+        self.store(result, len_eq);
+
+        let loop_bb = self.new_block();
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let neq_bb = self.new_block();
+        let end_bb = self.new_block();
+
+        self.set_term(Term::BrIf {
+            cond: len_eq,
+            then_bb: loop_bb,
+            else_bb: end_bb,
+        });
+
+        self.position(loop_bb);
+        let items = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(items),
+            func: "zap_set_items".to_string(),
+            args: vec![l],
+        });
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        self.set_term(Term::Br(cond_bb));
+
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let in_range = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: in_range,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: llen,
+        });
+        self.set_term(Term::BrIf {
+            cond: in_range,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let ety = self.elem_ty(lelem);
+        let e = self.new_value(ety);
+        self.emit(Inst::Call {
+            dest: Some(e),
+            func: format!("zap_list_get_{}", lelem.val_suffix()),
+            args: vec![items, i],
+        });
+        let kfns = self.key_fn_args(lelem)?;
+        let present_word = self.new_value(Ty::I64);
+        let mut cargs = vec![r, e];
+        cargs.extend_from_slice(&kfns);
+        self.key_rt_call(
+            Some(present_word),
+            format!("zap_set_contains_{}", lelem.key_suffix()),
+            cargs,
+            lelem,
+        );
+        let present = self.new_value(Ty::I1);
+        let zc = self.iconst(Ty::I64, 0);
+        self.emit(Inst::ICmp {
+            dest: present,
+            pred: CmpPred::Ne,
+            lhs: present_word,
+            rhs: zc,
+        });
+        self.set_term(Term::BrIf {
+            cond: present,
+            then_bb: incr_bb,
+            else_bb: neq_bb,
+        });
+
+        self.position(neq_bb);
+        let f = self.new_value(Ty::I1);
+        self.emit(Inst::BConst {
+            dest: f,
+            val: false,
+        });
+        self.store(result, f);
+        self.set_term(Term::Br(end_bb));
+
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+
+        self.position(end_bb);
+        let eq = self.load(result, Ty::I1);
+        if matches!(op, AstBin::Ne) {
+            let d = self.new_value(Ty::I1);
+            self.emit(Inst::Un {
+                dest: d,
+                op: UnOp::Not,
+                val: eq,
+            });
+            return Ok((d, Ty::I1));
+        }
+        Ok((eq, Ty::I1))
+    }
+
+    /// Structural `oset` / `deque` equality (#1328): both are **ordered**
+    /// sequences, so `==` / `!=` is an order-sensitive, length-sensitive,
+    /// element-wise comparison — the same shape as structural list equality
+    /// (#1239) — not a pointer-identity test. `oset` is order-sensitive by
+    /// decision (its insertion order is observable and is the reason it exists,
+    /// distinct from `set`); `deque` mirrors Python's `collections.deque`, whose
+    /// `==` is order-sensitive. Each pair of elements is compared through
+    /// `binop(Eq, ..)` (so nested/struct elements recurse). `len`/`get` are the
+    /// per-container typed entry points named by `len_fn`/`get_fn`. `!=` negates.
+    #[allow(clippy::too_many_arguments)]
+    fn ordered_seq_cmp(
+        &mut self,
+        op: AstBin,
+        l: Value,
+        lelem: Elem,
+        r: Value,
+        relem: Elem,
+        len_fn: &str,
+        get_fn: &str,
+    ) -> Result<(Value, Ty), LowerError> {
+        let result = self.alloca(Ty::I1);
+        let idx = self.alloca(Ty::I64);
+        let llen = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(llen),
+            func: len_fn.to_string(),
+            args: vec![l],
+        });
+        let rlen = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(rlen),
+            func: len_fn.to_string(),
+            args: vec![r],
+        });
+        let len_eq = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: len_eq,
+            pred: CmpPred::Eq,
+            lhs: llen,
+            rhs: rlen,
+        });
+        self.store(result, len_eq);
+
+        let loop_bb = self.new_block();
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let neq_bb = self.new_block();
+        let end_bb = self.new_block();
+
+        self.set_term(Term::BrIf {
+            cond: len_eq,
+            then_bb: loop_bb,
+            else_bb: end_bb,
+        });
+
+        self.position(loop_bb);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        self.set_term(Term::Br(cond_bb));
+
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let in_range = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: in_range,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: llen,
+        });
+        self.set_term(Term::BrIf {
+            cond: in_range,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let lety = self.elem_ty(lelem);
+        let le = self.new_value(lety);
+        self.emit(Inst::Call {
+            dest: Some(le),
+            func: format!("{get_fn}_{}", lelem.val_suffix()),
+            args: vec![l, i],
+        });
+        let rety = self.elem_ty(relem);
+        let re = self.new_value(rety);
+        self.emit(Inst::Call {
+            dest: Some(re),
+            func: format!("{get_fn}_{}", relem.val_suffix()),
+            args: vec![r, i],
+        });
+        let (elem_eq, _) = self.binop(AstBin::Eq, le, lety, re, rety)?;
+        self.set_term(Term::BrIf {
+            cond: elem_eq,
+            then_bb: incr_bb,
+            else_bb: neq_bb,
+        });
+
+        self.position(neq_bb);
+        let f = self.new_value(Ty::I1);
+        self.emit(Inst::BConst {
+            dest: f,
+            val: false,
+        });
+        self.store(result, f);
+        self.set_term(Term::Br(end_bb));
+
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+
+        self.position(end_bb);
+        let eq = self.load(result, Ty::I1);
+        if matches!(op, AstBin::Ne) {
+            let d = self.new_value(Ty::I1);
+            self.emit(Inst::Un {
+                dest: d,
+                op: UnOp::Not,
+                val: eq,
+            });
+            return Ok((d, Ty::I1));
+        }
+        Ok((eq, Ty::I1))
+    }
+
     /// The full ZIR type a collection element of kind `e` flows as. Identical to
     /// [`Elem::ty`] except for [`Elem::Nested`] (#625), whose precise
     /// `list`/`dict`/`set`/... type is recovered from the lowering interner so a

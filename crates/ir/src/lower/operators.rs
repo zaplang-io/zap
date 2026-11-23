@@ -539,6 +539,89 @@ impl<'a> FnLower<'a> {
             return self.list_cmp(op, r, relem, l, lt);
         }
 
+        // Structural dict equality (#1328): `==` / `!=` on two dicts compares
+        // entries, order-independent (Python mapping semantics), rather than by
+        // pointer identity (which the generic fall-through would do). Equality is
+        // symmetric, so a dict on either side routes with the dict on the left;
+        // `dict_cmp` raises a clear error if the other operand is not a dict.
+        if matches!(op, Eq | Ne) && (matches!(lt, Ty::Dict(..)) || matches!(rt, Ty::Dict(..))) {
+            if let Ty::Dict(lkk, lvk) = lt {
+                return self.dict_cmp(op, l, lkk, lvk, r, rt);
+            }
+            let Ty::Dict(rkk, rvk) = rt else {
+                unreachable!()
+            };
+            return self.dict_cmp(op, r, rkk, rvk, l, lt);
+        }
+
+        // Structural set equality (#1328): membership-based, order-independent
+        // (Python set semantics), rather than pointer identity.
+        if matches!(op, Eq | Ne) && (matches!(lt, Ty::Set(_)) || matches!(rt, Ty::Set(_))) {
+            if let Ty::Set(lelem) = lt {
+                return self.set_cmp(op, l, lelem, r, rt);
+            }
+            let Ty::Set(relem) = rt else { unreachable!() };
+            return self.set_cmp(op, r, relem, l, lt);
+        }
+
+        // Structural `oset` equality (#1328): order-SENSITIVE sequence equality
+        // (its insertion order is observable and is why `oset` is distinct from
+        // `set`), rather than pointer identity.
+        if matches!(op, Eq | Ne) && (matches!(lt, Ty::OSet(_)) || matches!(rt, Ty::OSet(_))) {
+            let (dl, le, dr, re) = if let Ty::OSet(le) = lt {
+                let Ty::OSet(re) = rt else {
+                    return Err(err("an oset compares for equality only with another oset"));
+                };
+                (l, le, r, re)
+            } else {
+                let Ty::OSet(re) = rt else { unreachable!() };
+                let Ty::OSet(le) = lt else {
+                    return Err(err("an oset compares for equality only with another oset"));
+                };
+                (r, re, l, le)
+            };
+            if le != re {
+                return Err(err(
+                    "cannot compare osets with different element types for equality",
+                ));
+            }
+            return self.ordered_seq_cmp(op, dl, le, dr, re, "zap_oset_len", "zap_oset_get");
+        }
+
+        // Structural `deque` equality (#1328): order-sensitive, length-sensitive,
+        // element-wise (Python `collections.deque` semantics), rather than pointer
+        // identity.
+        if matches!(op, Eq | Ne) && (matches!(lt, Ty::Deque(_)) || matches!(rt, Ty::Deque(_))) {
+            let (dl, le, dr, re) = if let Ty::Deque(le) = lt {
+                let Ty::Deque(re) = rt else {
+                    return Err(err("a deque compares for equality only with another deque"));
+                };
+                (l, le, r, re)
+            } else {
+                let Ty::Deque(re) = rt else { unreachable!() };
+                let Ty::Deque(le) = lt else {
+                    return Err(err("a deque compares for equality only with another deque"));
+                };
+                (r, re, l, le)
+            };
+            return self.ordered_seq_cmp(op, dl, le, dr, re, "zap_deque_len", "zap_deque_get");
+        }
+
+        // `heap` has no value equality (#1328): a heap's internal array order is
+        // implementation-defined (push order changes the layout), so neither a
+        // pointer-identity test (the old behaviour) nor an element-wise array
+        // compare is meaningful. Reject `==` / `!=` with a clear message; sema
+        // (`arith_result`) reports the same in the normal pipeline, but the ir
+        // crate is also exercised without sema, so guard here too. `is` / `is not`
+        // (identity) remain available and are handled at the top of `binop`.
+        if matches!(op, Eq | Ne) && (matches!(lt, Ty::Heap(_)) || matches!(rt, Ty::Heap(_))) {
+            return Err(err(
+                "a heap has no value equality: its internal order is implementation-defined, \
+                 so `==` / `!=` is undefined; compare a snapshot (e.g. `sorted(h.items())`) \
+                 or use `is` / `is not` for identity",
+            ));
+        }
+
         // Operator overloading on user structs (D-0047): `a op b` desugars to the
         // matching dunder method, resolved like any struct method call. `in`
         // dispatches on the right operand (`x in a` -> `a.__contains__(x)`); every
