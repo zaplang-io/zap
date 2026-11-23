@@ -2542,6 +2542,12 @@ impl<'a> FnLower<'a> {
             // `char`s (D-0025), walking the UTF-8 buffer once — so comprehensions
             // and `set(...)`/`set[T](...)` accept a string operand.
             Ty::Ptr => self.iterate_str(val, body),
+            // `bytes` iterates its raw bytes as unsigned `int64`s in 0..=255
+            // (#1349), byte-wise — so comprehensions, `sum(...)`, the
+            // `set(...)`/`list(...)` constructors, and `*bytes` splats accept a
+            // `bytes` operand, matching the statement-`for` path
+            // (`lower_for_bytes`). Distinct from `str`'s codepoint iteration.
+            Ty::Bytes => self.iterate_bytes(val, body),
             Ty::Struct(sid) => self.drive_iteration(val, sid, body),
             other => Err(err(format!(
                 "value of type {other:?} is not iterable (D-0048)"
@@ -2610,6 +2616,77 @@ impl<'a> FnLower<'a> {
             args: vec![s, cur2],
         });
         self.store(off, next);
+        self.set_term(Term::Br(cond_bb));
+        self.position(end_bb);
+        self.pop_scope();
+        Ok(())
+    }
+
+    /// Iterate a `bytes` value by byte index, invoking `body` with each byte as
+    /// an unsigned `int64` in 0..=255 (#1349). The closure form of
+    /// [`Self::lower_for_bytes`]: length via `zap_str_len` (the byte count),
+    /// element via `zap_bytes_index` (unsigned, so `0x00`/`0xFF` read back as
+    /// `0`/`255`). Used by the general iteration protocol ([`Self::iterate`])
+    /// for comprehensions, `sum(...)`, and the `set`/`list` constructors over a
+    /// `bytes` operand. Byte-wise, not UTF-8-decoded — distinct from
+    /// [`Self::iterate_str`].
+    fn iterate_bytes(
+        &mut self,
+        data: Value,
+        mut body: impl FnMut(&mut FnLower<'a>, Value, Ty) -> Result<(), LowerError>,
+    ) -> Result<(), LowerError> {
+        self.push_scope();
+        let idx = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let end_bb = self.new_block();
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let nbytes = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(nbytes),
+            func: "zap_str_len".to_string(),
+            args: vec![data],
+        });
+        let c = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: c,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: nbytes,
+        });
+        self.set_term(Term::BrIf {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let byte = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(byte),
+            func: "zap_bytes_index".to_string(),
+            args: vec![data, i],
+        });
+        self.push_loop(incr_bb, end_bb);
+        body(self, byte, Ty::I64)?;
+        self.loops.pop();
+        self.ensure_br(incr_bb);
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
         self.set_term(Term::Br(cond_bb));
         self.position(end_bb);
         self.pop_scope();
@@ -3144,6 +3221,13 @@ impl<'a> FnLower<'a> {
                 // walking the UTF-8 buffer once (D-0025).
                 if lty == Ty::Ptr {
                     return self.lower_for_str(target, lst, body);
+                }
+                // `for b in data` where `data : bytes` — iterate the raw bytes by
+                // index, binding each as an unsigned `int64` in 0..=255 (#1349).
+                // Distinct from `str`'s codepoint iteration: byte-wise, not
+                // UTF-8-decoded, and the loop variable is an integer, not a char.
+                if lty == Ty::Bytes {
+                    return self.lower_for_bytes(target, lst, body);
                 }
                 // `for x in <user iterable>` — the general D-0048 protocol.
                 if let Ty::Struct(sid) = lty {
@@ -4025,6 +4109,107 @@ impl<'a> FnLower<'a> {
             args: vec![s_i, cur2],
         });
         self.store(off, next);
+        self.set_term(Term::Br(cond_bb));
+
+        self.position(end_bb);
+        self.pop_scope();
+        Ok(())
+    }
+
+    /// `for b in data` where `data : bytes` — iterate the raw bytes by index,
+    /// binding each byte as an unsigned `int64` in 0..=255 (#1349). Mirrors
+    /// [`Self::lower_for_list`]'s indexed walk (length via `zap_str_len`, the
+    /// byte count; element via `zap_bytes_index`, which returns the unsigned
+    /// byte so `0x00`/`0xFF` read back as `0`/`255`, never sign-extended),
+    /// except the element type is a fixed `int64` rather than a collection
+    /// element kind. Empty `bytes` takes zero iterations; order is preserved.
+    /// Byte-wise, not UTF-8-decoded — distinct from [`Self::lower_for_str`],
+    /// whose loop variable is a codepoint `char`.
+    fn lower_for_bytes(
+        &mut self,
+        target: &Expr,
+        data: Value,
+        body: &ast::Block,
+    ) -> Result<(), LowerError> {
+        let name = match target {
+            Expr::Name(n, _) => n.clone(),
+            _ => {
+                return Err(err(
+                    "only a simple loop variable is supported by codegen yet",
+                ))
+            }
+        };
+
+        self.push_scope();
+        // Byte index into the buffer, and the total byte length. Inside a
+        // generator the index, the bytes handle, and the length must survive a
+        // `yield` in the body, so the index is a hoisted slot and the handle /
+        // length are spilled and reloaded (I#453); outside a generator the
+        // index is a plain alloca and both stay SSA. (Mirrors `lower_for_str`.)
+        let idx = self.for_control_slot(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        let nbytes = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(nbytes),
+            func: "zap_str_len".to_string(),
+            args: vec![data],
+        });
+        let nbytes_slot = self.spill_invariant(nbytes, Ty::I64);
+        let data_slot = self.spill_invariant(data, Ty::Bytes);
+        // Each byte binds as an unsigned `int64` in 0..=255 (#1349).
+        let var = self.decl_slot(&name, Ty::I64);
+
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let end_bb = self.new_block();
+
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let nbytes_c = self.reload_invariant(nbytes_slot, nbytes, Ty::I64);
+        let c = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: c,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: nbytes_c,
+        });
+        self.set_term(Term::BrIf {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let data_b = self.reload_invariant(data_slot, data, Ty::Bytes);
+        let byte = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(byte),
+            func: "zap_bytes_index".to_string(),
+            args: vec![data_b, i],
+        });
+        self.store(var, byte);
+        self.push_loop(incr_bb, end_bb);
+        for st in &body.stmts {
+            self.stmt(st)?;
+        }
+        self.loops.pop();
+        self.ensure_br(incr_bb);
+
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
         self.set_term(Term::Br(cond_bb));
 
         self.position(end_bb);

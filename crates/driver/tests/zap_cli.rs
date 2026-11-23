@@ -624,6 +624,67 @@ fn test_reflected_operator_sema_inference_1310() {
     assert!(stdout.contains("0 failed"), "stdout:\n{stdout}");
 }
 
+/// Iterating a `bytes` value in a `for` loop — the #1349 reproducer — runs
+/// green under `zap test`. The issue surfaced on the native test path (the
+/// datetime-utils parser iterating a bytes token in a `@test`), where the
+/// harness lowers with an empty `TypeMap`, so the loop variable's `int64`
+/// element type must come from the monomorphizer's own inferer (cf. #1308).
+/// Covers the issue's `b"UTC"` sum, unsigned 0x00/0xFF (never sign-extended
+/// negative), empty bytes (zero iterations), and the loop variable used as an
+/// int. Complements the `tests/golden/bytes_for_loop.zap` `zap run` golden.
+#[cfg(feature = "codegen")]
+#[test]
+fn test_bytes_iteration_1349() {
+    let dir = scratch("test_bytes_iter_1349");
+    write_file(
+        &dir,
+        "tests/bytes_iter_test.zap",
+        "@test\ndef sums_utc_bytes():\n\
+         \x20   auto data = b\"UTC\"\n    int64 total = 0\n\
+         \x20   for byte in data:\n        total += byte\n\
+         \x20   assert total == 236\n\n\
+         @test\ndef high_bytes_are_unsigned():\n\
+         \x20   auto edges = bytes([0, 127, 128, 255])\n\
+         \x20   list[int64] seen = []\n\
+         \x20   for b in edges:\n        seen.append(b)\n\
+         \x20   assert seen == [0, 127, 128, 255]\n\n\
+         @test\ndef empty_bytes_zero_iterations():\n\
+         \x20   int64 n = 0\n\
+         \x20   for b in bytes():\n        n += 1\n\
+         \x20   assert n == 0\n\n\
+         @test\ndef loop_variable_is_an_int():\n\
+         \x20   int64 first = -1\n\
+         \x20   for b in b\"A\":\n        first = b + 1\n\
+         \x20   assert first == 66\n",
+    );
+
+    let out = zap().arg("test").current_dir(&dir).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "zap test should pass; exit {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        out.status.code()
+    );
+    assert!(
+        stdout.contains("[PASS] sums_utc_bytes"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[PASS] high_bytes_are_unsigned"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[PASS] empty_bytes_zero_iterations"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[PASS] loop_variable_is_an_int"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("0 failed"), "stdout:\n{stdout}");
+}
+
 // --- `zap mcp` end-to-end (issue #72, D-0055) ---------------------------------
 
 /// Drive the real `zap mcp` server over stdio: spawn it rooted at `root`, feed

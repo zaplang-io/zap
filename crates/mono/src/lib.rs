@@ -2792,6 +2792,9 @@ impl Mono<'_> {
         match name.as_str() {
             "range" => self.prim("int64"),
             "str" => self.prim("char"),
+            // Iterating `bytes` yields unsigned byte values as `int64` (#1349),
+            // consistent with `bytes` subscripting in `index_elem` below.
+            "bytes" => self.prim("int64"),
             // Iterating a dict yields its keys (`args[0]`).
             "list" | "set" | "heap" | "deque" | "oset" | "dict" => {
                 args.first().map_or(CTy::Unknown, |t| CTy::Ty(t.clone()))

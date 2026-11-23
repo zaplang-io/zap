@@ -6782,6 +6782,10 @@ impl Checker {
             // `for k, v` uses `d.items()`. Order is unspecified (hash order).
             Ty::Dict(k, _) => Some((**k).clone()),
             Ty::Str => Some(Ty::Char),
+            // Iterating `bytes` yields its raw bytes as unsigned `int64`s in
+            // 0..=255 (#1349), byte-wise (not UTF-8-decoded) — matching Python,
+            // and distinct from `str`'s codepoint (`char`) iteration.
+            Ty::Bytes => Some(Ty::Int64),
             Ty::Unknown | Ty::Py => Some(Ty::Unknown),
             Ty::Named(_) => {
                 let info = self.struct_info(it)?;
