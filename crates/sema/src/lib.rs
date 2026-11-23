@@ -8049,42 +8049,66 @@ impl Checker {
                     return Ty::Unknown;
                 }
                 "sum" => {
-                    // Reduction over an array -> scalar; typed loosely for now.
+                    // Reduction over an iterable -> scalar (#1284). The result is
+                    // the iterable's element type, so `sum(list[int64])` is an
+                    // exact `int64` (never widened to float) and binds into an
+                    // int slot. A float-element iterable sums at `float64`. An
+                    // `array[T]` (and any iterable whose element type is not a
+                    // known numeric scalar, e.g. a loosely-typed array or a
+                    // genexpr) stays loose (`Unknown`) — the lowering computes
+                    // the real scalar there.
+                    let argc = args.len();
                     for a in args {
                         self.infer(&a.value);
                     }
-                    return Ty::Unknown;
+                    if argc != 1 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!("sum() takes exactly one argument, got {argc}"),
+                            span,
+                        );
+                        return Ty::Unknown;
+                    }
+                    let t = self.infer(&args[0].value);
+                    match self.iterable_elem(&t) {
+                        Some(e) if e.is_numeric() && !matches!(e, Ty::Bigint | Ty::Complex) => {
+                            return default_type(e);
+                        }
+                        _ => return Ty::Unknown,
+                    }
                 }
-                // Exact scalar `min`/`max` (#1279): the lesser / greater of two
-                // numeric scalars, typed as the numeric join of the operand
-                // types. Integer operands are compared and returned at integer
-                // width (never routed through `f64`), so adjacent `int64` values
-                // above 2^53 stay distinct — the exactness the DNS per-attempt
-                // deadline math (zaplang-io/dns#6) needs. The variadic
-                // `min(a, b, c)`, iterable `min(xs)`, `key=`, and `default=`
-                // forms, and `str`/`bigint` support, are tracked in #1284.
+                // Exact scalar `min`/`max`: the lesser / greater of two or more
+                // numeric scalar arguments (#1279 the two-arg form; #1284 the
+                // variadic `min(a, b, c, …)` form). The result is the numeric
+                // join of all operands. Integer operands are compared and
+                // returned at integer width (never routed through `f64`), so
+                // adjacent `int64` values above 2^53 stay distinct — the
+                // exactness the DNS per-attempt deadline math (zaplang-io/dns#6)
+                // needs. The iterable `min(xs)` form, `key=`, and `default=`
+                // remain follow-ups, as does `str`/`bigint` support.
                 "min" | "max" => {
-                    // No keyword arguments in this release (key=/default= are
-                    // #1284). Reject them explicitly rather than silently drop.
+                    // key= / default= (the iterable form) are not supported yet,
+                    // so no keyword arguments; reject rather than silently drop.
                     if let Some(a) = args.iter().find(|a| a.name.is_some()) {
                         self.error(
                             ErrorCode::ZAP4023,
                             format!(
                                 "{fname}() takes no keyword arguments yet \
-                                 (key= and default= are tracked in #1284); \
-                                 unexpected '{}'",
+                                 (key= and default=, with the iterable form, are \
+                                 a follow-up); unexpected '{}'",
                                 a.name.as_deref().unwrap_or_default()
                             ),
                             span,
                         );
                     }
-                    if args.len() != 2 {
+                    // Two-or-more positional scalars. A single argument would be
+                    // the iterable form `min(xs)`, which is a follow-up.
+                    if args.len() < 2 {
                         self.error(
                             ErrorCode::ZAP4025,
                             format!(
-                                "{fname}() takes exactly two arguments in this \
-                                 release (the variadic and iterable forms are \
-                                 tracked in #1284), got {}",
+                                "{fname}() takes two or more scalar arguments, got \
+                                 {} (the iterable form {fname}(xs) is a follow-up)",
                                 args.len()
                             ),
                             span,
@@ -8094,63 +8118,63 @@ impl Checker {
                         }
                         return Ty::Unknown;
                     }
-                    let ta = self.infer(&args[0].value);
-                    let tb = self.infer(&args[1].value);
-                    // Only fixed-width numeric scalars (int / uint / float) in
-                    // this slice. `bigint` (arbitrary precision, pointer-backed),
-                    // `complex` (not ordered), and the non-numeric orderables
-                    // (`str`/`char`/`bool`) are deferred follow-ups (#1284).
+                    // Only fixed-width numeric scalars (int / uint / float).
+                    // `bigint`, `complex`, and the non-numeric orderables
+                    // (`str`/`char`/`bool`) are deferred follow-ups.
                     let numeric_scalar = |t: &Ty| {
                         matches!(t, Ty::Unknown)
                             || matches!(t, Ty::Float64 | Ty::Float32 | Ty::UntypedFloat)
                             || (t.is_int() && !matches!(t, Ty::Bigint))
                     };
-                    if !numeric_scalar(&ta) || !numeric_scalar(&tb) {
+                    let tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.value)).collect();
+                    if let Some(bad) = tys.iter().find(|t| !numeric_scalar(t)) {
                         self.error(
                             ErrorCode::ZAP4024,
                             format!(
-                                "{fname}() takes two numeric scalar arguments \
-                                 (int, uint, or float), got {} and {} \
-                                 (str/bigint and the iterable form are tracked \
-                                 in #1284)",
-                                ta.display(),
-                                tb.display()
+                                "{fname}() takes numeric scalar arguments (int, \
+                                 uint, or float), got {} (str/bigint and the \
+                                 iterable form are follow-ups)",
+                                bad.display()
                             ),
                             span,
                         );
                         return Ty::Unknown;
                     }
-                    // No implicit signed<->unsigned mixing (#552, D-0019): the
-                    // same rule the comparison operators enforce (ZAP4015). An
-                    // untyped-int literal or `Unknown` partners either sign.
-                    let mix = |a: &Ty, b: &Ty| {
-                        a.is_unsigned()
-                            && b.is_numeric()
-                            && !b.is_unsigned()
-                            && !matches!(b, Ty::UntypedInt | Ty::Unknown)
-                    };
-                    if mix(&ta, &tb) || mix(&tb, &ta) {
+                    // No implicit signed<->unsigned mixing (#552, D-0019), the
+                    // same rule the comparison operators enforce (ZAP4015): an
+                    // unsigned operand may not share the call with a concrete
+                    // signed or float operand (an untyped-int literal or
+                    // `Unknown` partners either sign).
+                    let any_unsigned = tys.iter().any(|t| t.is_unsigned());
+                    let any_concrete_signed = tys.iter().any(|t| {
+                        t.is_numeric()
+                            && !t.is_unsigned()
+                            && !matches!(t, Ty::UntypedInt | Ty::Unknown)
+                    });
+                    if any_unsigned && any_concrete_signed {
                         self.error(
                             ErrorCode::ZAP4015,
                             format!(
-                                "cannot {fname}() a signed and an unsigned operand \
-                                 ({} and {}); convert one side explicitly \
-                                 (e.g. uint64(x) or int64(x))",
-                                ta.display(),
-                                tb.display()
+                                "cannot {fname}() signed and unsigned operands \
+                                 together; convert explicitly (e.g. uint64(x) or \
+                                 int64(x))"
                             ),
                             span,
                         );
                         return Ty::Unknown;
                     }
-                    if matches!(ta, Ty::Unknown) || matches!(tb, Ty::Unknown) {
+                    if tys.iter().any(|t| matches!(t, Ty::Unknown)) {
                         return Ty::Unknown;
                     }
-                    // `num_join` yields `int64` for two signed ints, `uint64`
-                    // for unsigned, and `float64` when either side is a float
-                    // (an explicit int/float mix promotes to `f64` exactly as
-                    // the `<`/`<=` operators do; pure-integer stays exact).
-                    return num_join(&ta, &tb);
+                    // Fold `num_join` across every operand: `int64` for signed
+                    // ints, `uint64` for unsigned, `float64` when any operand is
+                    // a float (an explicit int/float mix promotes to `f64` as the
+                    // `<`/`<=` operators do; pure-integer stays exact).
+                    let mut joined = tys[0].clone();
+                    for t in &tys[1..] {
+                        joined = num_join(&joined, t);
+                    }
+                    return joined;
                 }
                 // Scalar integer-preserving `abs` (#1283): the magnitude of one
                 // numeric scalar. A signed integer stays an integer (`int64`),
@@ -18843,18 +18867,50 @@ def main():
     }
 
     #[test]
-    fn min_max_wrong_arity_is_rejected() {
-        // One arg and three args both rejected (two-arg only in this slice).
+    fn min_max_variadic_and_arity() {
+        // Two or more scalar arguments are accepted (#1284 variadic form); the
+        // result is the numeric join and binds into the matching slot.
+        ok("def main():\n    int64 r = min(5, 2, 8, 1)\n    print(r)\n");
+        ok("def main():\n    int64 r = max(5, 2, 8, 1)\n    print(r)\n");
+        ok("def main():\n    float64 r = min(1.5, 2.5, 0.5)\n    print(r)\n");
+        ok("def main():\n    int32 a = 1\n    int64 r = max(a, 2, 3)\n    print(r)\n");
+        // A single argument is the iterable form, a follow-up: rejected now.
         assert!(has_code(
             "def main():\n    print(min(1))\n",
             ErrorCode::ZAP4025
         ));
         assert!(has_code(
-            "def main():\n    print(max(1, 2, 3))\n",
+            "def main():\n    print(min([1, 2, 3]))\n",
             ErrorCode::ZAP4025
         ));
+        // Mixing signed and unsigned is still rejected across any arity.
         assert!(has_code(
-            "def main():\n    print(min(1, 2, 3, 4))\n",
+            "def main():\n    uint64 u = 5\n    int64 s = 3\n    print(min(1, u, s))\n",
+            ErrorCode::ZAP4015
+        ));
+        // A non-numeric argument anywhere is rejected.
+        assert!(has_code(
+            "def main():\n    print(max(1, \"x\", 3))\n",
+            ErrorCode::ZAP4024
+        ));
+    }
+
+    #[test]
+    fn sum_is_typed_as_the_element_type() {
+        // sum(list[int64]) is an exact int64 (not widened to float), binding
+        // into an int slot and usable in int arithmetic.
+        ok("def main():\n    int64 s = sum([1, 2, 3])\n    print(s + 1)\n");
+        ok("def main():\n    auto xs = [10, 20, 30]\n    int64 s = sum(xs)\n    print(s)\n");
+        // sum of a float list is float64.
+        ok("def main():\n    float64 s = sum([1.5, 2.5])\n    print(s)\n");
+        // The int result is not a str (pins the element-typed result).
+        assert!(has_code(
+            "def main():\n    str s = sum([1, 2, 3])\n    print(s)\n",
+            ErrorCode::ZAP4001
+        ));
+        // Wrong arity is rejected.
+        assert!(has_code(
+            "def main():\n    print(sum([1], [2]))\n",
             ErrorCode::ZAP4025
         ));
     }
