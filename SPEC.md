@@ -230,7 +230,10 @@ yields `char`, and `len(s)` is the Unicode codepoint count — not the byte leng
 `bytes` is an **immutable byte sequence** (ticket #337), a distinct type from
 `str`. It shares `str`'s length-prefixed, GC-managed buffer but its operations
 are **byte-based**: `len(b)` is the byte count, `b[i]` is an `int64` byte value
-in `0..=255` (not a `char`), and a slice `b[lo:hi:step]` is `bytes`. `==`/`!=`
+in `0..=255` (not a `char`), a slice `b[lo:hi:step]` is `bytes`, and **iterating
+a `bytes` yields each byte as an `int64` in `0..=255`** in order (#1349) — a
+`for` loop, comprehension, or splat over `bytes` binds integers, not `char`s
+(byte-wise, not codepoint-wise). `==`/`!=`
 and ordering are byte-wise; `b1 + b2` concatenates. Construct it with the
 `b"..."` literal (its content is the UTF-8 encoding of the escaped text — there
 is no `\xNN` escape yet, so arbitrary non-UTF-8 bytes use `bytes([...])`),
@@ -249,6 +252,8 @@ auto raw = bytes(s)  # UTF-8 bytes (a `bytes` value)
 print(raw[0])        # 104   (a byte, as int64)
 print(str(raw))      # "héllo" (UTF-8 decode)
 auto blob = bytes([0, 255, 16])
+for b in blob:       # iterate bytes (int64 in 0..=255), in order
+    print(b)         # 0, then 255, then 16
 ```
 
 ### 4.3 Reference types (shared — passed by reference, D-0023)
