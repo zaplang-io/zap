@@ -539,6 +539,31 @@ impl<'a> FnLower<'a> {
             return self.list_cmp(op, r, relem, l, lt);
         }
 
+        // Lexicographic list ordering (#1334 sibling): `l1 < l2` / `<=` / `>` /
+        // `>=` compare two lists element-wise — the first differing element
+        // decides (by element `<`), and a shorter list that is a prefix of the
+        // other sorts first — matching Python's sequence ordering. Without this
+        // the operands fall through to the generic numeric path below, which
+        // `ptrtoint`-compares the two list headers (a meaningless allocation
+        // address compare). Ordering is NOT symmetric, so operands are never
+        // swapped: the list must be the left operand (a non-list left with a list
+        // right is a type error either way).
+        if matches!(op, Lt | Le | Gt | Ge)
+            && (matches!(lt, Ty::List(_)) || matches!(rt, Ty::List(_)))
+        {
+            let Ty::List(lelem) = lt else {
+                return Err(err(
+                    "a list's `< <= > >=` (lexicographic) compares only with another list",
+                ));
+            };
+            let Ty::List(relem) = rt else {
+                return Err(err(
+                    "a list's `< <= > >=` (lexicographic) compares only with another list",
+                ));
+            };
+            return self.list_order_cmp(op, l, lelem, r, relem);
+        }
+
         // Structural dict equality (#1328): `==` / `!=` on two dicts compares
         // entries, order-independent (Python mapping semantics), rather than by
         // pointer identity (which the generic fall-through would do). Equality is
