@@ -522,16 +522,24 @@ differs in a few places:
   (`TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT` on Linux, `TCP_KEEPALIVE` on
   macOS) and multicast membership are not yet exposed.
 
-### `fs` read errors (#1311, decisions/lang/1311-filesystem-notfound-error.md)
+### `os` / `fs` / `io` errors (#1311, #1320; decisions/lang/1311-filesystem-notfound-error.md, decisions/lang/1320-os-fs-typed-errors.md)
 
 - **`FileNotFoundError` ⊂ `OSError`, matching CPython — but a narrow subtree.**
-  `fs.read_file` / `fs.read_bytes` raise `FileNotFoundError` for a missing path
-  (`open` → `ENOENT`) and the generic `OSError` for any other failure
-  (permission, a directory where a file was expected, a post-open read error).
-  Both descend from `Exception`, so `except Exception` catches every read
-  failure, exactly as before this surface existed. The hierarchy edge is the
-  same as CPython (`FileNotFoundError` ⊂ `OSError` ⊂ `Exception`), so Python
-  code reads across unchanged.
+  Across the `os` / `fs` / `io` surface an errno-driven failure raises `OSError`,
+  and a missing path raises `FileNotFoundError` (`os.listdir`, `fs.read_file`/
+  `read_bytes`/`size`/`stat`/`rename`/`move`/`copy`/`scandir`/`walk`/`makedirs`/
+  `rmtree`/`write_file`/`write_bytes`/`append`, `io.open`/`read`/`write`,
+  `os.chdir`/`remove`/`rmdir`/`mkdir`/`path_abspath`/`realpath`). Both descend
+  from `Exception`, so `except Exception` catches every failure, exactly as
+  before. The hierarchy edge is the same as CPython (`FileNotFoundError` ⊂
+  `OSError` ⊂ `Exception`), so Python code reads across unchanged. A missing
+  executable passed to `process.run` / `process.Popen` likewise raises
+  `FileNotFoundError` (as CPython's `subprocess` does).
+- **`MemoryError` for allocation failures, `ValueError` for bad input.** An
+  out-of-memory condition raises `MemoryError`; an invalid `io.open` mode or an
+  empty path raises `ValueError`. `process.run` / `check_run` raise `RuntimeError`
+  for a non-zero child exit (a process result, not an OS error); `input()` raises
+  `EOFError`; a `process` timeout raises `TimeoutError`.
 - **No `IOError` spelling in Zap source.** CPython keeps `IOError` as a legacy
   alias of `OSError`; Zap source spells it `OSError`. (A Python-interop
   exception named `IOError` still maps to Zap's `OSError`.)
@@ -539,11 +547,9 @@ differs in a few places:
   `PermissionError`, `IsADirectoryError`, `FileExistsError`, `NotADirectoryError`,
   and the rest; Zap currently distinguishes only the missing-path case
   (`FileNotFoundError`) from everything else (`OSError`). Match on `OSError` for
-  the non-missing failures.
-- **Only filesystem *reads* are typed.** The mutating / metadata fs calls
-  (`fs.write_file`, `fs.append`, `fs.mkdir`, `fs.rename`, `fs.stat*`, …) still
-  raise the generic `Exception`; giving them `OSError` treatment is a tracked
-  follow-up.
+  the non-missing failures. Platform "not supported" failures also raise
+  `OSError` (CPython uses `OSError` / `NotImplementedError`; Zap has no
+  `NotImplementedError` type yet).
 
 ---
 

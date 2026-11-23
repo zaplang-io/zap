@@ -1,0 +1,7 @@
+size-missing:filenotfound
+size-missing:oserror
+size-missing:exception
+listdir-missing:filenotfound
+readfile-dir:oserror
+readfile-dir:exception
+open-badmode:valueerror

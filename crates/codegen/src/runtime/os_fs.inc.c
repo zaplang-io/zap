@@ -87,25 +87,40 @@ static void zap_sys_fail(const char *op, const char *detail) {
     zap_panic(zap_str_new(buf, (int64_t)n));
 }
 
-/* Raise a TYPED filesystem error "<op>: <strerror(err)>" from a read (#1311,
- * decisions/lang/1311-filesystem-notfound-error.md). `ENOENT` maps to
- * `FileNotFoundError`; every other errno maps to the generic `OSError`. Both
- * descend from `Exception`, so `except Exception` catches either, while a caller
- * can select `except FileNotFoundError` to handle only a missing path (e.g.
- * falling back to defaults for an absent config file). Never returns. The errno
- * is passed in by the caller, captured at the failing syscall, so an intervening
- * library call cannot clobber it before the message is built. */
-static void zap_fs_read_fail(const char *op, int err) {
+/* Raise a TYPED error "<op>: <detail>" (never returns). The typed companion to
+ * `zap_sys_fail`: the os/fs/io surface raises a specific subclass of `Exception`
+ * so a caller can tell a missing path from a permission error from an allocation
+ * failure, while `except Exception` still catches every one (#1311 introduced
+ * the read path; #1320 generalized it across the surface,
+ * decisions/lang/1320-os-fs-typed-errors.md). */
+static void zap_sys_fail_typed(int64_t type_id, const char *op, const char *detail) {
     char buf[512];
-    int n = snprintf(buf, sizeof buf, "%s: %s", op, strerror(err));
+    int n = snprintf(buf, sizeof buf, "%s: %s", op, detail);
     if (n < 0) {
         n = 0;
     }
     if (n >= (int)sizeof buf) {
         n = (int)sizeof buf - 1;
     }
-    int64_t type_id = (err == ENOENT) ? ZAP_EXC_FILE_NOT_FOUND_ERROR : ZAP_EXC_OS_ERROR;
     zap_panic_typed(type_id, zap_str_new(buf, (int64_t)n));
+}
+
+/* An errno-driven OS/filesystem failure: `ENOENT` -> `FileNotFoundError`, every
+ * other errno -> the generic `OSError` (#1311 for reads, generalized in #1320).
+ * CPython parity: `FileNotFoundError` subclass of `OSError` subclass of
+ * `Exception`, so `except FileNotFoundError` selects only a missing path while
+ * `except OSError` / `except Exception` catch any failure. The errno is passed
+ * in by the caller, captured at the failing syscall, so an intervening
+ * allocation cannot clobber it before the message is built. Never returns. */
+static void zap_sys_fail_errno(const char *op, int err) {
+    int64_t type_id = (err == ENOENT) ? ZAP_EXC_FILE_NOT_FOUND_ERROR : ZAP_EXC_OS_ERROR;
+    zap_sys_fail_typed(type_id, op, strerror(err));
+}
+
+/* An allocation failure -> `MemoryError` (#882 / #1320), never a bare
+ * `Exception`; still catchable by `except Exception`. Never returns. */
+static void zap_sys_oom(const char *op) {
+    zap_sys_fail_typed(ZAP_EXC_MEMORY_ERROR, op, "out of memory");
 }
 
 /* --- os: environment -------------------------------------------------------- */
@@ -126,7 +141,7 @@ int64_t zap_os_hasenv(void *name_) {
 void zap_os_setenv(void *name_, void *val_) {
     if (zap_setenv_compat(zap_sys_cstr((ZapStr *)name_), zap_sys_cstr((ZapStr *)val_),
                           1) != 0) {
-        zap_sys_fail("os.setenv", strerror(errno));
+        zap_sys_fail_errno("os.setenv", errno);
     }
 }
 
@@ -139,7 +154,7 @@ int64_t zap_os_getpid(void) { return (int64_t)getpid(); }
 void *zap_os_getcwd(void) {
     char buf[4096];
     if (getcwd(buf, sizeof buf) == NULL) {
-        zap_sys_fail("os.getcwd", strerror(errno));
+        zap_sys_fail_errno("os.getcwd", errno);
     }
     return zap_str_new(buf, (int64_t)strlen(buf));
 }
@@ -147,7 +162,7 @@ void *zap_os_getcwd(void) {
 /* os.chdir(path). */
 void zap_os_chdir(void *path_) {
     if (chdir(zap_sys_cstr((ZapStr *)path_)) != 0) {
-        zap_sys_fail("os.chdir", strerror(errno));
+        zap_sys_fail_errno("os.chdir", errno);
     }
 }
 
@@ -159,21 +174,21 @@ void zap_os_mkdir(void *path_) {
 #else
     if (mkdir(zap_sys_cstr((ZapStr *)path_), 0777) != 0) {
 #endif
-        zap_sys_fail("os.mkdir", strerror(errno));
+        zap_sys_fail_errno("os.mkdir", errno);
     }
 }
 
 /* os.remove(path): unlink a file. */
 void zap_os_remove(void *path_) {
     if (unlink(zap_sys_cstr((ZapStr *)path_)) != 0) {
-        zap_sys_fail("os.remove", strerror(errno));
+        zap_sys_fail_errno("os.remove", errno);
     }
 }
 
 /* os.rmdir(path): remove an empty directory. */
 void zap_os_rmdir(void *path_) {
     if (rmdir(zap_sys_cstr((ZapStr *)path_)) != 0) {
-        zap_sys_fail("os.rmdir", strerror(errno));
+        zap_sys_fail_errno("os.rmdir", errno);
     }
 }
 
@@ -183,7 +198,7 @@ void *zap_os_listdir(void *path_) {
     char *path = zap_sys_cstr((ZapStr *)path_);
     DIR *d = opendir(path);
     if (d == NULL) {
-        zap_sys_fail("os.listdir", strerror(errno));
+        zap_sys_fail_errno("os.listdir", errno);
     }
     void *out = zap_list_new();
     struct dirent *e;
@@ -450,12 +465,12 @@ int64_t zap_io_open(void *path_, void *mode_) {
     } else if (strcmp(mode, "a+") == 0) {
         flags = O_RDWR | O_CREAT | O_APPEND;
     } else {
-        zap_sys_fail("io.open", "invalid mode (want one of: r r+ w w+ a a+)");
+        zap_sys_fail_typed(ZAP_EXC_VALUE_ERROR, "io.open", "invalid mode (want one of: r r+ w w+ a a+)");
         return -1; /* unreachable */
     }
     int fd = open(zap_sys_cstr((ZapStr *)path_), flags | ZAP_O_BINARY, 0644);
     if (fd < 0) {
-        zap_sys_fail("io.open", strerror(errno));
+        zap_sys_fail_errno("io.open", errno);
     }
     return (int64_t)fd;
 }
@@ -471,7 +486,7 @@ void *zap_io_read(int64_t fd, int64_t n) {
         got = read((int)fd, buf, (size_t)n);
     } while (got < 0 && errno == EINTR);
     if (got < 0) {
-        zap_sys_fail("io.read", strerror(errno));
+        zap_sys_fail_errno("io.read", errno);
     }
     return zap_str_new(buf, (int64_t)got);
 }
@@ -486,7 +501,7 @@ int64_t zap_io_write(int64_t fd, void *data_) {
             if (errno == EINTR) {
                 continue;
             }
-            zap_sys_fail("io.write", strerror(errno));
+            zap_sys_fail_errno("io.write", errno);
         }
         off += (size_t)w;
     }
@@ -496,16 +511,26 @@ int64_t zap_io_write(int64_t fd, void *data_) {
 /* io.close(fd). */
 void zap_io_close(int64_t fd) {
     if (close((int)fd) != 0) {
-        zap_sys_fail("io.close", strerror(errno));
+        zap_sys_fail_errno("io.close", errno);
     }
 }
 
 /* --- fs: path-oriented convenience + metadata ------------------------------- */
 
 /* Read an entire open fd to a fresh ZapStr (for regular files; uses the file
- * size when seekable, otherwise grows). Caller handles open/close. */
+ * size when seekable, otherwise grows). Caller handles open/close.
+ *
+ * The `lseek(SEEK_END)` size is trusted ONLY for a regular file (#1320): for a
+ * directory, a pipe, or a character device, `lseek` either fails or returns a
+ * meaningless (possibly huge) value, and trusting it as the initial allocation
+ * drove an out-of-memory abort before the subsequent `read` could surface the
+ * real error (a directory `read` returns `EISDIR`). An `fstat` gate falls back
+ * to the 4096-byte growth path for every non-regular fd, so such a read now
+ * reaches the `EISDIR`/other errno -> `OSError` path cleanly instead of OOMing. */
 static void *zap_read_all_fd(int fd) {
-    off_t end = lseek(fd, 0, SEEK_END);
+    struct stat rst;
+    int is_regular = (fstat(fd, &rst) == 0) && S_ISREG(rst.st_mode);
+    off_t end = is_regular ? lseek(fd, 0, SEEK_END) : (off_t)-1;
     int64_t cap = (end > 0) ? (int64_t)end : 4096;
     if (end >= 0) {
         lseek(fd, 0, SEEK_SET);
@@ -527,7 +552,7 @@ static void *zap_read_all_fd(int fd) {
             }
             /* Post-open read error (the fd is already valid, so never ENOENT):
              * a generic OSError (#1311). */
-            zap_fs_read_fail("fs.read_file", errno);
+            zap_sys_fail_errno("fs.read_file", errno);
         }
         if (r == 0) {
             break;
@@ -542,7 +567,7 @@ void *zap_fs_read_file(void *path_) {
     int fd = open(zap_sys_cstr((ZapStr *)path_), O_RDONLY | ZAP_O_BINARY);
     if (fd < 0) {
         /* ENOENT -> FileNotFoundError, every other errno -> OSError (#1311). */
-        zap_fs_read_fail("fs.read_file", errno);
+        zap_sys_fail_errno("fs.read_file", errno);
     }
     void *s = zap_read_all_fd(fd);
     close(fd);
@@ -554,7 +579,7 @@ void zap_fs_write_file(void *path_, void *data_) {
     int fd = open(zap_sys_cstr((ZapStr *)path_), O_WRONLY | O_CREAT | O_TRUNC | ZAP_O_BINARY,
                   0644);
     if (fd < 0) {
-        zap_sys_fail("fs.write_file", strerror(errno));
+        zap_sys_fail_errno("fs.write_file", errno);
     }
     (void)zap_io_write((int64_t)fd, data_);
     close(fd);
@@ -588,7 +613,7 @@ int64_t zap_fs_is_file(void *path_) {
 int64_t zap_fs_size(void *path_) {
     struct stat st;
     if (stat(zap_sys_cstr((ZapStr *)path_), &st) != 0) {
-        zap_sys_fail("fs.size", strerror(errno));
+        zap_sys_fail_errno("fs.size", errno);
     }
     return (int64_t)st.st_size;
 }
@@ -674,7 +699,7 @@ void *zap_fs_mkdtemp(void) {
 #else
     if (mkdtemp(tmpl) == NULL) {
 #endif
-        zap_sys_fail("fs.mkdtemp", strerror(errno));
+        zap_sys_fail_errno("fs.mkdtemp", errno);
     }
     return zap_str_new(tmpl, (int64_t)strlen(tmpl));
 }
@@ -728,7 +753,7 @@ static int zap_temp_create(char *tmpl, size_t xoff, const char *op) {
             return fd;
         }
         if (errno != EEXIST) {
-            zap_sys_fail(op, strerror(errno));
+            zap_sys_fail_errno(op, errno);
         }
     }
     errno = EEXIST;
@@ -758,13 +783,13 @@ void *zap_fs_mkstemp(void *prefix_, void *suffix_, void *dir_) {
     char tmpl[4096];
     int base = snprintf(tmpl, sizeof tmpl, "%s/%sXXXXXX%s", d, prefix, suffix);
     if (base < 0 || base >= (int)sizeof tmpl) {
-        zap_sys_fail("fs.mkstemp", "temp path too long");
+        zap_sys_fail_typed(ZAP_EXC_OS_ERROR, "fs.mkstemp", "temp path too long");
     }
     /* The 6 X's sit right after "<d>/<prefix>". */
     size_t xoff = strlen(d) + 1 + strlen(prefix);
     int fd = zap_temp_create(tmpl, xoff, "fs.mkstemp");
     if (fd < 0) {
-        zap_sys_fail("fs.mkstemp", "could not create a unique temp file");
+        zap_sys_fail_typed(ZAP_EXC_OS_ERROR, "fs.mkstemp", "could not create a unique temp file");
     }
     /* Build the path string before the handle so the handle's pointer field is
      * never momentarily uninitialised (a runtime call takes no safepoint, so
@@ -801,12 +826,12 @@ void zap_fs_write_atomic(void *path_, void *data_) {
     char tmpl[4096];
     int base = snprintf(tmpl, sizeof tmpl, "%s.zaptmpXXXXXX", path);
     if (base < 0 || base >= (int)sizeof tmpl) {
-        zap_sys_fail("fs.write_atomic", "path too long");
+        zap_sys_fail_typed(ZAP_EXC_OS_ERROR, "fs.write_atomic", "path too long");
     }
     size_t xoff = strlen(path) + strlen(".zaptmp");
     int fd = zap_temp_create(tmpl, xoff, "fs.write_atomic");
     if (fd < 0) {
-        zap_sys_fail("fs.write_atomic", "could not create a temp file");
+        zap_sys_fail_typed(ZAP_EXC_OS_ERROR, "fs.write_atomic", "could not create a temp file");
     }
     const char *p = (const char *)data->data;
     int64_t left = data->len;
@@ -817,7 +842,7 @@ void zap_fs_write_atomic(void *path_, void *data_) {
             close(fd);
             unlink(tmpl);
             errno = e;
-            zap_sys_fail("fs.write_atomic", strerror(errno));
+            zap_sys_fail_errno("fs.write_atomic", errno);
         }
         p += w;
         left -= w;
@@ -831,14 +856,14 @@ void zap_fs_write_atomic(void *path_, void *data_) {
 #if defined(ZAP_PLATFORM_WINDOWS)
     if (!MoveFileExA(tmpl, path, MOVEFILE_REPLACE_EXISTING)) {
         unlink(tmpl);
-        zap_sys_fail("fs.write_atomic", "rename onto target failed");
+        zap_sys_fail_typed(ZAP_EXC_OS_ERROR, "fs.write_atomic", "rename onto target failed");
     }
 #else
     if (rename(tmpl, path) != 0) {
         int e = errno;
         unlink(tmpl);
         errno = e;
-        zap_sys_fail("fs.write_atomic", strerror(errno));
+        zap_sys_fail_errno("fs.write_atomic", errno);
     }
 #endif
 }
@@ -852,7 +877,7 @@ void zap_fs_write_atomic(void *path_, void *data_) {
 void zap_fs_unlink_quiet(void *path_) {
     const char *p = zap_sys_cstr((ZapStr *)path_);
     if (unlink(p) != 0 && errno != ENOENT) {
-        zap_sys_fail("fs.temp_file", strerror(errno));
+        zap_sys_fail_errno("fs.temp_file", errno);
     }
 }
 
@@ -875,7 +900,7 @@ void zap_fs_unlink_quiet(void *path_) {
  * (the others follow symlinks, like Python `os.stat`). */
 static void zap_fs_do_stat(void *path_, struct stat *st, const char *op) {
     if (stat(zap_sys_cstr((ZapStr *)path_), st) != 0) {
-        zap_sys_fail(op, strerror(errno));
+        zap_sys_fail_errno(op, errno);
     }
 }
 int64_t zap_fs_stat_size(void *path_) {
@@ -916,7 +941,7 @@ int64_t zap_fs_stat_is_symlink(void *path_) {
 #else
     struct stat st;
     if (lstat(zap_sys_cstr((ZapStr *)path_), &st) != 0) {
-        zap_sys_fail("fs.stat", strerror(errno));
+        zap_sys_fail_errno("fs.stat", errno);
     }
     return S_ISLNK(st.st_mode) ? 1 : 0;
 #endif
@@ -930,7 +955,7 @@ void zap_fs_rename(void *src_, void *dst_) {
     char *src = zap_sys_cstr((ZapStr *)src_);
     char *dst = zap_sys_cstr((ZapStr *)dst_);
     if (rename(src, dst) != 0) {
-        zap_sys_fail("fs.rename", strerror(errno));
+        zap_sys_fail_errno("fs.rename", errno);
     }
 }
 
@@ -981,7 +1006,7 @@ void zap_fs_copy(void *src_, void *dst_) {
     char *src = zap_sys_cstr((ZapStr *)src_);
     char *dst = zap_sys_cstr((ZapStr *)dst_);
     if (zap_fs_copy_file(src, dst) != 0) {
-        zap_sys_fail("fs.copy", strerror(errno));
+        zap_sys_fail_errno("fs.copy", errno);
     }
 }
 
@@ -1000,7 +1025,7 @@ void zap_fs_move(void *src_, void *dst_) {
         }
     }
 #endif
-    zap_sys_fail("fs.move", strerror(errno));
+    zap_sys_fail_errno("fs.move", errno);
 }
 
 /* fs.makedirs(path): create `path` and every missing parent (Python
@@ -1010,7 +1035,7 @@ void zap_fs_makedirs(void *path_) {
     const ZapStr *p = (const ZapStr *)path_;
     int64_t n = p->len;
     if (n == 0) {
-        zap_sys_fail("fs.makedirs", "empty path");
+        zap_sys_fail_typed(ZAP_EXC_VALUE_ERROR, "fs.makedirs", "empty path");
     }
     char *buf = (char *)zap_buf(n + 1);
     memcpy(buf, p->data, (size_t)n);
@@ -1027,7 +1052,7 @@ void zap_fs_makedirs(void *path_) {
                 int rc = mkdir(buf, 0777);
 #endif
                 if (rc != 0 && errno != EEXIST) {
-                    zap_sys_fail("fs.makedirs", strerror(errno));
+                    zap_sys_fail_errno("fs.makedirs", errno);
                 }
             }
             buf[i] = saved;
@@ -1047,17 +1072,17 @@ static void zap_fs_rmtree_cstr(const char *path) {
 #else
     if (lstat(path, &st) != 0) {
 #endif
-        zap_sys_fail("fs.rmtree", strerror(errno));
+        zap_sys_fail_errno("fs.rmtree", errno);
     }
     if (!S_ISDIR(st.st_mode)) {
         if (unlink(path) != 0) {
-            zap_sys_fail("fs.rmtree", strerror(errno));
+            zap_sys_fail_errno("fs.rmtree", errno);
         }
         return;
     }
     DIR *d = opendir(path);
     if (d == NULL) {
-        zap_sys_fail("fs.rmtree", strerror(errno));
+        zap_sys_fail_errno("fs.rmtree", errno);
     }
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
@@ -1068,7 +1093,7 @@ static void zap_fs_rmtree_cstr(const char *path) {
         char *child = (char *)malloc(need);
         if (child == NULL) {
             closedir(d);
-            zap_sys_fail("fs.rmtree", "out of memory");
+            zap_sys_oom("fs.rmtree");
         }
         snprintf(child, need, "%s/%s", path, e->d_name);
         zap_fs_rmtree_cstr(child);
@@ -1076,7 +1101,7 @@ static void zap_fs_rmtree_cstr(const char *path) {
     }
     closedir(d);
     if (rmdir(path) != 0) {
-        zap_sys_fail("fs.rmtree", strerror(errno));
+        zap_sys_fail_errno("fs.rmtree", errno);
     }
 }
 void zap_fs_rmtree(void *path_) {
@@ -1165,7 +1190,7 @@ static int zap_fs_read_dir_sorted(const char *dirpath, const char *op, ZapDirRec
                 }
                 free(arr);
                 closedir(d);
-                zap_sys_fail(op, "out of memory");
+                zap_sys_oom(op);
             }
             arr = grown;
         }
@@ -1177,7 +1202,7 @@ static int zap_fs_read_dir_sorted(const char *dirpath, const char *op, ZapDirRec
             }
             free(arr);
             closedir(d);
-            zap_sys_fail(op, "out of memory");
+            zap_sys_oom(op);
         }
         memcpy(nm, e->d_name, nl + 1);
         arr[n].name = nm;
@@ -1206,11 +1231,11 @@ static void zap_fs_dirrecs_free(ZapDirRec *arr, int64_t n) {
 static void zap_fs_copytree_cstr(const char *src, const char *dst) {
     struct stat st;
     if (stat(src, &st) != 0) {
-        zap_sys_fail("fs.copytree", strerror(errno));
+        zap_sys_fail_errno("fs.copytree", errno);
     }
     if (!S_ISDIR(st.st_mode)) {
         if (zap_fs_copy_file(src, dst) != 0) {
-            zap_sys_fail("fs.copytree", strerror(errno));
+            zap_sys_fail_errno("fs.copytree", errno);
         }
         return;
     }
@@ -1220,12 +1245,12 @@ static void zap_fs_copytree_cstr(const char *src, const char *dst) {
     int rc = mkdir(dst, 0777);
 #endif
     if (rc != 0 && errno != EEXIST) {
-        zap_sys_fail("fs.copytree", strerror(errno));
+        zap_sys_fail_errno("fs.copytree", errno);
     }
     ZapDirRec *recs = NULL;
     int64_t n = 0;
     if (zap_fs_read_dir_sorted(src, "fs.copytree", &recs, &n) != 0) {
-        zap_sys_fail("fs.copytree", strerror(errno));
+        zap_sys_fail_errno("fs.copytree", errno);
     }
     for (int64_t i = 0; i < n; i++) {
         size_t sneed = strlen(src) + 1 + strlen(recs[i].name) + 1;
@@ -1236,7 +1261,7 @@ static void zap_fs_copytree_cstr(const char *src, const char *dst) {
             free(cs);
             free(cd);
             zap_fs_dirrecs_free(recs, n);
-            zap_sys_fail("fs.copytree", "out of memory");
+            zap_sys_oom("fs.copytree");
         }
         snprintf(cs, sneed, "%s/%s", src, recs[i].name);
         snprintf(cd, dneed, "%s/%s", dst, recs[i].name);
@@ -1271,7 +1296,7 @@ void *zap_fs_scandir(void *path_) {
     ZapDirRec *recs = NULL;
     int64_t n = 0;
     if (zap_fs_read_dir_sorted(path, "fs.scandir", &recs, &n) != 0) {
-        zap_sys_fail("fs.scandir", strerror(errno));
+        zap_sys_fail_errno("fs.scandir", errno);
     }
     void *names = zap_list_new();
     void *kinds = zap_list_new();
@@ -1342,7 +1367,7 @@ static void zap_fs_walk_rec(const char *dirpath, void *dirpaths, void *dirs, voi
         char *child = (char *)malloc(need);
         if (child == NULL) {
             zap_fs_dirrecs_free(recs, n);
-            zap_sys_fail("fs.walk", "out of memory");
+            zap_sys_oom("fs.walk");
         }
         snprintf(child, need, "%s/%s", dirpath, recs[i].name);
         zap_fs_walk_rec(child, dirpaths, dirs, files);
@@ -1356,7 +1381,7 @@ void *zap_fs_walk(void *root_) {
      * at the call rather than silently yielding nothing. */
     DIR *probe = opendir(root);
     if (probe == NULL) {
-        zap_sys_fail("fs.walk", strerror(errno));
+        zap_sys_fail_errno("fs.walk", errno);
     }
     closedir(probe);
     void *dirpaths = zap_list_new();
@@ -1382,7 +1407,7 @@ void *zap_fs_read_bytes(void *path_) {
     int fd = open(zap_sys_cstr((ZapStr *)path_), O_RDONLY | ZAP_O_BINARY);
     if (fd < 0) {
         /* ENOENT -> FileNotFoundError, every other errno -> OSError (#1311). */
-        zap_fs_read_fail("fs.read_bytes", errno);
+        zap_sys_fail_errno("fs.read_bytes", errno);
     }
     void *s = zap_read_all_fd(fd);
     close(fd);
@@ -1394,7 +1419,7 @@ void zap_fs_write_bytes(void *path_, void *data_) {
     int fd = open(zap_sys_cstr((ZapStr *)path_), O_WRONLY | O_CREAT | O_TRUNC | ZAP_O_BINARY,
                   0644);
     if (fd < 0) {
-        zap_sys_fail("fs.write_bytes", strerror(errno));
+        zap_sys_fail_errno("fs.write_bytes", errno);
     }
     (void)zap_io_write((int64_t)fd, data_);
     close(fd);
@@ -1405,7 +1430,7 @@ void zap_fs_append(void *path_, void *data_) {
     int fd = open(zap_sys_cstr((ZapStr *)path_), O_WRONLY | O_CREAT | O_APPEND | ZAP_O_BINARY,
                   0644);
     if (fd < 0) {
-        zap_sys_fail("fs.append", strerror(errno));
+        zap_sys_fail_errno("fs.append", errno);
     }
     (void)zap_io_write((int64_t)fd, data_);
     close(fd);
@@ -1550,7 +1575,7 @@ void *zap_os_path_abspath(void *path_) {
     }
     char cwd[4096];
     if (getcwd(cwd, sizeof cwd) == NULL) {
-        zap_sys_fail("os.path_abspath", strerror(errno));
+        zap_sys_fail_errno("os.path_abspath", errno);
     }
     int64_t clen = (int64_t)strlen(cwd);
     int64_t joined = clen + 1 + p->len;
@@ -1569,13 +1594,13 @@ void *zap_os_path_realpath(void *path_) {
 #if defined(ZAP_PLATFORM_WINDOWS)
     char buf[4096];
     if (_fullpath(buf, zap_sys_cstr((ZapStr *)path_), sizeof buf) == NULL) {
-        zap_sys_fail("os.path_realpath", "cannot resolve path");
+        zap_sys_fail_typed(ZAP_EXC_OS_ERROR, "os.path_realpath", "cannot resolve path");
     }
     return zap_str_new(buf, (int64_t)strlen(buf));
 #else
     char buf[4096];
     if (realpath(zap_sys_cstr((ZapStr *)path_), buf) == NULL) {
-        zap_sys_fail("os.path_realpath", strerror(errno));
+        zap_sys_fail_errno("os.path_realpath", errno);
     }
     return zap_str_new(buf, (int64_t)strlen(buf));
 #endif
@@ -2032,7 +2057,7 @@ static void *zap_proc_run_impl(const char *op, void *cmd_arg, const ZapDict *env
         char *cmdz = zap_sys_cstr((ZapStr *)cmd_arg);
         cargv = (char **)malloc(sizeof(char *) * 4);
         if (!cargv) {
-            zap_sys_fail(op, "out of memory");
+            zap_sys_oom(op);
         }
 #if defined(ZAP_PLATFORM_WINDOWS)
         cargv[0] = "cmd.exe";
@@ -2048,11 +2073,11 @@ static void *zap_proc_run_impl(const char *op, void *cmd_arg, const ZapDict *env
     } else {
         n = zap_list_len(cmd_arg);
         if (n < 1) {
-            zap_sys_fail(op, "empty argument list");
+            zap_sys_fail_typed(ZAP_EXC_VALUE_ERROR, op, "empty argument list");
         }
         cargv = (char **)malloc(sizeof(char *) * (size_t)(n + 1));
         if (!cargv) {
-            zap_sys_fail(op, "out of memory");
+            zap_sys_oom(op);
         }
         for (int64_t i = 0; i < n; i++) {
             cargv[i] = zap_sys_cstr((ZapStr *)zap_list_get_ptr(cmd_arg, i));
@@ -2075,14 +2100,14 @@ static void *zap_proc_run_impl(const char *op, void *cmd_arg, const ZapDict *env
 #endif
         if (ifd < 0) {
             free(cargv);
-            zap_sys_fail(op, strerror(errno));
+            zap_sys_fail_errno(op, errno);
         }
         if (zap_proc_write_all_fd(ifd, input) != 0) {
             int e = errno;
             close(ifd);
             unlink(itmpl);
             free(cargv);
-            zap_sys_fail(op, strerror(e));
+            zap_sys_fail_errno(op, e);
         }
         lseek(ifd, 0, SEEK_SET);
     }
@@ -2102,7 +2127,7 @@ static void *zap_proc_run_impl(const char *op, void *cmd_arg, const ZapDict *env
                 unlink(itmpl);
             }
             free(cargv);
-            zap_sys_fail(op, strerror(e));
+            zap_sys_fail_errno(op, e);
         }
         if (!merge) {
             snprintf(etmpl, sizeof etmpl, "%s/zaperr_XXXXXX", tmp);
@@ -2120,7 +2145,7 @@ static void *zap_proc_run_impl(const char *op, void *cmd_arg, const ZapDict *env
                     unlink(itmpl);
                 }
                 free(cargv);
-                zap_sys_fail(op, strerror(e));
+                zap_sys_fail_errno(op, e);
             }
         }
     }
@@ -2148,7 +2173,7 @@ static void *zap_proc_run_impl(const char *op, void *cmd_arg, const ZapDict *env
             close(efd);
             unlink(etmpl);
         }
-        zap_sys_fail(op, "out of memory");
+        zap_sys_oom(op);
     }
     STARTUPINFOA si;
     memset(&si, 0, sizeof si);
@@ -2190,7 +2215,7 @@ static void *zap_proc_run_impl(const char *op, void *cmd_arg, const ZapDict *env
             close(efd);
             unlink(etmpl);
         }
-        zap_sys_fail(op, "CreateProcess failed");
+        zap_sys_fail_typed(ZAP_EXC_OS_ERROR, op, "CreateProcess failed");
     }
     if (ifd >= 0) {
         close(ifd); /* child holds its own inherited handle */
@@ -2239,7 +2264,7 @@ static void *zap_proc_run_impl(const char *op, void *cmd_arg, const ZapDict *env
             unlink(etmpl);
         }
         free(cargv);
-        zap_sys_fail(op, "cwd= is not supported on this platform");
+        zap_sys_fail_typed(ZAP_EXC_OS_ERROR, op, "cwd= is not supported on this platform");
 #endif
     }
     char **built = zap_proc_build_envp(env);
@@ -2265,7 +2290,7 @@ static void *zap_proc_run_impl(const char *op, void *cmd_arg, const ZapDict *env
             close(efd);
             unlink(etmpl);
         }
-        zap_sys_fail(op, strerror(rc));
+        zap_sys_fail_errno(op, rc);
     }
     code = zap_proc_wait_timed(pid, timeout_s, &timed_out);
 #endif
@@ -2481,8 +2506,7 @@ int64_t zap_popen_spawn(void *argv_list, void *env, void *cwd, int64_t flags) {
     (void)env;
     (void)cwd;
     (void)flags;
-    zap_sys_fail("process.Popen",
-                 "streaming subprocess is not yet supported on Windows (#976)");
+    zap_sys_fail_typed(ZAP_EXC_OS_ERROR, "process.Popen", "streaming subprocess is not yet supported on Windows (#976)");
     return 0;
 #else
     int merge = (flags & 1) != 0;
@@ -2494,11 +2518,11 @@ int64_t zap_popen_spawn(void *argv_list, void *env, void *cwd, int64_t flags) {
 
     int64_t n = zap_list_len(argv_list);
     if (n < 1) {
-        zap_sys_fail("process.Popen", "empty argument list");
+        zap_sys_fail_typed(ZAP_EXC_VALUE_ERROR, "process.Popen", "empty argument list");
     }
     char **cargv = (char **)malloc(sizeof(char *) * (size_t)(n + 1));
     if (!cargv) {
-        zap_sys_fail("process.Popen", "out of memory");
+        zap_sys_oom("process.Popen");
     }
     for (int64_t i = 0; i < n; i++) {
         cargv[i] = zap_sys_cstr((ZapStr *)zap_list_get_ptr(argv_list, i));
@@ -2516,7 +2540,7 @@ int64_t zap_popen_spawn(void *argv_list, void *env, void *cwd, int64_t flags) {
             if (epipe[k] >= 0) close(epipe[k]);
         }
         free(cargv);
-        zap_sys_fail("process.Popen", strerror(e));
+        zap_sys_fail_errno("process.Popen", e);
     }
 
     posix_spawn_file_actions_t fa;
@@ -2546,7 +2570,7 @@ int64_t zap_popen_spawn(void *argv_list, void *env, void *cwd, int64_t flags) {
             if (epipe[k] >= 0) close(epipe[k]);
         }
         free(cargv);
-        zap_sys_fail("process.Popen", "cwd= is not supported on this platform");
+        zap_sys_fail_typed(ZAP_EXC_OS_ERROR, "process.Popen", "cwd= is not supported on this platform");
 #endif
     }
 
@@ -2567,7 +2591,7 @@ int64_t zap_popen_spawn(void *argv_list, void *env, void *cwd, int64_t flags) {
         if (ipipe[1] >= 0) close(ipipe[1]);
         if (opipe[0] >= 0) close(opipe[0]);
         if (epipe[0] >= 0) close(epipe[0]);
-        zap_sys_fail("process.Popen", strerror(rc));
+        zap_sys_fail_errno("process.Popen", rc);
     }
 
     ZapPopen *h = (ZapPopen *)malloc(sizeof(ZapPopen));
@@ -2580,7 +2604,7 @@ int64_t zap_popen_spawn(void *argv_list, void *env, void *cwd, int64_t flags) {
             int st;
             waitpid(pid, &st, 0);
         }
-        zap_sys_fail("process.Popen", "out of memory");
+        zap_sys_oom("process.Popen");
     }
     h->pid = (int64_t)pid;
     h->in_fd = want_in ? ipipe[1] : -1;
@@ -2604,13 +2628,13 @@ int64_t zap_popen_write(int64_t h_, void *data_) {
 #if defined(ZAP_PLATFORM_WINDOWS)
     (void)h_;
     (void)data_;
-    zap_sys_fail("process.Popen.write", "not supported on Windows");
+    zap_sys_fail_typed(ZAP_EXC_OS_ERROR, "process.Popen.write", "not supported on Windows");
     return 0;
 #else
     ZapPopen *h = zap_popen_of(h_);
     const ZapStr *data = (const ZapStr *)data_;
     if (h->in_fd < 0) {
-        zap_sys_fail("process.Popen.write", "stdin is not open");
+        zap_sys_fail_typed(ZAP_EXC_OS_ERROR, "process.Popen.write", "stdin is not open");
     }
     int64_t total = data->len;
     if (total <= 0) {
@@ -2620,7 +2644,7 @@ int64_t zap_popen_write(int64_t h_, void *data_) {
      * the source ZapStr out from under a pointer held across the park. */
     char *scratch = (char *)malloc((size_t)total);
     if (!scratch) {
-        zap_sys_fail("process.Popen.write", "out of memory");
+        zap_sys_oom("process.Popen.write");
     }
     memcpy(scratch, data->data, (size_t)total);
     int64_t left = total;
@@ -2639,12 +2663,12 @@ int64_t zap_popen_write(int64_t h_, void *data_) {
                 }
                 if (pr < 0) {
                     free(scratch);
-                    zap_sys_fail("process.Popen.write", "stdin closed");
+                    zap_sys_fail_typed(ZAP_EXC_OS_ERROR, "process.Popen.write", "stdin closed");
                 }
                 continue;
             }
             free(scratch);
-            zap_sys_fail("process.Popen.write", strerror(errno));
+            zap_sys_fail_errno("process.Popen.write", errno);
         }
         p += w;
         left -= (int64_t)w;
@@ -2697,7 +2721,7 @@ static int64_t zap_popen_read_into(ZapPopen *h, int64_t which, char *buf, int64_
             }
             continue;
         }
-        zap_sys_fail("process.Popen.read", strerror(errno));
+        zap_sys_fail_errno("process.Popen.read", errno);
     }
 }
 #endif /* ZAP_PLATFORM_POSIX */
@@ -2710,7 +2734,7 @@ void *zap_popen_read(int64_t h_, int64_t which, int64_t maxn) {
     (void)h_;
     (void)which;
     (void)maxn;
-    zap_sys_fail("process.Popen.read", "not supported on Windows");
+    zap_sys_fail_typed(ZAP_EXC_OS_ERROR, "process.Popen.read", "not supported on Windows");
     return NULL;
 #else
     ZapPopen *h = zap_popen_of(h_);
@@ -2719,7 +2743,7 @@ void *zap_popen_read(int64_t h_, int64_t which, int64_t maxn) {
     }
     char *buf = (char *)malloc((size_t)maxn);
     if (!buf) {
-        zap_sys_fail("process.Popen.read", "out of memory");
+        zap_sys_oom("process.Popen.read");
     }
     int64_t got = zap_popen_read_into(h, which, buf, maxn);
     void *out = zap_str_new(buf, got);
@@ -2733,14 +2757,14 @@ void *zap_popen_read_all(int64_t h_, int64_t which) {
 #if defined(ZAP_PLATFORM_WINDOWS)
     (void)h_;
     (void)which;
-    zap_sys_fail("process.Popen.read_all", "not supported on Windows");
+    zap_sys_fail_typed(ZAP_EXC_OS_ERROR, "process.Popen.read_all", "not supported on Windows");
     return NULL;
 #else
     ZapPopen *h = zap_popen_of(h_);
     size_t cap = 4096, len = 0;
     char *buf = (char *)malloc(cap);
     if (!buf) {
-        zap_sys_fail("process.Popen.read_all", "out of memory");
+        zap_sys_oom("process.Popen.read_all");
     }
     for (;;) {
         if (len == cap) {
@@ -2748,7 +2772,7 @@ void *zap_popen_read_all(int64_t h_, int64_t which) {
             char *nb = (char *)realloc(buf, ncap);
             if (!nb) {
                 free(buf);
-                zap_sys_fail("process.Popen.read_all", "out of memory");
+                zap_sys_oom("process.Popen.read_all");
             }
             buf = nb;
             cap = ncap;
@@ -2833,7 +2857,7 @@ int64_t zap_popen_wait(int64_t h_) {
     return h->returncode;
 #else
     (void)h_;
-    zap_sys_fail("process.Popen.wait", "not supported on Windows");
+    zap_sys_fail_typed(ZAP_EXC_OS_ERROR, "process.Popen.wait", "not supported on Windows");
     return -1;
 #endif
 }
@@ -2849,7 +2873,7 @@ int64_t zap_popen_returncode(int64_t h_) {
     return h->returncode;
 #else
     (void)h_;
-    zap_sys_fail("process.Popen.returncode", "not supported on Windows");
+    zap_sys_fail_typed(ZAP_EXC_OS_ERROR, "process.Popen.returncode", "not supported on Windows");
     return -1;
 #endif
 }
@@ -2867,7 +2891,7 @@ void zap_popen_signal(int64_t h_, int64_t sig) {
 #else
     (void)h_;
     (void)sig;
-    zap_sys_fail("process.Popen.signal", "not supported on Windows");
+    zap_sys_fail_typed(ZAP_EXC_OS_ERROR, "process.Popen.signal", "not supported on Windows");
 #endif
 }
 
@@ -2897,7 +2921,7 @@ void *zap_input(void *prompt_) {
                 if (errno == EINTR) {
                     continue;
                 }
-                zap_sys_fail("input", strerror(errno));
+                zap_sys_fail_errno("input", errno);
             }
             off += (size_t)w;
         }
@@ -2905,7 +2929,7 @@ void *zap_input(void *prompt_) {
     size_t cap = 128, len = 0;
     char *buf = (char *)malloc(cap);
     if (!buf) {
-        zap_sys_fail("input", "out of memory");
+        zap_sys_oom("input");
     }
     int saw_any = 0;
     for (;;) {
@@ -2916,7 +2940,7 @@ void *zap_input(void *prompt_) {
         } while (got < 0 && errno == EINTR);
         if (got < 0) {
             free(buf);
-            zap_sys_fail("input", strerror(errno));
+            zap_sys_fail_errno("input", errno);
         }
         if (got == 0) {
             break; /* EOF */
@@ -2930,7 +2954,7 @@ void *zap_input(void *prompt_) {
             char *nb = (char *)realloc(buf, cap);
             if (!nb) {
                 free(buf);
-                zap_sys_fail("input", "out of memory");
+                zap_sys_oom("input");
             }
             buf = nb;
         }
@@ -2989,7 +3013,7 @@ static int32_t zap_io_reader_fill(zap_io_reader *r) {
         got = read((int)r->fd, r->buf, ZAP_IO_RBUF);
     } while (got < 0 && errno == EINTR);
     if (got < 0) {
-        zap_sys_fail("io.reader", strerror(errno));
+        zap_sys_fail_errno("io.reader", errno);
     }
     r->pos = 0;
     r->fill = (int32_t)got;
@@ -3008,7 +3032,7 @@ void *zap_io_readline(void *h_) {
     size_t cap = 128, len = 0;
     char *out = (char *)malloc(cap);
     if (!out) {
-        zap_sys_fail("io.readline", "out of memory");
+        zap_sys_oom("io.readline");
     }
     for (;;) {
         if (zap_io_reader_fill(r) == 0) {
@@ -3025,7 +3049,7 @@ void *zap_io_readline(void *h_) {
             char *nb = (char *)realloc(out, cap);
             if (!nb) {
                 free(out);
-                zap_sys_fail("io.readline", "out of memory");
+                zap_sys_oom("io.readline");
             }
             out = nb;
         }
@@ -3047,7 +3071,7 @@ void *zap_io_readall(void *h_) {
     size_t cap = ZAP_IO_RBUF, len = 0;
     char *out = (char *)malloc(cap);
     if (!out) {
-        zap_sys_fail("io.readall", "out of memory");
+        zap_sys_oom("io.readall");
     }
     for (;;) {
         if (zap_io_reader_fill(r) == 0) {
@@ -3061,7 +3085,7 @@ void *zap_io_readall(void *h_) {
             char *nb = (char *)realloc(out, cap);
             if (!nb) {
                 free(out);
-                zap_sys_fail("io.readall", "out of memory");
+                zap_sys_oom("io.readall");
             }
             out = nb;
         }
@@ -3082,7 +3106,7 @@ void *zap_io_readn(void *h_, int64_t n) {
     zap_io_reader *r = (zap_io_reader *)(void *)((ZapStr *)h_)->data;
     char *out = (char *)malloc((size_t)n);
     if (!out) {
-        zap_sys_fail("io.readn", "out of memory");
+        zap_sys_oom("io.readn");
     }
     size_t len = 0;
     while (len < (size_t)n) {
@@ -3135,7 +3159,7 @@ static void zap_io_write_full(zap_io_writer *w, const char *p, size_t n) {
             if (errno == EINTR) {
                 continue;
             }
-            zap_sys_fail("io.writer", strerror(errno));
+            zap_sys_fail_errno("io.writer", errno);
         }
         off += (size_t)got;
     }
@@ -3208,7 +3232,7 @@ void zap_io_writer_close(void *h_) {
     zap_io_writer_drain(w); /* may raise; leave closed=0 so a retry can flush */
     w->closed = 1;
     if (close((int)w->fd) != 0) {
-        zap_sys_fail("io.writer", strerror(errno));
+        zap_sys_fail_errno("io.writer", errno);
     }
 }
 
