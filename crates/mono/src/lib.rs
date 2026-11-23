@@ -41,8 +41,9 @@
 use std::collections::{HashMap, HashSet};
 
 use zapc_syntax::ast::{
-    self, Arg, BinOp, Block, CompClause, DictItem, EnumDef, Expr, Function, InterfaceDef, Item,
-    MethodSig, Module, Param, PatArg, Pattern, Stmt, StructDef, Type, TypeParam, UnOp,
+    self, Arg, ArgSpread, BinOp, Block, CompClause, DictItem, EnumDef, Expr, Function,
+    InterfaceDef, Item, MethodSig, Module, Param, PatArg, Pattern, Stmt, StructDef, Type,
+    TypeParam, UnOp,
 };
 use zapc_syntax::span::Span;
 
@@ -272,6 +273,11 @@ struct Mono<'a> {
     interfaces: HashMap<String, &'a InterfaceDef>,
     /// Free-function return types, for inference of `f(...)` results.
     func_ret: HashMap<String, Option<Type>>,
+    /// Every free-function declaration (generic or not), by name. Used to read a
+    /// callee's parameter types so a call argument can be rewritten with the
+    /// parameter's declared type as its expected-type sink (#1342), the way a
+    /// `return` already passes the function's return type.
+    funcs: HashMap<String, &'a Function>,
     /// Library-registered derivable generators (E3a, #1290): generator function
     /// name -> the trait it derives (from `@derivable(Trait)`). Used to recover
     /// the `@derive` context (trait + type) when a `comptime.error` or engine
@@ -783,6 +789,7 @@ impl<'a> Mono<'a> {
             enums: HashMap::new(),
             interfaces: HashMap::new(),
             func_ret: HashMap::new(),
+            funcs: HashMap::new(),
             derivable_generators: HashMap::new(),
             cur_derive: None,
             comptime_registry: type_registry(module),
@@ -830,6 +837,7 @@ impl<'a> Mono<'a> {
                 }
                 Item::Function(f) => {
                     m.func_ret.insert(f.name.clone(), f.ret.clone());
+                    m.funcs.insert(f.name.clone(), f);
                     if !f.generics.is_empty() {
                         m.gfuncs.insert(f.name.clone(), f);
                     }
@@ -3990,6 +3998,75 @@ impl Mono<'_> {
         Ok(out)
     }
 
+    /// Per-argument expected types for a call, so a payload-less generic variant
+    /// (`Optional.None`) or any inference-ambiguous argument is rewritten with
+    /// the callee's declared parameter/field type as its expected-type sink
+    /// (#1342) — the way a `return` already passes the function's return type.
+    ///
+    /// Only **non-generic** callees contribute a type (their parameter/field
+    /// types are concrete): a bare-name non-generic struct constructor
+    /// (`Box(..)`) uses its field types, a non-generic free function (`take(..)`)
+    /// its parameter types. A generic callee is left to the existing type-
+    /// argument inference (`instance_args` / `infer_fn_targs`), which drives the
+    /// whole-call `expected` sink itself; methods, enum-variant and indexed
+    /// callees, spreads, and variadic/kwargs slots stay `None` (unchanged). The
+    /// result aligns 1:1 with `args`; `None` reproduces the prior behavior.
+    fn call_arg_expected(&self, callee: &Expr, args: &[Arg]) -> Vec<Option<Type>> {
+        let none = vec![None; args.len()];
+        let Expr::Name(g, _) = callee else {
+            return none;
+        };
+        // Generic callees: their parameter/field types may mention type
+        // parameters; leave them to the dedicated inference paths.
+        if self.gstructs.contains_key(g) || self.gfuncs.contains_key(g) {
+            return none;
+        }
+        // Ordered (name, declared-type) slots from the callee, stopping at the
+        // first variadic / kwargs-collector parameter so a positional argument
+        // that lands on or after it keeps `None` (its expected type is the
+        // element/collector type, not the slot type — not modelled here).
+        let slots: Vec<(String, Type)> = if let Some(s) = self.structs.get(g) {
+            s.fields
+                .iter()
+                .map(|f| (f.name.clone(), f.ty.clone()))
+                .collect()
+        } else if let Some(f) = self.funcs.get(g) {
+            let mut v = Vec::new();
+            for p in &f.params {
+                if p.variadic || p.kwargs || p.ty.is_none() {
+                    break;
+                }
+                v.push((p.name.clone(), p.ty.clone().unwrap()));
+            }
+            v
+        } else {
+            return none;
+        };
+
+        let mut out = Vec::with_capacity(args.len());
+        let mut pos = 0usize;
+        let mut bail = false;
+        for a in args {
+            if bail || !matches!(a.spread, ArgSpread::None) {
+                // A spread fills an unknown number of slots; stop assigning
+                // positional expecteds once one appears (fail-safe to `None`).
+                bail = true;
+                out.push(None);
+                continue;
+            }
+            let ty = match &a.name {
+                Some(n) => slots.iter().find(|(sn, _)| sn == n).map(|(_, t)| t.clone()),
+                None => {
+                    let t = slots.get(pos).map(|(_, t)| t.clone());
+                    pos += 1;
+                    t
+                }
+            };
+            out.push(ty.map(|t| self.apply_subst(&t)));
+        }
+        out
+    }
+
     fn rewrite_call(
         &mut self,
         callee: &Expr,
@@ -4008,10 +4085,16 @@ impl Mono<'_> {
         let desugared = zapc_syntax::seam::desugar_seam_ctor_callee(callee);
         let callee = desugared.as_ref().unwrap_or(callee);
         // Rewrite the arguments once; keep their inferred types for unification.
+        // Each argument is rewritten with the callee's declared parameter/field
+        // type as its expected-type sink (#1342), so a payload-less
+        // `Optional.None` (or any inference-ambiguous argument) pins its type
+        // argument from the callee the way a `return` does from the return type.
+        let arg_expected = self.call_arg_expected(callee, args);
         let mut nargs = Vec::with_capacity(args.len());
         let mut argpairs = Vec::with_capacity(args.len());
-        for a in args {
-            let (v, cty) = self.rewrite_expr(&a.value, env, None)?;
+        for (i, a) in args.iter().enumerate() {
+            let exp = arg_expected.get(i).and_then(|t| t.as_ref());
+            let (v, cty) = self.rewrite_expr(&a.value, env, exp)?;
             argpairs.push((a.name.clone(), cty));
             nargs.push(Arg {
                 name: a.name.clone(),
