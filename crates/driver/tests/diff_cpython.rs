@@ -38,6 +38,14 @@ use std::process::Command;
 #[cfg(feature = "codegen")]
 use std::time::Duration;
 
+// Shared end-to-end harness: the two-pass bounded pool + compile/run deadline
+// split (zaplang-io/zap#1305, #1113). The python side keeps the local
+// single-deadline runner (an interpreter has no link phase); only the zap side
+// adopts the build/run split.
+mod common;
+#[cfg(feature = "codegen")]
+use common::{compile_then_run, run_e2e_parallel, Outcome};
+
 // ---------------------------------------------------------------------------
 // Zap -> CPython source transform
 // ---------------------------------------------------------------------------
@@ -396,13 +404,15 @@ fn python_cmd(file: &std::path::Path) -> Command {
 #[cfg(feature = "codegen")]
 fn run_zap(zap_file: &std::path::Path) -> Run {
     let bin = env!("CARGO_BIN_EXE_zapc");
-    let mut c = Command::new(bin);
-    c.arg("run").arg(zap_file);
-    run_with_timeout(
-        c,
-        Duration::from_secs(60),
-        &format!("zap {}", zap_file.display()),
-    )
+    // Build under a generous ceiling, then time ONLY the program's run
+    // (zaplang-io/zap#1113) — so at a wide pool width (zaplang-io/zap#1305) a
+    // linker starved of CPU on a loaded runner is never misreported as a hang.
+    let (status, stdout, stderr) = compile_then_run(bin, zap_file, &[], Duration::from_secs(60));
+    Run {
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        exit: status.code(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    }
 }
 
 #[cfg(feature = "codegen")]
@@ -632,13 +642,19 @@ fn generator_is_deterministic_and_bounded() {
 #[test]
 fn curated_corpus_matches_cpython() {
     let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    let mut match_cases = 0usize;
-    let mut diverge_cases = 0usize;
-    let mut failures = String::new();
-
-    for zap_file in curated_fixtures() {
+    let fixtures = curated_fixtures();
+    eprintln!(
+        "diff_cpython curated: {} fixtures end-to-end",
+        fixtures.len()
+    );
+    // The shared two-pass pool runs the corpus wide (zaplang-io/zap#1305); curated
+    // differential programs are fast and deterministic with no concurrency/timing
+    // sensitivity, so none classify into the conservative lane. Each fixture's
+    // unique stem gives its `.py` a distinct name, so parallel workers never
+    // collide in `CARGO_TARGET_TMPDIR`.
+    run_e2e_parallel(fixtures, |zap_file| {
         let name = zap_file.file_stem().unwrap().to_string_lossy().into_owned();
-        let src = std::fs::read_to_string(&zap_file).expect("read fixture");
+        let src = std::fs::read_to_string(zap_file).expect("read fixture");
         let expect = parse_directive(&src);
 
         let py_src = zap_to_python(&src);
@@ -646,41 +662,31 @@ fn curated_corpus_matches_cpython() {
         std::fs::write(&py_file, &py_src).expect("write python");
 
         let cpython = run_python(&py_file);
-        let zap = run_zap(&zap_file);
+        let zap = run_zap(zap_file);
         let agree = cpython.matches(&zap);
 
         match &expect {
             Expect::Match => {
-                match_cases += 1;
-                if !agree {
-                    failures.push_str(&report(
-                        "MATCH-FAILED",
-                        &name,
-                        &src,
-                        &py_src,
-                        &cpython,
-                        &zap,
-                    ));
+                if agree {
+                    Outcome::Pass
+                } else {
+                    Outcome::Failed(report("MATCH-FAILED", &name, &src, &py_src, &cpython, &zap))
                 }
             }
             Expect::Diverge { reason } => {
-                diverge_cases += 1;
                 if agree {
-                    failures.push_str(&format!(
-                        "\n================ DIVERGENCE-GONE: {name} ================\n\
-                         expected to diverge ({reason}) but zap and cpython now AGREE.\n\
-                         If the gap was fixed, promote this case to `# diff: match`.\n{}",
+                    Outcome::Failed(format!(
+                        "DIVERGENCE-GONE: {name} — expected to diverge ({reason}) but zap and \
+                         cpython now AGREE. If the gap was fixed, promote this case to \
+                         `# diff: match`.\n{}",
                         report("(now-agreeing)", &name, &src, &py_src, &cpython, &zap),
-                    ));
+                    ))
+                } else {
+                    Outcome::Pass
                 }
             }
         }
-    }
-
-    eprintln!(
-        "diff_cpython curated: {match_cases} match-cases, {diverge_cases} documented-divergence cases"
-    );
-    assert!(failures.is_empty(), "{failures}");
+    });
 }
 
 /// Generate a seeded corpus of pure-`print` programs over the safe shared
@@ -706,34 +712,46 @@ fn random_programs_match_cpython() {
 
     let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     let programs = gen::Generator::new(seed).programs(count);
-    let mut failures = String::new();
 
+    // Materialize every (zap, py) pair up front — generation is serial and
+    // deterministic — then run compile+link+run+compare in parallel on the shared
+    // pool (zaplang-io/zap#1305). Each program's unique `gen_<seed>_<i>` stem keeps
+    // the temp files collision-free across workers.
+    let mut zap_files = Vec::with_capacity(programs.len());
     for (i, prog) in programs.iter().enumerate() {
         let name = format!("gen_{seed:016x}_{i:03}");
         let zap_file = tmp.join(format!("{name}.zap"));
         let py_file = tmp.join(format!("{name}.py"));
         std::fs::write(&zap_file, prog).expect("write zap");
         std::fs::write(&py_file, zap_to_python(prog)).expect("write python");
+        zap_files.push(zap_file);
+    }
+    eprintln!("diff_cpython random: {count} generated programs (seed {seed:#018x})");
+
+    run_e2e_parallel(zap_files, move |zap_file| {
+        let name = zap_file.file_stem().unwrap().to_string_lossy().into_owned();
+        let prog = std::fs::read_to_string(zap_file).expect("read generated zap");
+        let py_file = zap_file.with_extension("py");
 
         let cpython = run_python(&py_file);
-        let zap = run_zap(&zap_file);
-        if !cpython.matches(&zap) {
-            failures.push_str(&report(
+        let zap = run_zap(zap_file);
+        if cpython.matches(&zap) {
+            Outcome::Pass
+        } else {
+            let mut msg = report(
                 "GENERATED-DIVERGENCE",
                 &name,
-                prog,
-                &zap_to_python(prog),
+                &prog,
+                &zap_to_python(&prog),
                 &cpython,
                 &zap,
+            );
+            msg.push_str(&format!(
+                "reproduce: ZAP_DIFF_SEED={seed} ZAP_DIFF_COUNT={count} (fixture {name})\n"
             ));
-            failures.push_str(&format!(
-                "reproduce: ZAP_DIFF_SEED={seed} ZAP_DIFF_COUNT={count} (program #{i})\n"
-            ));
+            Outcome::Failed(msg)
         }
-    }
-
-    eprintln!("diff_cpython random: {count} generated programs (seed {seed:#018x})");
-    assert!(failures.is_empty(), "{failures}");
+    });
 }
 
 // ---------------------------------------------------------------------------
