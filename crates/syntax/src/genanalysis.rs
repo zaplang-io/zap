@@ -82,6 +82,9 @@ fn each_yield_in_stmt<'a>(st: &'a Stmt, visit: &mut dyn FnMut(&'a Expr)) {
         }
         Stmt::For {
             target, iter, body, ..
+        }
+        | Stmt::ComptimeFor {
+            target, iter, body, ..
         } => {
             each_yield_in_expr(target, visit);
             each_yield_in_expr(iter, visit);
@@ -233,7 +236,7 @@ fn each_yield_in_expr<'a>(e: &'a Expr, visit: &mut dyn FnMut(&'a Expr)) {
             each_yield_in_expr(value, visit);
             each_yield_in_clauses(clauses, visit);
         }
-        Expr::Unary { expr, .. } => each_yield_in_expr(expr, visit),
+        Expr::Comptime { expr, .. } | Expr::Unary { expr, .. } => each_yield_in_expr(expr, visit),
         Expr::Binary { lhs, rhs, .. } => {
             each_yield_in_expr(lhs, visit);
             each_yield_in_expr(rhs, visit);

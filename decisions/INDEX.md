@@ -46,6 +46,7 @@ listed here (see [`README.md`](README.md)).
 | [1284](lang/1284-variadic-minmax-sum.md) | Variadic min/max and element-typed sum | Locked | 2026-11-23 |
 | [1285](lang/1285-any-all-reversed.md) | any / all / reversed built-ins | Locked | 2026-11-23 |
 | [1290](lang/1290-derivable-registration.md) | "@derivable(Trait) registration model (E3a)" | Accepted | 2026-11-22 |
+| [1297](lang/1297-comptime-surface-parser.md) | comptime/reflect parser surface — comptime keyword + comptime-for / comptime-expr (S1) | Accepted | 2026-11-23 |
 
 ## stdlib
 

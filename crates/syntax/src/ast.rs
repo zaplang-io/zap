@@ -535,6 +535,17 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
+    /// `comptime for <target> in <iter>:` — a compile-time-unrolled loop over a
+    /// comptime sequence (E2/E3 surface, epic #1296; locked decision 4 of epic
+    /// #1249). Distinct from the runtime [`Stmt::For`] so a later pass can find
+    /// and unroll it (the engine lives in `zapc_comptime`; the mono wiring is
+    /// #1298). Parsed by S1 (#1297); evaluated by S2 (#1298).
+    ComptimeFor {
+        target: Expr,
+        iter: Expr,
+        body: Block,
+        span: Span,
+    },
     /// `match scrutinee: case ...` (D-0040).
     Match {
         scrutinee: Expr,
@@ -911,6 +922,15 @@ pub enum Expr {
         span: Span,
     },
 
+    /// `comptime <expr>` — force compile-time evaluation of `expr` (E2/E3
+    /// surface, epic #1296; locked decision 4 of epic #1249). Used for a comptime
+    /// operand (`reflect.field(value, comptime f.index)`), a comptime binding
+    /// (`auto info = comptime reflect.type_info(T)`), or any value folded at
+    /// compile time. Parsed by S1 (#1297); evaluated by S2 (#1298).
+    Comptime {
+        expr: Box<Expr>,
+        span: Span,
+    },
     Unary {
         op: UnOp,
         expr: Box<Expr>,
@@ -1195,6 +1215,7 @@ pub fn render_expr(e: &Expr) -> String {
         }
         Expr::Attr { base, name, .. } => format!("{}.{name}", render_expr(base)),
         Expr::Named { name, value, .. } => format!("({name} := {})", render_expr(value)),
+        Expr::Comptime { expr, .. } => format!("comptime {}", render_expr(expr)),
         other => format!("{other:?}"),
     }
 }

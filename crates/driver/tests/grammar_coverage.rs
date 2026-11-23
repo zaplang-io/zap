@@ -192,9 +192,11 @@ const fn cov(production: &'static str, status: Status, src: &'static str) -> Cov
 /// (checked by [`tracked_gaps_are_documented`]).
 #[rustfmt::skip]
 const GAP_NOTES: &[(&str, &str)] = &[
-    // None. The `select` statement (D-0031) — the last tracked gap — now parses,
-    // type-checks and lowers end-to-end (#1002), so `select_stmt`/`select_case`/
-    // `select_op` moved to `Compiles` above.
+    // `comptime for` (E2/E3 surface) is parsed by S1 (#1297) but its comptime
+    // evaluation/unrolling is not wired until S2 (#1298); sema reports it as
+    // not-yet-implemented (ZAP0002), so the front end still rejects it. Graduates
+    // to `Compiles` when S2 lands.
+    ("comptime_for_stmt", "parsed by S1 (#1297); comptime evaluation not wired until S2 (#1298), sema reports ZAP0002"),
 ];
 
 /// One entry per nonterminal reachable from `module`. The example is a complete,
@@ -438,6 +440,10 @@ def f():
     cov("for_stmt",          Compiles , r#"def f():
     for x in range(3):
         print(str(x))
+"#),
+    cov("comptime_for_stmt", TrackedGap, r#"def f():
+    comptime for x in xs:
+        pass
 "#),
     cov("try_stmt",          Compiles , r#"def f():
     try:

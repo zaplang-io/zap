@@ -1301,6 +1301,9 @@ impl Walk {
             }
             Stmt::For {
                 target, iter, body, ..
+            }
+            | Stmt::ComptimeFor {
+                target, iter, body, ..
             } => {
                 self.bind_target_expr(target);
                 self.expr(target);
@@ -1462,7 +1465,7 @@ impl Walk {
                 self.expr(key);
                 self.expr(value);
             }
-            Expr::Unary { expr, .. } => self.expr(expr),
+            Expr::Comptime { expr, .. } | Expr::Unary { expr, .. } => self.expr(expr),
             Expr::Binary { lhs, rhs, .. } => {
                 self.expr(lhs);
                 self.expr(rhs);
@@ -1571,6 +1574,7 @@ fn expr_span(e: &Expr) -> Span {
         | Expr::DictComp { span, .. }
         | Expr::SetComp { span, .. }
         | Expr::GenExp { span, .. }
+        | Expr::Comptime { span, .. }
         | Expr::Unary { span, .. }
         | Expr::Binary { span, .. }
         | Expr::Compare { span, .. }

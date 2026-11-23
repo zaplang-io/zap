@@ -240,6 +240,17 @@ fn specialize_stmt(st: &Stmt, env: &mut Env, ev: &mut Evaluator) -> Result<Stmt,
             body: specialize_block(body, env, ev)?,
             span: *span,
         },
+        Stmt::ComptimeFor {
+            target,
+            iter,
+            body,
+            span,
+        } => Stmt::ComptimeFor {
+            target: fold(target, env, ev)?,
+            iter: fold(iter, env, ev)?,
+            body: specialize_block(body, env, ev)?,
+            span: *span,
+        },
         Stmt::Return { value, span } => Stmt::Return {
             value: match value {
                 Some(e) => Some(fold(e, env, ev)?),

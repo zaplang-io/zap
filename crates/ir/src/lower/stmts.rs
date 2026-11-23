@@ -194,6 +194,14 @@ impl<'a> FnLower<'a> {
             Stmt::For {
                 target, iter, body, ..
             } => self.lower_for(target, iter, body),
+            // `comptime for` (E2/E3 surface, #1297) is unrolled by the comptime
+            // engine (#1251/#1298), not lowered directly. Sema rejects it with
+            // ZAP0002 until that wiring lands, so this is an honest backstop:
+            // reaching lowering means the deferral was bypassed.
+            Stmt::ComptimeFor { .. } => Err(err(
+                "`comptime for` reached lowering but comptime evaluation is not \
+                 wired yet (comptime/reflect surface epic #1296, #1298)",
+            )),
             // Inside a generator, `return` ends iteration (D-0048/PEP 479): jump
             // to the shared exhaustion block (sema rejects `return <value>`).
             Stmt::Return { .. } if self.gen_entry.is_some() => {

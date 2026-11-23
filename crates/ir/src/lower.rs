@@ -17449,6 +17449,7 @@ fn collect_free_names(
                 out.push(n.clone());
             }
         }
+        Expr::Comptime { expr, .. } => collect_free_names(expr, bound, out, seen),
         Expr::Int(..)
         | Expr::Float(..)
         | Expr::Imaginary(..)

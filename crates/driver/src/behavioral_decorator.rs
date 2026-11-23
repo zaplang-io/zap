@@ -1543,6 +1543,17 @@ impl Rewriter<'_> {
                 body: self.block(body),
                 span,
             },
+            Stmt::ComptimeFor {
+                target,
+                iter,
+                body,
+                span,
+            } => Stmt::ComptimeFor {
+                target: self.expr(target),
+                iter: self.expr(iter),
+                body: self.block(body),
+                span,
+            },
             Stmt::Match {
                 scrutinee,
                 arms,
@@ -1820,6 +1831,10 @@ impl Rewriter<'_> {
             },
             Expr::Unary { op, expr, span } => Expr::Unary {
                 op,
+                expr: Box::new(self.expr(*expr)),
+                span,
+            },
+            Expr::Comptime { expr, span } => Expr::Comptime {
                 expr: Box::new(self.expr(*expr)),
                 span,
             },

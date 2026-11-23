@@ -311,6 +311,9 @@ impl Rewriter<'_> {
             }
             Stmt::For {
                 target, iter, body, ..
+            }
+            | Stmt::ComptimeFor {
+                target, iter, body, ..
             } => {
                 self.expr(target, locals);
                 self.expr(iter, locals);
@@ -464,7 +467,7 @@ impl Rewriter<'_> {
                     self.expr(part, locals);
                 }
             }
-            Expr::Unary { expr, .. } => self.expr(expr, locals),
+            Expr::Comptime { expr, .. } | Expr::Unary { expr, .. } => self.expr(expr, locals),
             Expr::Binary { lhs, rhs, .. } => {
                 self.expr(lhs, locals);
                 self.expr(rhs, locals);
@@ -783,6 +786,9 @@ fn collect_stmt_bindings(st: &Stmt, s: &mut HashSet<String>) {
             collect_expr_bindings(cond, s);
         }
         Stmt::For {
+            target, iter, body, ..
+        }
+        | Stmt::ComptimeFor {
             target, iter, body, ..
         } => {
             collect_target_names(target, s);

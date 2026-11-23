@@ -186,6 +186,7 @@ fn expr_span(e: &Expr) -> Span {
         | Expr::DictComp { span, .. }
         | Expr::SetComp { span, .. }
         | Expr::GenExp { span, .. }
+        | Expr::Comptime { span, .. }
         | Expr::Unary { span, .. }
         | Expr::Binary { span, .. }
         | Expr::Compare { span, .. }
@@ -2220,6 +2221,31 @@ impl Mono<'_> {
                     span: *span,
                 }
             }
+            // `comptime for` (E2/E3 surface, #1297): type-substitute like a
+            // runtime `for` so a specialized declaration is well-formed. Its
+            // compile-time unrolling (the engine wiring, #1251/#1298) is a
+            // separate pass; here mono only rewrites references/types.
+            Stmt::ComptimeFor {
+                target,
+                iter,
+                body,
+                span,
+            } => {
+                let iter = self.rw(iter, env)?;
+                env.push();
+                if let Expr::Name(n, _) = target {
+                    env.declare(n, CTy::Unknown);
+                }
+                let target = self.rw(target, env)?;
+                let body = self.rewrite_block(body, env)?;
+                env.pop();
+                Stmt::ComptimeFor {
+                    target,
+                    iter,
+                    body,
+                    span: *span,
+                }
+            }
             Stmt::Match {
                 scrutinee,
                 arms,
@@ -2815,6 +2841,20 @@ impl Mono<'_> {
                         span: *span,
                     },
                     cty,
+                ))
+            }
+            // `comptime <expr>` (E2/E3 surface, #1297): transparent to type
+            // substitution — rewrite the inner and carry its type through the
+            // `comptime` wrapper. Compile-time folding of the value is the engine
+            // wiring (#1298), not this reference-rewrite pass.
+            Expr::Comptime { expr, span } => {
+                let (inner, inner_cty) = self.rewrite_expr(expr, env, expected)?;
+                Ok((
+                    Expr::Comptime {
+                        expr: Box::new(inner),
+                        span: *span,
+                    },
+                    inner_cty,
                 ))
             }
             Expr::Binary { op, lhs, rhs, span } => {

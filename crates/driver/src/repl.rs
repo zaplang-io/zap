@@ -1104,7 +1104,8 @@ mod engine {
             | Expr::ChanRecv { span, .. }
             | Expr::Yield { span, .. }
             | Expr::IfElse { span, .. }
-            | Expr::Named { span, .. } => *span,
+            | Expr::Named { span, .. }
+            | Expr::Comptime { span, .. } => *span,
         }
     }
 }

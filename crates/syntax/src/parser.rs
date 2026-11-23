@@ -4533,6 +4533,14 @@ impl Parser {
     /// Parse one logical line into `out`: a compound statement, or one or more
     /// `;`-separated simple statements terminated by a newline.
     fn parse_line(&mut self, out: &mut Vec<Stmt>) {
+        // `comptime for …:` is a compound statement (E2/E3 surface, #1297). A
+        // bare `comptime <expr>` is a simple (expression) statement, handled by
+        // the expression parser's prefix, so only the `for` form is special here.
+        if self.is_kw(Keyword::Comptime) && matches!(self.peek2(), TokenKind::Keyword(Keyword::For))
+        {
+            out.push(self.parse_comptime_for());
+            return;
+        }
         if self.is_compound_start() {
             out.push(self.parse_compound());
             return;
@@ -4863,6 +4871,25 @@ impl Parser {
         let iter = self.parse_expr();
         let body = self.parse_block();
         Stmt::For {
+            target,
+            iter,
+            body,
+            span: self.span_from(start),
+        }
+    }
+
+    /// `comptime for <target> in <iter>:` — the compile-time-unrolled loop
+    /// (E2/E3 surface, #1297). Same shape as [`Self::parse_for`], behind the
+    /// `comptime` keyword, producing the distinct [`Stmt::ComptimeFor`].
+    fn parse_comptime_for(&mut self) -> Stmt {
+        let start = self.peek_span().start;
+        self.expect_kw(Keyword::Comptime, "'comptime'");
+        self.expect_kw(Keyword::For, "'for'");
+        let target = self.parse_target();
+        self.expect_kw(Keyword::In, "'in'");
+        let iter = self.parse_expr();
+        let body = self.parse_block();
+        Stmt::ComptimeFor {
             target,
             iter,
             body,
@@ -5677,6 +5704,22 @@ impl Parser {
     }
 
     fn parse_not_expr(&mut self) -> Expr {
+        // `comptime <expr>` — force compile-time evaluation of the operand
+        // (E2/E3 surface, #1297). A prefix at this level, so it wraps the whole
+        // following expression (`comptime f.index`, `comptime reflect.type_info(T)`,
+        // `comptime len(info.fields)`). The `comptime for` statement form is
+        // handled earlier in `parse_line`; `comptime.<builtin>` (e.g.
+        // `comptime.error(...)`, #1256) is a qualified call, parsed as an atom,
+        // so it is NOT treated as the prefix here.
+        if self.is_kw(Keyword::Comptime) && !matches!(self.peek2(), TokenKind::Dot) {
+            let start = self.peek_span().start;
+            self.bump();
+            let expr = self.parse_not_expr();
+            return Expr::Comptime {
+                expr: Box::new(expr),
+                span: self.span_from(start),
+            };
+        }
         if self.is_kw(Keyword::Not) {
             let start = self.peek_span().start;
             self.bump();
@@ -6187,6 +6230,14 @@ impl Parser {
     fn parse_atom(&mut self) -> Expr {
         let start = self.peek_span().start;
         let span = self.peek_span();
+        // `comptime.<builtin>` (e.g. `comptime.error(...)`, #1256): the `comptime`
+        // keyword used as a qualified-call namespace. Yield the `comptime` name so
+        // the postfix loop attaches `.error(...)` as an ordinary `Attr`/`Call`,
+        // preserving the merged #1256 surface now that `comptime` is a keyword.
+        if self.is_kw(Keyword::Comptime) && matches!(self.peek2(), TokenKind::Dot) {
+            self.bump();
+            return Expr::Name("comptime".to_string(), span);
+        }
         match self.peek().clone() {
             TokenKind::Int(s) => {
                 self.bump();
