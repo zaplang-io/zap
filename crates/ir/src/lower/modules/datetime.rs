@@ -25,7 +25,7 @@ use zapc_syntax::ast;
 
 use super::ModuleLower;
 use crate::ir::*;
-use crate::lower::{err, FnLower, LowerError};
+use crate::lower::{err, optional_layout, FnLower, LowerError};
 
 pub(super) const MODULE: ModuleLower = ModuleLower {
     name: "datetime",
@@ -1241,9 +1241,71 @@ fn lower(
             });
             build_datetime(lowerer, local_ts, 0, off, aware, zone_id, src_ns)?
         }
+        // zone_abbreviation(dt) -> Optional[str] (#1345): the IANA abbreviation
+        // of dt's retained named zone at its UTC instant. Monomorphization has
+        // encoded the concrete `Optional$str` instance into the symbol
+        // (`zone_abbreviation$Optional$str`), since this lowering cannot name it
+        // — the same device the dict.get path uses (`get$Optional$str`).
+        m if m.starts_with("zone_abbreviation$") => {
+            let opt_name = m
+                .strip_prefix("zone_abbreviation$")
+                .expect("prefix checked");
+            lower_zone_abbreviation(lowerer, args, opt_name)?
+        }
         _ => return Ok(None),
     };
     Ok(Some(r))
+}
+
+/// `datetime.zone_abbreviation(dt) -> Optional[str]` (#1345). The runtime
+/// returns the abbreviation at dt's UTC instant as a fresh `ZapStr*`, or a null
+/// pointer when the value carries no named zone (`zone_id < 0`: naive,
+/// fixed-offset, or unknown). `Optional[str]` has the niche layout — `Some(p)`
+/// IS the payload pointer, `None` IS the null pointer — so the nullable result
+/// is already the physical Optional value; it only needs to be reinterpreted to
+/// the enum's ZIR type (via a slot) so `match` / assignment dispatch resolves.
+fn lower_zone_abbreviation(
+    lowerer: &mut FnLower,
+    args: &[ast::Arg],
+    opt_name: &str,
+) -> Result<(Value, Ty), LowerError> {
+    // The UTC instant and the retained zone id; the abbreviation is a pure
+    // function of the two, so it is identical whether dt came from
+    // `resolve(..., fold=)` or from a UTC conversion.
+    let (inst, _off, _aware, zone_id, _nanos) = instant_of(lowerer, &args[0])?;
+    let ptr = lowerer.new_value(Ty::Ptr);
+    lowerer.emit(Inst::Call {
+        dest: Some(ptr),
+        func: "zap_tz_abbr_at_id".to_string(),
+        args: vec![zone_id, inst],
+    });
+
+    let sid = lowerer.ctx.ids.get(opt_name).copied().ok_or_else(|| {
+        err(format!(
+            "datetime.zone_abbreviation()'s result type '{opt_name}' was not \
+             instantiated (internal; #1345)"
+        ))
+    })?;
+    let opt = optional_layout(lowerer.ctx, Ty::Struct(sid)).ok_or_else(|| {
+        err(format!(
+            "datetime.zone_abbreviation()'s result type '{opt_name}' is not an \
+             Optional instance (internal; #1345)"
+        ))
+    })?;
+    if !opt.niche {
+        // `str` is a pointer payload, so its Optional is always the niche
+        // layout; a tagged layout here would be an internal invariant breach.
+        return Err(err(
+            "datetime.zone_abbreviation()'s Optional[str] is not niche-laid-out \
+             (internal; #1345)",
+        ));
+    }
+    // Reinterpret the nullable pointer as the Optional enum type (null == None,
+    // non-null == Some) without a branch, mirroring `gen_opt_some`'s niche path.
+    let slot = lowerer.alloca(Ty::Struct(opt.sid));
+    lowerer.store(slot, ptr);
+    let val = lowerer.load(slot, Ty::Struct(opt.sid));
+    Ok((val, Ty::Struct(opt.sid)))
 }
 
 /// Extract the optional `fold` selector for `resolve` (#1149): a trailing

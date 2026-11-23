@@ -4189,6 +4189,33 @@ impl Mono<'_> {
                     }
                 }
             }
+            // Built-in `datetime.zone_abbreviation(dt) -> Optional[str]` (#1345).
+            // The payload is always `str`, but lowering needs the concrete
+            // `Optional$str` instance to build the niche result and cannot name
+            // it from the lossy element kind alone — so request that instance
+            // here (where it can be named) and encode its mangled name into the
+            // method symbol (`zone_abbreviation$Optional$str`), which lowering
+            // decodes. Mirrors the `dict.get` → `get$Optional$str` precedent.
+            // Fires only for the genuine module call, not a local shadowing
+            // `datetime` or a user type's own `.zone_abbreviation`.
+            if variant == "zone_abbreviation" {
+                if let Expr::Name(m, _) = base.as_ref() {
+                    if m == "datetime" && env.lookup(m).is_none() {
+                        let str_ty = self.named("str", Vec::new());
+                        let opt_mangled = self.request("Optional", std::slice::from_ref(&str_ty));
+                        let node = Expr::Call {
+                            callee: Box::new(Expr::Attr {
+                                base: base.clone(),
+                                name: format!("zone_abbreviation${opt_mangled}"),
+                                span: *aspan,
+                            }),
+                            args: nargs,
+                            span,
+                        };
+                        return Ok((node, CTy::Ty(self.named("Optional", vec![str_ty]))));
+                    }
+                }
+            }
             // Ordinary method call `recv.m(args)`.
             let (bexpr, bcty) = self.rewrite_expr(base, env, None)?;
             // Built-in `dict.get(key) -> Optional[V]` (ticket #281): a safe read.

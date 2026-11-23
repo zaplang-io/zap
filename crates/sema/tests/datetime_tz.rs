@@ -597,3 +597,51 @@ fn classifiers_and_resolve_imaginary_reject_non_datetime() {
         "ZAP4025",
     );
 }
+
+// ---------------------------------------------------------------------------
+// zone_abbreviation(dt) -> Optional[str] (#1345).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn zone_abbreviation_returns_optional_str() {
+    // The result is an Optional[str] (the annotated sink forces the check), and
+    // it threads into the Optional surface (match / unwrap).
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    \
+         auto d = datetime.resolve(z, 2024, 11, 3, 1, 30, 0)\n    \
+         Optional[str] a = datetime.zone_abbreviation(d)\n",
+    ));
+    // A naive value is accepted too — the None case is still Optional[str].
+    assert_ok(&prog(
+        "    auto t = datetime.from_timestamp(0)\n    \
+         Optional[str] a = datetime.zone_abbreviation(t)\n",
+    ));
+}
+
+#[test]
+fn zone_abbreviation_rejects_non_datetime() {
+    assert_code(
+        &prog("    auto a = datetime.zone_abbreviation(5)\n"),
+        "ZAP4024",
+    );
+    assert_code(
+        &prog("    auto a = datetime.zone_abbreviation(\"x\")\n"),
+        "ZAP4024",
+    );
+}
+
+#[test]
+fn zone_abbreviation_arity_errors() {
+    // No argument, and more than one argument, are both rejected.
+    assert_code(
+        &prog("    auto a = datetime.zone_abbreviation()\n"),
+        "ZAP4025",
+    );
+    assert_code(
+        &prog(
+            "    auto t = datetime.from_timestamp(0)\n    \
+             auto a = datetime.zone_abbreviation(t, t)\n",
+        ),
+        "ZAP4025",
+    );
+}
