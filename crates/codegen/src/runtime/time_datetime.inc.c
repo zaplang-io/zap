@@ -37,10 +37,13 @@ double zap_time_wall_seconds(void) {
 }
 
 /* --- sleep ---
- * v1 is a plain blocking nanosleep (EINTR-resuming): it blocks the current OS
- * thread, so under the M:N scheduler it parks that M rather than yielding
- * cooperatively. A scheduler-aware sleep (via the netpoller timer) is a
- * follow-up (#99).
+ * This is the plain blocking nanosleep (EINTR-resuming): it blocks the current
+ * OS thread, so under the M:N scheduler it pins that M rather than yielding
+ * cooperatively. It is the FALLBACK path used on a native thread (`main`), on a
+ * coroutine with no owning scope, or where the netpoller is unavailable; a
+ * coroutine with an owning `scope:` instead takes the cooperative, cancellable
+ * `zap_time_sleep_cancellable_ns` below (#1357), which parks on the netpoller
+ * timer and frees its M. Making every coroutine sleep free its M is #1360.
  *
  * Precise GC (#48/#188): the nanosleep is bracketed in zap_enter_blocking/
  * zap_leave_blocking so a sleeping mutator is marked GC-safe (roots flushed to
@@ -69,6 +72,101 @@ void zap_time_sleep_seconds(double s) {
         return;
     }
     zap_time_sleep_ns((int64_t)(s * 1e9));
+}
+
+/* --- cancellable, scheduler-aware sleep (#1357) ---
+ * A coroutine running inside an owning `scope:` sleeps *cooperatively*: it parks
+ * its G on the netpoller timer until the monotonic deadline, which (a) FREES its
+ * M so sibling coroutines on that worker keep running (unlike the blocking
+ * `nanosleep` above, which pins the OS thread for the whole duration), and (b)
+ * observes caller-scope cancellation — a `scope(timeout=)` deadline, a signal,
+ * or a sibling failure wakes the wait at once and raises `Cancelled` (surfaced
+ * to the caller as `ScopeTimeout` under a timed scope, per #825 sever rules).
+ *
+ * The wake rides the poller's epoll tick, so resolution is MILLISECOND-class;
+ * the blocking `zap_time_sleep_ns` path stays nanosecond-exact and is used
+ * whenever there is nothing to free or cancel: a native thread (`main`), a
+ * coroutine with no owning scope, or a platform without the netpoller (non-Linux
+ * v1). Generalizing M-freeing to *every* coroutine sleep — including the
+ * scope-less case still handled by the blocking path here — is tracked in #1360
+ * (an fd-less timer registry that this fd-backed park is the forerunner of).
+ *
+ * `ns <= 0` is a cooperative checkpoint (observe a pending cancel, then yield
+ * once), not a silent no-op, so a tight `sleep(0)` loop both cancels promptly
+ * and lets siblings progress. The park uses a fresh pipe whose read end never
+ * becomes ready (mirroring the netpoll self-test's deadline probe), so only the
+ * deadline or a cancellation ever wakes it. */
+void zap_time_sleep_cancellable_ns(int64_t ns) {
+    M *m = cur_m;
+    G *g = m ? m->current : NULL;
+    if (!g || !g->scope) {
+        /* No owning scope: nothing can cancel this wait, and on a native thread
+         * there is no M to free. Keep the precise blocking sleep (#1360). */
+        zap_time_sleep_ns(ns);
+        return;
+    }
+    if (ns <= 0) {
+        zap_checkpoint(); /* cancel-or-yield; never a no-op inside a scope */
+        return;
+    }
+#if defined(__linux__)
+    /* The cooperative timer park is the Linux epoll netpoller + a never-ready
+     * pipe fd; the netpoller's own backend is `#if defined(__linux__)`, so off
+     * Linux we fall through to the portable blocking path below. */
+    int fds[2];
+    /* Plain `pipe()` (not `pipe2`): the runtime is compiled without
+     * `_GNU_SOURCE`, so `pipe2` is an undeclared function under the LTO bitcode
+     * compile. The read end is never written, so it is never ready (no
+     * O_NONBLOCK needed — the netpoller self-test's deadline probe registers a
+     * plain pipe the same way); set FD_CLOEXEC by hand so the short-lived fds do
+     * not leak across an `exec` during the wait. */
+    if (pipe(fds) == 0) {
+        (void)fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+        (void)fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+        void *pd = zap_netpoll_open(fds[0]);
+        if (pd) {
+            int64_t now = np_now_ns();
+            /* Absolute CLOCK_MONOTONIC deadline; clamp so a very long duration
+             * cannot overflow to a past (or negative) deadline and wake early. */
+            int64_t deadline = (ns > INT64_MAX - now) ? INT64_MAX : now + ns;
+            int64_t st = zap_netpoll_wait(pd, ZAP_POLL_READ, deadline);
+            zap_netpoll_close(pd); /* only waiter: wakes nothing; recycles pd */
+            close(fds[0]);
+            close(fds[1]);
+            if (st == ZAP_POLL_CANCELLED) {
+                zap_raise(cancelled_exc());
+            }
+            /* ZAP_POLL_TIMEOUT (deadline passed) and ZAP_POLL_CLOSED (runtime
+             * shutdown) return normally; ZAP_POLL_OK cannot occur (the pipe read
+             * end is never written). A cancel that lands after a timeout wake is
+             * caught by the next cancellation point. */
+            return;
+        }
+        /* Netpoller registration failed: drop the pipe and block. */
+        close(fds[0]);
+        close(fds[1]);
+    }
+    /* pipe/netpoller unavailable: degrade to the blocking sleep. */
+#endif
+    /* Portable fallback (non-Linux, or no netpoller): observe a pending cancel,
+     * then block. Not cancellable mid-sleep here — the cooperative timer park is
+     * the Linux netpoller path above (#1360 generalizes it). */
+    zap_check_cancel();
+    zap_time_sleep_ns(ns);
+}
+
+/* Seconds entry for the cancellable sleep (mirrors `zap_time_sleep_seconds`).
+ * A non-positive or non-finite request routes through the ns path so it still
+ * acts as a checkpoint inside a scope; a huge request is clamped to the max
+ * nanosecond count to avoid undefined `double`->`int64` conversion. */
+void zap_time_sleep_cancellable_seconds(double s) {
+    if (!(s > 0.0)) { /* <= 0 or NaN */
+        zap_time_sleep_cancellable_ns(0);
+        return;
+    }
+    double ns = s * 1e9;
+    int64_t ins = (ns >= 9.2e18) ? INT64_MAX : (int64_t)ns;
+    zap_time_sleep_cancellable_ns(ins);
 }
 
 /* --- duration unit constructors (-> nanoseconds) --- */

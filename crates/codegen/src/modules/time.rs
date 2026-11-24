@@ -17,9 +17,15 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_time_monotonic_seconds", &[], Some(f.into()));
     cg.declare_rt("zap_time_wall_ns", &[], Some(i.into()));
     cg.declare_rt("zap_time_wall_seconds", &[], Some(f.into()));
-    // sleep
+    // sleep (blocking nanosleep — native-thread / no-scope fallback)
     cg.declare_rt("zap_time_sleep_seconds", &[f.into()], None);
     cg.declare_rt("zap_time_sleep_ns", &[i.into()], None);
+    // cancellable, scheduler-aware sleep (#1357): parks the G on the netpoller
+    // timer (frees the M) and raises `Cancelled` on scope cancellation. These
+    // are the targets a coroutine `time.sleep*` lowers to; they may raise, so
+    // the lowering emits them as `throwing_call`s.
+    cg.declare_rt("zap_time_sleep_cancellable_seconds", &[f.into()], None);
+    cg.declare_rt("zap_time_sleep_cancellable_ns", &[i.into()], None);
     // duration unit constructors (-> nanoseconds)
     cg.declare_rt("zap_time_seconds_to_ns", &[i.into()], Some(i.into()));
     cg.declare_rt("zap_time_millis_to_ns", &[i.into()], Some(i.into()));
