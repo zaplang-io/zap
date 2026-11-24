@@ -153,6 +153,13 @@ impl<'a> FnLower<'a> {
             // `ZAP6001`), and a bare payload auto-wraps into `Some` where sema
             // accepts it (#1262).
             let val = self.expr_coerced(&a.value, fty, zapc_diag::ErrorCode::ZAP4001)?;
+            // A variant payload is an aggregate field (a pointer), so a
+            // `value struct` is boxed onto the heap like a struct field: an
+            // lvalue read for value semantics, and — the #1400 fix — a by-value
+            // (inline-eligible) call/return result whose stack spill would
+            // otherwise dangle once the producing frame returns (e.g. a
+            // `TimeZone` returned from a user zone resolver into `Optional.Some`).
+            let val = self.copy_field_value(val, fty, &a.value);
             self.emit(Inst::FieldSet {
                 base: dest,
                 sid,
