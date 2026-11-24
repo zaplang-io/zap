@@ -5654,6 +5654,20 @@ typedef struct G {
     pthread_mutex_t *parkmu; /* chan mutex the scheduler unlocks after parking */
     int64_t all_idx;   /* index in g_all[] for O(1) removal on death           */
     struct Scope *scope; /* owning `scope:` (ticket #50), or NULL (root/detached)*/
+    /* Innermost lexically-active cancellation scope (#1398). `scope` is the
+     * SPAWN-ownership scope — fixed for this coroutine's lifetime and used by the
+     * deadline report / sever to decide tree membership. `cancel_scope` is the
+     * scope whose BODY this coroutine is currently executing: it starts equal to
+     * `scope` at spawn and is re-pointed to each nested lexical `scope:` the
+     * coroutine enters (`zap_scope_enter`), restored to the enclosing scope at the
+     * matching exit. Cancellation points (`zap_time_timer_wait`, `chan_block`,
+     * `g_is_cancelled`) select against THIS, so a nested scope's own deadline can
+     * wake a wait in its body (and an enclosing deadline still reaches it, since
+     * `cancel_scope`'s parent chain runs up through every ancestor). Spawn
+     * ownership is unchanged: `zap_spawn_scoped` binds a child to the explicit
+     * handle, never to `cancel_scope`. A GC-managed pointer -> listed in
+     * `zap_off_gobj`. */
+    struct Scope *cancel_scope;
     int in_live;       /* 1 iff this G is counted in g_live (root-scope join)   */
     void *shadow_head; /* precise GC (#48): saved shadow-stack head when this G
                         * is not running on an M. A running G's live head is in
@@ -6369,6 +6383,7 @@ static G *galloc(void *fn, void *arg) {
     g->run_m = NULL; /* I#869: set by switch_to_g on every resume */
     g->no_preempt = 0; /* I#889: a recycled G must not inherit a stale window */
     g->scope = NULL;
+    g->cancel_scope = NULL; /* #1398: no lexical scope entered yet */
     g->in_live = 0;
     g->name = NULL;
     g->park_reason = NULL;
@@ -6395,6 +6410,7 @@ static void gfree(G *g) {
     g->fn = NULL;
     g->arg = NULL;
     g->scope = NULL; /* drop the scope reference so a reused G starts clean */
+    g->cancel_scope = NULL; /* #1398: likewise drop the lexical cancel scope */
     g->in_live = 0;
     g->severed = 0; /* #825: a reused G is not a severed orphan */
     g->coctx = NULL; /* #1237: drop context bindings so a reused G starts clean */
@@ -7377,10 +7393,15 @@ static void copreempt(void) {
 static int g_is_cancelled(void) {
     M *m = cur_m;
     G *g = m ? m->current : NULL;
-    if (!g || !g->scope) {
+    /* #1398: walk from the innermost lexical scope this coroutine is executing in,
+     * not its spawn scope, so a cancellation point in a nested `scope:` body
+     * observes that scope's own cancel (and every enclosing scope's, via the
+     * parent chain). `cancel_scope` equals `scope` for a coroutine that has
+     * entered no nested scope, so the common case is unchanged. */
+    if (!g || !g->cancel_scope) {
         return 0;
     }
-    for (Scope *sc = g->scope; sc; sc = sc->parent) {
+    for (Scope *sc = g->cancel_scope; sc; sc = sc->parent) {
         zap_np_lock(&sc->mu);
         int cancelled = sc->cancelled;
         zap_np_unlock(&sc->mu);
@@ -7438,6 +7459,17 @@ void *zap_scope_enter(int64_t on_error) {
     sc->deadline_ms = 0;
     sc->timeout_msg = NULL;
     sc->timeout_msg_len = 0;
+    /* #1398: the entering coroutine now executes THIS scope's body, so a
+     * cancellation point in the body (sleep / channel wait / checkpoint) must
+     * select against `sc`. The matching exit restores `cancel_scope` to the
+     * enclosing scope via `sc->parent` (finalized by `zap_scope_set_parent`).
+     * Spawn ownership (`g->scope`) is deliberately left untouched. A scope opened
+     * on `main`'s native thread has no G and needs no tracking (its sleeps fall
+     * back to blocking, with no cancellation point). */
+    G *g = cur_m ? cur_m->current : NULL;
+    if (g) {
+        g->cancel_scope = sc;
+    }
     return sc;
 }
 
@@ -7471,6 +7503,7 @@ void zap_spawn_scoped(void *fn_, void *arg, void *scope_, const char *name) {
     zap_np_unlock(&sc->mu);
     G *g = galloc(fn_, arg);
     g->scope = sc; /* in_live stays 0: the scope, not the root join, owns it */
+    g->cancel_scope = sc; /* #1398: the child starts executing inside its spawn scope */
     g->name = name;
     zap_race_on_spawn(g); /* --race: parent->child happens-before edge (#678) */
     sched_enqueue(g);
@@ -7816,8 +7849,22 @@ void *zap_exception_exceptions(void *exc) {
  * their failure — the single exception, or an `ExceptionGroup` when several
  * failed concurrently (D-0045). No failure => returns normally. */
 void zap_scope_disarm(void *scope_); /* fwd (signals section, #77) */
+/* #1398: leaving a lexical scope restores the coroutine's active cancellation
+ * scope to the enclosing one (`sc->parent`, the scope we were in when we entered
+ * `sc`; finalized by `zap_scope_set_parent`). Done at every scope exit — normal
+ * join, early-exit cancel, and the landing-pad variant — BEFORE the join/raise,
+ * so any `finally`/`with` cleanup that runs on this coroutine while unwinding
+ * selects against the enclosing scope, not the one being left. A no-op off a
+ * coroutine (main's native thread). */
+static void scope_pop_cancel(Scope *sc) {
+    G *g = cur_m ? cur_m->current : NULL;
+    if (g) {
+        g->cancel_scope = sc->parent;
+    }
+}
 void zap_scope_exit(void *scope_) {
     Scope *sc = (Scope *)scope_;
+    scope_pop_cancel(sc);
     scope_join(sc);
     /* The scope's lifetime ends here; drop any `cancel_on` subscription (ticket
      * #77) AFTER the join, so a signal can still cancel during the join. A no-op
@@ -7844,6 +7891,7 @@ void zap_scope_exit(void *scope_) {
  * failures the children recorded are discarded (the parent's exception wins). */
 void zap_scope_exit_cancel(void *scope_) {
     Scope *sc = (Scope *)scope_;
+    scope_pop_cancel(sc); /* #1398: restore the enclosing cancel scope */
     scope_request_cancel(sc);
     scope_join(sc);
     zap_scope_disarm(sc); /* drop any cancel_on subscription (ticket #77) */
@@ -7861,6 +7909,7 @@ void zap_scope_exit_cancel(void *scope_) {
  *      injected by an *enclosing* scope, which must propagate upward unchanged. */
 void *zap_scope_exit_cancel_exc(void *scope_, void *pending) {
     Scope *sc = (Scope *)scope_;
+    scope_pop_cancel(sc); /* #1398: restore the enclosing cancel scope */
     scope_request_cancel(sc);
     scope_join(sc);
     zap_scope_disarm(sc);
@@ -8118,9 +8167,12 @@ static void chan_block(ZapChan *c, Waiter *w) {
     G *g = cur_m ? cur_m->current : NULL;
     if (g) g->park_reason = "channel"; /* I#475 diagnostics */
     ScopeWait *node = NULL;
-    if (g && g->scope) {
+    if (g && g->cancel_scope) {
+        /* #1398: register against the innermost lexical scope so a nested
+         * `scope:` deadline cancels a channel wait in its body (and an enclosing
+         * deadline still reaches it through the parent chain). */
         node = (ScopeWait *)zap_ptrbuf(sizeof(ScopeWait));
-        node->scope = g->scope; node->channel = c; node->waiter = w; node->refs = 1;
+        node->scope = g->cancel_scope; node->channel = c; node->waiter = w; node->refs = 1;
         zap_np_lock(&g_scope_wait_mu);
         node->next = g_scope_waits; g_scope_waits = node;
         int cancelled = g_is_cancelled();
@@ -9262,11 +9314,14 @@ int64_t zap_netpoll_wait(void *pd_, int64_t mode, int64_t deadline_ns) {
     if (g) g->park_reason = "io";
     if (is_read) {
         pd->rg = &w;
-        pd->r_scope = g ? g->scope : NULL;
+        /* #1398: bind the I/O waiter to the innermost lexical scope, not the
+         * spawn scope, so a nested `scope(timeout=)` around a blocking read (e.g.
+         * an exporter's socket wait) is cancelled by that scope's deadline. */
+        pd->r_scope = g ? g->cancel_scope : NULL;
         pd->r_deadline = deadline_ns;
     } else {
         pd->wg = &w;
-        pd->w_scope = g ? g->scope : NULL;
+        pd->w_scope = g ? g->cancel_scope : NULL; /* #1398: see the read slot above */
         pd->w_deadline = deadline_ns;
     }
     /* Registration and the cancellation check share pd->mu with the canceller.
@@ -9436,7 +9491,13 @@ static int64_t zap_time_timer_wait(int64_t deadline_ns) {
         G *g = cur_m ? cur_m->current : NULL;
         if (g) g->park_reason = "sleep";
         pd->rg = &w;
-        pd->r_scope = g ? g->scope : NULL;
+        /* #1398: bind the sleep waiter to the innermost lexical scope the
+         * coroutine is executing in (`cancel_scope`), not its spawn scope, so a
+         * nested `scope(timeout=)` deadline can select and wake this wait. An
+         * enclosing deadline still wakes it: `scope_cancel_io` matches any waiter
+         * whose recorded scope is the cancelled scope or a descendant, and
+         * `cancel_scope` is a descendant of every enclosing scope. */
+        pd->r_scope = g ? g->cancel_scope : NULL;
         pd->r_deadline = deadline_ns;
         /* A cancel before registration is observed above; one after it wakes w
          * via scope_cancel_io. Kick the poller so it folds our deadline into its
@@ -10835,6 +10896,7 @@ static const int32_t zap_off_gobj[] = {
     (int32_t)offsetof(G, stack),
     (int32_t)offsetof(G, arg),
     (int32_t)offsetof(G, scope),
+    (int32_t)offsetof(G, cancel_scope), /* #1398: innermost lexical cancel scope */
     (int32_t)offsetof(G, coctx), /* #1237: coroutine-local context chain head */
 };
 static const int32_t zap_off_sigsub[] = {
@@ -10880,7 +10942,7 @@ const ZapTypeDesc zap_desc_pyobj = {(int64_t)sizeof(ZapPy), ZAP_TD_ATOMIC, 0, NU
  * header only (the real size is per-object, via zap_gc_alloc_var). */
 const ZapTypeDesc zap_desc_strobj = {(int64_t)sizeof(ZapStr), ZAP_TD_ATOMIC, 0,
                                      NULL};
-const ZapTypeDesc zap_desc_gobj = {(int64_t)sizeof(G), ZAP_TD_PRECISE, 4, zap_off_gobj};
+const ZapTypeDesc zap_desc_gobj = {(int64_t)sizeof(G), ZAP_TD_PRECISE, 5, zap_off_gobj};
 const ZapTypeDesc zap_desc_sigsub = {(int64_t)sizeof(SigSub), ZAP_TD_PRECISE, 2,
                                      zap_off_sigsub};
 const ZapTypeDesc zap_desc_ctxvar = {(int64_t)sizeof(ZapCtxVar), ZAP_TD_PRECISE, 2,

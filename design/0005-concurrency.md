@@ -364,9 +364,12 @@ coroutine:
 - `sleep`, timer, and I/O waits — every coroutine `time.sleep*` parks on the
   fd-less scheduler timer and frees its M (I#1357 for sleeps with an owning
   `scope:`, generalized to every coroutine sleep, scope-less ones included, in
-  I#1360); with an owning scope it also raises `Cancelled` on cancellation. Only
-  a sleep on a native thread (`main`) keeps the blocking, non-cancellable path
-  (nothing to free, nothing to cancel);
+  I#1360); with an owning scope it also raises `Cancelled` on cancellation. A
+  wait is cancelled by the **innermost** `scope:` the coroutine is executing in
+  and by any scope enclosing it, so a deadline on a lexically nested `scope:`
+  wakes a wait in its own body — not only the coroutine's spawn scope (I#1398).
+  Only a sleep on a native thread (`main`) keeps the blocking, non-cancellable
+  path (nothing to free, nothing to cancel);
 - entering or leaving a nested `scope:`;
 - an explicit `checkpoint()` call in long CPU-bound loops.
 
