@@ -22,9 +22,11 @@
 
 use std::rc::Rc;
 
+use std::collections::HashMap;
+
 use zapc_comptime::{
-    desugar_reflect_field, error_code, reflect_field, specialize_one, type_info_of_enum, unroll,
-    CtError, CtErrorKind, Env, Evaluator, TypeInfo, TypeRegistry, Value,
+    desugar_reflect_field, error_code, reflect_field, seed_kind_constants, specialize_one,
+    type_info_of_enum, unroll, CtError, CtErrorKind, Env, Evaluator, TypeInfo, TypeRegistry, Value,
 };
 use zapc_syntax::ast::{Block, EnumDef, Expr, Function, Module, Stmt, StructDef};
 use zapc_syntax::span::Span;
@@ -116,6 +118,41 @@ pub fn specialize_variant_arms(
     Ok(out)
 }
 
+/// Select the taken branch of a generator's `if` when its condition chain is a
+/// **comptime constant** (#1394) — a `reflect.type_info(T).kind`-based kind
+/// dispatch, evaluable because `type_subst` resolves the type parameter to the
+/// concrete instantiation. Returns the statements of the first branch whose
+/// condition is comptime-`true` (or the `else` branch when all are comptime-
+/// `false`), so mono can splice just that branch and drop the dead ones. Returns
+/// `None` the moment a condition is **not** a comptime-constant bool — then the
+/// whole `if` stays an ordinary runtime `if` (never partially pruned).
+pub fn select_comptime_if<'b>(
+    branches: &'b [(Expr, Block)],
+    else_block: &'b Option<Block>,
+    registry: &TypeRegistry,
+    type_subst: HashMap<String, String>,
+) -> Result<Option<&'b [Stmt]>, LowerError> {
+    let mut ev = Evaluator::new()
+        .with_registry(registry)
+        .with_type_subst(type_subst);
+    let mut env = Env::new();
+    seed_kind_constants(&mut env);
+    for (cond, body) in branches {
+        match ev.eval(cond, &mut env) {
+            Ok(Value::Bool(true)) => return Ok(Some(&body.stmts)),
+            Ok(Value::Bool(false)) => continue,
+            // A non-comptime (runtime) condition, or a non-bool: do not prune.
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(
+        else_block
+            .as_ref()
+            .map(|b| b.stmts.as_slice())
+            .unwrap_or(&[]),
+    ))
+}
+
 /// Build the comptime [`TypeRegistry`] for a module's user `struct`/`enum`
 /// declarations (#1253): the no-sema resolver that drives `type_info(T).kind`-
 /// switch container recursion. Mono attaches this to the evaluator (via
@@ -163,6 +200,7 @@ pub fn unroll_struct_fields_with_access(
 /// Desugar `reflect.field` in the expression(s) of one emitted statement.
 fn desugar_stmt_fields(st: &Stmt, info: &TypeInfo) -> Result<Stmt, LowerError> {
     let d = |e: &Expr| desugar_reflect_field(e, info).map_err(ct_lower_error);
+    let db = |b: &Block| desugar_block_fields(b, info);
     Ok(match st {
         Stmt::Expr(e) => Stmt::Expr(d(e)?),
         Stmt::Return { value, span } => Stmt::Return {
@@ -185,7 +223,84 @@ fn desugar_stmt_fields(st: &Stmt, info: &TypeInfo) -> Result<Stmt, LowerError> {
             value: d(value)?,
             span: *span,
         },
+        // Accumulation forms — `acc = acc + reflect.field(...)`,
+        // `acc += reflect.field(...)` — must desugar their operand(s) too
+        // (#1374/#1375: a codec that folds over fields/payload uses these).
+        Stmt::Assign {
+            target,
+            value,
+            span,
+        } => Stmt::Assign {
+            target: d(target)?,
+            value: d(value)?,
+            span: *span,
+        },
+        Stmt::AugAssign {
+            target,
+            op,
+            value,
+            span,
+        } => Stmt::AugAssign {
+            target: d(target)?,
+            op: *op,
+            value: d(value)?,
+            span: *span,
+        },
+        Stmt::AssignChain {
+            targets,
+            value,
+            span,
+        } => Stmt::AssignChain {
+            targets: targets.iter().map(&d).collect::<Result<_, _>>()?,
+            value: d(value)?,
+            span: *span,
+        },
+        // Runtime control flow in a generator body: desugar conditions/operands
+        // and recurse into the nested blocks.
+        Stmt::If {
+            branches,
+            else_block,
+            span,
+        } => Stmt::If {
+            branches: branches
+                .iter()
+                .map(|(c, b)| Ok((d(c)?, db(b)?)))
+                .collect::<Result<_, LowerError>>()?,
+            else_block: match else_block {
+                Some(b) => Some(db(b)?),
+                None => None,
+            },
+            span: *span,
+        },
+        Stmt::While { cond, body, span } => Stmt::While {
+            cond: d(cond)?,
+            body: db(body)?,
+            span: *span,
+        },
+        Stmt::For {
+            target,
+            iter,
+            body,
+            span,
+        } => Stmt::For {
+            target: target.clone(),
+            iter: d(iter)?,
+            body: db(body)?,
+            span: *span,
+        },
         other => other.clone(),
+    })
+}
+
+/// Desugar `reflect.field` in every statement of a block (#1374/#1375).
+fn desugar_block_fields(b: &Block, info: &TypeInfo) -> Result<Block, LowerError> {
+    Ok(Block {
+        stmts: b
+            .stmts
+            .iter()
+            .map(|s| desugar_stmt_fields(s, info))
+            .collect::<Result<_, _>>()?,
+        span: b.span,
     })
 }
 

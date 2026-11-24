@@ -1606,6 +1606,67 @@ def main():
 }
 
 #[test]
+fn a_derive_generator_dispatches_on_kind_across_struct_and_enum() {
+    // #1394: one `@derivable` generator handles both a struct and an enum by
+    // comptime-dispatching on `reflect.type_info(T).kind` at its top level. The
+    // dead-kind branch (the enum `match` when `T` is a struct, the struct field
+    // fold when `T` is an enum) is pruned per instantiation, so a single trait
+    // derives on both kinds — the prerequisite for a real codec and for
+    // recursion where an enum payload is a struct.
+    let src = "\
+@derivable(Sum)
+def _derive_sum[T](T value) -> int64:
+    if reflect.type_info(T).kind.name == \"enum\":
+        match value:
+            case comptime v in reflect.type_info(T).variants as payload:
+                int64 acc = 0
+                comptime for f in v.fields:
+                    acc = acc + reflect.field(payload, comptime f.index)
+                return acc
+        return 0
+    else:
+        int64 sacc = 0
+        comptime for f in reflect.type_info(T).fields:
+            sacc = sacc + reflect.field(value, comptime f.index)
+        return sacc
+
+interface Sum:
+    def sum(self) -> int64
+
+@derive(Sum)
+struct Pair:
+    int64 a
+    int64 b
+@derive(Sum)
+enum E:
+    Nothing
+    Two(int64 a, int64 b)
+
+def main():
+    print(Pair(10, 20).sum())
+    print(E.Two(3, 4).sum())
+";
+    let f = write_zap("e3-kind-dispatch", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a kind-dispatch generator must compile for both kinds; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Both kinds specialize from the one generator; the dead branch is pruned
+    // (no stray `reflect`, no comptime construct at lowering).
+    assert!(
+        stdout.contains("@_derive_sum$Pair") && stdout.contains("@_derive_sum$E"),
+        "both struct and enum specializations present: {stdout}"
+    );
+    assert!(
+        !stderr.contains("unknown variable 'reflect'") && !stderr.contains("reached lowering"),
+        "the dead-kind branch must be pruned, not lowered: {stderr}"
+    );
+}
+
+#[test]
 fn a_generator_bug_is_a_dual_span_error_not_a_crash() {
     // An engine fault inside a generator (here an out-of-range `reflect.field`)
     // is the library author's bug, not the consumer's: it renders as the
