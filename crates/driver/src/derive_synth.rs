@@ -60,7 +60,7 @@ use std::collections::HashMap;
 use zapc_diag::ErrorCode;
 use zapc_sema::TypeError;
 use zapc_syntax::ast::{
-    Arg, ArgSpread, Block, Decorator, Expr, Function, Item, MethodSig, Module, Stmt, Type,
+    Arg, ArgSpread, Block, Decorator, Expr, Function, Item, MethodSig, Module, Param, Stmt, Type,
     TypeParam,
 };
 use zapc_syntax::span::Span;
@@ -208,16 +208,33 @@ fn synthesize_for_type(
     let mut synthesized: Vec<String> = Vec::new();
     for trait_name in &derived {
         let generator = &generators[trait_name];
-        let Some(sigs) = interfaces.get(trait_name) else {
-            diags.push(err(
-                format!(
-                    "cannot derive `{trait_name}` for `{name}`: `{trait_name}` is registered with \
-                     @derivable but has no `interface {trait_name}` declaring the method(s) to \
-                     synthesize (E3b, #1291)"
-                ),
-                sp,
-            ));
-            continue;
+        // The method set to synthesize comes from a same-named `interface Trait`
+        // the library declares (E3b). For a **ported built-in** trait (E4, #1433)
+        // the name collides with a generic, reference-gated operator-overloading
+        // interface (`Eq[R]`/`Ord[R]`), so there is no plain `interface Eq` to
+        // read; the synthesis then supplies the dunder signature internally from
+        // [`builtin_derive_method_sigs`]. This fallback is inert until a built-in
+        // gains a `@derivable` generator (its port slice) — the current built-ins
+        // are never in `generators`, so `derived` never names them here.
+        let builtin_sigs = if interfaces.contains_key(trait_name) {
+            None
+        } else {
+            builtin_derive_method_sigs(trait_name, sp)
+        };
+        let sigs: &[MethodSig] = match (interfaces.get(trait_name), &builtin_sigs) {
+            (Some(s), _) => s,
+            (None, Some(s)) => s,
+            (None, None) => {
+                diags.push(err(
+                    format!(
+                        "cannot derive `{trait_name}` for `{name}`: `{trait_name}` is registered \
+                         with @derivable but has no `interface {trait_name}` declaring the \
+                         method(s) to synthesize (E3b, #1291)"
+                    ),
+                    sp,
+                ));
+                continue;
+            }
         };
         for m in sigs {
             // A hand-written method of the same name wins (HQ7): skip.
@@ -327,6 +344,62 @@ fn type_mentions_param(ty: &Type, param: &str, param_names: &[&str]) -> bool {
                     .is_some_and(|r| type_mentions_param(r, param, param_names))
         }
     }
+}
+
+/// The dunder method signature(s) a **ported built-in** derivable trait (E4,
+/// #1429/#1433) synthesizes, supplied internally so the derive synthesis does
+/// not need a user-authored `interface Trait` — whose name would collide with
+/// the generic, reference-gated operator-overloading interfaces (`Eq[R]` /
+/// `Ord[R]`) the operator prelude already declares. Returns `None` for any other
+/// trait, so a library `@derivable(X)` with no `interface X` still gets the clear
+/// "no interface" error. The signatures mirror the built-in codegen's
+/// (`DerivedTrait::signatures`, D-0047): `Eq`→`__eq__(self, Self) -> bool`,
+/// `Ord`→`__cmp__(self, Self) -> int64`, `Hash`→`__hash__(self) -> int64`,
+/// `Repr`→`__repr__(self) -> str`. The codec traits (`Json`/`Csv`/`Yaml`) carry
+/// associated functions and are supplied by their own port slices.
+fn builtin_derive_method_sigs(trait_name: &str, sp: Span) -> Option<Vec<MethodSig>> {
+    let named = |n: &str| Type::Named {
+        name: n.to_string(),
+        args: Vec::new(),
+        span: sp,
+    };
+    let param = |name: &str, ty: Option<Type>| Param {
+        decorators: Vec::new(),
+        ty,
+        name: name.to_string(),
+        default: None,
+        variadic: false,
+        kwargs: false,
+        keyword_only: false,
+        positional_only: false,
+        span: sp,
+    };
+    // `self` is the untyped receiver; `other` is the same type (`Self`), matching
+    // the built-in `__eq__`/`__cmp__` two-argument shape.
+    let self_param = || param("self", None);
+    let other_param = || param("other", Some(named("Self")));
+    let sig = |name: &str, params: Vec<Param>, ret: Type| MethodSig {
+        name: name.to_string(),
+        params,
+        ret: Some(ret),
+        span: sp,
+    };
+    let sigs = match trait_name {
+        "Eq" => vec![sig(
+            "__eq__",
+            vec![self_param(), other_param()],
+            named("bool"),
+        )],
+        "Ord" => vec![sig(
+            "__cmp__",
+            vec![self_param(), other_param()],
+            named("int64"),
+        )],
+        "Hash" => vec![sig("__hash__", vec![self_param()], named("int64"))],
+        "Repr" => vec![sig("__repr__", vec![self_param()], named("str"))],
+        _ => return None,
+    };
+    Some(sigs)
 }
 
 /// Build the thin forwarding stub for one interface method `m`, forwarding every
@@ -1024,6 +1097,117 @@ interface Show:
             bounds[0].params[0].field_spans.len(),
             2,
             "both payload fields' spans collected"
+        );
+    }
+
+    // ---- E4 enabler (#1433): built-in trait method sigs without an interface ----
+
+    // A ported built-in's generator with NO same-named `interface` (the name
+    // would collide with the operator-overloading `Eq[R]`): the synthesis must
+    // supply the dunder signature internally.
+    const EQ_LIB_NO_IFACE: &str = "\
+@derivable(Eq)
+def _derive_eq[T](T a, T b) -> bool:
+    return True
+";
+
+    #[test]
+    fn a_built_in_trait_sig_is_supplied_without_an_interface() {
+        // #1433: `@derive(Eq)` with a `@derivable(Eq)` generator but no
+        // `interface Eq` synthesizes the `__eq__` stub from the built-in sig
+        // table — the enabler for porting the built-in `Eq` to a library
+        // generator (#1431), since the name `Eq` is taken by the generic
+        // operator interface `Eq[R]`.
+        let mut m = module(&format!(
+            "{EQ_LIB_NO_IFACE}@derive(Eq)\nstruct Point:\n    int64 x\n    int64 y\n"
+        ));
+        let (diags, _bounds) = expand_library_derives(&mut m);
+        assert!(
+            diags.is_empty(),
+            "the built-in sig supplies the method, so no 'no interface' error: {diags:?}"
+        );
+        let point = get_struct(&m, "Point");
+        let eq = method(point, "__eq__").expect("synthesized `__eq__` stub");
+        // Two-argument shape: untyped `self` + `Self other`, returning `bool`.
+        assert_eq!(eq.params.len(), 2, "self + other");
+        assert_eq!(eq.params[0].name, "self");
+        assert!(eq.params[0].ty.is_none(), "untyped self");
+        assert_eq!(eq.params[1].name, "other");
+        assert!(
+            matches!(&eq.params[1].ty, Some(Type::Named { name, .. }) if name == "Self"),
+            "other is typed `Self`: {:?}",
+            eq.params[1].ty
+        );
+        assert!(
+            matches!(&eq.ret, Some(Type::Named { name, .. }) if name == "bool"),
+            "returns bool: {:?}",
+            eq.ret
+        );
+        // Forwards to `_derive_eq[Point](self, other)`.
+        let Stmt::Return {
+            value: Some(Expr::Call { callee, args, .. }),
+            ..
+        } = &eq.body.stmts[0]
+        else {
+            panic!(
+                "expected a forwarding `return` call, got {:?}",
+                eq.body.stmts[0]
+            );
+        };
+        let Expr::Index { base, index, .. } = &**callee else {
+            panic!("expected `gen[Type](...)`, got {callee:?}");
+        };
+        assert!(matches!(&**base, Expr::Name(n, _) if n == "_derive_eq"));
+        assert!(matches!(&**index, Expr::Name(n, _) if n == "Point"));
+        assert_eq!(args.len(), 2, "self + other forwarded");
+        assert!(matches!(&args[0].value, Expr::Name(n, _) if n == "self"));
+        assert!(matches!(&args[1].value, Expr::Name(n, _) if n == "other"));
+        // The trait is stripped; the now-empty `@derive` is removed.
+        assert!(derive_args(point).is_empty(), "library trait stripped");
+    }
+
+    #[test]
+    fn the_built_in_sig_table_covers_the_four_method_traits_only() {
+        let sp = Span::default();
+        for (trait_name, dunder, nparams, ret) in [
+            ("Eq", "__eq__", 2usize, "bool"),
+            ("Ord", "__cmp__", 2, "int64"),
+            ("Hash", "__hash__", 1, "int64"),
+            ("Repr", "__repr__", 1, "str"),
+        ] {
+            let sigs = builtin_derive_method_sigs(trait_name, sp)
+                .unwrap_or_else(|| panic!("`{trait_name}` has a built-in sig"));
+            assert_eq!(sigs.len(), 1, "{trait_name}: one method");
+            assert_eq!(sigs[0].name, dunder, "{trait_name} dunder");
+            assert_eq!(sigs[0].params.len(), nparams, "{trait_name} arity");
+            assert_eq!(sigs[0].params[0].name, "self");
+            assert!(
+                matches!(&sigs[0].ret, Some(Type::Named { name, .. }) if name == ret),
+                "{trait_name} return type"
+            );
+        }
+        // The codec traits carry associated functions and are out of scope for
+        // this enabler, and a non-built-in trait has no built-in sig.
+        assert!(builtin_derive_method_sigs("Json", sp).is_none());
+        assert!(builtin_derive_method_sigs("Csv", sp).is_none());
+        assert!(builtin_derive_method_sigs("Yaml", sp).is_none());
+        assert!(builtin_derive_method_sigs("Dump", sp).is_none());
+    }
+
+    #[test]
+    fn a_non_built_in_derivable_without_an_interface_still_errors() {
+        // The fallback is scoped to the built-in trait names only: a library
+        // `@derivable(Dump)` with no `interface Dump` keeps the clear
+        // "no interface" diagnostic (no regression).
+        let mut m = module(
+            "@derivable(Dump)\ndef _derive_dump[T](T self):\n    pass\n\
+             @derive(Dump)\nstruct Point:\n    int64 x\n",
+        );
+        let (diags, _bounds) = expand_library_derives(&mut m);
+        assert_eq!(diags.len(), 1, "one diagnostic for the missing interface");
+        assert!(
+            format!("{:?}", diags[0]).contains("no `interface Dump`"),
+            "names the missing interface: {diags:?}"
         );
     }
 }
