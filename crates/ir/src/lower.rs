@@ -8812,6 +8812,31 @@ impl<'a> FnLower<'a> {
                 self.throwing_call(Some(dest), "zap_input", vec![prompt]);
                 return Ok((dest, Ty::Ptr));
             }
+            if fname == "open" {
+                // open(path[, mode]) -> int64 fd (#1388). Prelude sugar: forward
+                // to the same throwing `zap_io_open` that `io.open(path, mode)`
+                // lowers to, defaulting the mode to "r" when only the path is
+                // given. The handle type and the catchable open-failure behaviour
+                // are therefore identical to `io.open`.
+                if args.is_empty() || args.len() > 2 {
+                    return Err(err("open() takes one or two arguments (path[, mode])"));
+                }
+                let (path, _pt) = self.expr(&args[0].value)?;
+                let mode = if let Some(a) = args.get(1) {
+                    let (v, _) = self.expr(&a.value)?;
+                    v
+                } else {
+                    let m = self.new_value(Ty::Ptr);
+                    self.emit(Inst::StrConst {
+                        dest: m,
+                        bytes: b"r".to_vec(),
+                    });
+                    m
+                };
+                let dest = self.new_value(Ty::I64);
+                self.throwing_call(Some(dest), "zap_io_open", vec![path, mode]);
+                return Ok((dest, Ty::I64));
+            }
             // REPL session-binding slot access (I#159, design/0025-repl.md). The
             // driver synthesizes these calls to persist `let` values across
             // entries: a load reads a slot (integer bindings via `_i64`, GC
