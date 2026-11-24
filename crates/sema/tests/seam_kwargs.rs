@@ -549,6 +549,21 @@ fn time_unknown_keyword_rejected() {
 }
 
 #[test]
+fn time_after_keyword_and_positional() {
+    // time.after(d: Duration) -> channel[int64] (#1395): the one-shot timer
+    // channel accepts its sole Duration argument positionally or by the `d`
+    // keyword; an unknown keyword is rejected like every other seam method.
+    assert_ok(&prog(
+        "    auto d = time.millis(50)\n    auto t = time.after(d=d)\n",
+    ));
+    assert_ok(&prog("    auto t = time.after(time.millis(50))\n"));
+    assert_code(
+        &prog("    auto t = time.after(dur=time.millis(50))\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
 fn process_run_keyword() {
     assert_ok(&prog("    auto r = process.run(cmd=[\"echo\"])\n"));
 }

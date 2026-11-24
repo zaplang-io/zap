@@ -26,6 +26,10 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     // the lowering emits them as `throwing_call`s.
     cg.declare_rt("zap_time_sleep_cancellable_seconds", &[f.into()], None);
     cg.declare_rt("zap_time_sleep_cancellable_ns", &[i.into()], None);
+    // one-shot timer channel `time.after(ns)` -> channel[int64] (#1395): makes a
+    // cap-1 channel + a detached firing coroutine and returns the channel ptr.
+    let p = cg.ctx.ptr_type(inkwell::AddressSpace::default());
+    cg.declare_rt("zap_time_after", &[i.into()], Some(p.into()));
     // duration unit constructors (-> nanoseconds)
     cg.declare_rt("zap_time_seconds_to_ns", &[i.into()], Some(i.into()));
     cg.declare_rt("zap_time_millis_to_ns", &[i.into()], Some(i.into()));
@@ -35,6 +39,5 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_time_ns_to_millis", &[i.into()], Some(f.into()));
     cg.declare_rt("zap_time_ns_to_micros", &[i.into()], Some(f.into()));
     // human-readable Duration formatting (Go-style, #1055): nanos -> ZapStr*.
-    let p = cg.ctx.ptr_type(inkwell::AddressSpace::default());
     cg.declare_rt("zap_duration_format", &[i.into()], Some(p.into()));
 }

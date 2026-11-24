@@ -113,6 +113,13 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_duration1(checker, "format", args, span);
             Some(Ty::Str)
         }
+        // time.after(d) -> channel[int64] (#1395): a one-shot timer channel for
+        // `select`. Fires once after the Duration, delivering the monotonic-ns
+        // instant at which it fired (Go `time.After` shape).
+        "after" => {
+            expect_duration1(checker, "after", args, span);
+            Some(Ty::Chan(Box::new(Ty::Int64)))
+        }
         // time.since(start_ns) -> Duration: elapsed since a saved monotonic_ns()
         // reading, as a typed Duration (#1055).
         "since" => {
