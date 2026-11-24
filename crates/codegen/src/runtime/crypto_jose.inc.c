@@ -3870,16 +3870,36 @@ static int zap_http_send_req(ZapHttpConn *hc, const char *method, const ZapHttpU
     return sent;
 }
 
+/* Raise the catchable response-too-large error (#1448): a response body would
+ * exceed the client's `max_response_bytes` cap. `ResponseTooLargeError` ⊂
+ * `OSError` ⊂ `Exception` (zaprt.c), thrown via the typed-panic/invoke path so
+ * it is caught inside a `try` rather than aborting. The caller closes the
+ * connection before this fires, so a partial over-limit response never returns
+ * to the keep-alive pool. */
+static void zap_http_too_large_panic(void) {
+    const char *m = "http: response body exceeds max_response_bytes";
+    zap_panic_typed(ZAP_EXC_RESPONSE_TOO_LARGE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+}
+
 /* Read exactly one response off `hc`. On success returns 0 and sets the out
  * params: `status`, a malloc'd first-line-stripped header block
  * (`headers`/`headers_len`, like `ZapHttpResp.headers`), a malloc'd decoded body
  * (`body`/`body_len`), and `reusable` (the connection may be pooled). Returns 1
  * — "stale" — when the peer closed before sending any byte (a dead pooled
  * connection the caller retries once). Raises on a read deadline / cancellation /
- * malformed response. The buffer lives across parks (never GC). */
-static int zap_http_read_one(ZapHttpConn *hc, long *status_out, char **headers_out,
-                             size_t *headers_len_out, char **body_out, size_t *body_len_out,
-                             int *reusable_out) {
+ * malformed response. The buffer lives across parks (never GC).
+ *
+ * `max_response_bytes` (#1448) caps the received body: `0` is unlimited;
+ * otherwise a body of exactly the limit succeeds and the first byte over it
+ * raises `ResponseTooLargeError`. The cap is enforced during the receive in all
+ * three framing modes — a `Content-Length` over the cap is rejected before any
+ * body byte is read, and a `chunked` / EOF-framed body is cut off the moment its
+ * running decoded/buffered size crosses the cap. On an over-limit raise this
+ * closes `hc` before unwinding, so the socket is neither released to the pool nor
+ * reused. */
+static int zap_http_read_one(ZapHttpConn *hc, int64_t max_response_bytes, long *status_out,
+                             char **headers_out, size_t *headers_len_out, char **body_out,
+                             size_t *body_len_out, int *reusable_out) {
     ZapDynBuf b = {NULL, 0, 0};
     size_t hlen = 0, body_off = 0;
     int have_headers = 0;
@@ -4025,6 +4045,15 @@ static int zap_http_read_one(ZapHttpConn *hc, long *status_out, char **headers_o
             }
             memcpy(out.buf + out.len, b.buf + data_start, (size_t)csize);
             out.len += (size_t)csize;
+            if (max_response_bytes > 0 && out.len > (size_t)max_response_bytes) {
+                /* Over the cap mid-stream: evict the socket (never pool it) and
+                 * raise. Exactly the limit is fine; this fires only past it. */
+                zap_dyn_free(&out);
+                zap_dyn_free(&b);
+                zap_httpconn_close(hc);
+                zap_http_too_large_panic();
+                return -1;
+            }
             pos = data_start + (size_t)csize + 2; /* data + trailing CRLF */
         }
         if (!framed) {
@@ -4037,6 +4066,14 @@ static int zap_http_read_one(ZapHttpConn *hc, long *status_out, char **headers_o
         body = out.buf ? out.buf : (char *)malloc(1);
         /* ownership of out.buf transferred to `body` */
     } else if (clen >= 0) {
+        if (max_response_bytes > 0 && clen > max_response_bytes) {
+            /* Declared length already over the cap: reject off the header alone,
+             * before reading a single body byte. Evict the socket. */
+            zap_dyn_free(&b);
+            zap_httpconn_close(hc);
+            zap_http_too_large_panic();
+            return -1;
+        }
         while ((long)(b.len - body_off) < clen) {
             ssize_t r = zap_httpconn_fill(hc, &b);
             if (r == -2 || r == -3) {
@@ -4070,6 +4107,14 @@ static int zap_http_read_one(ZapHttpConn *hc, long *status_out, char **headers_o
             }
             if (r <= 0) {
                 break;
+            }
+            if (max_response_bytes > 0 && (b.len - body_off) > (size_t)max_response_bytes) {
+                /* Buffered body crossed the cap: evict the socket and raise.
+                 * Exactly the limit is fine; this fires only past it. */
+                zap_dyn_free(&b);
+                zap_httpconn_close(hc);
+                zap_http_too_large_panic();
+                return -1;
             }
         }
         blen = b.len > body_off ? b.len - body_off : 0;
@@ -4218,7 +4263,8 @@ void zap_http_pool_close(int64_t handle) {
  * `max_redirects` (#1049) and connection reuse (#990). `timeout_ms` is the #986
  * total deadline. Returns a `ZapHttpResp`. */
 void *zap_http_pool_do(int64_t handle, void *method_, void *url_, void *body_, void *headers_,
-                       int64_t timeout_ms, int64_t follow, int64_t max_redirects) {
+                       int64_t timeout_ms, int64_t follow, int64_t max_redirects,
+                       int64_t max_response_bytes) {
     ZapHttpPool *p = (ZapHttpPool *)(intptr_t)handle;
     const ZapStr *body = (const ZapStr *)body_;
     const ZapDict *hdrs = (const ZapDict *)headers_;
@@ -4233,6 +4279,12 @@ void *zap_http_pool_do(int64_t handle, void *method_, void *url_, void *body_, v
         zap_panic_typed(ZAP_EXC_VALUE_ERROR,
                         zap_str_new("http: max_redirects must be non-negative",
                                     (int64_t)sizeof("http: max_redirects must be non-negative") - 1));
+        return NULL;
+    }
+    if (max_response_bytes < 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("http: max_response_bytes must be non-negative",
+                                    (int64_t)sizeof("http: max_response_bytes must be non-negative") - 1));
         return NULL;
     }
 
@@ -4305,8 +4357,8 @@ void *zap_http_pool_do(int64_t handle, void *method_, void *url_, void *body_, v
             free(resp_body);
             resp_headers = NULL;
             resp_body = NULL;
-            rc = zap_http_read_one(&hc, &status, &resp_headers, &resp_headers_len, &resp_body,
-                                   &resp_body_len, &reusable);
+            rc = zap_http_read_one(&hc, max_response_bytes, &status, &resp_headers,
+                                   &resp_headers_len, &resp_body, &resp_body_len, &reusable);
             if (rc == 1) {
                 /* stale pooled connection (EOF before a byte) */
                 zap_httpconn_close(&hc);

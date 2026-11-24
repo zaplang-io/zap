@@ -70,6 +70,7 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
             i.into(), // timeout_ms
             i.into(), // follow (0/1)
             i.into(), // max_redirects
+            i.into(), // max_response_bytes (0 = unlimited, #1448)
         ],
         Some(p.into()),
     );

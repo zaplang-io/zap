@@ -185,11 +185,12 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             Ty::Int64
         }
         // http._pool_do(handle, method, url, body, headers, timeout, follow,
-        // max_redirects) -> response handle. Does the whole exchange: pooled
-        // dial/reuse, single-response framing, and redirect following per
-        // `follow` / `max_redirects` (#1049).
+        // max_redirects, max_response_bytes) -> response handle. Does the whole
+        // exchange: pooled dial/reuse, single-response framing, and redirect
+        // following per `follow` / `max_redirects` (#1049). The trailing
+        // `max_response_bytes` (#1448) caps the received body (0 = unlimited).
         "_pool_do" => {
-            expect_argc(checker, "http", method, args, 8, span);
+            expect_argc(checker, "http", method, args, 9, span);
             Ty::Bytes
         }
         // http._pool_close(handle) -> unit. Drains + frees the pool.
