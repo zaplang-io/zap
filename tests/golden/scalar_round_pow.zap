@@ -24,8 +24,8 @@ def main():
     # round(float, ndigits) -> float64.
     print(round(3.14159, 2))  # 3.14
     print(round(3.14159, 4))  # 3.1416
-    print(round(2.675, 2))  # 2.67
-    print(round(1.005, 2))  # 1.0  (binary-float caveat; matches CPython)
+    print(round(2.675, 2))  # 2.68  (binary caveat: 2.675*100 == 267.5 in f64; CPython's dtoa gives 2.67 — see ADR)
+    print(round(1.005, 2))  # 1.0  (binary caveat; here it agrees with CPython)
     print(round(2.5, 0))  # 2.0
     print(round(12345.0, -2))  # 12300.0
 

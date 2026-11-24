@@ -35,7 +35,10 @@ out-of-scope by epic #1286 (`decisions/lang/1279-scalar-min-max.md`,
     scaling for the positive-`ndigits` case, so a
     value whose exact decimal is not representable in `f64` can round like its
     nearest `f64` rather than its decimal literal (the standard float caveat;
-    CPython's decimal-correct `dtoa` path is explicitly **not** reproduced).
+    CPython's decimal-correct `dtoa` path is explicitly **not** reproduced). For
+    example `round(2.675, 2) == 2.68` here (because `2.675 * 100 == 267.5`
+    exactly in `f64`, and ties-to-even gives `268`), whereas CPython's `dtoa`
+    gives `2.67`.
   - `round(int)` → the integer **unchanged** (preserving signedness:
     `int*`→`int64`, `uint*`→`uint64`).
   - `round(int, ndigits)` → **`int64`**: a no-op for `ndigits >= 0`; for
