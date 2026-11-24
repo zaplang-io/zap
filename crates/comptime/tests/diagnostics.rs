@@ -114,7 +114,7 @@ fn comptime_error_span_is_faithful_to_a_parsed_source_field() {
 
     let err = eval_with(
         "comptime.error(info.fields[1].span, \"nope\")",
-        vec![("info", Value::Type(Rc::new(info.clone())))],
+        vec![("info", Value::Type(Rc::new(info.clone()), None))],
     )
     .expect_err("aborts");
     assert_eq!(err.span, name_field_span);
@@ -463,7 +463,7 @@ def check(str f):
     let fns = common::parse_fns(module);
     let e = parse_expr("classify(info)");
     let mut env = Env::new();
-    env.define("info", Value::Type(Rc::new(info.clone())));
+    env.define("info", Value::Type(Rc::new(info.clone()), None));
     zapc_comptime::seed_kind_constants(&mut env);
     let mut ev = Evaluator::with_functions(&fns).with_registry(&reg);
     let err = ev
@@ -502,7 +502,7 @@ fn field_spans_are_faithful_across_comptime_for_unrolling() {
     let body = common::parse_body("let idx = f.index\n");
     let iterable = parse_expr("info.fields");
     let mut base = Env::new();
-    base.define("info", Value::Type(Rc::new(info.clone())));
+    base.define("info", Value::Type(Rc::new(info.clone()), None));
     let mut ev = Evaluator::new();
     let stmts = unroll("f", &iterable, &body, &base, &mut ev).expect("unrolls");
     assert_eq!(stmts.len(), 2, "one `let idx = ...` per field");

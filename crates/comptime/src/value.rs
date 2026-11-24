@@ -19,6 +19,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use zapc_sema_types::{AttrArg, AttrInfo, FieldInfo, TypeInfo, TypeKind, VariantInfo};
+use zapc_syntax::ast::Type as AstType;
 use zapc_syntax::span::Span;
 
 /// A compile-time value in the Tier-B1 fragment (#1250).
@@ -41,7 +42,19 @@ pub enum Value {
     /// A `tuple` of comptime values (heterogeneous, fixed arity, immutable).
     Tuple(Rc<Vec<Value>>),
     /// An E1 `TypeInfo` reflection record (`reflect.type_info(T)`).
-    Type(Rc<TypeInfo>),
+    ///
+    /// The second component is the **use-site** declared [`AstType`] this
+    /// reference came from, when known (#1346): the `list[Widget]` in
+    /// `list[Widget] items`, or the nested `Widget` reached via `.elem`. It is
+    /// the per-reference source location — distinct from the canonical,
+    /// memoized `TypeInfo`, which is structural and span-free, so the same type
+    /// referenced at two declarations yields two values with two use-sites. It
+    /// is `None` for a type resolved from a span-free resolved `Ty` (no AST in
+    /// hand) and for a top-level `reflect.type_info(T)`. `.span` reads it, and
+    /// the container accessors (`.elem`/`.key`/`.value`/`.inner`/`.elems`)
+    /// descend into its argument subtree so a nested type's `.span` is its
+    /// use-site, not a declaration elsewhere.
+    Type(Rc<TypeInfo>, Option<Rc<AstType>>),
     /// An E1 `FieldInfo` record — a struct field or enum-variant payload field.
     Field(Rc<FieldInfo>),
     /// An E1 `VariantInfo` record — one enum variant.
@@ -70,7 +83,7 @@ impl Value {
             Value::Char(_) => "char",
             Value::List(_) => "list",
             Value::Tuple(_) => "tuple",
-            Value::Type(_) => "TypeInfo",
+            Value::Type(..) => "TypeInfo",
             Value::Field(_) => "FieldInfo",
             Value::Variant(_) => "VariantInfo",
             Value::Attr(_) => "AttrInfo",
@@ -146,7 +159,10 @@ impl PartialEq for Value {
             (Value::Tuple(a), Value::Tuple(b)) => a == b,
             (Value::Kind(a), Value::Kind(b)) => a == b,
             (Value::Span(a), Value::Span(b)) => a == b,
-            (Value::Type(a), Value::Type(b)) => Rc::ptr_eq(a, b),
+            // Two type references are equal when they name the same canonical
+            // type record; the use-site span is a diagnostic attachment, not
+            // part of a type's comptime identity.
+            (Value::Type(a, _), Value::Type(b, _)) => Rc::ptr_eq(a, b),
             (Value::Field(a), Value::Field(b)) => Rc::ptr_eq(a, b),
             (Value::Variant(a), Value::Variant(b)) => Rc::ptr_eq(a, b),
             (Value::Attr(a), Value::Attr(b)) => Rc::ptr_eq(a, b),
@@ -165,7 +181,7 @@ impl fmt::Debug for Value {
             Value::Char(c) => write!(f, "Char({c:?})"),
             Value::List(xs) => write!(f, "List({xs:?})"),
             Value::Tuple(xs) => write!(f, "Tuple({xs:?})"),
-            Value::Type(t) => write!(f, "Type({:?})", t.kind()),
+            Value::Type(t, _) => write!(f, "Type({:?})", t.kind()),
             Value::Field(x) => write!(f, "Field({:?})", x.name),
             Value::Variant(x) => write!(f, "Variant({:?})", x.name),
             Value::Attr(x) => write!(f, "Attr({:?})", x.name),

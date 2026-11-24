@@ -35,7 +35,7 @@ fn over_fields(struct_src: &str, loop_var: &str, body_src: &str) -> Vec<String> 
     let body = parse_body(body_src);
     let iterable = parse_expr("info.fields");
     let mut base = Env::new();
-    base.define("info", Value::Type(Rc::new(info)));
+    base.define("info", Value::Type(Rc::new(info), None));
     let mut ev = Evaluator::new();
     let stmts = unroll(loop_var, &iterable, &body, &base, &mut ev)
         .unwrap_or_else(|e| panic!("unroll failed: {e:?}"));
@@ -101,7 +101,7 @@ fn hq3_each_iteration_is_an_outlineable_call_not_an_inlined_body() {
     let body = parse_body("emit(f.index)");
     let iterable = parse_expr("info.fields");
     let mut base = Env::new();
-    base.define("info", Value::Type(Rc::new(info)));
+    base.define("info", Value::Type(Rc::new(info), None));
     let mut ev = Evaluator::new();
     let stmts = unroll("f", &iterable, &body, &base, &mut ev).unwrap();
     assert_eq!(stmts.len(), 3);
@@ -130,7 +130,7 @@ fn unroll_over_enum_variants() {
     let body = parse_body("register(v.name, v.index)");
     let iterable = parse_expr("info.variants");
     let mut base = Env::new();
-    base.define("info", Value::Type(Rc::new(info)));
+    base.define("info", Value::Type(Rc::new(info), None));
     let mut ev = Evaluator::new();
     let stmts = unroll("v", &iterable, &body, &base, &mut ev).unwrap();
     let rendered: Vec<String> = stmts.iter().map(render_stmt).collect();
@@ -164,7 +164,7 @@ fn comptime_user_function_call_folds_to_constant() {
     let body = parse_body("emit(value, serialized(f))");
     let iterable = parse_expr("info.fields");
     let mut base = Env::new();
-    base.define("info", Value::Type(Rc::new(info)));
+    base.define("info", Value::Type(Rc::new(info), None));
     let mut ev = Evaluator::with_functions(&fns);
     let stmts = unroll("f", &iterable, &body, &base, &mut ev).unwrap();
     let rendered: Vec<String> = stmts.iter().map(render_stmt).collect();
@@ -188,7 +188,7 @@ fn non_list_iterable_is_an_error() {
     let body = parse_body("emit(f)");
     let iterable = parse_expr("info.name");
     let mut base = Env::new();
-    base.define("info", Value::Type(Rc::new(info)));
+    base.define("info", Value::Type(Rc::new(info), None));
     let mut ev = Evaluator::new();
     let e = unroll("f", &iterable, &body, &base, &mut ev).unwrap_err();
     assert!(e.message.contains("comptime list"), "{}", e.message);
@@ -237,9 +237,12 @@ fn materialize_aggregates() {
 #[test]
 fn reflection_records_do_not_materialize() {
     use zapc_comptime::{TypeInfo, TypeShape};
-    let ti = Value::Type(Rc::new(TypeInfo {
-        shape: TypeShape::Tuple { elems: vec![] },
-    }));
+    let ti = Value::Type(
+        Rc::new(TypeInfo {
+            shape: TypeShape::Tuple { elems: vec![] },
+        }),
+        None,
+    );
     assert!(materialize(&ti, sp()).is_none());
     assert!(materialize(&Value::Kind(zapc_comptime::TypeKind::Struct), sp()).is_none());
 }
@@ -299,7 +302,7 @@ fn try_over_fields(
     let body = parse_body(body_src);
     let iterable = parse_expr("info.fields");
     let mut base = Env::new();
-    base.define("info", Value::Type(Rc::new(info)));
+    base.define("info", Value::Type(Rc::new(info), None));
     let mut ev = Evaluator::new();
     unroll(loop_var, &iterable, &body, &base, &mut ev)
 }

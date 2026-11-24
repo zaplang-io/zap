@@ -1321,6 +1321,79 @@ def main():
 }
 
 #[test]
+fn a_derive_can_point_at_a_nested_element_use_site() {
+    // #1346: a nested type carries its own *use-site* span, so a generator can
+    // reject a list *element* (not just the whole field) via
+    // `comptime.error(f.ty.elem.span, …)`. The primary error must underline the
+    // element `Widget` inside `list[Widget] items` — a strictly deeper span than
+    // the field — while the `required because of …` frame still attributes to the
+    // enclosing field `items`. One diagnostic, two distinct spans on one line.
+    let src = "\
+@derivable(Ser)
+def _derive_ser[T](T value):
+    comptime for f in reflect.type_info(T).fields:
+        if f.ty.kind.name == \"list\":
+            if f.ty.elem.kind.name == \"struct\":
+                comptime.error(f.ty.elem.span, \"`Ser`: list element type is not serializable\")
+
+interface Ser:
+    def ser(self)
+
+@derive(Ser)
+struct Widget:
+    int64 w
+@derive(Ser)
+struct Bag:
+    list[Widget] items
+
+def main():
+    auto b = Bag([Widget(1)])
+    b.ser()
+";
+    let f = write_zap("e3d-nested-element", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(!out.status.success(), "the derive must fail to compile");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Consumer header + the library's own message about the element.
+    assert!(
+        stderr.contains("error[ZAP7003]: cannot derive `Ser` for `Bag`"),
+        "consumer header naming the user's type: {stderr}"
+    );
+    assert!(
+        stderr.contains("the generator reported: `Ser`: list element type is not serializable"),
+        "the library's own message as the root cause: {stderr}"
+    );
+    // The chain still attributes to the enclosing field (mono matches the field
+    // whose declaration contains the nested cause span, #1346).
+    assert!(
+        stderr.contains("required because of field `items` of `Bag`"),
+        "backtrace frame at the enclosing field: {stderr}"
+    );
+    // Precision: the primary span is the element `Widget` (col 10 of the
+    // `    list[Widget] items` line), strictly deeper than the field frame,
+    // which points at the field start (col 5). Two distinct spans prove the
+    // nested use-site is live, not a fallback to the whole field.
+    assert!(
+        stderr.contains(":16:10: error[ZAP7003]"),
+        "primary error must underline the element use-site `Widget`: {stderr}"
+    );
+    assert!(
+        stderr.contains(":16:5: note: required because of field `items`"),
+        "the field frame points at the field declaration start: {stderr}"
+    );
+    // The caret underlines exactly `Widget` (6 columns), not the whole field.
+    assert!(
+        stderr.contains("         ^~~~~~\n"),
+        "the element caret spans `Widget` alone: {stderr}"
+    );
+    // Never leak the generator symbol or a mangled internal name.
+    assert!(
+        !stderr.contains("_derive_ser") && !stderr.contains('$'),
+        "no comptime-internal symbol in the diagnostic: {stderr}"
+    );
+}
+
+#[test]
 fn a_generator_bug_is_a_dual_span_error_not_a_crash() {
     // An engine fault inside a generator (here an out-of-range `reflect.field`)
     // is the library author's bug, not the consumer's: it renders as the

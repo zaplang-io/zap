@@ -455,7 +455,7 @@ impl<'a> Evaluator<'a> {
 
     fn eval_attr(&self, base: &Value, name: &str, span: Span) -> Result<Value, CtError> {
         match base {
-            Value::Type(ti) => match name {
+            Value::Type(ti, decl) => match name {
                 "kind" => Ok(Value::Kind(ti.kind())),
                 "name" => ti.name().map(Value::str).ok_or_else(|| {
                     CtError::value(
@@ -475,30 +475,49 @@ impl<'a> Evaluator<'a> {
                         .map(|v| Value::Variant(Rc::new(v.clone())))
                         .collect(),
                 )),
+                // The use-site source span of this type reference (#1346): the
+                // `list[Widget]` of a field, or the nested `Widget` reached via
+                // `.elem`. Available only when the reference was resolved from a
+                // declared `Type` (a field's type and the nested types under it);
+                // a type resolved from a span-free `Ty` has none.
+                "span" => decl.as_ref().map(|t| Value::Span(t.span())).ok_or_else(|| {
+                    CtError::value(
+                        "this type has no source span at comptime (only a type \
+                             written at a declaration — a field's type or a nested \
+                             element/key/value — carries one)",
+                        span,
+                    )
+                }),
                 // Container element accessors (#1253): resolve the element/key/
                 // value type back to a nested `TypeInfo` so a comptime
-                // kind-switch can recurse on it.
+                // kind-switch can recurse on it. When the use-site declared
+                // `Type` is in hand, descend into its argument subtree so the
+                // nested reference keeps its own use-site span (#1346).
                 "elem" => match &ti.shape {
-                    TypeShape::List { elem } => self.resolve_ty_value(elem, span),
+                    TypeShape::List { elem } => self.descend(decl, elem, ArgSel::ListElem, span),
                     _ => Err(container_accessor_err("elem", "list", ti, span)),
                 },
                 "key" => match &ti.shape {
-                    TypeShape::Dict { key, .. } => self.resolve_ty_value(key, span),
+                    TypeShape::Dict { key, .. } => self.descend(decl, key, ArgSel::DictKey, span),
                     _ => Err(container_accessor_err("key", "dict", ti, span)),
                 },
                 "value" => match &ti.shape {
-                    TypeShape::Dict { value, .. } => self.resolve_ty_value(value, span),
+                    TypeShape::Dict { value, .. } => {
+                        self.descend(decl, value, ArgSel::DictValue, span)
+                    }
                     _ => Err(container_accessor_err("value", "dict", ti, span)),
                 },
                 "inner" => match &ti.shape {
                     TypeShape::Optional { elem } => {
-                        if matches!(elem, zapc_sema_types::Ty::Unknown) {
+                        if let Some(arg) = container_arg(decl, ArgSel::OptInner) {
+                            self.resolve_type_value(&arg, span, Some(arg.clone()))
+                        } else if matches!(elem, zapc_sema_types::Ty::Unknown) {
                             Err(CtError::not_available(
                                 "a bare `Optional`'s element type at comptime",
                                 span,
                             ))
                         } else {
-                            self.resolve_ty_value(elem, span)
+                            self.resolve_ty_value(elem, span, None)
                         }
                     }
                     _ => Err(container_accessor_err("inner", "optional", ti, span)),
@@ -506,8 +525,8 @@ impl<'a> Evaluator<'a> {
                 "elems" => match &ti.shape {
                     TypeShape::Tuple { elems } => {
                         let mut out = Vec::with_capacity(elems.len());
-                        for e in elems {
-                            out.push(self.resolve_ty_value(e, span)?);
+                        for (i, e) in elems.iter().enumerate() {
+                            out.push(self.descend(decl, e, ArgSel::TupleElem(i), span)?);
                         }
                         Ok(Value::list(out))
                     }
@@ -526,8 +545,13 @@ impl<'a> Evaluator<'a> {
                 )),
                 // A field's own comptime type (#1253): resolve from the declared
                 // type (which preserves an `Optional`/container element the
-                // resolved `Ty` erases), so a kind-switch can recurse on it.
-                "ty" | "type_info" => self.resolve_type_value(&f.decl_ty, span),
+                // resolved `Ty` erases), so a kind-switch can recurse on it. The
+                // declared type is the use-site, so `f.ty.span` (and the spans of
+                // every nested type reached through it) point at the field's own
+                // declaration (#1346).
+                "ty" | "type_info" => {
+                    self.resolve_type_value(&f.decl_ty, span, Some(Rc::new(f.decl_ty.clone())))
+                }
                 // The field's source span (#1256), for `comptime.error(f.span,
                 // msg)` — point a library diagnostic at the user's declaration.
                 "span" => Ok(Value::Span(f.span)),
@@ -659,7 +683,11 @@ impl<'a> Evaluator<'a> {
                 let ty = expr_as_type(&args[0].value).ok_or_else(|| {
                     CtError::value("`reflect.type_info(T)` expects a type name", span)
                 })?;
-                self.resolve_type_value(&ty, span)
+                // A top-level `type_info(T)` has no single use-site span (the
+                // type is named abstractly, often a generator's type parameter),
+                // so it carries no `decl` (#1346). Use-site spans begin at a
+                // field's declared type.
+                self.resolve_type_value(&ty, span, None)
             }
             "has_override" => {
                 let argv = self.eval_args(args, env)?;
@@ -670,7 +698,7 @@ impl<'a> Evaluator<'a> {
                     ));
                 }
                 let type_name = match &argv[0] {
-                    Value::Type(ti) => ti.name().map(|s| s.to_string()),
+                    Value::Type(ti, _) => ti.name().map(|s| s.to_string()),
                     other => {
                         return Err(CtError::value(
                             format!(
@@ -764,17 +792,51 @@ impl<'a> Evaluator<'a> {
     }
 
     /// Resolve a resolved `Ty` (from a container shape) to a nested `TypeInfo`
-    /// value via the registry (#1253).
-    fn resolve_ty_value(&self, ty: &zapc_sema_types::Ty, span: Span) -> Result<Value, CtError> {
+    /// value via the registry (#1253). `use_site` is the declared `Type` this
+    /// reference came from, when known (#1346) — `None` here, since a `Ty` has
+    /// no source location.
+    fn resolve_ty_value(
+        &self,
+        ty: &zapc_sema_types::Ty,
+        span: Span,
+        use_site: Option<Rc<zapc_syntax::ast::Type>>,
+    ) -> Result<Value, CtError> {
         let reg = self.registry.ok_or_else(|| no_registry_err(span))?;
-        Ok(Value::Type(Rc::new(reg.resolve_ty(ty, span)?)))
+        Ok(Value::Type(Rc::new(reg.resolve_ty(ty, span)?), use_site))
     }
 
     /// Resolve a declared `Type` (e.g. a field's `decl_ty`) to a nested
-    /// `TypeInfo` value via the registry (#1253).
-    fn resolve_type_value(&self, t: &zapc_syntax::ast::Type, span: Span) -> Result<Value, CtError> {
+    /// `TypeInfo` value via the registry (#1253). `use_site` is the declared
+    /// `Type` carried as this reference's source location (#1346) — the caller
+    /// passes `Some(Rc::new(t.clone()))` to record it, or `None` for a reference
+    /// with no meaningful single use-site (a top-level `type_info(T)`).
+    fn resolve_type_value(
+        &self,
+        t: &zapc_syntax::ast::Type,
+        span: Span,
+        use_site: Option<Rc<zapc_syntax::ast::Type>>,
+    ) -> Result<Value, CtError> {
         let reg = self.registry.ok_or_else(|| no_registry_err(span))?;
-        Ok(Value::Type(Rc::new(reg.resolve_type(t, span)?)))
+        Ok(Value::Type(Rc::new(reg.resolve_type(t, span)?), use_site))
+    }
+
+    /// Resolve a container's nested type (list element, dict key/value, tuple
+    /// element) to a nested `TypeInfo` value, preserving its **use-site span**
+    /// (#1346). When the parent's declared `Type` is in hand, descend into its
+    /// argument subtree (`sel`) so the nested reference carries its own
+    /// declaration span; otherwise fall back to resolving the span-free
+    /// `fallback` `Ty` with no use-site.
+    fn descend(
+        &self,
+        decl: &Option<Rc<zapc_syntax::ast::Type>>,
+        fallback: &zapc_sema_types::Ty,
+        sel: ArgSel,
+        span: Span,
+    ) -> Result<Value, CtError> {
+        match container_arg(decl, sel) {
+            Some(arg) => self.resolve_type_value(&arg, span, Some(arg.clone())),
+            None => self.resolve_ty_value(fallback, span, None),
+        }
     }
 
     fn eval_method(
@@ -1159,6 +1221,62 @@ fn container_accessor_err(
         ),
         span,
     )
+}
+
+/// Which nested type to pull out of a container's declared `Type` (#1346), so a
+/// container accessor can descend into the *use-site* AST and keep the nested
+/// reference's own source span.
+#[derive(Clone, Copy)]
+enum ArgSel {
+    /// `list[T]` element `T`.
+    ListElem,
+    /// `dict[K, V]` key `K`.
+    DictKey,
+    /// `dict[K, V]` value `V`.
+    DictValue,
+    /// `Optional[T]` / `T?` element `T`.
+    OptInner,
+    /// The i-th element of a tuple type `(A, B, …)`.
+    TupleElem(usize),
+}
+
+/// Extract the nested declared `Type` selected by `sel` from a container's
+/// use-site declared `Type` (#1346). Returns `None` when no declared type is in
+/// hand (the reference was resolved from a span-free `Ty`) or its shape does not
+/// match the selector — in which case the caller falls back to the span-free
+/// resolved `Ty`, so recursion still works (just without a use-site span).
+fn container_arg(
+    decl: &Option<Rc<zapc_syntax::ast::Type>>,
+    sel: ArgSel,
+) -> Option<Rc<zapc_syntax::ast::Type>> {
+    use zapc_syntax::ast::Type;
+    let t = decl.as_ref()?;
+    match (&**t, sel) {
+        (Type::Named { name, args, .. }, ArgSel::ListElem)
+            if matches!(name.as_str(), "list" | "List") && args.len() == 1 =>
+        {
+            Some(Rc::new(args[0].clone()))
+        }
+        (Type::Named { name, args, .. }, ArgSel::DictKey)
+            if matches!(name.as_str(), "dict" | "Dict") && args.len() == 2 =>
+        {
+            Some(Rc::new(args[0].clone()))
+        }
+        (Type::Named { name, args, .. }, ArgSel::DictValue)
+            if matches!(name.as_str(), "dict" | "Dict") && args.len() == 2 =>
+        {
+            Some(Rc::new(args[1].clone()))
+        }
+        (Type::Named { name, args, .. }, ArgSel::OptInner)
+            if name == "Optional" && args.len() == 1 =>
+        {
+            Some(Rc::new(args[0].clone()))
+        }
+        (Type::Tuple { elems, .. }, ArgSel::TupleElem(i)) => {
+            elems.get(i).map(|e| Rc::new(e.clone()))
+        }
+        _ => None,
+    }
 }
 
 /// The registry is required for container recursion / `field.ty` but absent.

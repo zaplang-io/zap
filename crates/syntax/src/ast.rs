@@ -163,6 +163,18 @@ pub enum Type {
     },
 }
 
+impl Type {
+    /// The source span of this type expression — the whole reference as written
+    /// (`list[Widget]`, `Widget`, `(int64, str)`, …). Each variant carries its
+    /// own span; this is the uniform accessor comptime reflection uses to anchor
+    /// a nested type's *use-site* (#1346).
+    pub fn span(&self) -> Span {
+        match self {
+            Type::Named { span, .. } | Type::Tuple { span, .. } | Type::Func { span, .. } => *span,
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Declarations
 // ----------------------------------------------------------------------------
