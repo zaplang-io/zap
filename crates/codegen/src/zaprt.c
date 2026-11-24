@@ -8757,6 +8757,22 @@ int64_t zap_select(uint64_t *outval, int64_t *outok, int64_t n, int64_t has_defa
         scope_q_remove(&c->recvq_head, &c->recvq_tail, &wcases[i]);
         zap_np_unlock(&c->mu);
     }
+    /* The claimer that woke us ran `coready(sel->pw)` while STILL holding
+     * `sel.mu` and unlocks it only afterwards (see `deliver_to_receiver` /
+     * `take_from_sender` / `chan_buf_refill_from_sender`). `sel.mu` lives on THIS
+     * stack frame, which is reclaimed and reused the instant `zap_select`
+     * returns — so destroying or reusing it before that trailing
+     * `pthread_mutex_unlock(&sel->mu)` lets the claimer, running on another M,
+     * scribble pthread-mutex bytes over the reused frame. That has been observed
+     * as a corrupted allocation size in a subsequent spawn (x86) and, on
+     * aarch64, as a reused-mutex `__kind` that glibc reads as
+     * PTHREAD_PRIO_PROTECT, tripping the `__pthread_tpp_change_priority`
+     * assertion and aborting the process. Re-acquiring `sel.mu` here blocks
+     * until that claimer has released it (the non-chosen cleanup above already
+     * flushed any late claimer by taking each channel lock), so the mutex is
+     * truly private before we destroy it and return. */
+    pthread_mutex_lock(&sel.mu);
+    pthread_mutex_unlock(&sel.mu);
     pthread_mutex_destroy(&sel.mu);
     zap_check_cancel(); /* a cancel may have severed us while parked */
     if (sel.send_closed) {
