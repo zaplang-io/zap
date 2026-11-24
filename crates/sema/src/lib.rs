@@ -674,6 +674,10 @@ const GENEXPR_ITER_TYPE: &str = "$genexpr";
 const BUILTINS: &[&str] = &[
     "print",
     "input",
+    // open(path[, mode]) (#1388): prelude sugar forwarding to io.open with mode
+    // defaulting to "r"; returns the same int64 fd handle, same catchable
+    // failure. `input` is already a built-in above.
+    "open",
     "range",
     "len",
     // Fold one field hash into an accumulator for a hand-written `__hash__`
@@ -9019,6 +9023,41 @@ impl Checker {
                         }
                     }
                     return Ty::Str;
+                }
+                "open" => {
+                    // open(path[, mode]) (#1388): prelude sugar forwarding to
+                    // io.open with mode defaulting to "r". Positional, like
+                    // io.open; returns the int64 fd handle and raises a catchable
+                    // error on failure (lowering emits the throwing zap_io_open).
+                    if args.is_empty() || args.len() > 2 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!(
+                                "open() takes one or two arguments (path[, mode]), found {}",
+                                args.len()
+                            ),
+                            span,
+                        );
+                    }
+                    for (i, a) in args.iter().enumerate() {
+                        if a.name.is_some() {
+                            self.error(
+                                ErrorCode::ZAP4023,
+                                "open() arguments are positional: open(path[, mode])".to_string(),
+                                expr_span(&a.value),
+                            );
+                        }
+                        let t = self.infer(&a.value);
+                        if !matches!(t, Ty::Str | Ty::Unknown) {
+                            let what = if i == 0 { "path" } else { "mode" };
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!("open() {what} must be a str, found {}", t.display()),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::Int64;
                 }
                 // REPL session-binding slot intrinsics (I#159, design/0025-repl.md).
                 // Synthesized only by the `zap repl` driver, never written by

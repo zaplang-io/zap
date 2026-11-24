@@ -574,3 +574,31 @@ fn repr_ascii_base_builtin_codes() {
     );
     assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
 }
+
+#[test]
+fn open_builtin_codes() {
+    // open(path[, mode]) (#1388) is prelude sugar over io.open: one or two
+    // positional str arguments. Wrong arity -> ZAP4025, a non-str argument ->
+    // ZAP4024, and a keyword argument (it is positional) -> ZAP4023.
+    assert_code("def main():\n    auto f = open()\n", "ZAP4025");
+    assert_code(
+        "def main():\n    auto f = open(\"a\", \"w\", \"x\")\n",
+        "ZAP4025",
+    );
+    assert_code("def main():\n    auto f = open(1)\n", "ZAP4024");
+    assert_code("def main():\n    auto f = open(\"a\", 2)\n", "ZAP4024");
+    assert_code(
+        "def main():\n    auto f = open(\"a\", mode=\"w\")\n",
+        "ZAP4023",
+    );
+    // The well-typed forms are clean: default mode and an explicit mode.
+    let ok = check_source(
+        "import io\n\
+         def main():\n\
+         \x20   auto a = open(\"data.txt\")\n\
+         \x20   io.close_fd(a)\n\
+         \x20   auto b = open(\"out.log\", \"w\")\n\
+         \x20   io.close_fd(b)\n",
+    );
+    assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
+}
