@@ -287,6 +287,7 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("time", "sleep_ns", &["ns"]),
     ("time", "sleep_for", &["d"]),
     ("time", "after", &["d"]),
+    ("time", "ticker", &["d"]),
     ("time", "format", &["d"]),
     ("time", "since", &["start"]),
     ("time", "seconds", &["n"]),

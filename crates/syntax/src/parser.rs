@@ -182,6 +182,56 @@ value struct Duration:
     def __mul__(self, int64 k) -> Duration:
         return Duration(nanos=self.nanos * k)
 
+# A periodic timer (#1409): `time.ticker(d)` returns this handle. Receive the
+# monotonic-ns instant of each tick from `chan`; call `stop()` to end the firing
+# loop. A reference struct, so copies share the same channels.
+struct Ticker:
+    channel[int64] chan
+    channel[int64] _done
+
+    def stop(self):
+        # Idempotent, race-free stop: a cap-1 `_done` absorbs the first signal; a
+        # repeat (or a stop after the firing loop already drained it) hits the
+        # full buffer and drops via `default`, so there is no double-stop fault.
+        select:
+            case self._done <- 1:
+                pass
+            default:
+                pass
+
+# The periodic firing loop, spawned detached by `time.ticker` so it never joins
+# at program exit (a never-stopped ticker is simply terminated at exit). It MUST
+# never raise (D-0044: a detached coroutine that raises aborts the program); on a
+# scope-less coroutine every op below is non-raising. The schedule is fixed to
+# absolute multiples of the period, so wake latency does not accumulate as drift.
+def __ticker_fire(channel[int64] out, channel[int64] done, int64 period_ns):
+    if period_ns <= 0:
+        return
+    auto next = time.monotonic_ns() + period_ns
+    while True:
+        auto now = time.monotonic_ns()
+        auto remaining = next - now
+        if remaining < 0:
+            remaining = 0
+        select:
+            case _stop = <-done:
+                return
+            case fired = <-time.after(time.nanos(remaining)):
+                # Deliver the tick, or drop it when the consumer has not drained
+                # the previous one: a cap-1 channel + non-blocking send keeps the
+                # ticker on schedule instead of queuing or blocking on a slow peer.
+                select:
+                    case out <- fired:
+                        pass
+                    default:
+                        pass
+                next = next + period_ns
+                auto now2 = time.monotonic_ns()
+                if next <= now2:
+                    # Fell behind (slow consumer): resync to the next future
+                    # deadline rather than firing a catch-up burst.
+                    next = now2 + period_ns
+
 @derive(Eq, Ord)
 value struct Date:
     int64 year
@@ -3015,6 +3065,11 @@ fn references_prelude(module: &Module) -> bool {
         "\"Duration\"",
         "\"time\"",
         "\"datetime\"",
+        // The periodic `Ticker` handle (#1409): `time.ticker(d)` returns it and
+        // its firing loop/`stop()` ship in the prelude. `"time"` already covers
+        // `time.ticker(...)`; this also covers a direct `Ticker`-typed reference.
+        "\"ticker\"",
+        "\"Ticker\"",
         // The validated asymmetric-key metadata `crypto.key_info()` returns
         // (#643, D-0126): the `KeyInfo` value struct ships in the prelude,
         // injected for any program that names the method or the struct.
