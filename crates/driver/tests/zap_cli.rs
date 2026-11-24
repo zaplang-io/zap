@@ -1722,6 +1722,77 @@ def main():
 }
 
 #[test]
+fn an_enum_derive_recurses_through_an_enum_typed_variant_payload() {
+    // #1401: a `@derive` generator may recurse through a variant payload that is
+    // ITSELF a derived enum — the generated `$cvp` payload capture is enum-typed
+    // and dispatches its method correctly. This was mis-filed as a core defect:
+    // the original repro only failed because its generator called `.sum()` on a
+    // scalar leaf field (an `int64`, which has no `sum` method) → `ZAP6001`. A
+    // per-field comptime kind check routes scalar leaves to a direct add and
+    // struct/enum payloads to a recursive `.sum()`, so an enum nesting another
+    // enum lowers end-to-end. This pins that it compiles and that `Outer`'s
+    // specialization dispatches through `Inner`'s derived method (the enum-typed
+    // capture, not a scalar), so the behavior cannot silently regress.
+    let src = "\
+@derivable(Sum)
+def _derive_sum[T](T value) -> int64:
+    if reflect.type_info(T).kind.name == \"enum\":
+        match value:
+            case comptime v in reflect.type_info(T).variants as payload:
+                int64 acc = 0
+                comptime for f in v.fields:
+                    if f.ty.kind.name == \"struct\" or f.ty.kind.name == \"enum\":
+                        acc = acc + reflect.field(payload, comptime f.index).sum()
+                    else:
+                        acc = acc + reflect.field(payload, comptime f.index)
+                return acc
+        return 0
+    else:
+        int64 sacc = 0
+        comptime for f in reflect.type_info(T).fields:
+            sacc = sacc + reflect.field(value, comptime f.index)
+        return sacc
+
+interface Sum:
+    def sum(self) -> int64
+
+@derive(Sum)
+enum Inner:
+    Leaf(int64 a)
+
+@derive(Sum)
+enum Outer:
+    O(Inner inner)
+
+def main():
+    print(Outer.O(Inner.Leaf(42)).sum())
+";
+    let f = write_zap("e3-enum-enum-recurse", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "enum->enum recursion must lower to IR; stderr: {stderr}"
+    );
+    // The receiver of the recursive call is the enum-typed payload capture, not a
+    // struct or scalar — the exact dispatch the issue claimed was broken.
+    assert!(
+        !stderr.contains("non-struct value") && !stderr.contains("ZAP6001"),
+        "no spurious non-struct method error on an enum-typed capture: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("@_derive_sum$Outer") && stdout.contains("@_derive_sum$Inner"),
+        "both the outer and inner enum specialize from the one generator: {stdout}"
+    );
+    assert!(
+        stdout.contains("call @Inner__sum"),
+        "the outer specialization dispatches through the inner enum's derived \
+         method on its enum-typed payload capture: {stdout}"
+    );
+}
+
+#[test]
 fn a_generator_bug_is_a_dual_span_error_not_a_crash() {
     // An engine fault inside a generator (here an out-of-range `reflect.field`)
     // is the library author's bug, not the consumer's: it renders as the

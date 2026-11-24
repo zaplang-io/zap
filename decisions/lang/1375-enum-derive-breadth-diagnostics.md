@@ -51,7 +51,10 @@ Two breadth cases need core language fixes, filed rather than worked around
 - **enum→enum recursion** — a method call on an enum-typed variant-pattern
   capture (`reflect.field(payload, i).method()` where the field is an enum) fails
   with `method call on a non-struct value`, though struct captures and
-  hand-written match bindings work (#1401).
+  hand-written match bindings work (#1401). **Update (2026-11-24): resolved as
+  NOT a core defect — see `decisions/lang/1401-enum-derive-recursion-supported.md`.
+  Enum→enum recursion is supported; this scope-out was based on an incomplete
+  generator that called `.sum()` on a scalar leaf field.**
 - **generic enum construction** — `Box[int64].Variant(…)` is unresolved
   (`ZAP3001`), so generic-enum deriving cannot be exercised end-to-end though its
   synthesis is unit-tested (#1402).
@@ -60,6 +63,7 @@ Two breadth cases need core language fixes, filed rather than worked around
 
 Enum `@derive` is usable for the common cases — constant and payload enums,
 traits shared with structs, nested-struct recursion — with average-programmer-grade
-diagnostics pointing at the offending variant payload. The remaining breadth
-(enum→enum recursion, generic enums) is tracked by #1401/#1402; E4 (the dogfood
-port of the built-in derives) is the next phase.
+diagnostics pointing at the offending variant payload. Enum→enum recursion is
+also supported (#1401, see above); the only remaining enum-`@derive` breadth gap
+is generic-enum construction (#1402). E4 (the dogfood port of the built-in
+derives) is the next phase.
