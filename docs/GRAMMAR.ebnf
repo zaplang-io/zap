@@ -279,6 +279,11 @@ wrap_inner_param  ::= [ "*" | "**" ] IDENT ;
 
 import        ::= "import" "python" STRING [ "as" IDENT ] NEWLINE   (* CPython interop, D-0012 *)
                 | "import" import_list NEWLINE ;                    (* D-0028, D-0052, D-0081 *)
+                  (* `python` is a SOFT keyword (#1412): the interop head only
+                     when it immediately follows `import` AND is immediately
+                     followed by the module STRING; otherwise an IDENT, so
+                     `import python` imports a module named `python`. See the
+                     soft-keyword note above `compound_stmt`. *)
 import_list   ::= import_item { "," import_item }                  (* import a, b as c (no trailing comma) *)
                 | "(" import_item { "," import_item } [ "," ] ")" ; (* grouped; trailing comma allowed (I#70) *)
 import_item   ::= dotted_name [ "as" IDENT ] ;
@@ -332,7 +337,8 @@ simple_stmt   ::= decl
                 | "return" [ expr { "," expr } ]     (* bare comma-list -> tuple return, D-0049 *)
                 | "raise" [ expr [ "from" expr ] ]   (* "from": explicit cause chain, #604 D-0103 *)
                 | "assert" expr [ "," expr ]          (* power-assert; message, D-0054 *)
-                | "spawn" [ "detached" ] call_expr   (* "detached": D-0044 *)
+                | "spawn" [ "detached" ] call_expr   (* "detached": D-0044; "spawn" SOFT #1412:
+                                                        keyword at statement start, IDENT elsewhere *)
                 | "break"
                 | "continue"
                 | "pass"                             (* no-op statement, #591 *)
@@ -396,20 +402,29 @@ target_elem   ::= [ "*" ] target                (* at most one "*" per tuple (se
                      a `<-ch` receive expr; multiple return destructures a
                      tuple-returning call the same way. *)
 
-(* ---------- Soft (contextual) keywords: scope / select / match / case ----------
-   #1405 (`scope`) and #1411 (`select`, `match`, `case`), epic #1413. Each of
-   these four words is a keyword ONLY in its single statement/clause slot below
-   and an ordinary IDENT everywhere else — struct field, parameter, named-
-   argument label, `.member` read, and general expression (variable / call
-   target). They are therefore NOT in the reserved-word set: the lexer emits
-   them as IDENT (like the contextual `pass`/`from`/`del`/`value`/`default` and
-   the soft `type`/`fn`), and the parser recognizes one only at the head of its
-   slot. This is strictly widening — every program that parsed before still
-   parses — so it is backward-compatible.
+(* ---------- Soft (contextual) keywords ----------
+   Epic #1413. Tier 1: #1405 (`scope`), #1411 (`select`, `match`, `case`).
+   Tier 2: #1412 (`spawn`, `when`, `do`, `unsafe`, `python`). Each of these words
+   is a keyword ONLY in its single statement/clause slot and an ordinary IDENT
+   everywhere else — struct field, parameter, named-argument label, `.member`
+   read, and general expression (variable / call target). They are therefore NOT
+   in the reserved-word set: the lexer emits them as IDENT (like the contextual
+   `pass`/`from`/`del`/`value`/`default`/`detached`/`target` and the soft
+   `type`/`fn`), and the parser recognizes one only at the head of its slot. This
+   is strictly widening — every program that parsed before still parses — so it
+   is backward-compatible.
 
-   The disambiguating marker is a trailing ":" + indented block in every case:
+   The disambiguating marker is a trailing ":" + indented block, except for
+   `spawn` and `python` which have no ":" marker (noted below):
      scope  — statement-leading `scope` + optional "(" arg_list ")" + ":"-block.
      select — statement-leading `select` IMMEDIATELY followed by ":"-block.
+     do     — statement-leading `do` IMMEDIATELY followed by ":"-block (then the
+              trailing `while` expr); otherwise IDENT (`do(x)`, `do = v`, ...).
+     unsafe — statement-leading `unsafe` IMMEDIATELY followed by ":"-block;
+              otherwise IDENT.
+     when   — statement/item-leading `when` followed by its `target` "." predicate
+              head (see cfg_pred); otherwise IDENT (`when = v`, `when(x)`,
+              `when.attr`, and the member access `when.target`).
      match  — statement-leading `match`, then a subject expr, then ":"-block;
               distinguished from a call `match(x)` / name use `match`,
               `match = v`, `match.attr`, `match[i]` by a bounded backtracking
@@ -418,8 +433,17 @@ target_elem   ::= [ "*" ] target                (* at most one "*" per tuple (se
               Resolve toward the statement iff the ":"+block marker is present,
               otherwise IDENT.
      case   — a keyword ONLY inside a `match`/`select` body (case_clause /
-              select_case); an IDENT anywhere else, including inside an arm
-              body. *)
+              select_case); an IDENT anywhere else, including inside an arm body.
+     spawn  — NO ":" marker. A *simple* statement `spawn [detached] call_expr`.
+              Resolve toward the keyword at statement start (so `spawn f()` is the
+              spawn statement) and toward IDENT elsewhere — as an assignment
+              target, argument/named-arg label, sub-expression, field or param
+              (#1412). `detached` stays a contextual modifier after `spawn`.
+     python — NO ":" marker. A keyword ONLY in the interop import head
+              `import python STRING [as IDENT]`: recognized when it immediately
+              follows `import` AND is immediately followed by the module STRING.
+              Otherwise IDENT, so `import python` / `import python as p` import a
+              logical module named `python`. *)
 compound_stmt ::= if_stmt
                 | while_stmt
                 | do_while_stmt
@@ -440,6 +464,9 @@ if_stmt       ::= "if" expr block
 while_stmt    ::= "while" expr block ;
 
 do_while_stmt ::= "do" block "while" expr NEWLINE ;   (* D-0039 *)
+                  (* `do` is a SOFT keyword (#1412): the statement only when
+                     statement-leading with the ":"+block marker; else IDENT.
+                     See the soft-keyword note above `compound_stmt`. *)
 
 comptime_for_stmt ::= "comptime" "for" target "in" expr block ;
                   (* A compile-time-unrolled loop over a comptime sequence
@@ -499,7 +526,10 @@ unsafe_stmt   ::= "unsafe" block ;
                      directly (a SIGILL risk) — typically after an
                      `arch.cpu_has(...)` guard. It does NOT widen memory safety:
                      the v1 `arch.*` intrinsics are memory-safe and need no
-                     `unsafe`. Hard keyword, additive/Experimental (D-0076). The
+                     `unsafe`. A SOFT keyword (#1412): the statement only when
+                     statement-leading with the ":"+block marker, else an IDENT
+                     (see the soft-keyword note above). Additive/Experimental
+                     (D-0076). The
                      user-facing `@target_feature("feat")` and `arch.cpu_has(name)`
                      that pair with it add no new grammar — a function decorator
                      and a qualified call respectively. *)
@@ -531,7 +561,13 @@ unsafe_stmt   ::= "unsafe" block ;
    lowered ("dead-arm skip"), so an arm written for another target does not break
    the build. A `when` block introduces no new scope. `cfg_item` carries a block
    of items (imports/declarations); `cfg_stmt` carries ordinary statement blocks.
-   Experimental, additive (D-0076); post-1.0. Boolean combinators are not in v1. *)
+   Experimental, additive (D-0076); post-1.0. Boolean combinators are not in v1.
+   `when` is a SOFT keyword (#1412): the cfg statement/item only when
+   statement/item-leading and followed by its `target` "." predicate head (the
+   first alternative of `cfg_pred`); an ordinary IDENT otherwise (`when = v`,
+   `when(x)`, `when.attr`, and the member access `when.target`). The `elif` /
+   `else` that continue it stay hard keywords. See the soft-keyword note above
+   `compound_stmt`. *)
 cfg_item      ::= "when" cfg_pred item_block
                   { "elif" cfg_pred item_block }
                   [ "else" item_block ] ;
