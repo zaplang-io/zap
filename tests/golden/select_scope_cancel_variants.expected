@@ -1,0 +1,4 @@
+A: innermost of three nested scopes woke the select
+B: multi-case select woken exactly once by the deadline
+C: sibling failure cancelled and drained the parked select
+variants: 3

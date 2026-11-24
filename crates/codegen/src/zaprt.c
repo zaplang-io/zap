@@ -8127,6 +8127,7 @@ static int scope_contains(Scope *ancestor, Scope *scope) {
     return 0;
 }
 static void scope_cancel_io(Scope *sc);
+static void sel_claim_cancel(Waiter *w); /* #1414: wake a parked select on cancel */
 
 static void scope_request_cancel(Scope *sc) {
     zap_np_lock(&sc->mu);
@@ -8153,8 +8154,14 @@ static void scope_request_cancel(Scope *sc) {
         Waiter *w = n->waiter;
         if (w && (scope_q_remove(&c->sendq_head, &c->sendq_tail, w) ||
                   scope_q_remove(&c->recvq_head, &c->recvq_tail, w))) {
-            w->ok = 0;
-            coready(w);
+            if (w->sel) {
+                /* #1414: a parked `select` case — claim-and-wake the whole select
+                 * (defined with the other sel helpers, after `SelState`). */
+                sel_claim_cancel(w);
+            } else {
+                w->ok = 0;
+                coready(w);
+            }
         }
         scope_wait_release(n);
         zap_np_unlock(&g_scope_wait_mu);
@@ -8242,6 +8249,29 @@ typedef struct SelState {
     int send_closed;  /* a send case fired because the channel was closed */
     Waiter *pw;       /* the parking waiter (copark vehicle; carries the G) */
 } SelState;
+
+/* #1414: a scope cancel / deadline reached a parked `select` through one of its
+ * per-case `ScopeWait` nodes (registered in `zap_select`, like `chan_block`).
+ * Claim the select the same single-fire way a channel counterpart does — lock
+ * `sel->mu`, and if no case has fired yet, mark it fired with `chosen == -1` (no
+ * case value: woken by cancellation) and wake the one parking waiter. A select
+ * already claimed elsewhere — a real case fired, or another of its cases was
+ * cancelled first — is simply dropped, so `sel->pw` is woken at most once. The
+ * caller (`scope_request_cancel`) holds the case's channel lock and
+ * `g_scope_wait_mu`; adding `sel->mu` innermost keeps the channel -> sel lock
+ * order the counterpart paths use, with no cycle through `g_scope_wait_mu`. The
+ * post-park `zap_check_cancel()` in `zap_select` then raises (D-0094 labelling is
+ * applied unchanged at the owning scope's exit). */
+static void sel_claim_cancel(Waiter *w) {
+    SelState *sel = w->sel;
+    pthread_mutex_lock(&sel->mu);
+    if (!sel->fired) {
+        sel->fired = 1;
+        sel->chosen = -1;
+        coready(sel->pw);
+    }
+    pthread_mutex_unlock(&sel->mu);
+}
 
 /* Deliver value word `v` to a receiver waiter `r` popped from a recvq. Returns
  * 1 if `r` was woken (the send is complete), 0 if `r` was a dead `select` case
@@ -8737,6 +8767,60 @@ int64_t zap_select(uint64_t *outval, int64_t *outok, int64_t n, int64_t has_defa
             q_push(&cases[i].ch->recvq_head, &cases[i].ch->recvq_tail, w);
         }
     }
+
+    /* #1414: register each case against the coroutine's innermost lexical scope
+     * (`cancel_scope`, #1398) so a scope deadline or cancel wakes the parked
+     * `select`, exactly as `chan_block` wires up a bare channel wait. Without this
+     * a parked `select` was the one cancellation point unreachable by a cancel: it
+     * woke only when a real case fired, or after the grace-window sever (#825), so
+     * its `finally`/`with` cleanup never ran on cancellation. One `ScopeWait` per
+     * case drives the same channel-queue removal a bare wait gets; the canceller
+     * claims the single select once (`sel_claim_cancel`). Nodes are allocated and
+     * linked while every channel lock is still held (as `chan_block` links under
+     * its channel lock), so a concurrent canceller — which takes the channel lock
+     * first — sees a consistent waiter+node state. */
+    G *selg = cur_m ? cur_m->current : NULL;
+    if (selg) {
+        selg->park_reason = "select"; /* I#475 diagnostics */
+    }
+    ScopeWait *swnodes[cap];
+    int nsw = 0;
+    if (selg && selg->cancel_scope) {
+        for (int64_t i = 0; i < n; i++) {
+            ScopeWait *node = (ScopeWait *)zap_ptrbuf(sizeof(ScopeWait));
+            node->scope = selg->cancel_scope;
+            node->channel = cases[i].ch;
+            node->waiter = &wcases[i];
+            node->refs = 1;
+            swnodes[nsw++] = node;
+        }
+        zap_np_lock(&g_scope_wait_mu);
+        int pre_cancelled = g_is_cancelled();
+        if (!pre_cancelled) {
+            for (int s = 0; s < nsw; s++) {
+                swnodes[s]->next = g_scope_waits;
+                g_scope_waits = swnodes[s];
+            }
+        }
+        zap_np_unlock(&g_scope_wait_mu);
+        if (pre_cancelled) {
+            /* Cancelled between the entry check and the park: unlink every waiter
+             * (we still hold all channel locks) and raise without parking. The
+             * nodes above were never published, so GC simply reclaims them. */
+            for (int64_t i = 0; i < n; i++) {
+                ZapChan *c = cases[i].ch;
+                scope_q_remove(&c->sendq_head, &c->sendq_tail, &wcases[i]);
+                scope_q_remove(&c->recvq_head, &c->recvq_tail, &wcases[i]);
+            }
+            for (int j = nl - 1; j >= 0; j--) {
+                zap_np_unlock(&locks[j]->mu);
+            }
+            pthread_mutex_destroy(&sel.mu);
+            zap_raise(cancelled_exc());
+            return -1; /* unreachable: zap_raise unwinds */
+        }
+    }
+
     pthread_mutex_lock(&sel.mu);
     for (int j = nl - 1; j >= 0; j--) {
         zap_np_unlock(&locks[j]->mu);
@@ -8748,13 +8832,23 @@ int64_t zap_select(uint64_t *outval, int64_t *outok, int64_t n, int64_t has_defa
      * counterpart that pops a stale waiter sees `sel.fired` and discards it, so
      * a double-removal here is harmless. */
     for (int64_t i = 0; i < n; i++) {
-        if ((int)i == sel.chosen) {
-            continue;
-        }
         ZapChan *c = cases[i].ch;
         zap_np_lock(&c->mu);
-        scope_q_remove(&c->sendq_head, &c->sendq_tail, &wcases[i]);
-        scope_q_remove(&c->recvq_head, &c->recvq_tail, &wcases[i]);
+        if ((int)i != sel.chosen) {
+            scope_q_remove(&c->sendq_head, &c->sendq_tail, &wcases[i]);
+            scope_q_remove(&c->recvq_head, &c->recvq_tail, &wcases[i]);
+        }
+        if (nsw) {
+            /* #1414: detach and release this case's ScopeWait node under the same
+             * channel + registry locks `scope_request_cancel` reads it under, so a
+             * concurrent canceller never acts on a waiter whose stack frame is
+             * about to leave. The chosen case's node is released here too (its
+             * waiter was already popped by the counterpart). */
+            zap_np_lock(&g_scope_wait_mu);
+            swnodes[i]->waiter = NULL;
+            scope_wait_release(swnodes[i]);
+            zap_np_unlock(&g_scope_wait_mu);
+        }
         zap_np_unlock(&c->mu);
     }
     /* The claimer that woke us ran `coready(sel->pw)` while STILL holding
@@ -8774,7 +8868,7 @@ int64_t zap_select(uint64_t *outval, int64_t *outok, int64_t n, int64_t has_defa
     pthread_mutex_lock(&sel.mu);
     pthread_mutex_unlock(&sel.mu);
     pthread_mutex_destroy(&sel.mu);
-    zap_check_cancel(); /* a cancel may have severed us while parked */
+    zap_check_cancel(); /* a cancel may have woken/severed us while parked */
     if (sel.send_closed) {
         zap_panic(zap_str_new("send on closed channel", 22));
     }

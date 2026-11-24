@@ -380,7 +380,10 @@ Cancelling a coroutine arms it; the cancel takes effect at the next
 **cancellation point**, where the runtime raises a `Cancelled` exception in that
 coroutine:
 
-- any channel send/receive and any `select`;
+- any channel send/receive and any `select` — a parked `select` (no ready case,
+  no `default`) is woken by a cancel or scope deadline the same way a bare
+  send/receive is, binding to the **innermost** `scope:` the coroutine is
+  executing in and every scope enclosing it (I#1414, built on I#1398);
 - `sleep`, timer, and I/O waits — every coroutine `time.sleep*` parks on the
   fd-less scheduler timer and frees its M (I#1357 for sleeps with an owning
   `scope:`, generalized to every coroutine sleep, scope-less ones included, in
