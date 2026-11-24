@@ -8,7 +8,13 @@
 # exit 0 (the default `.exit`, which also proves it never reaches `_exit(1)`).
 def wont_drain(channel[int64] ready):
     ready <- 1
-    time.sleep_for(time.millis(500))  # blocking syscall: never reaches a cancel point
+    # Wall-clock-bounded busy-wait with NO cancellation point (no sleep /
+    # checkpoint / channel), so it never observes the cancel and is severed. Since
+    # #1357 a coroutine `time.sleep` is itself a cancellation point and would
+    # drain, so it can no longer stand in for a non-draining child here.
+    auto deadline = time.monotonic_ns() + 500000000
+    while time.monotonic_ns() < deadline:
+        auto spin = 0
 
 def main():
     auto ready = channel[int64](1)

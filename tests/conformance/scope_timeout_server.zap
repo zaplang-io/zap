@@ -8,7 +8,12 @@
 # scope, so the outer scope does not wait on it. MAXPROCS=4.
 def faulty_handler(channel[int64] ready):
     ready <- 1
-    time.sleep_for(time.millis(400))  # non-draining child
+    # Non-draining child: a wall-clock-bounded busy-wait with NO cancellation
+    # point (since #1357 a coroutine `time.sleep` is a cancellation point and
+    # would drain cooperatively, so it can no longer stand in for one here).
+    auto deadline = time.monotonic_ns() + 400000000
+    while time.monotonic_ns() < deadline:
+        auto spin = 0
 
 def faulty_endpoint() -> int64:
     auto ready = channel[int64](1)
