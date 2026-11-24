@@ -110,13 +110,19 @@ void zap_time_sleep_cancellable_ns(int64_t ns) {
         return;
     }
 #if defined(__linux__)
-    /* The cooperative timer park is the Linux epoll netpoller + a `pipe2`-created
-     * never-ready fd; both are Linux-specific (the netpoller's own backend is
-     * `#if defined(__linux__)`, and `pipe2` is a glibc extension absent on
-     * Windows/macOS). Elsewhere we fall through to the portable blocking path
-     * below. */
+    /* The cooperative timer park is the Linux epoll netpoller + a never-ready
+     * pipe fd; the netpoller's own backend is `#if defined(__linux__)`, so off
+     * Linux we fall through to the portable blocking path below. */
     int fds[2];
-    if (pipe2(fds, O_NONBLOCK | O_CLOEXEC) == 0) {
+    /* Plain `pipe()` (not `pipe2`): the runtime is compiled without
+     * `_GNU_SOURCE`, so `pipe2` is an undeclared function under the LTO bitcode
+     * compile. The read end is never written, so it is never ready (no
+     * O_NONBLOCK needed — the netpoller self-test's deadline probe registers a
+     * plain pipe the same way); set FD_CLOEXEC by hand so the short-lived fds do
+     * not leak across an `exec` during the wait. */
+    if (pipe(fds) == 0) {
+        (void)fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+        (void)fcntl(fds[1], F_SETFD, FD_CLOEXEC);
         void *pd = zap_netpoll_open(fds[0]);
         if (pd) {
             int64_t now = np_now_ns();
@@ -140,7 +146,7 @@ void zap_time_sleep_cancellable_ns(int64_t ns) {
         close(fds[0]);
         close(fds[1]);
     }
-    /* `pipe2`/netpoller unavailable: degrade to the blocking sleep. */
+    /* pipe/netpoller unavailable: degrade to the blocking sleep. */
 #endif
     /* Portable fallback (non-Linux, or no netpoller): observe a pending cancel,
      * then block. Not cancellable mid-sleep here — the cooperative timer park is
