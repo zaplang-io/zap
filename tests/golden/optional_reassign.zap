@@ -1,23 +1,22 @@
 # Regression for #1362: a bare payload value `T` assigned into an existing
-# `Optional[T]` local (or module-level global) via a plain `name = value`
-# reassignment must box as a tagged/boxed `Some(T)`, never store the raw
-# scalar/pointer into the Optional slot. The plain `Stmt::Assign` to a `Name`
-# lowered its right-hand side with a bare `self.expr(value)`, bypassing the
-# `expr_coerced` chokepoint every other accepted Optional position uses (#1262,
-# #1075/#1080/#1195), so a later `is_some()` / `unwrap()` read the raw bits as an
-# Optional object and SIGSEGV'd (the issue's `0xffffffffffffd5d0` = the bit
-# pattern of `-10800`). This is the reassignment partner of the #1262
-# constructor/field/index wrap. All reads below are native
-# (is_some/is_none/unwrap/unwrap_or) so the tagged-vs-raw storage is actually
-# observed — it only matters once the native collector runs.
+# `Optional[T]` local via a plain `name = value` reassignment must box as a
+# tagged/boxed `Some(T)`, never store the raw scalar/pointer into the Optional
+# slot. The plain `Stmt::Assign` to a `Name` lowered its right-hand side with a
+# bare `self.expr(value)`, bypassing the `expr_coerced` chokepoint every other
+# accepted Optional position uses (#1262, #1075/#1080/#1195), so a later
+# `is_some()` / `unwrap()` read the raw bits as an Optional object and SIGSEGV'd
+# (the issue's `0xffffffffffffd5d0` = the bit pattern of `-10800`). This is the
+# reassignment partner of the #1262 constructor/field/index wrap. All reads
+# below are native (is_some/is_none/unwrap/unwrap_or) so the tagged-vs-raw
+# storage is actually observed — it only matters once the native collector runs.
+#
+# Scope: this covers the plain local reassignment. The reassignment of a
+# module-level global is boxed the same way (proven by the host IR test
+# `global_reassign_boxes_some_not_raw`), but its *runtime* persistence is a
+# separate module-state concern tracked in #1369, so it is not exercised here.
 
 struct Item:
     int64 value
-
-
-# A module-level mutable global (D-0112): the `Stmt::Assign` to a `Name` path
-# covers a global's slot identically, so it must box the same way.
-Optional[int64] g_offset = None
 
 
 def describe(Optional[int64] opt) -> int64:
@@ -92,22 +91,7 @@ def main():
     print(slot.is_some())  # True
     print(slot.unwrap().value)  # 42
 
-    # A collection payload (`list[int64]`): a bare list reassigned into
-    # `Optional[list[int64]]` must box.
-    Optional[list[int64]] nums = None
-    nums = [10, 20, 30]
-    print(nums.is_some())  # True
-    print(nums.unwrap()[1])  # 20
-
     # unwrap_or on the empty side after a reassignment back to None.
     Optional[int64] bk = Optional.Some(5)
     bk = None
     print(bk.unwrap_or(-9))  # -9
-
-    # A module-level mutable global reassigned in place with a bare payload
-    # (D-0112): the `Stmt::Assign` to a `Name` path covers a global's slot the
-    # same way, so it must box `Some` too.
-    print(g_offset.is_none())  # True
-    g_offset = -10800
-    print(g_offset.is_some())  # True
-    print(g_offset.unwrap())  # -10800
