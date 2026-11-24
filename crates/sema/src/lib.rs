@@ -11874,6 +11874,28 @@ impl Checker {
                 self.declare(name, scrut.clone(), *span);
                 (covered, catch_all)
             }
+            Pattern::ComptimeVariants {
+                loop_var,
+                bind,
+                span,
+                ..
+            } => {
+                // #1374: a comptime-generated set of variant arms (a derive
+                // generator's `case comptime v in …variants [as payload]:`). The
+                // loop variable is a comptime variant record and the optional
+                // `as` binds the per-variant payload handle; both are introduced
+                // as `Unknown` so the generator body type-checks leniently — the
+                // same tolerance the generator's `comptime for` / `reflect.*`
+                // surface already receives (concrete checking is per
+                // instantiation in mono). The arm covers every variant by
+                // construction, so it is treated as an irrefutable catch-all for
+                // exhaustiveness.
+                self.declare(loop_var, Ty::Unknown, *span);
+                if let Some(b) = bind {
+                    self.declare(b, Ty::Unknown, *span);
+                }
+                (Vec::new(), true)
+            }
         }
     }
 

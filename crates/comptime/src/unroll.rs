@@ -137,6 +137,73 @@ pub fn unroll(
     Ok(out)
 }
 
+/// Specialize `body` for a single bound `item` (#1374): bind `loop_var` to
+/// `item` and run the comptime specializer, returning the specialized [`Block`]
+/// on its own (rather than flattening into a statement list like [`unroll`]).
+/// Match-arm generation uses this to keep each variant's arm body separate while
+/// still unrolling any inner `comptime for` and resolving `comptime <expr>`
+/// inside it. Runtime constructs in the body are left untouched.
+pub fn specialize_one(
+    loop_var: &str,
+    item: Value,
+    payload: Option<&str>,
+    body: &Block,
+    base_env: &Env,
+    ev: &mut Evaluator,
+) -> Result<Block, CtError> {
+    let mut env = base_env.clone();
+    env.define(loop_var, item);
+    // Record the arm's payload handle (#1374) so `reflect.field(<payload>, i)`
+    // inside the body resolves to the i-th payload capture the arm pattern binds
+    // (`$cvp{i}`), rather than being left as a struct field access.
+    if let Some(p) = payload {
+        env.define(PAYLOAD_HANDLE_KEY, Value::str(p));
+    }
+    specialize_block(body, &mut env, ev)
+}
+
+/// Env key under which [`specialize_one`] stashes the current comptime arm's
+/// `as <payload>` binding name (#1374). The specializer reads it to rewrite
+/// `reflect.field(<payload>, i)` into the arm pattern's i-th payload capture.
+const PAYLOAD_HANDLE_KEY: &str = "$arm_payload";
+
+/// The canonical name the arm pattern binds a variant's i-th payload field to
+/// (#1374). Deterministic and arm-local (each match arm is its own scope), so no
+/// gensym counter is needed.
+pub fn payload_capture_name(index: usize) -> String {
+    format!("$cvp{index}")
+}
+
+/// If `e` is `reflect.field(<payload>, <comptime index>)` where `<payload>` is
+/// the current arm's payload handle (#1374), return the comptime-folded field
+/// index. The specializer rewrites such a call to the arm's payload capture.
+fn reflect_field_payload_index(
+    e: &Expr,
+    env: &mut Env,
+    ev: &mut Evaluator,
+) -> Result<Option<usize>, CtError> {
+    let Expr::Call { callee, args, .. } = e else {
+        return Ok(None);
+    };
+    let Expr::Attr { base, name, .. } = &**callee else {
+        return Ok(None);
+    };
+    if name != "field" || !matches!(&**base, Expr::Name(n, _) if n == "reflect") || args.len() != 2
+    {
+        return Ok(None);
+    }
+    let Some(Value::Str(payload)) = env.lookup(PAYLOAD_HANDLE_KEY).cloned() else {
+        return Ok(None);
+    };
+    if !matches!(&args[0].value, Expr::Name(n, _) if *n == *payload) {
+        return Ok(None);
+    }
+    match ev.eval(&args[1].value, env)? {
+        Value::Int(i) if i >= 0 => Ok(Some(i as usize)),
+        _ => Ok(None),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // specialization (comptime-constant folding over the body)
 // ---------------------------------------------------------------------------
@@ -159,6 +226,27 @@ fn specialize_block(b: &Block, env: &mut Env, ev: &mut Evaluator) -> Result<Bloc
         {
             if let Some(mut taken) = prune_comptime_if(branches, else_block, env, ev)? {
                 stmts.append(&mut taken);
+                continue;
+            }
+        }
+        // A nested `comptime for <v> in <iter>:` whose iterable is comptime-known
+        // here is unrolled in place — binding `<v>` per item and splicing the
+        // specialized body (#1374). This is what lets a comptime arm's inner
+        // `comptime for f in v.fields:` unroll once `v` is a concrete variant
+        // record. An iterable that is not a comptime list (e.g. a still-abstract
+        // `reflect.type_info(T).fields` the outer mono pass unrolls) is left as a
+        // `comptime for` for that later pass.
+        if let Stmt::ComptimeFor {
+            target: Expr::Name(lv, _),
+            iter,
+            body,
+            ..
+        } = st
+        {
+            let mut probe = env.clone();
+            if matches!(ev.eval(iter, &mut probe), Ok(Value::List(_))) {
+                let mut unrolled = unroll(lv, iter, body, env, ev)?;
+                stmts.append(&mut unrolled);
                 continue;
             }
         }
@@ -490,6 +578,15 @@ fn specialize_expr(e: &Expr, env: &mut Env, ev: &mut Evaluator) -> Result<Expr, 
         // `comptime.error` never evaluates to a value; if that ever changes, keep
         // the call verbatim rather than silently dropping it.
         return Ok(e.clone());
+    }
+    // #1374: `reflect.field(<payload>, i)` in a comptime-generated variant arm
+    // rewrites to the arm pattern's i-th payload capture (a runtime binding),
+    // with the index comptime-folded.
+    if let Some(i) = reflect_field_payload_index(e, env, ev)? {
+        return Ok(Expr::Name(
+            payload_capture_name(i),
+            crate::eval::expr_span(e),
+        ));
     }
     if let Ok(v) = ev.eval(e, env) {
         if let Some(lit) = materialize(&v, crate::eval::expr_span(e)) {

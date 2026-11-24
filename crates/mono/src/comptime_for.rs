@@ -23,10 +23,10 @@
 use std::rc::Rc;
 
 use zapc_comptime::{
-    desugar_reflect_field, error_code, reflect_field, unroll, CtError, CtErrorKind, Env, Evaluator,
-    TypeInfo, TypeRegistry, Value,
+    desugar_reflect_field, error_code, reflect_field, specialize_one, type_info_of_enum, unroll,
+    CtError, CtErrorKind, Env, Evaluator, TypeInfo, TypeRegistry, Value,
 };
-use zapc_syntax::ast::{Block, EnumDef, Expr, Module, Stmt, StructDef};
+use zapc_syntax::ast::{Block, EnumDef, Expr, Function, Module, Stmt, StructDef};
 use zapc_syntax::span::Span;
 
 use crate::{DeriveErrorInfo, LowerError};
@@ -81,6 +81,39 @@ pub fn unroll_enum_variants(
 ) -> Result<Vec<Stmt>, LowerError> {
     let info = zapc_comptime::type_info_of_enum(def);
     unroll_member(info, loop_var, "variants", body, funcs, registry)
+}
+
+/// Specialize a `case comptime v in …variants [as _]:` arm body once per
+/// variant of the concrete enum `def` (#1374, epic #1371). Returns, in
+/// declaration order, each variant's specialized body [`Block`]: `loop_var` is
+/// bound to that variant's reflect record, so `comptime <v>.name` and any inner
+/// `comptime for f in <v>.fields:` resolve/unroll, while runtime constructs —
+/// including `reflect.field(payload, i)` — are left intact for the caller to
+/// rewrite to the arm's payload bindings. The returned Vec is parallel to
+/// `def.variants`.
+pub fn specialize_variant_arms(
+    def: &EnumDef,
+    loop_var: &str,
+    payload: Option<&str>,
+    body: &Block,
+    funcs: &[Function],
+    registry: Option<&TypeRegistry>,
+) -> Result<Vec<Block>, LowerError> {
+    let info = type_info_of_enum(def);
+    let mut ev = Evaluator::with_functions(funcs);
+    if let Some(reg) = registry {
+        ev = ev.with_registry(reg);
+    }
+    let base = Env::new();
+    let mut out = Vec::with_capacity(info.variants().len());
+    for variant in info.variants() {
+        let item = Value::Variant(Rc::new(variant.clone()));
+        out.push(
+            specialize_one(loop_var, item, payload, body, &base, &mut ev)
+                .map_err(ct_lower_error)?,
+        );
+    }
+    Ok(out)
 }
 
 /// Build the comptime [`TypeRegistry`] for a module's user `struct`/`enum`

@@ -118,7 +118,7 @@ pub use lint::lint_comptime_callable;
 pub use reflect_ast::{type_info_of_enum, type_info_of_struct, MemoStats, TypeRegistry};
 pub use reflect_field::{desugar_reflect_field, field_decl_type, reflect_field};
 pub use specialize::SpecializationCache;
-pub use unroll::{materialize, unroll};
+pub use unroll::{materialize, payload_capture_name, specialize_one, unroll};
 pub use value::Value;
 pub use zapc_diag::ErrorCode;
 

@@ -795,6 +795,22 @@ pub enum Pattern {
         name: String,
         span: Span,
     },
+    /// `case comptime <loop_var> in <iter> [as <bind>]:` — a **comptime-generated
+    /// set of variant arms** (#1374, epic #1371, decision #1372). Used inside a
+    /// `@derivable` generator's `match value:` over an enum: `iter` is a comptime
+    /// sequence of variants (`reflect.type_info(T).variants`), and at
+    /// monomorphization this one arm expands into one ordinary variant pattern
+    /// arm per variant — the arm body shared, with `loop_var` bound (comptime) to
+    /// each variant and `reflect.field(bind, i)` resolving to the variant's i-th
+    /// payload field. It never reaches sema's exhaustiveness check as itself
+    /// (sema treats it as covering every variant) nor lowering (mono expands it
+    /// first). `bind` is the optional `as <name>` payload handle.
+    ComptimeVariants {
+        loop_var: String,
+        iter: Box<Expr>,
+        bind: Option<String>,
+        span: Span,
+    },
 }
 
 /// One argument of a struct/variant pattern (D-0040/D-0046). `name` is `Some`

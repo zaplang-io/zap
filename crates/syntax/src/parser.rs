@@ -4927,11 +4927,18 @@ impl Parser {
         while self.is_kw(Keyword::Case) {
             let astart = self.peek_span().start;
             self.bump();
-            let pattern = self.parse_pattern();
-            let guard = if self.eat_kw(Keyword::If) {
-                Some(self.parse_expr())
+            // `case comptime <v> in <iter> [as <bind>]:` — a comptime-generated
+            // set of variant arms (#1374). Otherwise an ordinary pattern arm.
+            let (pattern, guard) = if self.is_kw(Keyword::Comptime) {
+                (self.parse_comptime_variants_pattern(astart), None)
             } else {
-                None
+                let pattern = self.parse_pattern();
+                let guard = if self.eat_kw(Keyword::If) {
+                    Some(self.parse_expr())
+                } else {
+                    None
+                };
+                (pattern, guard)
             };
             let body = self.parse_block();
             arms.push(MatchArm {
@@ -4945,6 +4952,38 @@ impl Parser {
         Stmt::Match {
             scrutinee,
             arms,
+            span: self.span_from(start),
+        }
+    }
+
+    /// `comptime <loop_var> in <iter> [as <bind>]` — the comptime-generated
+    /// variant-arm pattern (#1374), after the `case` keyword. `iter` is an
+    /// ordinary expression (a comptime `reflect.type_info(T).variants`); `as`
+    /// binds the per-variant payload handle. Parsing stops before the arm's
+    /// block, which [`parse_match`] then reads.
+    fn parse_comptime_variants_pattern(&mut self, start: u32) -> Pattern {
+        self.expect_kw(Keyword::Comptime, "'comptime'");
+        let loop_var = match self.ident_opt() {
+            Some((name, _)) => name,
+            None => {
+                self.error_here(
+                    ErrorCode::ZAP2014,
+                    "expected a loop variable after `case comptime`",
+                );
+                "<error>".to_string()
+            }
+        };
+        self.expect_kw(Keyword::In, "'in'");
+        let iter = self.parse_expr();
+        let bind = if self.eat_kw(Keyword::As) {
+            Some(self.pattern_capture_name())
+        } else {
+            None
+        };
+        Pattern::ComptimeVariants {
+            loop_var,
+            iter: Box::new(iter),
+            bind,
             span: self.span_from(start),
         }
     }
