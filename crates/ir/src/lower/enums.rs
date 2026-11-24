@@ -91,8 +91,15 @@ impl<'a> FnLower<'a> {
                         "niche variant '{enum_name}.{variant}' takes exactly one value"
                     )));
                 }
-                let (val, vt) = self.expr(&args[0].value)?;
-                let val = self.coerce(val, vt, payload);
+                // Lower the payload against its declared type through the shared
+                // type-contextual chokepoint (#1367), the same one struct fields,
+                // call args and returns use: a bare `None` payload becomes the
+                // canonical empty option (for a nested `Optional[Optional[T]]`) or
+                // the reference null (`lower_none_expr`), and a bare payload
+                // auto-wraps where accepted (#1262) — instead of bailing at the
+                // generic `ZAP6001` on a typeless `self.expr(None)`.
+                let val =
+                    self.expr_coerced(&args[0].value, payload, zapc_diag::ErrorCode::ZAP4001)?;
                 return Ok((val, Ty::Struct(sid)));
             }
         }
@@ -138,8 +145,14 @@ impl<'a> FnLower<'a> {
                     (f.1, f.2)
                 }
             };
-            let (val, vt) = self.expr(&a.value)?;
-            let val = self.coerce(val, vt, fty);
+            // Lower each payload field against its declared type through the
+            // shared chokepoint (#1367), matching struct-constructor fields
+            // (`fill_struct_fields`): a bare `None` for an `Optional`/reference
+            // field lowers to its canonical empty value via `lower_none_expr`
+            // (a clear type error for a non-nullable scalar field, not the opaque
+            // `ZAP6001`), and a bare payload auto-wraps into `Some` where sema
+            // accepts it (#1262).
+            let val = self.expr_coerced(&a.value, fty, zapc_diag::ErrorCode::ZAP4001)?;
             self.emit(Inst::FieldSet {
                 base: dest,
                 sid,
