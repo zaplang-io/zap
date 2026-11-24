@@ -473,6 +473,13 @@ struct Checker {
     user_types: HashSet<String>,
     /// Registered enums (tier-1 and tier-3), keyed by type name.
     enums: HashMap<String, EnumInfo>,
+    /// Names of enums declared with type parameters (`enum Box[T]: …`). Gates
+    /// the explicit-type-argument variant construction `Box[int64].Full(…)`
+    /// (#1402) to genuinely generic enums, mirroring the monomorphizer's
+    /// `genums`; a non-generic enum never accepts a type-argument subscript.
+    /// (Type-argument arity is validated during monomorphization, as it is for
+    /// generic struct construction `Foo[int64](…)`.)
+    generic_enums: HashSet<String>,
     /// Registered structs, keyed by type name (operator overloading, D-0047).
     structs: HashMap<String, StructInfo>,
     /// Registered structural interfaces, keyed by name (D-0016). A struct is
@@ -1278,6 +1285,7 @@ impl Checker {
             sigs: HashMap::new(),
             user_types: HashSet::new(),
             enums: HashMap::new(),
+            generic_enums: HashSet::new(),
             structs: HashMap::new(),
             interfaces: HashMap::new(),
             aliases: HashMap::new(),
@@ -1706,6 +1714,9 @@ impl Checker {
                     let mut methods: HashMap<String, FnSig> = HashMap::new();
                     for m in &e.methods {
                         methods.insert(m.name.clone(), self.sig_of_method(m, &e.name));
+                    }
+                    if !e.generics.is_empty() {
+                        self.generic_enums.insert(e.name.clone());
                     }
                     self.enums.insert(
                         e.name.clone(),
@@ -6358,6 +6369,45 @@ impl Checker {
                         }
                     }
                 }
+                // Payload-free variant of a GENERIC enum with explicit type
+                // arguments: `Box[int64].Empty` (#1402). The base is `Index {
+                // base: Name(g), index }` — a generic enum subscripted with its
+                // type arguments — matched before the base is inferred as a value
+                // (which would reject `Box`/`int64` as unknown names, ZAP3001).
+                // Mirrors the bare `Color.Red` member access above; the
+                // monomorphizer lowers the explicit type arguments. A
+                // data-carrying variant `Box[int64].Full(9)` is a call, handled in
+                // `check_call`. Gated to generic enums.
+                if let Expr::Index { base: ibase, .. } = base.as_ref() {
+                    if let Expr::Name(g, _) = ibase.as_ref() {
+                        if self.generic_enums.contains(g) {
+                            if let Some(info) = self.enums.get(g) {
+                                return match info.variant(name) {
+                                    Some(v) if v.fields.is_empty() => Ty::Named(g.clone()),
+                                    Some(_) => {
+                                        self.error(
+                                            ErrorCode::ZAP4061,
+                                            format!(
+                                                "variant '{name}' of enum '{g}' carries data; \
+                                                 construct it with '{g}[...].{name}(...)'"
+                                            ),
+                                            *span,
+                                        );
+                                        Ty::Named(g.clone())
+                                    }
+                                    None => {
+                                        self.error(
+                                            ErrorCode::ZAP4060,
+                                            format!("enum '{g}' has no variant '{name}'"),
+                                            *span,
+                                        );
+                                        Ty::Unknown
+                                    }
+                                };
+                            }
+                        }
+                    }
+                }
                 let b = self.infer(base);
                 // `.name` on an enum value yields its member name (D-0018).
                 if matches!(&b, Ty::Named(n) if self.enums.contains_key(n)) && name == "name" {
@@ -7472,6 +7522,31 @@ impl Checker {
                     self.infer(&a.value);
                 }
                 return Ty::Unknown;
+            }
+        }
+        // Explicit-type-argument generic enum-variant construction:
+        // `Box[int64].Full(9)` (#1402). The callee is `Attr { base: Index {
+        // base: Name(g), index }, name: variant }` — a generic enum subscripted
+        // with its type arguments, then a variant path/call. Intercepted here,
+        // before the base `Box[int64]` would be resolved as a value subscript
+        // (which rejects `Box` and `int64` as unknown names, ZAP3001). The
+        // monomorphizer already lowers this form (via `type_args_from_index`);
+        // sema only type-checks the variant and its payload arguments and yields
+        // the enum type. Gated to generic enums so a type-argument subscript on
+        // a non-generic enum is not silently accepted.
+        if let Expr::Attr {
+            base,
+            name: variant,
+            ..
+        } = callee
+        {
+            if let Expr::Index { base: ibase, .. } = base.as_ref() {
+                if let Expr::Name(g, _) = ibase.as_ref() {
+                    if self.generic_enums.contains(g) {
+                        let info = self.enums.get(g).cloned().expect("generic enum registered");
+                        return self.check_variant_construction(g, variant, &info, args, span);
+                    }
+                }
             }
         }
         // Qualified enum-variant construction: `Shape.Circle(r=2.0)` /

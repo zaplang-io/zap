@@ -1793,6 +1793,195 @@ def main():
 }
 
 #[test]
+fn a_generic_enum_constructs_with_explicit_type_arguments() {
+    // #1402: a generic enum is constructible with an explicit type argument and
+    // a variant path — the data-carrying call form `Box[int64].Full(9)` and the
+    // payload-free member form `Box[int64].Empty` — then matched. Before the
+    // fix both failed in sema with `ZAP3001: unknown name 'Box'` (the base
+    // `Box[int64]` was resolved as a value subscript). No variant mentions `T`,
+    // so inference cannot recover the instance; the explicit argument is the
+    // only way to name it, which is exactly the case the issue reports.
+    let src = "\
+enum Box[T]:
+    Empty
+    Full(int64 a)
+
+def main():
+    auto b = Box[int64].Full(9)
+    match b:
+        case Box.Full(n):
+            print(n)
+        case Box.Empty:
+            print(-1)
+    auto e = Box[int64].Empty
+    match e:
+        case Box.Full(n):
+            print(n)
+        case Box.Empty:
+            print(0)
+";
+    let f = write_zap("gen-enum-ctor", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a generic enum must construct with explicit type arguments; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("ZAP3001") && !stderr.contains("unknown name"),
+        "the type-argument subscript must not be read as a value: {stderr}"
+    );
+}
+
+#[test]
+fn a_generic_enum_derive_runs_on_an_explicitly_constructed_instance() {
+    // #1402: generic-enum `@derive` works end-to-end now that an instance can be
+    // built. The derived `sum()` is called on an explicitly-constructed generic
+    // enum value (both a data variant and the payload-free one), and the
+    // generator specializes to the concrete `Box[int64]` instance.
+    let src = "\
+@derivable(Sum)
+def _derive_sum[T](T value) -> int64:
+    match value:
+        case comptime v in reflect.type_info(T).variants as payload:
+            int64 acc = 0
+            comptime for f in v.fields:
+                acc = acc + reflect.field(payload, comptime f.index)
+            return acc
+    return 0
+
+interface Sum:
+    def sum(self) -> int64
+
+@derive(Sum)
+enum Box[T]:
+    Empty
+    Full(int64 a)
+
+def main():
+    print(Box[int64].Full(9).sum())
+    print(Box[int64].Empty.sum())
+";
+    let f = write_zap("gen-enum-derive", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "generic-enum derive must lower end-to-end; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("@_derive_sum$Box$int64"),
+        "the generator specializes to the concrete generic-enum instance: {stdout}"
+    );
+    assert!(
+        !stderr.contains("not available") && !stderr.contains("reached lowering"),
+        "no comptime construct should survive to lowering: {stderr}"
+    );
+}
+
+#[test]
+fn an_explicit_type_argument_subscript_picks_the_generic_enum_instance() {
+    // #1402: the explicit type argument genuinely selects the instance — two
+    // different arguments (`Box[int64]` vs `Box[str]`) specialize to two
+    // distinct layouts, and a `T`-typed payload takes the argument's type. This
+    // is the inference-free counterpart of `Box.Full(x)` (which pins `T` from
+    // the payload).
+    let src = "\
+enum Box[T]:
+    Empty
+    Full(T a)
+
+def main():
+    auto a = Box[int64].Full(9)
+    auto b = Box[str].Empty
+    match a:
+        case Box.Full(x):
+            print(x)
+        case Box.Empty:
+            print(-1)
+    match b:
+        case Box.Full(y):
+            print(y)
+        case Box.Empty:
+            print(0)
+";
+    let f = write_zap("gen-enum-two-instances", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "two distinct generic-enum instances must both lower; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("ZAP3001"),
+        "neither type-argument subscript is read as a value: {stderr}"
+    );
+}
+
+#[test]
+fn a_type_argument_subscript_on_a_non_generic_enum_is_an_error() {
+    // #1402: the explicit-type-argument form is gated to genuinely generic
+    // enums — a type-argument subscript on a non-generic enum is not silently
+    // accepted (it is a clear error, as it was before the fix).
+    let src = "\
+enum C:
+    Red
+    Blue
+
+def main():
+    auto x = C[int64].Red
+    print(1)
+";
+    let f = write_zap("gen-enum-nongeneric", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "a type-argument subscript on a non-generic enum must be rejected"
+    );
+}
+
+#[test]
+fn an_explicit_generic_enum_variant_is_arity_and_name_checked() {
+    // #1402: the explicit form still type-checks the variant and its payload —
+    // a data variant used payload-free is `ZAP4061`, and an unknown variant is
+    // `ZAP4060`, exactly as the bare `Enum.Variant` forms are.
+    let data_as_bare = "\
+enum Box[T]:
+    Empty
+    Full(int64 a)
+
+def main():
+    auto x = Box[int64].Full
+    print(1)
+";
+    let f = write_zap("gen-enum-data-bare", data_as_bare);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ZAP4061"),
+        "a data variant used payload-free is ZAP4061: {stderr}"
+    );
+
+    let unknown = "\
+enum Box[T]:
+    Empty
+    Full(int64 a)
+
+def main():
+    auto x = Box[int64].Nope
+    print(1)
+";
+    let f = write_zap("gen-enum-unknown-variant", unknown);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ZAP4060"),
+        "an unknown variant is ZAP4060: {stderr}"
+    );
+}
+
+#[test]
 fn a_generator_bug_is_a_dual_span_error_not_a_crash() {
     // An engine fault inside a generator (here an out-of-range `reflect.field`)
     // is the library author's bug, not the consumer's: it renders as the
