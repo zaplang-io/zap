@@ -2036,6 +2036,104 @@ def main():
 }
 
 #[test]
+fn a_library_generator_shadows_the_built_in_ord_without_replacing_it() {
+    // E4 (#1443): a library `@derivable` generator expresses three-way structural
+    // comparison. A struct derives both built-in `Ord` (reached via `<`) and a
+    // library `StructOrd`; both comparison functions are emitted, the built-in
+    // `P____cmp__` untouched. Ordering agreement is pinned by the golden
+    // `derive_ord_shadow` under the CI LLVM matrix.
+    let src = "\
+@derivable(StructOrd)
+def _derive_structord[T](T a, T b) -> int64:
+    comptime for f in reflect.type_info(T).fields:
+        if reflect.field(a, comptime f.index) < reflect.field(b, comptime f.index):
+            return -1
+        if reflect.field(a, comptime f.index) > reflect.field(b, comptime f.index):
+            return 1
+    return 0
+
+interface StructOrd:
+    def structcmp(self, Self other) -> int64
+
+@derive(Ord, Eq, StructOrd)
+struct P:
+    int64 x
+    str s
+
+def main():
+    auto p = P(1, \"a\")
+    print(p < p)
+    print(p.structcmp(p))
+";
+    let f = write_zap("e4-ord-shadow", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the shadow Ord generator must lower alongside the built-in; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("@P____cmp__"),
+        "the built-in `__cmp__` is untouched: {stdout}"
+    );
+    assert!(
+        stdout.contains("@_derive_structord$P") && stdout.contains("@P__structcmp"),
+        "the library generator specializes and forwards: {stdout}"
+    );
+}
+
+#[test]
+fn a_library_generator_shadows_the_built_in_hash_without_replacing_it() {
+    // E4 (#1444): a library `@derivable` generator reproduces the built-in hash
+    // fold byte-identically — seed 0, `hash_combine` (→ `zap_hash_combine`) over
+    // each field's `.__hash__()` in declaration order. Both hash functions are
+    // emitted, the built-in `P____hash__` untouched; value equality is pinned by
+    // the golden `derive_hash_shadow` under the CI LLVM matrix.
+    let src = "\
+@derivable(StructHash)
+def _derive_structhash[T](T value) -> int64:
+    int64 h = 0
+    comptime for f in reflect.type_info(T).fields:
+        h = hash_combine(h, reflect.field(value, comptime f.index).__hash__())
+    return h
+
+interface StructHash:
+    def structhash(self) -> int64
+
+@derive(Hash, Eq, StructHash)
+struct P:
+    int64 x
+    str s
+
+def main():
+    auto p = P(1, \"a\")
+    print(p.__hash__() == p.structhash())
+";
+    let f = write_zap("e4-hash-shadow", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the shadow Hash generator must lower alongside the built-in; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("@P____hash__"),
+        "the built-in `__hash__` is untouched: {stdout}"
+    );
+    assert!(
+        stdout.contains("@_derive_structhash$P") && stdout.contains("@P__structhash"),
+        "the library generator specializes and forwards: {stdout}"
+    );
+    // The shadow folds via the same `zap_hash_combine` primitive as the built-in.
+    assert!(
+        stdout.contains("@zap_hash_combine"),
+        "the shadow uses the runtime hash-combine fold: {stdout}"
+    );
+}
+
+#[test]
 fn a_generator_bug_is_a_dual_span_error_not_a_crash() {
     // An engine fault inside a generator (here an out-of-range `reflect.field`)
     // is the library author's bug, not the consumer's: it renders as the
