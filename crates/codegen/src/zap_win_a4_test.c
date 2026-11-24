@@ -22,6 +22,10 @@
  *                switch + Windows preempt wiring) sends over a channel and the
  *                main thread receives it — the headline "the scheduler runs on
  *                Windows" check — then zap_rt_join_all tears everything down.
+ *   T7  timer:   a coroutine time.sleep parks on the fd-less IOCP scheduler timer
+ *                (#1422) and resumes at its deadline, then hands a sentinel to
+ *                main — proving the netpoller deadline park works on IOCP rather
+ *                than falling back to the thread-pinning blocking sleep.
  *
  * Build (see the `windows-runtime` CI job): the shipping runtime TUs plus this
  * harness, linked against the MSYS2 mingw-w64-x86_64-{gc,pcre2,zlib,openssl}
@@ -71,6 +75,8 @@ extern void zap_spawn(void *fn, void *arg);
 extern void zap_chan_send_i64(void *ch, int64_t v);
 extern int64_t zap_chan_recv_i64(void *ch);
 extern void zap_rt_join_all(void);
+/* scheduler-aware sleep (parks the coroutine on the netpoller timer, #1357/#1360) */
+extern void zap_time_sleep_cancellable_ns(int64_t ns);
 
 static int g_failures = 0;
 #define CHECK(cond, label)                                                                     \
@@ -94,6 +100,16 @@ static int streq(void *zs, const char *c) {
 static void *producer(void *arg) {
     void *ch = arg;
     zap_chan_send_i64(ch, 0x5A33); /* 'Z3' */
+    return NULL;
+}
+
+/* T7 coroutine body: sleep on the scheduler timer (the fd-less IOCP deadline
+ * park, #1422), then hand a sentinel to main. If the park were broken the
+ * coroutine would hang (CI timeout) rather than resume. */
+static void *napper(void *arg) {
+    void *ch = arg;
+    zap_time_sleep_cancellable_ns(20LL * 1000000LL); /* 20ms */
+    zap_chan_send_i64(ch, 0x5A37); /* 'Z7' */
     return NULL;
 }
 
@@ -144,6 +160,14 @@ int main(void) {
     zap_spawn((void *)producer, ch);
     int64_t got = zap_chan_recv_i64(ch);
     CHECK(got == 0x5A33, "T6 coroutine -> channel -> main round-trip");
+
+    /* T7 a coroutine time.sleep parks on the fd-less IOCP scheduler timer (#1422)
+     * and resumes at its deadline (vs. the thread-pinning blocking fallback). */
+    void *ch2 = zap_chan_new(1);
+    zap_spawn((void *)napper, ch2);
+    int64_t slept = zap_chan_recv_i64(ch2);
+    CHECK(slept == 0x5A37, "T7 coroutine time.sleep parks on the IOCP timer and resumes");
+
     zap_rt_join_all();
 
     if (g_failures == 0) {
