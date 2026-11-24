@@ -1667,6 +1667,61 @@ def main():
 }
 
 #[test]
+fn an_inapplicable_enum_derive_points_at_the_variant_payload_field() {
+    // #1375 (E3d): a derive generator that rejects an enum variant's payload
+    // field must render the consumer `ZAP7003` pointing at that payload field,
+    // with a `required because of field … of <Enum>` frame — the enum analog of
+    // the struct-field attribution (#1293/#1346), now that variant payload
+    // fields are attributed in the chain.
+    let src = "\
+@derivable(Ser)
+def _derive_ser[T](T value):
+    comptime for v in reflect.type_info(T).variants:
+        comptime for f in v.fields:
+            if f.ty.kind.name == \"struct\":
+                comptime.error(f.span, \"`Ser` is not implemented for a struct payload\")
+
+interface Ser:
+    def ser(self)
+
+@derive(Ser)
+struct W:
+    int64 w
+@derive(Ser)
+enum E:
+    Unit
+    Bad(W inner)
+
+def main():
+    auto e = E.Bad(W(1))
+    e.ser()
+";
+    let f = write_zap("e3d-enum-variant-frame", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "the enum derive must fail to compile"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error[ZAP7003]: cannot derive `Ser` for `E`"),
+        "consumer header naming the enum: {stderr}"
+    );
+    assert!(
+        stderr.contains("required because of field `inner` of `E`"),
+        "the frame attributes the offending variant payload field: {stderr}"
+    );
+    assert!(
+        stderr.contains("the generator reported: `Ser` is not implemented for a struct payload"),
+        "the library's own message as the root cause: {stderr}"
+    );
+    assert!(
+        !stderr.contains("_derive_ser") && !stderr.contains('$'),
+        "no comptime-internal symbol in the diagnostic: {stderr}"
+    );
+}
+
+#[test]
 fn a_generator_bug_is_a_dual_span_error_not_a_crash() {
     // An engine fault inside a generator (here an out-of-range `reflect.field`)
     // is the library author's bug, not the consumer's: it renders as the
