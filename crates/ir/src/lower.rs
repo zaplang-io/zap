@@ -6421,6 +6421,15 @@ struct FnLower<'a> {
     /// handler, or in a function merely called from one) is rejected at compile
     /// time with ZAP6002 (D-0116) rather than Python's runtime `RuntimeError`.
     active_exc: Vec<Value>,
+    /// Typed payload sid for each caught package-defined exception binding
+    /// (#1432), keyed by the stashed exception-object slot (the `exc_obj_key`
+    /// alloca, unique per catch binding, so this is scope-safe without push/pop).
+    /// When `except E as e` names an `@exception` struct, the binding's entry
+    /// here is E's struct id, so a later `e.<field>` reads that field off the
+    /// exception object's payload — the declared struct instance attached at the
+    /// raise site. A built-in / message-only catch records no entry, leaving `e`
+    /// as the plain message string.
+    exc_payload_sid: HashMap<Value, u32>,
     /// Stack of active `scope:` handles (innermost last), each the `ptr` value
     /// returned by `zap_scope_enter`. A `spawn` lowered while this is non-empty is
     /// owned by the top scope ([`Owner::Scope`]); a `spawn` at the root is
@@ -6559,6 +6568,7 @@ impl<'a> FnLower<'a> {
             loops: Vec::new(),
             cleanups: Vec::new(),
             active_exc: Vec::new(),
+            exc_payload_sid: HashMap::new(),
             term_set: HashSet::new(),
             landing_pads: Vec::new(),
             used_lps: HashSet::new(),
@@ -8068,6 +8078,41 @@ impl<'a> FnLower<'a> {
                                 args: vec![obj],
                             });
                             return Ok((d, Ty::List(Elem::Ptr)));
+                        }
+                    }
+                    // Typed field read on a caught package-defined exception
+                    // (#1432, decisions/lang/1432-exception-fields.md):
+                    // `failure.error` / `failure.status`. The catch bound
+                    // `failure` to the message string (unchanged, so `str(e)` /
+                    // `print(e)` still see the message) and stashed the real
+                    // exception object under `exc_obj_key`; the declared struct
+                    // instance rides on that object's payload slot. When the
+                    // caught clause named an `@exception` struct (its sid is
+                    // recorded against the object slot) and `name` is one of its
+                    // declared fields, read it off the payload with ordinary
+                    // struct field access — no diagnostic-message parsing. Any
+                    // other attribute (or a message-only / built-in binding with
+                    // no recorded sid) falls through to the normal path, which
+                    // reports the field access on the message string as before.
+                    if let Some((obj_slot, _)) = self.lookup(&exc_obj_key(tyname)) {
+                        if let Some(&sid) = self.exc_payload_sid.get(&obj_slot) {
+                            if let Some((idx, fty)) = self.ctx.field(sid, name) {
+                                let obj = self.load(obj_slot, Ty::Ptr);
+                                let payload = self.new_value(Ty::Struct(sid));
+                                self.emit(Inst::Call {
+                                    dest: Some(payload),
+                                    func: "zap_exception_payload".to_string(),
+                                    args: vec![obj],
+                                });
+                                let d = self.new_value(fty);
+                                self.emit(Inst::FieldGet {
+                                    dest: d,
+                                    base: payload,
+                                    sid,
+                                    idx,
+                                });
+                                return Ok((d, fty));
+                            }
                         }
                     }
                     // Built-in module constant `math.pi`-style access (ticket

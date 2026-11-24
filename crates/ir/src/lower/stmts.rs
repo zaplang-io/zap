@@ -1065,9 +1065,42 @@ impl<'a> FnLower<'a> {
                 let custom_exception = self.ctx.ids.contains_key(name)
                     && !self.ctx.enums.contains_key(name)
                     && !self.sigs.contains_key(name);
-                if let Some(type_id) = exception_type_id_name(name)
-                    .or_else(|| custom_exception.then(|| custom_exception_type_id(name)))
-                {
+                // A package-defined `@exception` struct (#1432,
+                // decisions/lang/1432-exception-fields.md). Construct the real
+                // struct instance with the ordinary constructor machinery
+                // (positional + keyword arguments, declared defaults, and the
+                // `@validate`/`@range` field checks), so its declared fields —
+                // of any type, including `Optional[T]` — are preserved. Derive
+                // the exception's message (for `str(e)` and the uncaught
+                // diagnostic) from the struct's message field, then attach the
+                // instance to the exception object as a typed payload that a
+                // later `except E as e` reads fields off (`e.error`,
+                // `e.status`) without parsing the message. A raise with a
+                // single positional message keeps working — it simply sets the
+                // one field — so every #1278 message-only exception is
+                // unchanged. A built-in exception name keeps the dedicated
+                // message-only path below.
+                if custom_exception {
+                    if let Some(&sid) = self.ctx.ids.get(name) {
+                        let type_id = custom_exception_type_id(name);
+                        let (payload, _) = self.construct(sid, args)?;
+                        let message = self.exception_message_value(sid, payload);
+                        let id = self.iconst(Ty::I64, type_id);
+                        let exc = self.new_value(Ty::Ptr);
+                        self.emit(Inst::Call {
+                            dest: Some(exc),
+                            func: "zap_exception_new".to_string(),
+                            args: vec![id, message],
+                        });
+                        self.emit(Inst::Call {
+                            dest: None,
+                            func: "zap_exception_set_payload".to_string(),
+                            args: vec![exc, payload],
+                        });
+                        return self.finish_raise(exc, cause);
+                    }
+                }
+                if let Some(type_id) = exception_type_id_name(name) {
                     if args.len() != 1 || args[0].name.is_some() {
                         return Err(err(format!("{name}() takes one positional message")));
                     }
@@ -1132,6 +1165,42 @@ impl<'a> FnLower<'a> {
             self.set_term(Term::Unreachable);
         }
         Ok(())
+    }
+
+    /// Derive a package-defined exception's message string (#1432) from its
+    /// already-constructed struct instance `payload` of type `sid`. The message
+    /// is the value of a declared `str message` field when one exists (the
+    /// convention every #1278 exception already follows), else the struct's
+    /// first `str` field, else the empty string. This string populates the
+    /// exception object's `message` slot, so `str(e)`, `print(e)`, and the
+    /// uncaught diagnostic are identical to a message-only raise — the typed
+    /// fields are additive and read off the payload, never the message.
+    fn exception_message_value(&mut self, sid: u32, payload: Value) -> Value {
+        let fields = &self.ctx.fields[sid as usize];
+        let msg_idx = fields
+            .iter()
+            .position(|(n, t)| n == "message" && *t == Ty::Ptr)
+            .or_else(|| fields.iter().position(|(_, t)| *t == Ty::Ptr));
+        match msg_idx {
+            Some(idx) => {
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::FieldGet {
+                    dest: d,
+                    base: payload,
+                    sid,
+                    idx: idx as u32,
+                });
+                d
+            }
+            None => {
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::StrConst {
+                    dest: d,
+                    bytes: Vec::new(),
+                });
+                d
+            }
+        }
     }
 
     /// Evaluate a `from <cause>` operand to an exception object. When the cause
@@ -1783,6 +1852,22 @@ impl<'a> FnLower<'a> {
                 let obj_slot = self.alloca(Ty::Ptr);
                 self.store(obj_slot, exc);
                 self.declare(&exc_obj_key(bind), obj_slot, Ty::Ptr);
+                // If this clause catches a package-defined `@exception` struct
+                // (#1432), record its struct id against the stashed object slot
+                // so `e.<field>` reads declared fields off the exception's
+                // payload (the struct instance built at the raise site). A
+                // built-in / message-only / catch-all clause records nothing, so
+                // `e` stays the plain message string. The typed fields are those
+                // of the clause's static type; for a concrete catch (every
+                // direct catch, incl. the OAuth use case) the payload is exactly
+                // that type, so the read is exact.
+                if let Some(ast::Type::Named { name, args, .. }) = &clause.ty {
+                    if args.is_empty() && !self.ctx.enums.contains_key(name) {
+                        if let Some(&sid) = self.ctx.ids.get(name) {
+                            self.exc_payload_sid.insert(obj_slot, sid);
+                        }
+                    }
+                }
             }
             let handler_lp = self.new_block();
             self.landing_pads.push(handler_lp);
