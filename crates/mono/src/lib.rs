@@ -4815,6 +4815,31 @@ impl Mono<'_> {
         env: &mut Env,
         expected: Option<&Type>,
     ) -> Result<(Expr, CTy), LowerError> {
+        // `reflect.type_info(T).name` as a VALUE (#1430, E4): fold to the concrete
+        // type's name as a string literal during specialization, so a derive
+        // generator can build `TypeName(...)` (e.g. a library `Repr`). The
+        // comptime engine already evaluates `.name`, but only in a comptime-for
+        // iterator or a kind-dispatch `if` condition; used as a plain value it
+        // otherwise reaches lowering as an unresolved `reflect`. Resolved only
+        // when `T` is substituted to a concrete type (an active instantiation);
+        // a still-generic `reflect.type_info(T)` falls through unchanged.
+        if name == "name" {
+            if let Some(tn) = reflect_type_info_arg(base) {
+                if let Some(Type::Named { name: concrete, .. }) = self.cur_subst.get(&tn) {
+                    return Ok((
+                        Expr::Str {
+                            value: concrete.clone(),
+                            raw: false,
+                            bytes: false,
+                            fstring: false,
+                            span,
+                            fstring_fields: Vec::new(),
+                        },
+                        CTy::Ty(self.named("str", Vec::new())),
+                    ));
+                }
+            }
+        }
         // Payload-free generic enum variant value: `G.None` / `G[args].None`.
         if let Expr::Name(g, bspan) = base {
             if self.is_generic_enum_variant(g, name) {

@@ -2134,6 +2134,62 @@ def main():
 }
 
 #[test]
+fn a_library_generator_shadows_the_built_in_repr_without_replacing_it() {
+    // E4 (#1430): now that `repr()` is a builtin (#1384) and
+    // `reflect.type_info(T).name` folds to the type name in a value position, a
+    // library `@derivable` generator can express the built-in `Repr`'s
+    // `TypeName(field=value, …)` form. A struct derives both the built-in `Repr`
+    // (reached via the `repr()` builtin, which resolves its `__repr__`) and a
+    // library `StructRepr`; both comparison functions are emitted, the built-in
+    // `P____repr__` untouched. String agreement is pinned by the golden
+    // `derive_repr_shadow` under the CI LLVM matrix.
+    let src = "\
+@derivable(StructRepr)
+def _derive_structrepr[T](T value) -> str:
+    str out = reflect.type_info(T).name + \"(\"
+    comptime for f in reflect.type_info(T).fields:
+        if comptime f.index > 0:
+            out = out + \", \"
+        out = out + f.name + \"=\" + repr(reflect.field(value, comptime f.index))
+    return out + \")\"
+
+interface StructRepr:
+    def structrepr(self) -> str
+
+@derive(Repr, StructRepr)
+struct P:
+    int64 x
+    str s
+
+def main():
+    auto p = P(1, \"a\")
+    print(repr(p))
+    print(p.structrepr())
+";
+    let f = write_zap("e4-repr-shadow", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the shadow Repr generator must lower alongside the built-in; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("@P____repr__"),
+        "the built-in `__repr__` is untouched: {stdout}"
+    );
+    assert!(
+        stdout.contains("@_derive_structrepr$P") && stdout.contains("@P__structrepr"),
+        "the library generator specializes and forwards: {stdout}"
+    );
+    // `reflect.type_info(T).name` folded to the concrete type name string.
+    assert!(
+        stdout.contains("strconst \"P\""),
+        "the type name folds to a string literal in the shadow: {stdout}"
+    );
+}
+
+#[test]
 fn a_generator_bug_is_a_dual_span_error_not_a_crash() {
     // An engine fault inside a generator (here an out-of-range `reflect.field`)
     // is the library author's bug, not the consumer's: it renders as the
