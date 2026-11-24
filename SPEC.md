@@ -426,6 +426,15 @@ compile time (D-0017, I#154). Methods on an enum are allowed (D-0046). The
 prelude `Optional[T]` (D-0065) is the canonical optional type (Python
 `typing.Optional`).
 
+`Optional[T]` values compare with `==`/`!=` **structurally** (`None == None`;
+`Some(x) == Some(y)` iff `x == y`; a `Some` is never equal to a `None`) and with
+the ordering operators `<` `<=` `>` `>=` as a **total order with `None` before
+every `Some`** (`None < Some(_)`; `Some(x) OP Some(y)` is `x OP y`), matching
+Rust's `Option<T>` and **deliberately diverging from Python**, which raises
+`TypeError` when ordering `None` against a value (#1368). `T` must support the
+corresponding operator (`==` for equality, ordering for `<` etc.); a bare
+payload on the right compares as if wrapped (`opt == 7` is `opt == Some(7)`).
+
 ### 4.7 Generics (D-0017)
 
 Built-in containers are generic today (`list[T]`, `dict[K,V]`, `set[T]`,
