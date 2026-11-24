@@ -10197,6 +10197,11 @@ impl<'a> FnLower<'a> {
         // `coerce` / sema to reject (never silently wrapped).
         if let Some(opt) = optional_layout(self.ctx, target) {
             let (iv, it) = self.expr_collection_context(e, opt.payload_ty)?;
+            // A bare `bigint` payload for a fixed-width-numeric `Optional[T]`
+            // (e.g. `Optional[int64] x = <bigint>`) is not assignable (#1379):
+            // sema's #1265 widening is payload-agnostic, so catch it here rather
+            // than store the raw `bigint` pointer as the Optional's value.
+            self.check_numeric_payload(&it, opt.payload_ty)?;
             if it == target {
                 return Ok((iv, target));
             }
@@ -10336,6 +10341,36 @@ impl<'a> FnLower<'a> {
     /// only way its parameter types are known). Collection literals also inherit
     /// their destination element kinds; other expressions lower normally and
     /// are coerced.
+    /// Reject a `bigint` value flowing into a fixed-width integer or float slot
+    /// (#1379). A `bigint` is never implicitly assignable to an `int*`/`float*`:
+    /// sema rejects `int64 x = <bigint>` / `float64 f = <bigint>` with `ZAP4001`.
+    /// But the #1265 bare-payload→`Optional[T]` widening and struct-constructor
+    /// fields are not sema-type-checked (sema erases the `Optional` payload and
+    /// does not type-check constructor fields), so such a value reaches lowering
+    /// here, where `coerce` has no `bigint -> int*` arm and would silently store
+    /// the `bigint` heap pointer into the scalar slot — a miscompile, since a
+    /// later `.unwrap()` / field read then reads the pointer bits as the value
+    /// (or, for a tagged `Optional`, reads it as `None` and raises). Reject it
+    /// with the same `ZAP4001` assignability error instead. `bigint -> bigint`
+    /// and `bigint -> Optional[bigint]` are unaffected (the target is not a
+    /// fixed-width numeric), and an explicit `int64(x)` conversion takes a
+    /// different path, so no legitimate coercion is rejected.
+    fn check_numeric_payload(&self, from: &Ty, to: Ty) -> Result<(), LowerError> {
+        if *from == Ty::Bigint && (to.int_width().is_some() || to.is_float()) {
+            return Err(err_code(
+                zapc_diag::ErrorCode::ZAP4001,
+                format!(
+                    "cannot assign value of type `bigint` to `{}` (a bigint is not \
+                     implicitly convertible to a fixed-width numeric type; convert \
+                     explicitly, e.g. `{}(x)`)",
+                    self.render_ty(&to),
+                    self.render_ty(&to),
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn expr_coerced(
         &mut self,
         e: &Expr,
@@ -10355,6 +10390,9 @@ impl<'a> FnLower<'a> {
             return self.lower_none_expr(target);
         }
         let (v, vt) = self.expr_collection_context(e, target)?;
+        // A `bigint` is never implicitly assignable to a fixed-width numeric
+        // target (#1379); reject it rather than let `coerce` store it raw.
+        self.check_numeric_payload(&vt, target)?;
         // A function value coerced to a `fn(...)` slot (argument / assignment /
         // return) must have the *exact* structural signature of that slot
         // (I#465). First-class function values are monomorphic: the
