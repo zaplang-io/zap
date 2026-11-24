@@ -95,8 +95,14 @@ impl<'a> FnLower<'a> {
                     // (I#163), lowered against the field type.
                     let v = self.expr_coerced(value, fty, zapc_diag::ErrorCode::ZAP4001)?;
                     // Storing a value struct into a field copies it (D-0051), so
-                    // the field holds an independent instance.
-                    let v = self.copy_if_value(v, fty, value);
+                    // the field holds an independent instance. The field is a
+                    // pointer, so a by-value (inline-eligible) call/return result
+                    // — physically a stack spill — is boxed onto the heap too, or
+                    // it would dangle once the producing frame returns and a
+                    // later read of the field would be corrupted (#1446, the
+                    // field-reassignment twin of the #1400 construction/enum-
+                    // payload/Optional-wrap stores already using this chokepoint).
+                    let v = self.copy_field_value(v, fty, value);
                     // --race (#684): a write of a shared heap struct field.
                     self.emit_race_field(bv, sid, idx, name, true, *span);
                     self.emit(Inst::FieldSet {
