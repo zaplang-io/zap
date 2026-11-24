@@ -3531,6 +3531,58 @@ static int zap_utf8_encode(int32_t cp, char *out) {
     return 4;
 }
 
+/* ascii(x) escaping (#1384): the `repr` output with every non-ASCII codepoint
+ * replaced by a Python backslash escape — `\xNN` (cp <= 0xff), `\uNNNN`
+ * (cp <= 0xffff), else `\UNNNNNNNN`. ASCII bytes (the quotes/short-escapes repr
+ * already produced included) pass through unchanged; a malformed UTF-8 lead byte
+ * is escaped as `\xNN` of that raw byte, so the function is total and never
+ * raises. */
+void *zap_ascii_escape(void *sp) {
+    ZapStr *s = (ZapStr *)sp;
+    const unsigned char *d = (const unsigned char *)s->data;
+    int64_t n = s->len;
+    /* worst case: each input byte -> `\UXXXXXXXX` (10 chars). */
+    char *out = (char *)zap_buf(n * 10 + 1);
+    int64_t o = 0;
+    static const char hx[] = "0123456789abcdef";
+    int64_t i = 0;
+    while (i < n) {
+        unsigned char c = d[i];
+        if (c < 0x80) {
+            out[o++] = (char)c;
+            i++;
+            continue;
+        }
+        int w = zap_utf8_width(c);
+        if (w <= 1 || i + w > n) {
+            /* malformed lead byte: escape the raw byte itself. */
+            out[o++] = '\\';
+            out[o++] = 'x';
+            out[o++] = hx[(c >> 4) & 0xF];
+            out[o++] = hx[c & 0xF];
+            i++;
+            continue;
+        }
+        int32_t cp = zap_utf8_decode(d, i, w);
+        i += w;
+        if (cp <= 0xff) {
+            out[o++] = '\\';
+            out[o++] = 'x';
+            out[o++] = hx[(cp >> 4) & 0xF];
+            out[o++] = hx[cp & 0xF];
+        } else if (cp <= 0xffff) {
+            out[o++] = '\\';
+            out[o++] = 'u';
+            for (int k = 12; k >= 0; k -= 4) out[o++] = hx[(cp >> k) & 0xF];
+        } else {
+            out[o++] = '\\';
+            out[o++] = 'U';
+            for (int k = 28; k >= 0; k -= 4) out[o++] = hx[(cp >> k) & 0xF];
+        }
+    }
+    return zap_str_new(out, o);
+}
+
 /* Build a `str`/`bytes` object from `len` scratch bytes. With the one-object
  * layout (#837) a string owns its bytes inline, so the scratch buffer is copied
  * in (it was a short-lived GC/stack buffer the caller no longer needs); the name

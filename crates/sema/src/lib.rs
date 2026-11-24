@@ -729,6 +729,17 @@ const BUILTINS: &[&str] = &[
     "complex",
     "bool",
     "format",
+    // Representation / base-formatting built-ins (#1384). `repr`/`ascii` expose
+    // the debug (`RenderMode::Repr`) side of the Display protocol as free
+    // functions (strings quoted, containers rendered with element `repr`);
+    // `ascii` additionally backslash-escapes every non-ASCII codepoint.
+    // `bin`/`oct`/`hex` render an integer in the Python sign-magnitude form with
+    // the `0b`/`0o`/`0x` prefix (`bin(-5) == "-0b101"`). All five return `str`.
+    "repr",
+    "ascii",
+    "bin",
+    "oct",
+    "hex",
     "reflect_has",
     "reflect_names",
     // Function/callable signature reflection (I#458, D-0089).
@@ -9241,6 +9252,72 @@ impl Checker {
                             self.error(
                                 ErrorCode::ZAP4024,
                                 format!("str() cannot render {}", at.display()),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::Str;
+                }
+                "repr" | "ascii" => {
+                    // repr(x) / ascii(x) (#1384): the debug string form — the
+                    // `RenderMode::Repr` side of the Display protocol (strings
+                    // quoted, `bytes` as `b'…'`, containers rendered with element
+                    // `repr`, user types via `__repr__`/`@derive(Repr)`). `ascii`
+                    // is `repr` with every non-ASCII codepoint backslash-escaped.
+                    // The accepted operand set is exactly `str()`'s.
+                    if args.len() != 1 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!("{fname}() takes exactly one argument"),
+                            span,
+                        );
+                    }
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        if !matches!(
+                            at,
+                            Ty::Str
+                                | Ty::Bytes
+                                | Ty::Char
+                                | Ty::Bool
+                                | Ty::Unknown
+                                | Ty::Py
+                                | Ty::Named(_)
+                                | Ty::Tuple(_)
+                                | Ty::List(_)
+                                | Ty::Dict(_, _)
+                                | Ty::Set(_)
+                        ) && !at.is_numeric()
+                        {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!("{fname}() cannot render {}", at.display()),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::Str;
+                }
+                "bin" | "oct" | "hex" => {
+                    // bin(n)/oct(n)/hex(n) (#1384): an integer rendered in the
+                    // Python sign-magnitude base form with the `0b`/`0o`/`0x`
+                    // prefix (`hex(255) == "0xff"`, `bin(-5) == "-0b101"`).
+                    // Accepts any integer (`int*`, `uint*`, `usize`, `bigint`);
+                    // `bool`/`float`/`complex` are rejected (no Python int-subclass
+                    // coercion here).
+                    if args.len() != 1 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!("{fname}() takes exactly one argument"),
+                            span,
+                        );
+                    }
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        if !at.is_int() && !matches!(at, Ty::Unknown) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!("{fname}() expects an integer, found {}", at.display()),
                                 expr_span(&a.value),
                             );
                         }

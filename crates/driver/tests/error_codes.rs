@@ -542,3 +542,35 @@ fn hash_dunder_and_hash_combine_misuse_is_rejected() {
     );
     assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
 }
+
+#[test]
+fn repr_ascii_base_builtin_codes() {
+    // repr/ascii (#1384) take exactly one argument (wrong arity -> ZAP4025) and
+    // accept the same renderable operand set as str(); there is no operand that
+    // str() accepts but repr() rejects, so the arity error is the representative.
+    assert_code("def main():\n    x = repr()\n", "ZAP4025");
+    assert_code("def main():\n    x = ascii(1, 2)\n", "ZAP4025");
+
+    // bin/oct/hex (#1384) take exactly one *integer* argument. A non-integer is
+    // the arg-type error ZAP4024; `bool`/`float` are rejected (no Python
+    // int-subclass coercion). Wrong arity is ZAP4025.
+    assert_code("def main():\n    x = bin(1.5)\n", "ZAP4024");
+    assert_code("def main():\n    x = oct(\"nope\")\n", "ZAP4024");
+    assert_code("def main():\n    x = hex(True)\n", "ZAP4024");
+    assert_code("def main():\n    x = hex(1, 2)\n", "ZAP4025");
+    assert_code("def main():\n    x = bin()\n", "ZAP4025");
+
+    // The well-typed forms are clean: repr/ascii over a renderable, and
+    // bin/oct/hex over every integer kind (int*/uint*/bigint).
+    let ok = check_source(
+        "def main():\n\
+         \x20   str a = repr(\"hi\")\n\
+         \x20   str b = ascii([1, 2])\n\
+         \x20   str c = bin(10)\n\
+         \x20   str d = oct(uint32(8))\n\
+         \x20   str e = hex(bigint(255))\n\
+         \x20   int64 lo = -9223372036854775807 - 1\n\
+         \x20   str f = hex(lo)\n",
+    );
+    assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
+}

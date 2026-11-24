@@ -1455,6 +1455,97 @@ void *zap_bigint_pow(void *bp,void *ep){const ZapBigInt*b=bp,*e=ep;if(e->sign<0)
 int64_t zap_bigint_truthy(void*p){return ((ZapBigInt*)p)->sign!=0;}
 void *zap_bigint_to_str(void*p){const ZapBigInt*a=p;if(!a->sign)return zap_str_new("0",1);ZapBigRaw r=zap_big_raw_copy(a);uint32_t *chunks=(uint32_t*)calloc(r.n*2+1,4);if(!chunks)abort();uint32_t cn=0;while(r.n){uint64_t rem=0;for(uint32_t i=r.n;i;i--){uint64_t x=(rem<<32)|r.limb[i-1];r.limb[i-1]=(uint32_t)(x/1000000000u);rem=x%1000000000u;}zap_big_trim(&r);chunks[cn++]=(uint32_t)rem;}size_t cap=(size_t)cn*9+2;char*buf=(char*)malloc(cap);if(!buf)abort();size_t n=0;if(a->sign<0)buf[n++]='-';n+=(size_t)snprintf(buf+n,cap-n,"%u",chunks[cn-1]);for(uint32_t i=cn-1;i;i--)n+=(size_t)snprintf(buf+n,cap-n,"%09u",chunks[i-1]);void*s=zap_str_new(buf,(int64_t)n);free(buf);free(chunks);free(r.limb);return s;}
 
+/* bin()/oct()/hex() integer base formatting (#1384). Python sign-magnitude: a
+ * negative value is "-0b101", never two's-complement; the `0b`/`0o`/`0x` prefix
+ * is chosen by `base` (2/8/16). Digits are lowercase, matching CPython. These
+ * never raise — the base is a compile-time constant and the operand is already
+ * known to be an integer (sema). */
+static const char *zap_base_prefix(int32_t base) {
+    return base == 2 ? "0b" : (base == 8 ? "0o" : "0x");
+}
+static const char ZAP_BASE_DIGITS[] = "0123456789abcdef";
+
+/* Unsigned: the true magnitude, no sign (a `uint64` above INT64_MAX prints its
+ * real value). */
+void *zap_uint_to_base(uint64_t v, int32_t base) {
+    char tmp[64];
+    int ti = 0;
+    if (v == 0) tmp[ti++] = '0';
+    while (v) {
+        tmp[ti++] = ZAP_BASE_DIGITS[v % (uint64_t)base];
+        v /= (uint64_t)base;
+    }
+    const char *pfx = zap_base_prefix(base);
+    char out[70];
+    int o = 0;
+    out[o++] = pfx[0];
+    out[o++] = pfx[1];
+    while (ti) out[o++] = tmp[--ti];
+    return zap_str_new(out, o);
+}
+
+/* Signed: a leading '-' then the magnitude. `-(uint64_t)v` yields the correct
+ * magnitude even for INT64_MIN (whose positive does not fit in int64). */
+void *zap_int_to_base(int64_t v, int32_t base) {
+    int neg = v < 0;
+    uint64_t mag = neg ? -(uint64_t)v : (uint64_t)v;
+    char tmp[64];
+    int ti = 0;
+    if (mag == 0) tmp[ti++] = '0';
+    while (mag) {
+        tmp[ti++] = ZAP_BASE_DIGITS[mag % (uint64_t)base];
+        mag /= (uint64_t)base;
+    }
+    const char *pfx = zap_base_prefix(base);
+    char out[70];
+    int o = 0;
+    if (neg) out[o++] = '-';
+    out[o++] = pfx[0];
+    out[o++] = pfx[1];
+    while (ti) out[o++] = tmp[--ti];
+    return zap_str_new(out, o);
+}
+
+/* bigint: short division by `base` over a mutable copy of the base-2^32 limbs
+ * (the `zap_bigint_to_str` pattern, dividing by 2/8/16 instead of 1e9), least
+ * significant digit first, then reversed with prefix + sign. */
+void *zap_bigint_to_base(void *p, int32_t base) {
+    const ZapBigInt *a = (const ZapBigInt *)p;
+    const char *pfx = zap_base_prefix(base);
+    if (!a->sign) {
+        char z[3] = {pfx[0], pfx[1], '0'};
+        return zap_str_new(z, 3);
+    }
+    ZapBigRaw r = zap_big_raw_copy(a);
+    /* base 2 is the widest: up to 32 digits per 32-bit limb. */
+    size_t cap = (size_t)r.n * 32 + 1;
+    char *digits = (char *)malloc(cap);
+    if (!digits) abort();
+    size_t dn = 0;
+    while (r.n) {
+        uint64_t rem = 0;
+        for (uint32_t i = r.n; i; i--) {
+            uint64_t x = (rem << 32) | r.limb[i - 1];
+            r.limb[i - 1] = (uint32_t)(x / (uint64_t)base);
+            rem = x % (uint64_t)base;
+        }
+        zap_big_trim(&r);
+        digits[dn++] = ZAP_BASE_DIGITS[rem];
+    }
+    char *out = (char *)malloc(dn + 3);
+    if (!out) abort();
+    size_t o = 0;
+    if (a->sign < 0) out[o++] = '-';
+    out[o++] = pfx[0];
+    out[o++] = pfx[1];
+    while (dn) out[o++] = digits[--dn];
+    void *s = zap_str_new(out, (int64_t)o);
+    free(out);
+    free(digits);
+    free(r.limb);
+    return s;
+}
+
 void *zap_str_concat(void *a, void *b) {
     ZapStr *x = (ZapStr *)a;
     ZapStr *y = (ZapStr *)b;
