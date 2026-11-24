@@ -1,0 +1,4 @@
+A: innermost of three nested scopes woke the sleep
+B: flat scope deadline still wakes the sleep
+C: channel-parked sibling still cancelled by the deadline
+variants: 3
