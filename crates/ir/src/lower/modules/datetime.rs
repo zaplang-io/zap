@@ -1099,11 +1099,13 @@ fn lower(
                 (w, Ty::I64)
             }
         }
-        // resolve(tz, year, month, day, hour, minute, second, fold=0) -> DateTime
-        // (#1149): localize a wall clock into `tz`, picking the `fold` instant on
-        // an overlap and PEP-495-resolving a gap. The civil fields are stored
-        // verbatim; only the offset is zone-resolved (the UTC instant is derived
-        // on demand as timegm(civil) − offset, as everywhere else).
+        // resolve(tz, year, month, day, hour, minute, second, fold=0,
+        // nanosecond=0) -> DateTime (#1149, #1361): localize a wall clock into
+        // `tz`, picking the `fold` instant on an overlap and PEP-495-resolving a
+        // gap, and carrying an optional sub-second `nanosecond=` fraction. The
+        // civil fields are stored verbatim; only the offset is zone-resolved (the
+        // UTC instant is derived on demand as timegm(civil) − offset, as
+        // everywhere else).
         "resolve" => {
             let sid = datetime_sid(lowerer)?;
             let tzsid = timezone_sid(lowerer)?;
@@ -1167,13 +1169,16 @@ fn lower(
                 idx: F_ZONE_ID,
                 val: zone_id,
             });
-            // A localized wall clock carries no sub-second fraction (#1148).
-            let zero_ns = lowerer.iconst(Ty::I64, 0);
+            // Optional sub-second fraction (#1361): a `nanosecond=` keyword
+            // overrides the default 0 (whole seconds), so a chosen `fold` and a
+            // fractional second can be constructed together. Stored verbatim,
+            // like `replace` and the lenient civil fields (no range validation).
+            let nanos = resolve_nanosecond(lowerer, args)?;
             lowerer.emit(Inst::FieldSet {
                 base: dest,
                 sid,
                 idx: F_NANOSECOND,
-                val: zero_ns,
+                val: nanos,
             });
             (dest, Ty::Struct(sid))
         }
@@ -1318,6 +1323,21 @@ fn resolve_fold(lowerer: &mut FnLower, args: &[ast::Arg]) -> Result<Value, Lower
     }
     if args.len() > 7 && args[7].name.is_none() {
         let (v, vt) = lowerer.expr(&args[7].value)?;
+        return Ok(lowerer.coerce(v, vt, Ty::I64));
+    }
+    Ok(lowerer.iconst(Ty::I64, 0))
+}
+
+/// Extract the optional `nanosecond` fraction for `resolve` (#1361): a
+/// keyword-only `nanosecond=` selector gives the nanoseconds-of-second written
+/// to `F_NANOSECOND`; otherwise `0` (whole seconds, the historical behaviour).
+/// Stored verbatim, mirroring `replace` and the lenient civil fields.
+fn resolve_nanosecond(lowerer: &mut FnLower, args: &[ast::Arg]) -> Result<Value, LowerError> {
+    if let Some(a) = args
+        .iter()
+        .find(|a| a.name.as_deref() == Some("nanosecond"))
+    {
+        let (v, vt) = lowerer.expr(&a.value)?;
         return Ok(lowerer.coerce(v, vt, Ty::I64));
     }
     Ok(lowerer.iconst(Ty::I64, 0))

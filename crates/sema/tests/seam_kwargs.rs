@@ -1631,6 +1631,25 @@ fn datetime_zone_resolution_keyword_and_positional() {
     assert_ok(&prog(
         "    auto z = datetime.zone(\"America/New_York\")\n    auto d = datetime.resolve(z, 2024, 11, 3, 1, 30, 0, 1)\n",
     ));
+    // #1361 — a keyword-only `nanosecond=` fraction, standalone, with `fold=`,
+    // with a positional fold, and in either keyword order.
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    auto d = datetime.resolve(z, 2024, 11, 3, 1, 30, 0, nanosecond=123456789)\n",
+    ));
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    auto d = datetime.resolve(z, 2024, 11, 3, 1, 30, 0, fold=1, nanosecond=123456789)\n",
+    ));
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    auto d = datetime.resolve(z, 2024, 11, 3, 1, 30, 0, nanosecond=1, fold=0)\n",
+    ));
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    auto d = datetime.resolve(z, 2024, 11, 3, 1, 30, 0, 1, nanosecond=500)\n",
+    ));
+    // `nanosecond` is keyword-only — a 9th positional is rejected.
+    assert_code(
+        &prog("    auto z = datetime.zone(\"UTC\")\n    auto d = datetime.resolve(z, 2024, 1, 1, 0, 0, 0, 1, 500)\n"),
+        "ZAP4023",
+    );
     // The TimeZone must be positional (a `tz=` keyword in slot 0 is rejected).
     assert_code(
         &prog("    auto z = datetime.zone(\"UTC\")\n    auto d = datetime.resolve(tz=z, 2024, 1, 1, 0, 0, 0)\n"),
