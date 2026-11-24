@@ -130,6 +130,11 @@ pub enum TokenKind {
 /// Note: `m` and `s` are *contextual* (they start a regex literal only when
 /// immediately followed by a delimiter, D-0010) and so are lexed as identifiers
 /// elsewhere — they are intentionally absent from this table.
+///
+/// Likewise the *soft (contextual) keywords* `match`, `case`, `select`, `scope`
+/// (#1405/#1411, epic #1413) are absent: each is a keyword only in its single
+/// statement/clause slot and an ordinary identifier everywhere else, so the
+/// lexer emits them as `Ident` and the parser recognizes them in their slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Keyword {
     // Declarations / control flow
@@ -143,14 +148,17 @@ pub enum Keyword {
     For,
     In,
     Range,
-    Match,
+    // NOTE: `match` and `case` are *contextual* (soft) keywords (#1405/#1411,
+    // epic #1413) — keyword only in the `match EXPR:` statement slot and its
+    // `case PATTERN:` arms, an ordinary identifier everywhere else. They are
+    // lexed as `Ident` (absent from this table, like `m`/`s`/`default`) and
+    // recognized by the parser in their slot. Hence no `Match`/`Case` variant.
     /// `when target.*:` — compile-time conditional compilation (I#139, D-0079).
     When,
     /// `comptime` — the compile-time evaluation surface (E2/E3, epic #1296):
     /// `comptime for f in …:` (a compile-time-unrolled loop) and `comptime <expr>`
     /// (force compile-time evaluation). Locked decision 4 of epic #1249.
     Comptime,
-    Case,
     Break,
     Continue,
     Auto,
@@ -169,9 +177,12 @@ pub enum Keyword {
     // Concurrency
     Spawn,
     Channel,
-    Select,
+    // NOTE: `select` and `scope` are *contextual* (soft) keywords
+    // (#1411/#1405, epic #1413) — keyword only statement-leading in their
+    // `select:` / `scope(...):` slot, an ordinary identifier everywhere else.
+    // Lexed as `Ident` (absent from this table), recognized by the parser in
+    // the slot. Hence no `Select`/`Scope` variant.
     Close,
-    Scope,
     Unsafe,
     // Type/decl keywords
     Struct,
@@ -242,10 +253,9 @@ impl Keyword {
             "for" => For,
             "in" => In,
             "range" => Range,
-            "match" => Match,
+            // `match`/`case` are soft keywords (#1411) — lexed as idents.
             "when" => When,
             "comptime" => Comptime,
-            "case" => Case,
             "break" => Break,
             "continue" => Continue,
             "auto" => Auto,
@@ -263,9 +273,8 @@ impl Keyword {
             "python" => Python,
             "spawn" => Spawn,
             "channel" => Channel,
-            "select" => Select,
+            // `select`/`scope` are soft keywords (#1411/#1405) — lexed as idents.
             "close" => Close,
-            "scope" => Scope,
             "unsafe" => Unsafe,
             "struct" => Struct,
             "interface" => Interface,
@@ -367,10 +376,8 @@ impl Keyword {
             For => "for",
             In => "in",
             Range => "range",
-            Match => "match",
             When => "when",
             Comptime => "comptime",
-            Case => "case",
             Break => "break",
             Continue => "continue",
             Auto => "auto",
@@ -388,9 +395,7 @@ impl Keyword {
             Python => "python",
             Spawn => "spawn",
             Channel => "channel",
-            Select => "select",
             Close => "close",
-            Scope => "scope",
             Unsafe => "unsafe",
             Struct => "struct",
             Interface => "interface",
@@ -482,12 +487,22 @@ mod tests {
         for kw in [
             Keyword::Def,
             Keyword::Spawn,
-            Keyword::Match,
+            Keyword::When,
             Keyword::True,
             Keyword::Int64,
             Keyword::Array,
         ] {
             assert_eq!(Keyword::from_ident(kw.as_str()), Some(kw));
+        }
+    }
+
+    #[test]
+    fn soft_keywords_lex_as_identifiers() {
+        // `match`/`case`/`select`/`scope` are contextual (soft) keywords
+        // (#1405/#1411): never reserved words, so the lexer emits them as
+        // ordinary identifiers and the parser recognizes them only in-slot.
+        for w in ["match", "case", "select", "scope"] {
+            assert_eq!(Keyword::from_ident(w), None, "`{w}` must not be reserved");
         }
     }
 

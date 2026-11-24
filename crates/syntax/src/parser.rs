@@ -3501,6 +3501,33 @@ impl Parser {
         }
     }
 
+    /// The token `k` positions ahead of the cursor (`0` = current), for bounded
+    /// lookahead; `Eof` past the end.
+    fn peek_nth(&self, k: usize) -> &TokenKind {
+        self.toks
+            .get(self.pos + k)
+            .map(|t| &t.kind)
+            .unwrap_or(&TokenKind::Eof)
+    }
+
+    /// True when the current token is the identifier `word`. The soft
+    /// (contextual) keywords `scope`/`select`/`match`/`case` (#1405/#1411, epic
+    /// #1413) are lexed as ordinary identifiers; this recognizes one in its
+    /// statement/clause slot, where the parser treats it as a keyword.
+    fn is_soft_kw(&self, word: &str) -> bool {
+        matches!(self.peek(), TokenKind::Ident(n) if n == word)
+    }
+
+    /// Consume a soft keyword the caller has confirmed is in its slot (via
+    /// [`is_soft_kw`] or a slot predicate). Mirrors [`expect_kw`] diagnostics.
+    fn expect_soft_kw(&mut self, word: &str) {
+        if self.is_soft_kw(word) {
+            self.bump();
+        } else {
+            self.error_here(ErrorCode::ZAP2001, format!("expected '{word}'"));
+        }
+    }
+
     fn error_here(&mut self, code: ErrorCode, message: impl Into<String>) {
         self.errors.push(ParseError {
             code,
@@ -4541,6 +4568,15 @@ impl Parser {
             out.push(self.parse_comptime_for());
             return;
         }
+        // Contextual (soft) keyword statements (#1405/#1411, epic #1413):
+        // `scope`, `select`, `match`. Each is a keyword only when
+        // statement-leading in its slot (trailing `:` + indented block);
+        // otherwise it falls through below as an ordinary identifier. Checked
+        // before `is_compound_start` so the statement form wins in its slot.
+        if let Some(stmt) = self.try_soft_keyword_stmt() {
+            out.push(stmt);
+            return;
+        }
         if self.is_compound_start() {
             out.push(self.parse_compound());
             return;
@@ -4561,6 +4597,9 @@ impl Parser {
     }
 
     fn is_compound_start(&self) -> bool {
+        // `match`, `scope`, `select` are soft keywords lexed as identifiers, so
+        // they are NOT listed here — [`try_soft_keyword_stmt`] dispatches them
+        // (it runs before this in `parse_line`).
         matches!(
             self.peek(),
             TokenKind::Keyword(
@@ -4568,12 +4607,9 @@ impl Parser {
                     | Keyword::While
                     | Keyword::Do
                     | Keyword::For
-                    | Keyword::Match
                     | Keyword::Try
                     | Keyword::With
-                    | Keyword::Scope
                     | Keyword::Unsafe
-                    | Keyword::Select
                     | Keyword::When
             )
         )
@@ -4585,15 +4621,112 @@ impl Parser {
             TokenKind::Keyword(Keyword::While) => self.parse_while(),
             TokenKind::Keyword(Keyword::Do) => self.parse_do_while(),
             TokenKind::Keyword(Keyword::For) => self.parse_for(),
-            TokenKind::Keyword(Keyword::Match) => self.parse_match(),
             TokenKind::Keyword(Keyword::Try) => self.parse_try(),
             TokenKind::Keyword(Keyword::With) => self.parse_with(),
-            TokenKind::Keyword(Keyword::Scope) => self.parse_scope(),
             TokenKind::Keyword(Keyword::Unsafe) => self.parse_unsafe(),
-            TokenKind::Keyword(Keyword::Select) => self.parse_select(),
             TokenKind::Keyword(Keyword::When) => Stmt::Cfg(self.parse_cfg_stmt()),
             _ => unreachable!("parse_compound called on non-compound token"),
         }
+    }
+
+    /// Contextual-keyword statement dispatch (#1405/#1411, epic #1413).
+    ///
+    /// `scope`, `select`, `match` are soft keywords: a keyword only when
+    /// statement-leading in their slot, an ordinary identifier otherwise.
+    /// Called at statement start (before [`is_compound_start`]); returns the
+    /// parsed statement when the slot marker is present, else `None` so the
+    /// word falls through to the expression/declaration parser as a plain
+    /// identifier (so `match(x)`, `x = select`, `scope.foo`, a named arg
+    /// `f(match=1)`, a field `str scope`, etc. all keep their identifier
+    /// meaning).
+    ///
+    /// The disambiguating marker is always a trailing `:` + indented block.
+    /// `match` additionally backtracks over a trial scrutinee parse — the same
+    /// rule CPython uses for its soft `match`: resolve to the statement iff a
+    /// clean subject expression is followed by `:` NEWLINE INDENT, else
+    /// identifier. `case` is never dispatched here; it is recognized only
+    /// inside a `match`/`select` body (see [`parse_match`]/[`parse_select`]).
+    fn try_soft_keyword_stmt(&mut self) -> Option<Stmt> {
+        enum Soft {
+            Scope,
+            Select,
+            Match,
+        }
+        let which = match self.peek() {
+            TokenKind::Ident(n) if n == "scope" => Soft::Scope,
+            TokenKind::Ident(n) if n == "select" => Soft::Select,
+            TokenKind::Ident(n) if n == "match" => Soft::Match,
+            _ => return None,
+        };
+        match which {
+            Soft::Scope => self.at_scope_stmt().then(|| self.parse_scope()),
+            Soft::Select => self.at_select_stmt().then(|| self.parse_select()),
+            Soft::Match => self.at_match_stmt().then(|| self.parse_match()),
+        }
+    }
+
+    /// `select` opens the channel-select statement iff it is immediately
+    /// followed by `:` NEWLINE INDENT; otherwise it is an identifier. Pure
+    /// lookahead — no identifier use of `select` is statement-leading and ends
+    /// in `:` + block, so the marker admits no false positive.
+    fn at_select_stmt(&self) -> bool {
+        self.is_soft_kw("select")
+            && matches!(self.peek_nth(1), TokenKind::Colon)
+            && matches!(self.peek_nth(2), TokenKind::Newline)
+            && matches!(self.peek_nth(3), TokenKind::Indent)
+    }
+
+    /// `scope` opens the structured-concurrency statement iff it is followed by
+    /// an optional balanced `(...)` option list and then `:` NEWLINE INDENT;
+    /// otherwise an identifier. Lookahead only: it scans a balanced paren group
+    /// (parens nest; brackets/braces and string tokens never contribute a bare
+    /// `)`), then checks the block marker. As with `select`, no identifier use
+    /// of `scope` is statement-leading and `:`-and-block terminated, so there
+    /// is no false positive.
+    fn at_scope_stmt(&self) -> bool {
+        if !self.is_soft_kw("scope") {
+            return false;
+        }
+        let mut k = 1;
+        if matches!(self.peek_nth(1), TokenKind::LParen) {
+            let mut depth = 0usize;
+            loop {
+                match self.peek_nth(k) {
+                    TokenKind::LParen => depth += 1,
+                    TokenKind::RParen => depth -= 1,
+                    TokenKind::Eof => return false,
+                    _ => {}
+                }
+                k += 1;
+                if depth == 0 {
+                    break; // closed the group we entered
+                }
+            }
+        }
+        matches!(self.peek_nth(k), TokenKind::Colon)
+            && matches!(self.peek_nth(k + 1), TokenKind::Newline)
+            && matches!(self.peek_nth(k + 2), TokenKind::Indent)
+    }
+
+    /// `match` opens the runtime match statement iff a clean scrutinee
+    /// expression is followed by `:` NEWLINE INDENT; otherwise it is an
+    /// identifier. Bounded backtracking trial parse (CPython's soft-`match`
+    /// disambiguation): a bare `match`, `match(x)`, `match = v`, `match.attr`,
+    /// `match[i]`, `match + 1` all leave the trial parse without the `:`+block
+    /// marker (or make it error), so they stay identifier uses.
+    fn at_match_stmt(&mut self) -> bool {
+        if !self.is_soft_kw("match") {
+            return false;
+        }
+        let cp = (self.pos, self.errors.len());
+        self.bump(); // the `match` identifier, tentatively the keyword
+        self.parse_expr(); // trial scrutinee
+        let ok = self.errors.len() == cp.1
+            && matches!(self.peek(), TokenKind::Colon)
+            && matches!(self.peek_nth(1), TokenKind::Newline)
+            && matches!(self.peek_nth(2), TokenKind::Indent);
+        self.restore(cp);
+        ok
     }
 
     // --- conditional compilation (`when target.*`, I#139 / D-0079) ---
@@ -4783,7 +4916,7 @@ impl Parser {
     /// the block owns every `spawn` lexically inside it.
     fn parse_scope(&mut self) -> Stmt {
         let start = self.peek_span().start;
-        self.expect_kw(Keyword::Scope, "'scope'");
+        self.expect_soft_kw("scope");
         let opts = if self.eat(&TokenKind::LParen) {
             self.parse_args()
         } else {
@@ -4918,13 +5051,13 @@ impl Parser {
 
     fn parse_match(&mut self) -> Stmt {
         let start = self.peek_span().start;
-        self.expect_kw(Keyword::Match, "'match'");
+        self.expect_soft_kw("match");
         let scrutinee = self.parse_expr();
         self.expect(&TokenKind::Colon, "':'");
         self.expect(&TokenKind::Newline, "newline");
         self.expect(&TokenKind::Indent, "indented block");
         let mut arms = Vec::new();
-        while self.is_kw(Keyword::Case) {
+        while self.is_soft_kw("case") {
             let astart = self.peek_span().start;
             self.bump();
             // `case comptime <v> in <iter> [as <bind>]:` — a comptime-generated
@@ -4994,14 +5127,14 @@ impl Parser {
     /// rules are enforced in sema, so the parser stays permissive.
     fn parse_select(&mut self) -> Stmt {
         let start = self.peek_span().start;
-        self.expect_kw(Keyword::Select, "'select'");
+        self.expect_soft_kw("select");
         self.expect(&TokenKind::Colon, "':'");
         self.expect(&TokenKind::Newline, "newline");
         self.expect(&TokenKind::Indent, "indented block");
         let mut cases = Vec::new();
         loop {
             let cstart = self.peek_span().start;
-            if self.is_kw(Keyword::Case) {
+            if self.is_soft_kw("case") {
                 self.bump();
                 let op = self.parse_select_op();
                 let body = self.parse_block();
@@ -8864,5 +8997,374 @@ def main():
         };
         assert_eq!(cases.len(), 1);
         assert!(matches!(&cases[0].op, SelectOp::Send { .. }));
+    }
+
+    // ----------------------------------------------------------------------
+    // Soft (contextual) keywords: `scope` (#1405), `select`/`match`/`case`
+    // (#1411), epic #1413. Each is a keyword ONLY in its statement/clause slot
+    // and an ordinary identifier everywhere else. These tests are a walled
+    // garden: every program below exercises BOTH meanings in ONE module —
+    // struct field, parameter, named-argument label, attribute read, and
+    // general expression (variable / call target) alongside the statement form.
+    // ----------------------------------------------------------------------
+
+    /// Helper: the single top-level function's statements.
+    fn fn_stmts<'m>(m: &'m Module, name: &str) -> &'m [Stmt] {
+        let f = m
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Function(f) if f.name == name => Some(f),
+                _ => None,
+            })
+            .expect("function");
+        &f.body.stmts
+    }
+
+    fn only_struct(m: &Module) -> &StructDef {
+        m.items
+            .iter()
+            .find_map(|i| match i {
+                Item::Struct(s) => Some(s),
+                _ => None,
+            })
+            .expect("a struct item")
+    }
+
+    #[test]
+    fn scope_soft_keyword_both_meanings_coexist() {
+        // #1405: `scope` as field + param + named arg + attribute + variable,
+        // alongside the structured-concurrency statement (with and without an
+        // option list).
+        let src = "\
+struct Token:
+    str scope
+
+def authorize(str scope) -> str:
+    return scope
+
+def main():
+    auto t = Token(scope=\"read\")
+    print(t.scope)
+    auto scope = authorize(scope=\"x\")
+    print(scope)
+    scope:
+        spawn f()
+    scope(on_error=w):
+        spawn g()
+";
+        let m = parse_ok(src);
+        // field
+        assert_eq!(only_struct(&m).fields[0].name, "scope");
+        // param
+        let auth = fn_stmts(&m, "authorize");
+        assert!(matches!(&auth[0], Stmt::Return { .. }));
+        // body
+        let st = fn_stmts(&m, "main");
+        // `auto t = Token(scope="read")` — named-argument label
+        let Stmt::Let { value, .. } = &st[0] else {
+            panic!("let t");
+        };
+        let Expr::Call { args, .. } = value else {
+            panic!("call Token(...)");
+        };
+        assert_eq!(args[0].name.as_deref(), Some("scope"));
+        // `print(t.scope)` — attribute read
+        let Stmt::Expr(Expr::Call { args, .. }) = &st[1] else {
+            panic!("print(t.scope)");
+        };
+        assert!(matches!(&args[0].value, Expr::Attr { name, .. } if name == "scope"));
+        // `auto scope = ...` — variable binding named `scope`
+        assert!(matches!(&st[2], Stmt::Let { name, .. } if name == "scope"));
+        // `print(scope)` — `scope` as a general expression
+        let Stmt::Expr(Expr::Call { args, .. }) = &st[3] else {
+            panic!("print(scope)");
+        };
+        assert!(matches!(&args[0].value, Expr::Name(n, _) if n == "scope"));
+        // the two statement forms, unchanged
+        assert!(matches!(&st[4], Stmt::Scope { opts, .. } if opts.is_empty()));
+        assert!(matches!(&st[5], Stmt::Scope { opts, .. } if opts.len() == 1));
+    }
+
+    #[test]
+    fn scope_call_without_block_stays_an_identifier_call() {
+        // `scope(x)` as a statement with NO trailing `:`+block is a call on a
+        // function named `scope`, not the scope statement.
+        let m = parse_ok("def main():\n    scope(x)\n");
+        let s = fn_stmts(&m, "main");
+        let Stmt::Expr(Expr::Call { callee, .. }) = &s[0] else {
+            panic!("expected a call statement, got {:?}", s[0]);
+        };
+        assert!(matches!(&**callee, Expr::Name(n, _) if n == "scope"));
+    }
+
+    #[test]
+    fn select_soft_keyword_both_meanings_coexist() {
+        // #1411: `select` as field + param + named arg + attribute + call
+        // target, alongside the channel-select statement.
+        let src = "\
+struct Query:
+    str select
+
+def run(str select) -> str:
+    return select
+
+def main():
+    auto q = Query(select=\"id\")
+    print(q.select)
+    auto select = run(select=\"x\")
+    select()
+    select:
+        case v = <-ch:
+            use(v)
+        default:
+            idle()
+";
+        let m = parse_ok(src);
+        assert_eq!(only_struct(&m).fields[0].name, "select");
+        let st = fn_stmts(&m, "main");
+        // named arg
+        let Stmt::Let { value, .. } = &st[0] else {
+            panic!("let q");
+        };
+        let Expr::Call { args, .. } = value else {
+            panic!("Query(...)");
+        };
+        assert_eq!(args[0].name.as_deref(), Some("select"));
+        // attribute read
+        let Stmt::Expr(Expr::Call { args, .. }) = &st[1] else {
+            panic!("print(q.select)");
+        };
+        assert!(matches!(&args[0].value, Expr::Attr { name, .. } if name == "select"));
+        // variable
+        assert!(matches!(&st[2], Stmt::Let { name, .. } if name == "select"));
+        // `select()` call target (no `:` → identifier)
+        let Stmt::Expr(Expr::Call { callee, .. }) = &st[3] else {
+            panic!("select() call, got {:?}", st[3]);
+        };
+        assert!(matches!(&**callee, Expr::Name(n, _) if n == "select"));
+        // statement form unchanged
+        assert!(matches!(&st[4], Stmt::Select { cases, .. } if cases.len() == 2));
+    }
+
+    #[test]
+    fn match_soft_keyword_both_meanings_coexist() {
+        // #1411: `match` as field + param + named arg + attribute + call target
+        // + variable, alongside the runtime match statement. The bounded
+        // backtrack keeps a statement-leading call `match(...)` an identifier.
+        let src = "\
+struct Query:
+    str match
+
+def run(str match) -> str:
+    return match
+
+def main():
+    auto q = Query(match=\"exact\")
+    print(q.match)
+    auto match = run(match=\"x\")
+    auto r = match(q.match)
+    match(q.match)
+    match q.match:
+        case \"exact\":
+            ok()
+        case _:
+            no()
+";
+        let m = parse_ok(src);
+        assert_eq!(only_struct(&m).fields[0].name, "match");
+        // param
+        let run = fn_stmts(&m, "run");
+        assert!(matches!(&run[0], Stmt::Return { .. }));
+        let st = fn_stmts(&m, "main");
+        // named arg
+        let Stmt::Let { value, .. } = &st[0] else {
+            panic!("let q");
+        };
+        let Expr::Call { args, .. } = value else {
+            panic!("Query(...)");
+        };
+        assert_eq!(args[0].name.as_deref(), Some("match"));
+        // attribute read
+        let Stmt::Expr(Expr::Call { args, .. }) = &st[1] else {
+            panic!("print(q.match)");
+        };
+        assert!(matches!(&args[0].value, Expr::Attr { name, .. } if name == "match"));
+        // variable
+        assert!(matches!(&st[2], Stmt::Let { name, .. } if name == "match"));
+        // `auto r = match(q.match)` — call target in RHS expression position
+        let Stmt::Let { value, .. } = &st[3] else {
+            panic!("let r");
+        };
+        assert!(
+            matches!(value, Expr::Call { callee, .. } if matches!(&**callee, Expr::Name(n,_) if n == "match"))
+        );
+        // statement-leading `match(q.match)` with NO `:` → a call, not a match
+        let Stmt::Expr(Expr::Call { callee, .. }) = &st[4] else {
+            panic!("match(...) call, got {:?}", st[4]);
+        };
+        assert!(matches!(&**callee, Expr::Name(n, _) if n == "match"));
+        // the match statement itself
+        assert!(matches!(&st[5], Stmt::Match { arms, .. } if arms.len() == 2));
+    }
+
+    #[test]
+    fn match_statement_subject_may_be_the_soft_keyword_itself() {
+        // `match match:` — the subject is a variable literally named `match`.
+        let m = parse_ok(
+            "def main():\n    auto match = 1\n    match match:\n        case 1:\n            ok()\n",
+        );
+        let st = fn_stmts(&m, "main");
+        let Stmt::Match {
+            scrutinee, arms, ..
+        } = &st[1]
+        else {
+            panic!("match stmt, got {:?}", st[1]);
+        };
+        assert!(matches!(scrutinee, Expr::Name(n, _) if n == "match"));
+        assert_eq!(arms.len(), 1);
+    }
+
+    #[test]
+    fn bare_match_name_is_an_expression_statement() {
+        // A statement that is just `match` (no subject, no `:`) is the
+        // identifier used as an expression, never a malformed match statement.
+        let m = parse_ok("def main():\n    auto match = 1\n    match\n");
+        let st = fn_stmts(&m, "main");
+        assert!(matches!(&st[1], Stmt::Expr(Expr::Name(n, _)) if n == "match"));
+    }
+
+    #[test]
+    fn match_assignment_and_member_access_stay_identifier_uses() {
+        // `match = v` (assignment target) and `match.attr` (member access),
+        // both statement-leading, must parse as identifier uses of `match`.
+        let m =
+            parse_ok("def main():\n    auto match = 1\n    match = 2\n    match.bit_length()\n");
+        let st = fn_stmts(&m, "main");
+        let Stmt::Assign { target, .. } = &st[1] else {
+            panic!("assign, got {:?}", st[1]);
+        };
+        assert!(matches!(target, Expr::Name(n, _) if n == "match"));
+        let Stmt::Expr(Expr::Call { callee, .. }) = &st[2] else {
+            panic!("member call, got {:?}", st[2]);
+        };
+        assert!(matches!(&**callee, Expr::Attr { base, name, .. }
+            if name == "bit_length" && matches!(&**base, Expr::Name(n,_) if n == "match")));
+    }
+
+    #[test]
+    fn case_soft_keyword_both_meanings_coexist() {
+        // #1411: `case` as field + param + named arg + attribute + variable,
+        // and `case` as an ordinary identifier INSIDE a match arm body, while
+        // the `case PATTERN:` arm headers keep their keyword meaning.
+        let src = "\
+struct Query:
+    str case
+
+def run(str case) -> str:
+    return case
+
+def main():
+    auto q = Query(case=\"a\")
+    print(q.case)
+    auto case = run(case=\"x\")
+    case = case
+    match q.case:
+        case \"a\":
+            use(case)
+        case _:
+            no()
+";
+        let m = parse_ok(src);
+        assert_eq!(only_struct(&m).fields[0].name, "case");
+        let st = fn_stmts(&m, "main");
+        // named arg
+        let Stmt::Let { value, .. } = &st[0] else {
+            panic!("let q");
+        };
+        let Expr::Call { args, .. } = value else {
+            panic!("Query(...)");
+        };
+        assert_eq!(args[0].name.as_deref(), Some("case"));
+        // attribute read
+        let Stmt::Expr(Expr::Call { args, .. }) = &st[1] else {
+            panic!("print(q.case)");
+        };
+        assert!(matches!(&args[0].value, Expr::Attr { name, .. } if name == "case"));
+        // variable + assignment where `case` is both target and value
+        assert!(matches!(&st[2], Stmt::Let { name, .. } if name == "case"));
+        let Stmt::Assign { target, value, .. } = &st[3] else {
+            panic!("case = case, got {:?}", st[3]);
+        };
+        assert!(matches!(target, Expr::Name(n, _) if n == "case"));
+        assert!(matches!(value, Expr::Name(n, _) if n == "case"));
+        // the match statement with two case arms; the first arm's body uses
+        // `case` as an identifier.
+        let Stmt::Match { arms, .. } = &st[4] else {
+            panic!("match stmt, got {:?}", st[4]);
+        };
+        assert_eq!(arms.len(), 2);
+        let Stmt::Expr(Expr::Call { args, .. }) = &arms[0].body.stmts[0] else {
+            panic!("use(case)");
+        };
+        assert!(matches!(&args[0].value, Expr::Name(n, _) if n == "case"));
+    }
+
+    #[test]
+    fn soft_keywords_as_select_receive_targets_and_sends() {
+        // The soft keywords are also valid identifiers deep inside a `select`
+        // body: receive targets and channel/send operands.
+        let src = "\
+def main():
+    select:
+        case match = <-ch:
+            use(match)
+        case scope, select = <-done:
+            use2(scope, select)
+        case out <- case:
+            done()
+";
+        let m = parse_ok(src);
+        let st = fn_stmts(&m, "main");
+        let Stmt::Select { cases, .. } = &st[0] else {
+            panic!("select");
+        };
+        assert_eq!(cases.len(), 3);
+        let SelectOp::Recv { value, .. } = &cases[0].op else {
+            panic!("recv");
+        };
+        assert_eq!(value, "match");
+        let SelectOp::Recv { value, ok, .. } = &cases[1].op else {
+            panic!("comma-ok recv");
+        };
+        assert_eq!(value, "scope");
+        assert_eq!(ok.as_deref(), Some("select"));
+        assert!(matches!(&cases[2].op, SelectOp::Send { .. }));
+    }
+
+    #[test]
+    fn soft_keyword_statements_are_unchanged_when_nested() {
+        // Strictly-widening sanity: a nested `match` inside a `scope` inside a
+        // `select` arm still parses to the same statement nodes.
+        let src = "\
+def main():
+    scope:
+        select:
+            case v = <-ch:
+                match v:
+                    case 0:
+                        a()
+                    case _:
+                        b()
+";
+        let m = parse_ok(src);
+        let st = fn_stmts(&m, "main");
+        let Stmt::Scope { body, .. } = &st[0] else {
+            panic!("scope");
+        };
+        let Stmt::Select { cases, .. } = &body.stmts[0] else {
+            panic!("select");
+        };
+        assert!(matches!(&cases[0].body.stmts[0], Stmt::Match { .. }));
     }
 }
