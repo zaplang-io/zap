@@ -18,5 +18,10 @@ def main():
     auto a = <-ch
     auto b = <-ch
     print(g)
-    print(a)
-    print(b)
+    # The two workers race to send on the unbuffered channel, so the receive
+    # order is scheduler-dependent (and perturbed by the wide CI e2e pool,
+    # zaplang-io/zap#1305). The GC claim under test is "both parked coroutines'
+    # live strings survive collection", which is order-independent — so sort the
+    # received pair before printing to keep this golden deterministic.
+    for s in sorted([a, b]):
+        print(s)
