@@ -404,6 +404,13 @@ fn err(m: impl Into<String>) -> LowerError {
     }
 }
 
+/// Whether `outer` fully encloses `inner` (half-open byte ranges). Used to
+/// attribute a derive diagnostic whose cause is a nested type's use-site span
+/// (#1346) to the enclosing field's declaration.
+fn span_contains(outer: Span, inner: Span) -> bool {
+    outer.start <= inner.start && inner.end <= outer.end
+}
+
 /// The trait a free function registers via `@derivable(Trait)` (one positional
 /// identifier), or `None` (E3a, #1290). Mirrors the driver's synthesis scan.
 fn derivable_trait(f: &Function) -> Option<String> {
@@ -2394,7 +2401,18 @@ impl Mono<'_> {
             di.instantiation_span = Some(instantiation_span);
             le.code = zapc_diag::ErrorCode::ZAP7003;
             if di.frames.is_empty() {
-                if let Some(f) = fields.iter().find(|f| f.span == di.cause_span) {
+                // Attribute the failure to the field the generator pointed at.
+                // The cause span is either the field itself (`comptime.error(
+                // f.span, …)`) or — now that nested types carry use-site spans
+                // (#1346) — a type *inside* the field's declared type (e.g. the
+                // `Widget` element of `list[Widget] items`, via
+                // `comptime.error(f.ty.elem.span, …)`). In both cases the right
+                // `required because of …` frame is the enclosing field, so match
+                // the field whose declaration contains the cause span.
+                if let Some(f) = fields
+                    .iter()
+                    .find(|f| f.span == di.cause_span || span_contains(f.ty.span(), di.cause_span))
+                {
                     di.frames
                         .push((format!("field `{}` of `{}`", f.name, ty), f.span));
                 }

@@ -97,7 +97,7 @@ fn memo_is_shared_through_the_evaluator() {
     for _ in 0..5 {
         let e = common::parse_expr("info.fields[0].ty.kind.name");
         let mut env = Env::new();
-        env.define("info", Value::Type(std::rc::Rc::new(info.clone())));
+        env.define("info", Value::Type(std::rc::Rc::new(info.clone()), None));
         let v = ev.eval(&e, &mut env).unwrap();
         assert_eq!(v, Value::str("primitive")); // x: int64
     }

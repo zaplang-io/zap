@@ -142,7 +142,7 @@ fn comptime_for_with_reflect_field_access() {
     let body = parse_body("emit(reflect.field(value, f.index))");
     let iterable = parse_expr("info.fields");
     let mut base = Env::new();
-    base.define("info", Value::Type(Rc::new(info.clone())));
+    base.define("info", Value::Type(Rc::new(info.clone()), None));
     let mut ev = Evaluator::new();
     let unrolled = unroll("f", &iterable, &body, &base, &mut ev).unwrap();
 

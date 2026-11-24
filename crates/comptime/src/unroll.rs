@@ -69,7 +69,7 @@ pub fn materialize(v: &Value, span: Span) -> Option<Expr> {
         },
         Value::List(xs) => Expr::List(materialize_all(xs, span)?, span),
         Value::Tuple(xs) => Expr::Tuple(materialize_all(xs, span)?, span),
-        Value::Type(_)
+        Value::Type(..)
         | Value::Field(_)
         | Value::Variant(_)
         | Value::Attr(_)

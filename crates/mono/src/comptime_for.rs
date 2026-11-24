@@ -172,7 +172,7 @@ fn unroll_member(
         ev = ev.with_registry(reg);
     }
     let mut base = Env::new();
-    base.define("info", Value::Type(Rc::new(info)));
+    base.define("info", Value::Type(Rc::new(info), None));
     let iterable = Expr::Attr {
         base: Box::new(Expr::Name("info".to_string(), z)),
         name: member.to_string(),

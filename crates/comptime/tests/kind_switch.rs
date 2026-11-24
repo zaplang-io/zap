@@ -51,7 +51,7 @@ fn shapes_info() -> TypeInfo {
 fn eval_k(reg: &TypeRegistry, info: &TypeInfo, expr_src: &str) -> Value {
     let e = parse_expr(expr_src);
     let mut env = Env::new();
-    env.define("info", Value::Type(Rc::new(info.clone())));
+    env.define("info", Value::Type(Rc::new(info.clone()), None));
     seed_kind_constants(&mut env);
     let mut ev = Evaluator::new().with_registry(reg);
     ev.eval(&e, &mut env)
@@ -256,7 +256,7 @@ def classify(str info):\n\
     // classify the struct P (a Struct), a list field's type, and a primitive.
     let p = reg.resolve_type(&named("P"), sp()).unwrap();
     assert_eq!(
-        ev.call("classify", vec![Value::Type(Rc::new(p))], sp())
+        ev.call("classify", vec![Value::Type(Rc::new(p), None)], sp())
             .unwrap(),
         Value::str("struct")
     );
@@ -268,13 +268,13 @@ def classify(str info):\n\
         .unwrap(),
     );
     assert_eq!(
-        ev.call("classify", vec![Value::Type(list_ty)], sp())
+        ev.call("classify", vec![Value::Type(list_ty, None)], sp())
             .unwrap(),
         Value::str("list")
     );
     let prim_ti = reg.resolve_ty(&zapc_sema_types::Ty::Int64, sp()).unwrap();
     assert_eq!(
-        ev.call("classify", vec![Value::Type(Rc::new(prim_ti))], sp())
+        ev.call("classify", vec![Value::Type(Rc::new(prim_ti), None)], sp())
             .unwrap(),
         Value::str("primitive")
     );
@@ -308,12 +308,12 @@ def encode(str info):\n\
     let custom = reg.resolve_type(&named("Custom"), sp()).unwrap();
     let plain = reg.resolve_type(&named("Plain"), sp()).unwrap();
     assert_eq!(
-        ev.call("encode", vec![Value::Type(Rc::new(custom))], sp())
+        ev.call("encode", vec![Value::Type(Rc::new(custom), None)], sp())
             .unwrap(),
         Value::str("override")
     );
     assert_eq!(
-        ev.call("encode", vec![Value::Type(Rc::new(plain))], sp())
+        ev.call("encode", vec![Value::Type(Rc::new(plain), None)], sp())
             .unwrap(),
         Value::str("reflect")
     );
@@ -369,7 +369,7 @@ fn recursive_type_is_observable_and_walk_can_be_bounded() {
 fn eval_cycle(reg: &TypeRegistry, node: &TypeInfo) -> String {
     let e = parse_expr("info.fields[1].ty.elem.name");
     let mut env = Env::new();
-    env.define("info", Value::Type(Rc::new(node.clone())));
+    env.define("info", Value::Type(Rc::new(node.clone()), None));
     let mut ev = Evaluator::new().with_registry(reg);
     match ev.eval(&e, &mut env).unwrap() {
         Value::Str(s) => s.to_string(),

@@ -62,7 +62,7 @@ fn struct_info(name: &str, fields: Vec<FieldInfo>) -> TypeInfo {
 
 /// Evaluate `expr_src` with `info` pre-bound to a type record.
 fn eval_info(info: TypeInfo, expr_src: &str) -> Value {
-    common::eval_with(expr_src, vec![("info", Value::Type(Rc::new(info)))])
+    common::eval_with(expr_src, vec![("info", Value::Type(Rc::new(info), None))])
         .unwrap_or_else(|e| panic!("eval `{expr_src}` failed: {e:?}"))
 }
 
@@ -153,7 +153,7 @@ fn positional_attr_arg_has_no_name() {
     // `.name` on a positional argument is a value fault, not a silent default.
     let e = common::eval_with(
         "info.fields[0].attrs[0].args[0].name",
-        vec![("info", Value::Type(Rc::new(ti)))],
+        vec![("info", Value::Type(Rc::new(ti), None))],
     )
     .unwrap_err();
     assert!(e.message.contains("positional"), "{}", e.message);
@@ -168,7 +168,7 @@ fn field_type_recursion_needs_a_registry() {
     let ti = struct_info("T", vec![field("f", 0, vec![])]);
     let e = common::eval_with(
         "info.fields[0].ty",
-        vec![("info", Value::Type(Rc::new(ti)))],
+        vec![("info", Value::Type(Rc::new(ti), None))],
     )
     .unwrap_err();
     assert!(e.is_not_available(), "{}", e.message);
