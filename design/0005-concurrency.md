@@ -209,6 +209,26 @@ monotonic-ns instant it fired — after the duration, then blocks (Go `time.Afte
 shape). A `select` receive case always binds a name, so the timer value is
 received into `fired` even when it is discarded.
 
+For *repeated* work, `time.ticker(d)` returns a stoppable `Ticker` handle whose
+`chan` delivers a tick every `d`:
+
+```python
+import time
+
+auto tk = time.ticker(time.seconds(60))
+while True:
+    select:
+        case fired = <-tk.chan:
+            flush_metrics()
+        case stopping = <-done:
+            tk.stop()
+            return
+```
+
+The ticker keeps a fixed schedule and drops a tick if the consumer is behind;
+`tk.stop()` ends it (a never-stopped ticker is simply terminated at program
+exit).
+
 ### Sync primitives (D-0032)
 
 Channels are the idiom; the classic toolbox covers shared-state and
@@ -836,10 +856,16 @@ parks its G and frees its M.
   decisions/runtime/1395-one-shot-timer-channel-after.md): `time.after(d)`
   returns a `channel[int64]` that fires once after `d` (the monotonic-ns instant),
   backed by a detached firing coroutine that reuses the same fd-less timer, for
-  the `select` timeout idiom. Still open: a periodic ticker, a deadline-keyed
-  timer heap for very many concurrent timers/sleepers (the linear registry scan
-  is reused today), and a non-Linux (Windows/IOCP) timer backend. Scope deadlines
-  are integer milliseconds (`scope(timeout=<ms>)`, D-0094).
+  the `select` timeout idiom. The periodic **ticker** is RESOLVED too (I#1409 +
+  decisions/runtime/1409-periodic-ticker.md): `time.ticker(d)` returns a
+  stoppable `Ticker` handle (a receive channel `chan` + `stop()`) that delivers a
+  tick on a fixed schedule, dropping a tick when the consumer is behind; it is a
+  prelude `Ticker` struct whose detached firing loop `select`s the fd-less timer
+  against a `done` channel, so `stop()` wakes it promptly and a never-stopped
+  ticker is terminated at exit rather than joined. Still open: a deadline-keyed
+  timer heap for very many concurrent timers/sleepers (I#1410; the linear registry
+  scan is reused today), and a non-Linux (Windows/IOCP) timer backend. Scope
+  deadlines are integer milliseconds (`scope(timeout=<ms>)`, D-0094).
 - **Blocking FFI.**
   How CPython interop (D-0012) and its GIL interact with coroutines that must not
   block an M (likely a dedicated M pool for FFI calls).

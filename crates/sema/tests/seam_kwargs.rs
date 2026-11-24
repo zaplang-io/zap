@@ -564,6 +564,21 @@ fn time_after_keyword_and_positional() {
 }
 
 #[test]
+fn time_ticker_keyword_and_positional() {
+    // time.ticker(d: Duration) -> Ticker (#1409): the periodic timer accepts its
+    // Duration argument positionally or by the `d` keyword; an unknown keyword is
+    // rejected like every other seam method.
+    assert_ok(&prog(
+        "    auto d = time.millis(50)\n    auto tk = time.ticker(d=d)\n",
+    ));
+    assert_ok(&prog("    auto tk = time.ticker(time.millis(50))\n"));
+    assert_code(
+        &prog("    auto tk = time.ticker(every=time.millis(50))\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
 fn process_run_keyword() {
     assert_ok(&prog("    auto r = process.run(cmd=[\"echo\"])\n"));
 }

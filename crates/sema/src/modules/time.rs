@@ -120,6 +120,13 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_duration1(checker, "after", args, span);
             Some(Ty::Chan(Box::new(Ty::Int64)))
         }
+        // time.ticker(d) -> Ticker (#1409): a stoppable periodic timer. Returns
+        // the prelude `Ticker` handle (receive channel `chan` + `stop()`); each
+        // tick delivers the monotonic-ns instant, on a fixed schedule.
+        "ticker" => {
+            expect_duration1(checker, "ticker", args, span);
+            Some(Ty::Named("Ticker".to_string()))
+        }
         // time.since(start_ns) -> Duration: elapsed since a saved monotonic_ns()
         // reading, as a typed Duration (#1055).
         "since" => {

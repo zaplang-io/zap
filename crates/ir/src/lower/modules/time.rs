@@ -47,6 +47,30 @@ fn unwrap_duration(lowerer: &mut FnLower, arg: &ast::Arg) -> Result<Value, Lower
     Ok(lowerer.field_get(base, sid, 0, Ty::I64))
 }
 
+/// Resolve the prelude `Ticker` struct id (injected whenever the `time` surface
+/// or the `Ticker` type is referenced). Used by `time.ticker` (#1409).
+fn ticker_sid(lowerer: &FnLower) -> Result<u32, LowerError> {
+    lowerer
+        .ctx
+        .ids
+        .get("Ticker")
+        .copied()
+        .ok_or_else(|| err("Ticker struct unavailable (built-in prelude missing)"))
+}
+
+/// Emit `zap_chan_new(1)` — a fresh cap-1 buffered `channel[int64]`. Used to
+/// build the two timer channels a `Ticker` owns.
+fn new_cap1_i64_chan(lowerer: &mut FnLower) -> Value {
+    let ch = lowerer.new_value(Ty::Chan(Elem::I64));
+    let cap = lowerer.iconst(Ty::I64, 1);
+    lowerer.emit(Inst::Call {
+        dest: Some(ch),
+        func: "zap_chan_new".to_string(),
+        args: vec![cap],
+    });
+    ch
+}
+
 pub(super) const MODULE: ModuleLower = ModuleLower {
     name: "time",
     lower,
@@ -134,6 +158,41 @@ fn lower(
                 args: vec![nanos],
             });
             (d, Ty::Chan(Elem::I64))
+        }
+        // ticker(d: Duration) -> Ticker (#1409): a stoppable periodic timer.
+        // Build the tick stream `chan` and the `_done` stop signal (both cap-1
+        // int64 channels), spawn the prelude firing loop `__ticker_fire` over
+        // them DETACHED (so a never-stopped ticker neither joins at program exit
+        // nor stalls it — it is terminated at exit), and wrap both channels in
+        // the prelude `Ticker` handle (field 0 = `chan`, field 1 = `_done`). The
+        // loop, the drop-on-slow send, and `stop()` live in the Zap prelude; this
+        // only assembles the handle around the existing channel/spawn primitives.
+        "ticker" => {
+            let nanos = unwrap_duration(lowerer, &args[0])?;
+            let out = new_cap1_i64_chan(lowerer);
+            let done = new_cap1_i64_chan(lowerer);
+            lowerer.emit(Inst::Spawn {
+                func: "__ticker_fire".to_string(),
+                args: vec![out, done, nanos],
+                name: None,
+                owner: Owner::Detached,
+            });
+            let sid = ticker_sid(lowerer)?;
+            let dest = lowerer.new_value(Ty::Struct(sid));
+            lowerer.emit(Inst::StructNew { dest, sid });
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: 0,
+                val: out,
+            });
+            lowerer.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: 1,
+                val: done,
+            });
+            (dest, Ty::Struct(sid))
         }
         // duration unit constructors (-> Duration, #1047): compute nanoseconds
         // via the existing runtime entries, then wrap.
