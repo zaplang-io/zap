@@ -1714,6 +1714,37 @@ int64_t zap_upow(int64_t base, int64_t exp) {
     }
     return (int64_t)result;
 }
+/* Python built-in pow(base, exp, mod): integer modular exponentiation (#1381).
+ * `exp` must be non-negative (a modular inverse for a negative exponent is a
+ * follow-up) and `mod` must be non-zero; both raise a catchable ValueError
+ * otherwise. The result takes the sign of the modulus, matching Python (and
+ * Zap's floored `%`). The running product is kept in __int128 so the
+ * intermediate `result * b` never overflows (both operands are < |mod| <=
+ * 2^63). */
+int64_t zap_imodpow(int64_t base, int64_t exp, int64_t mod) {
+    if (mod == 0) {
+        static const char m[] = "pow() 3rd argument (modulus) cannot be 0";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, sizeof(m) - 1));
+    }
+    if (exp < 0) {
+        static const char m[] = "pow() with 3 arguments requires a non-negative exponent";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, sizeof(m) - 1));
+    }
+    __int128 am = (__int128)mod;
+    if (am < 0) am = -am; /* |mod| */
+    __int128 b = (__int128)base % am;
+    if (b < 0) b += am; /* b in [0, |mod|) */
+    __int128 result = (__int128)1 % am; /* 0 when |mod| == 1 */
+    uint64_t e = (uint64_t)exp;
+    while (e != 0) {
+        if (e & 1u) result = (result * b) % am;
+        e >>= 1;
+        if (e != 0) b = (b * b) % am;
+    }
+    int64_t r = (int64_t)result; /* in [0, |mod|) */
+    if (mod < 0 && r != 0) r = r - (int64_t)am; /* sign of the modulus */
+    return r;
+}
 /* Logical right shift with a validated count (#552), the unsigned counterpart of
  * `zap_ishr`: zero-fills from the left. A negative count raises a catchable
  * ValueError; a count >= 64 shifts every bit out and is defined as 0 (not LLVM
