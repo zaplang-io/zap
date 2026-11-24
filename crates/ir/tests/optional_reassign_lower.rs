@@ -157,21 +157,24 @@ fn scalar_reassign_none_then_some_each_boxed() {
     );
 }
 
-// ----- INT_MIN payload (the negative-extreme end of the issue's `-10800`) -----
+// ----- Large negative payload (the negative-extreme end of the issue's
+//        `-10800`). Uses the valid int64 minimum + 1: the true i64::MIN literal
+//        `-9223372036854775808` overflows int64 and is a `bigint`, rejected in
+//        an `int64` position (#1379), so it is not a valid payload here. -----
 
 #[test]
-fn scalar_reassign_int_min_boxes_some() {
+fn scalar_reassign_large_negative_boxes_some() {
     let (insts, vts, opt) = lower_main(
         "def main():\n\
-        \x20   int64 lo = -9223372036854775808\n\
+        \x20   int64 lo = -9223372036854775807\n\
         \x20   Optional[int64] slot = None\n\
         \x20   slot = lo\n\
-        \x20   assert slot.unwrap() == -9223372036854775808\n",
+        \x20   assert slot.unwrap() == -9223372036854775807\n",
         "Optional$int64",
     );
     assert!(
         optional_typed_stores(&insts, &vts, opt) >= 2,
-        "INT_MIN must box as `Some` like any other payload (#1362)"
+        "a large negative payload must box as `Some` like any other payload (#1362)"
     );
 }
 

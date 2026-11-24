@@ -225,13 +225,18 @@ fn optional_negative_float_literal_infers() {
 
 #[test]
 fn optional_negative_min_magnitude_int_literal_infers() {
-    // The i64::MIN magnitude: inference types the literal `int64` regardless of
-    // value (overflow/folding is sema/codegen's job, not the inferer's), so
-    // this must pin `T = int64` and lower like any other negative literal.
-    lower_ok(
+    // The i64::MIN magnitude: inference still pins `T = int64` from the unary
+    // negation (the #1117 behaviour), but the literal `9223372036854775808`
+    // overflows `int64` and is therefore a `bigint`, which is not implicitly
+    // assignable to the `int64` payload — exactly as `int64 x =
+    // -9223372036854775808` is rejected (`ZAP4001`). Lowering now rejects it
+    // rather than silently storing the `bigint` pointer into the scalar payload
+    // slot (#1379); previously this lowered to that miscompile.
+    lower_err_contains(
         "def main():\n\
         \x20   auto option = Optional.Some(-9223372036854775808)\n\
         \x20   print(option.is_some())\n",
+        "bigint",
     );
 }
 
