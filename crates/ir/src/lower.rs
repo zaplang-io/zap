@@ -7158,6 +7158,41 @@ impl<'a> FnLower<'a> {
         v
     }
 
+    /// Store a value into an aggregate FIELD — a struct field or a tagged
+    /// enum-variant payload — boxing a `value struct` onto the heap when its
+    /// storage might not outlive the field (#1400).
+    ///
+    /// A field physically holds a *pointer* to its value struct's storage
+    /// (D-0051). Boxing is required in two cases, not just the [`copy_if_value`]
+    /// lvalue-read one:
+    /// * **lvalue read** — the source is an existing object, so a copy preserves
+    ///   value semantics (no shared identity / aliasing); and
+    /// * **[`inline-eligible`](StructCtx::inline_eligible)** — a flat value
+    ///   struct / tuple crosses a by-value call/return boundary in a register or
+    ///   `sret` *stack spill*. Storing that spill's pointer into a heap
+    ///   aggregate leaves the field dangling once the producing frame returns
+    ///   (the zaplang-io/zap#1400 `zap_tz_zone_id` segfault: a `TimeZone`
+    ///   returned by value from a user zone resolver, wrapped in
+    ///   `Optional.Some`, whose `name` read null after the resolver's frame was
+    ///   reused). This is exactly why the interface-coercion path boxes a value
+    ///   struct ("its storage may be a stack slot under the register/sret ABI",
+    ///   `coerce.rs`) and why collection elements box unconditionally.
+    ///
+    /// A *non*-inline-eligible value struct is already a heap instance (it is
+    /// never passed by value), so a non-lvalue one needs no copy — matching
+    /// [`copy_if_value`] and avoiding a redundant allocation. Reference structs
+    /// and non-struct types pass through unchanged.
+    fn copy_field_value(&mut self, v: Value, ty: Ty, src: &ast::Expr) -> Value {
+        if let Ty::Struct(sid) = ty {
+            if self.ctx.is_value_struct(sid)
+                && (is_lvalue_read(src) || self.ctx.inline_eligible(sid))
+            {
+                return self.copy_value_struct(v, sid);
+            }
+        }
+        v
+    }
+
     /// Like [`copy_if_value`], but for a value crossing a **by-value calling
     /// boundary** — a function/method argument, a `return`, or a `spawn`
     /// argument. For an [`inline-eligible`](StructCtx::inline_eligible) aggregate
@@ -10207,6 +10242,14 @@ impl<'a> FnLower<'a> {
             }
             if self.opt_payload_source(&it, opt.payload_ty) {
                 let inner = self.coerce(iv, it, opt.payload_ty);
+                // The `Some` payload is an aggregate field (a pointer): box a
+                // `value struct` onto the heap so a by-value (inline-eligible)
+                // call/return result — physically a stack spill — does not
+                // dangle once the producing frame returns (#1400). This is the
+                // auto-wrap twin of the explicit `Optional.Some(...)` boxing in
+                // `build_variant`; e.g. `return resolver_result` where a user
+                // zone resolver returns a bare `TimeZone` into `Optional[TimeZone]`.
+                let inner = self.copy_field_value(inner, opt.payload_ty, e);
                 let some = gen_opt_some(self, &opt, inner);
                 return Ok((some, target));
             }
@@ -10724,8 +10767,11 @@ impl<'a> FnLower<'a> {
             // (`obj.field = value`), which already uses `expr_coerced`.
             let v = self.expr_coerced(&a.value, fty, zapc_diag::ErrorCode::ZAP4001)?;
             // A value-struct field is copied in (D-0051): the new struct holds an
-            // independent instance of the aggregate.
-            let v = self.copy_if_value(v, fty, &a.value);
+            // independent instance of the aggregate. The field is a pointer, so a
+            // by-value (inline-eligible) call/return result — physically a stack
+            // spill — is boxed onto the heap too, or it would dangle once the
+            // producing frame returns (#1400).
+            let v = self.copy_field_value(v, fty, &a.value);
             self.emit(Inst::FieldSet {
                 base: dest,
                 sid,
@@ -10761,7 +10807,7 @@ impl<'a> FnLower<'a> {
             // an `Optional[T]` field (#461 adjacent gap noted under #564) becomes
             // the canonical empty option rather than a stray null.
             let v = self.expr_coerced(&default, fty, zapc_diag::ErrorCode::ZAP4001)?;
-            let v = self.copy_if_value(v, fty, &default);
+            let v = self.copy_field_value(v, fty, &default);
             self.emit(Inst::FieldSet {
                 base: dest,
                 sid,
