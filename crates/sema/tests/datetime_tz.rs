@@ -493,6 +493,72 @@ fn resolve_returns_datetime() {
     ));
 }
 
+// #1361 — resolve carries a fold AND a fractional second together.
+#[test]
+fn resolve_accepts_nanosecond_keyword() {
+    // nanosecond= on its own (no fold).
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    \
+         DateTime d = datetime.resolve(z, 2024, 11, 3, 1, 30, 0, nanosecond=123456789)\n",
+    ));
+    // fold= AND nanosecond= together (the headline case).
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    \
+         DateTime d = datetime.resolve(z, 2024, 11, 3, 1, 30, 0, fold=1, nanosecond=123456789)\n",
+    ));
+    // Keyword order is immaterial.
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    \
+         DateTime d = datetime.resolve(z, 2024, 11, 3, 1, 30, 0, nanosecond=1, fold=0)\n",
+    ));
+    // Positional 8th fold + keyword nanosecond coexist.
+    assert_ok(&prog(
+        "    auto z = datetime.zone(\"America/New_York\")\n    \
+         DateTime d = datetime.resolve(z, 2024, 11, 3, 1, 30, 0, 1, nanosecond=500)\n",
+    ));
+    // A fixed-offset zone takes a fraction too.
+    assert_ok(&prog(
+        "    auto z = datetime.fixed_offset(-300)\n    \
+         auto d = datetime.resolve(z, 2024, 3, 10, 2, 30, 0, nanosecond=999999999)\n",
+    ));
+}
+
+#[test]
+fn resolve_rejects_bad_nanosecond_usage() {
+    // nanosecond must be an int.
+    assert_code(
+        &prog(
+            "    auto z = datetime.zone(\"UTC\")\n    \
+             auto d = datetime.resolve(z, 2024, 1, 1, 0, 0, 0, nanosecond=\"x\")\n",
+        ),
+        "ZAP4024",
+    );
+    // nanosecond is keyword-only — a 9th positional is rejected.
+    assert_code(
+        &prog(
+            "    auto z = datetime.zone(\"UTC\")\n    \
+             auto d = datetime.resolve(z, 2024, 1, 1, 0, 0, 0, 1, 500)\n",
+        ),
+        "ZAP4023",
+    );
+    // Duplicate nanosecond keyword.
+    assert_code(
+        &prog(
+            "    auto z = datetime.zone(\"UTC\")\n    \
+             auto d = datetime.resolve(z, 2024, 1, 1, 0, 0, 0, nanosecond=1, nanosecond=2)\n",
+        ),
+        "ZAP4023",
+    );
+    // Duplicate fold (positional 8th + keyword).
+    assert_code(
+        &prog(
+            "    auto z = datetime.zone(\"UTC\")\n    \
+             auto d = datetime.resolve(z, 2024, 1, 1, 0, 0, 0, 1, fold=0)\n",
+        ),
+        "ZAP4023",
+    );
+}
+
 #[test]
 fn classifiers_return_bool() {
     assert_ok(&prog(
@@ -568,13 +634,22 @@ fn resolve_arity_errors() {
         ),
         "ZAP4025",
     );
-    // Too many (beyond the optional fold).
+    // Too many (beyond the optional fold + nanosecond selectors: max 9 args).
+    assert_code(
+        &prog(
+            "    auto z = datetime.zone(\"UTC\")\n    \
+             auto d = datetime.resolve(z, 2024, 1, 1, 0, 0, 0, 0, 0, 0)\n",
+        ),
+        "ZAP4025",
+    );
+    // A 9th POSITIONAL arg is in range but rejected — `nanosecond` is
+    // keyword-only, so the trailing fraction cannot be passed positionally.
     assert_code(
         &prog(
             "    auto z = datetime.zone(\"UTC\")\n    \
              auto d = datetime.resolve(z, 2024, 1, 1, 0, 0, 0, 0, 0)\n",
         ),
-        "ZAP4025",
+        "ZAP4023",
     );
 }
 

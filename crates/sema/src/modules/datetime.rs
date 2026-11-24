@@ -585,21 +585,24 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             });
             Some(Ty::Named(DATETIME.to_string()))
         }
-        // resolve(tz, year, month, day, hour, minute, second, fold=0) -> DateTime
-        // (#1149): localize a wall clock into `tz`, classifying gap / overlap and
-        // selecting the instant with `fold`. The TimeZone is positional first,
-        // then six int civil fields; `fold` is an optional trailing int (keyword
-        // `fold=` or an 8th positional). Bespoke binding (an optional trailing
-        // arg, like `replace`), so it is omitted from the seam signatures.
+        // resolve(tz, year, month, day, hour, minute, second, fold=0,
+        // nanosecond=0) -> DateTime (#1149, #1361): localize a wall clock into
+        // `tz`, classifying gap / overlap and selecting the instant with `fold`,
+        // and carrying an optional sub-second `nanosecond=` fraction (#1361). The
+        // TimeZone is positional first, then six int civil fields; `fold` is an
+        // optional trailing int (keyword `fold=` or an 8th positional) and
+        // `nanosecond` is keyword-only (`nanosecond=`). Bespoke binding (optional
+        // trailing selectors, like `replace`), so it is omitted from the seam
+        // signatures.
         "resolve" => {
             let n = args.len();
-            if !(7..=8).contains(&n) {
+            if !(7..=9).contains(&n) {
                 checker.error(
                     ErrorCode::ZAP4025,
                     format!(
-                        "datetime.resolve() takes a TimeZone, 6 civil fields and an \
-                         optional fold ({}–{} arguments), found {}",
-                        7, 8, n
+                        "datetime.resolve() takes a TimeZone, 6 civil fields, and optional \
+                         fold= / nanosecond= selectors ({}–{} arguments), found {}",
+                        7, 9, n
                     ),
                     span,
                 );
@@ -626,10 +629,49 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
                         expr_span(&args[0].value),
                     );
                 }
+                let mut seen_fold = false;
+                let mut seen_nanosecond = false;
                 for (i, a) in args.iter().enumerate().skip(1) {
-                    // The 8th argument may be named `fold`; all others positional.
-                    if let Some(name) = &a.name {
-                        if !(i == n - 1 && name == "fold") {
+                    match a.name.as_deref() {
+                        // A positional civil field (slots 1..=6) or the optional
+                        // 8th positional `fold` (slot 7, kept for back-compat). A
+                        // 9th positional (slot >= 8) is rejected: `nanosecond`
+                        // must be passed by keyword.
+                        None => {
+                            if i >= 8 {
+                                checker.error(
+                                    ErrorCode::ZAP4023,
+                                    "datetime.resolve() nanosecond must be passed by keyword \
+                                     (nanosecond=)"
+                                        .to_string(),
+                                    a.span,
+                                );
+                            } else if i == 7 {
+                                seen_fold = true;
+                            }
+                        }
+                        Some("fold") => {
+                            if seen_fold {
+                                checker.error(
+                                    ErrorCode::ZAP4023,
+                                    "datetime.resolve() got multiple values for 'fold'".to_string(),
+                                    a.span,
+                                );
+                            }
+                            seen_fold = true;
+                        }
+                        Some("nanosecond") => {
+                            if seen_nanosecond {
+                                checker.error(
+                                    ErrorCode::ZAP4023,
+                                    "datetime.resolve() got multiple values for 'nanosecond'"
+                                        .to_string(),
+                                    a.span,
+                                );
+                            }
+                            seen_nanosecond = true;
+                        }
+                        Some(name) => {
                             checker.error(
                                 ErrorCode::ZAP4023,
                                 format!("datetime.resolve() has no keyword argument '{name}'"),
@@ -642,7 +684,8 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
                         checker.error(
                             ErrorCode::ZAP4024,
                             format!(
-                                "datetime.resolve() civil fields and fold must be ints, found {}",
+                                "datetime.resolve() civil fields, fold, and nanosecond must be \
+                                 ints, found {}",
                                 v.display()
                             ),
                             expr_span(&a.value),
