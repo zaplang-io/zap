@@ -8857,6 +8857,40 @@ static pthread_mutex_t g_np_mu = PTHREAD_MUTEX_INITIALIZER;
 static PollDesc *g_np_all = NULL;   /* doubly-linked list of live descriptors   */
 static PollDesc *g_np_free = NULL;  /* recycled descriptors                      */
 
+/* Deadline min-heap (#1410): O(1) nearest-deadline for `epoll_wait`'s timeout and
+ * O(log n) expiry, replacing the former O(n) scans of `g_np_all` in
+ * `np_compute_timeout` / `np_expire_deadlines`. Each armed read/write deadline
+ * pushes one entry `{deadline, pd, is_read}`.
+ *
+ * ADDITIVE, not a replacement: `g_np_all` still backs scope-cancellation wakeups
+ * (`scope_cancel_io`) and GC root marking (`zap_netpoll_mark_roots`), which must
+ * enumerate every live descriptor. So a readiness wake or a scope cancel does NOT
+ * remove the pd's heap entry; the entry is reclaimed LAZILY when the poller pops
+ * it and finds the slot no longer armed with that exact deadline (deadline-
+ * equality validation under `pd->mu`). PollDescs are pooled and never `free`d (an
+ * idle one goes on `g_np_free`), so a heap entry's `pd` stays dereferenceable even
+ * after recycle; a recycled pd is re-armed with a fresh deadline, so a stale entry
+ * fails the equality check and is discarded. An equal deadline that is already due
+ * can only belong to a waiter whose own deadline has likewise passed, so waking it
+ * is correct even across a recycle.
+ *
+ * Lock order: the arm path holds `pd->mu` and then briefly takes `g_np_heap_mu` to
+ * push; the poller pops under `g_np_heap_mu`, RELEASES it, then takes `pd->mu` to
+ * validate and wake — so `g_np_heap_mu` and any `pd->mu` are never held together
+ * on the poller side, and no cycle forms with the `g_np_mu -> pd->mu` registry
+ * order. A heap entry holds only an infra pointer and integers (no GC pointers),
+ * so the heap itself needs no GC tracing; borrowed `Scope*`s are still pinned via
+ * `g_np_all` in `zap_netpoll_mark_roots`. */
+typedef struct NpTimer {
+    int64_t deadline;  /* absolute CLOCK_MONOTONIC ns */
+    PollDesc *pd;
+    int is_read;       /* 1 = read slot (rg / r_deadline), 0 = write slot */
+} NpTimer;
+static pthread_mutex_t g_np_heap_mu = PTHREAD_MUTEX_INITIALIZER;
+static NpTimer *g_np_heap = NULL;
+static size_t g_np_heap_len = 0;
+static size_t g_np_heap_cap = 0;
+
 static pthread_once_t g_np_once = PTHREAD_ONCE_INIT;
 static volatile int g_np_started = 0;
 /* Poller-thread exit latch (#213, D-0121). The shutdown thread sets it then
@@ -8997,28 +9031,66 @@ static void np_all_remove_locked(PollDesc *pd) { /* caller holds g_np_mu */
     pd->all_prev = pd->all_next = NULL;
 }
 
-/* epoll_wait timeout (ms) = time until the nearest pending deadline, -1 if none.
- * Capped at 1h so a far-future deadline still re-polls periodically. */
-static int np_compute_timeout(void) {
-    int have = 0;
-    int64_t best = 0;
-    zap_np_lock(&g_np_mu);
-    for (PollDesc *pd = g_np_all; pd; pd = pd->all_next) {
-        zap_np_lock(&pd->mu);
-        int64_t d = 0;
-        if (pd->rg && pd->r_deadline) {
-            d = pd->r_deadline;
-        }
-        if (pd->wg && pd->w_deadline && (d == 0 || pd->w_deadline < d)) {
-            d = pd->w_deadline;
-        }
-        zap_np_unlock(&pd->mu);
-        if (d && (!have || d < best)) {
-            best = d;
-            have = 1;
+/* --- deadline min-heap (#1410) -------------------------------------------- */
+static void np_heap_swap(size_t a, size_t b) {
+    NpTimer t = g_np_heap[a];
+    g_np_heap[a] = g_np_heap[b];
+    g_np_heap[b] = t;
+}
+/* Record an armed deadline. The caller holds the owning `pd->mu` (so the slot is
+ * armed atomically with the push, and a concurrent poller pop cannot observe the
+ * entry before the slot it validates against); this takes only `g_np_heap_mu`. */
+static void np_heap_push(int64_t deadline, PollDesc *pd, int is_read) {
+    zap_np_lock(&g_np_heap_mu);
+    if (g_np_heap_len == g_np_heap_cap) {
+        size_t ncap = g_np_heap_cap ? g_np_heap_cap * 2 : 16;
+        NpTimer *n = (NpTimer *)realloc(g_np_heap, ncap * sizeof(NpTimer));
+        if (!n) abort(); /* infra allocation: match the runtime's malloc-fail policy */
+        g_np_heap = n;
+        g_np_heap_cap = ncap;
+    }
+    size_t i = g_np_heap_len++;
+    g_np_heap[i].deadline = deadline;
+    g_np_heap[i].pd = pd;
+    g_np_heap[i].is_read = is_read;
+    while (i > 0) {
+        size_t parent = (i - 1) / 2;
+        if (g_np_heap[i].deadline < g_np_heap[parent].deadline) {
+            np_heap_swap(i, parent);
+            i = parent;
+        } else {
+            break;
         }
     }
-    zap_np_unlock(&g_np_mu);
+    zap_np_unlock(&g_np_heap_mu);
+}
+/* Remove and return the root (earliest deadline). Caller holds `g_np_heap_mu` and
+ * has checked `g_np_heap_len > 0`. */
+static NpTimer np_heap_pop_locked(void) {
+    NpTimer root = g_np_heap[0];
+    g_np_heap[0] = g_np_heap[--g_np_heap_len];
+    size_t i = 0;
+    for (;;) {
+        size_t l = 2 * i + 1, r = 2 * i + 2, m = i;
+        if (l < g_np_heap_len && g_np_heap[l].deadline < g_np_heap[m].deadline) m = l;
+        if (r < g_np_heap_len && g_np_heap[r].deadline < g_np_heap[m].deadline) m = r;
+        if (m == i) break;
+        np_heap_swap(i, m);
+        i = m;
+    }
+    return root;
+}
+
+/* epoll_wait timeout (ms) = time until the nearest pending deadline, -1 if none.
+ * Capped at 1h so a far-future deadline still re-polls periodically. The heap root
+ * may be a STALE entry (an earlier deadline whose waiter was already woken); that
+ * only yields a smaller timeout, i.e. an extra harmless poll wake after which
+ * `np_expire_deadlines` validates and discards the stale root. */
+static int np_compute_timeout(void) {
+    zap_np_lock(&g_np_heap_mu);
+    int have = g_np_heap_len > 0;
+    int64_t best = have ? g_np_heap[0].deadline : 0;
+    zap_np_unlock(&g_np_heap_mu);
     if (!have) {
         return -1;
     }
@@ -9033,31 +9105,43 @@ static int np_compute_timeout(void) {
     return (int)ms;
 }
 
-/* Wake every waiter whose deadline has passed (called after each poll wait). */
+/* Wake every waiter whose deadline has passed (called after each poll wait). Pop
+ * due roots from the heap; for each, validate under `pd->mu` that the slot is
+ * still parked with that exact deadline before waking — a mismatch means the entry
+ * is stale (the waiter was already woken by readiness or a scope cancel, or the pd
+ * was recycled and re-armed) and is simply discarded (lazy deletion). */
 static void np_expire_deadlines(void) {
     int64_t now = np_now_ns();
-    zap_np_lock(&g_np_mu);
-    for (PollDesc *pd = g_np_all; pd; pd = pd->all_next) {
-        zap_np_lock(&pd->mu);
-        if (pd->rg && pd->r_deadline && pd->r_deadline <= now) {
-            Waiter *w = pd->rg;
-            pd->rg = NULL;
-            pd->r_scope = NULL;
-            pd->r_deadline = 0;
-            w->val = ZAP_POLL_TIMEOUT;
-            coready(w);
+    for (;;) {
+        zap_np_lock(&g_np_heap_mu);
+        if (g_np_heap_len == 0 || g_np_heap[0].deadline > now) {
+            zap_np_unlock(&g_np_heap_mu);
+            break;
         }
-        if (pd->wg && pd->w_deadline && pd->w_deadline <= now) {
-            Waiter *w = pd->wg;
-            pd->wg = NULL;
-            pd->w_scope = NULL;
-            pd->w_deadline = 0;
-            w->val = ZAP_POLL_TIMEOUT;
-            coready(w);
+        NpTimer e = np_heap_pop_locked();
+        zap_np_unlock(&g_np_heap_mu);
+        zap_np_lock(&e.pd->mu);
+        if (e.is_read) {
+            if (e.pd->rg && e.pd->r_deadline == e.deadline) {
+                Waiter *w = e.pd->rg;
+                e.pd->rg = NULL;
+                e.pd->r_scope = NULL;
+                e.pd->r_deadline = 0;
+                w->val = ZAP_POLL_TIMEOUT;
+                coready(w);
+            }
+        } else {
+            if (e.pd->wg && e.pd->w_deadline == e.deadline) {
+                Waiter *w = e.pd->wg;
+                e.pd->wg = NULL;
+                e.pd->w_scope = NULL;
+                e.pd->w_deadline = 0;
+                w->val = ZAP_POLL_TIMEOUT;
+                coready(w);
+            }
         }
-        zap_np_unlock(&pd->mu);
+        zap_np_unlock(&e.pd->mu);
     }
-    zap_np_unlock(&g_np_mu);
 }
 
 #if defined(ZAP_NETPOLL_EPOLL)
@@ -9229,6 +9313,13 @@ static PollDesc *np_pd_alloc(int fd) {
         }
         pthread_mutex_init(&pd->mu, NULL);
     }
+    /* Reset under pd->mu (#1410): a recycled pd may still be referenced by a STALE
+     * deadline-heap entry, so the poller's `np_expire_deadlines` can be reading
+     * `rg`/`r_deadline` (etc.) under pd->mu concurrently with this reset. The pd is
+     * already off `g_np_all` (removed before being freed) and off `g_np_free`
+     * (popped above), so nothing else touches it here. Serializing closes the
+     * read/write race the former g_np_mu-guarded linear scan avoided implicitly. */
+    zap_np_lock(&pd->mu);
     pd->fd = fd;
     pd->closing = 0;
     pd->rg = pd->wg = NULL;
@@ -9241,6 +9332,7 @@ static PollDesc *np_pd_alloc(int fd) {
     pd->sock = 0;
     pd->afd = NULL;
 #endif
+    zap_np_unlock(&pd->mu);
     return pd;
 }
 
@@ -9323,6 +9415,9 @@ int64_t zap_netpoll_wait(void *pd_, int64_t mode, int64_t deadline_ns) {
         pd->wg = &w;
         pd->w_scope = g ? g->cancel_scope : NULL; /* #1398: see the read slot above */
         pd->w_deadline = deadline_ns;
+    }
+    if (deadline_ns) {
+        np_heap_push(deadline_ns, pd, is_read); /* #1410: deadline-ordered expiry */
     }
     /* Registration and the cancellation check share pd->mu with the canceller.
      * A cancel before registration is observed above; one after it wakes w. */
@@ -9444,20 +9539,18 @@ static void zap_netpoll_mark_roots(void) {
  * scope or not, without an fd — so thousands of concurrent sleepers cannot
  * exhaust file descriptors the way an fd-per-sleep park would).
  *
- * Mechanism: a `PollDesc` with NO fd. It is linked into the live registry
- * (`g_np_all`) only so the poller's existing deadline scan (`np_compute_timeout`
- * / `np_expire_deadlines`) wakes it at the deadline, `scope_cancel_io` wakes it
- * when its owning scope is cancelled, and `zap_netpoll_mark_roots` pins its
- * borrowed scope under Immix — but it is NEVER handed to `np_backend_add`, so no
- * epoll/IOCP registration and no fd. Returns ZAP_POLL_TIMEOUT (deadline passed),
- * ZAP_POLL_CANCELLED (scope cancelled), or ZAP_POLL_CLOSED (no poller available
- * — the caller then blocks). The read slot/`r_deadline` are the timer's; the
- * write slot is unused.
+ * Mechanism: a `PollDesc` with NO fd. Its deadline is recorded in the poller's
+ * deadline min-heap (#1410) so `np_compute_timeout` / `np_expire_deadlines` wake
+ * it at the deadline in O(log n); it is also linked into the live registry
+ * (`g_np_all`) so `scope_cancel_io` wakes it when its owning scope is cancelled
+ * and `zap_netpoll_mark_roots` pins its borrowed scope under Immix — but it is
+ * NEVER handed to `np_backend_add`, so no epoll/IOCP registration and no fd.
+ * Returns ZAP_POLL_TIMEOUT (deadline passed), ZAP_POLL_CANCELLED (scope cancelled),
+ * or ZAP_POLL_CLOSED (no poller available — the caller then blocks). The read
+ * slot/`r_deadline` are the timer's; the write slot is unused.
  *
  * Linux (epoll) only in v1; elsewhere it returns CLOSED and the caller keeps the
- * blocking fallback (the IOCP poller does not run the deadline scan). The linear
- * registry scan is reused as-is; a timer heap for very many concurrent sleepers
- * is a documented optimization follow-up. */
+ * blocking fallback (the IOCP poller does not run the deadline scan). */
 static int64_t zap_time_timer_wait(int64_t deadline_ns) {
 #if defined(ZAP_NETPOLL_EPOLL)
     if (np_ensure() != 0) {
@@ -9467,7 +9560,8 @@ static int64_t zap_time_timer_wait(int64_t deadline_ns) {
     if (!pd) {
         return ZAP_POLL_CLOSED;
     }
-    /* Link into the live registry (deadline scan + scope cancel + GC roots). */
+    /* Link into the live registry (scope cancel + GC roots; the deadline itself
+     * is tracked in the min-heap, pushed under pd->mu below). */
     zap_np_lock(&g_np_mu);
     pd->all_prev = NULL;
     pd->all_next = g_np_all;
@@ -9499,6 +9593,7 @@ static int64_t zap_time_timer_wait(int64_t deadline_ns) {
          * `cancel_scope` is a descendant of every enclosing scope. */
         pd->r_scope = g ? g->cancel_scope : NULL;
         pd->r_deadline = deadline_ns;
+        np_heap_push(deadline_ns, pd, 1); /* #1410: deadline-ordered expiry */
         /* A cancel before registration is observed above; one after it wakes w
          * via scope_cancel_io. Kick the poller so it folds our deadline into its
          * next epoll_wait timeout. */
