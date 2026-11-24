@@ -1623,6 +1623,7 @@ impl Checker {
         // even in a module that never declares them. A user interface of the same
         // name (declared below) overwrites, keeping the names in the user's hands.
         self.register_builtin_capabilities();
+        self.register_builtin_iteration_interfaces();
         // First register every type name so field/payload types (which may
         // reference a type declared later, or the enum itself — a recursive
         // variant, D-0046) resolve in the second pass.
@@ -2075,6 +2076,56 @@ impl Checker {
         ] {
             self.user_types.insert(name.clone());
             self.interfaces.insert(name, info);
+        }
+    }
+
+    /// Register the compiler-known **iteration interfaces** (#1382, RFC
+    /// discussion #1417): `Iterable[T]` and `Iterator[T]`, the nameable generic
+    /// structural interfaces a library writes in a signature (`-> Iterator[T]`).
+    /// Unlike the capability interfaces above these ARE generic (one type
+    /// parameter `T`): `T` appears in a method signature as `Ty::Named("T")` and
+    /// is substituted with the concrete element type at conformance (#1205).
+    ///
+    /// - `Iterable[T]` requires `__iter__(self) -> Iterator` (a fresh iterator).
+    /// - `Iterator[T]` requires the comma-ok `__next__(self) -> (T, bool)`
+    ///   (D-0048, the primary form — the hot iteration path never raises).
+    ///
+    /// `Iterator` is deliberately **not** a structural refinement of `Iterable`:
+    /// a generator expression has `__next__` but no `__iter__` (see the lowering
+    /// `setup_iter`), yet is a valid iterator. The "an iterator is itself
+    /// iterable" guarantee is realized by `iter(it)` returning the iterator
+    /// unchanged (a later phase), not by requiring every iterator to define
+    /// `__iter__`. Precise element typing flows through a conformer's own
+    /// concrete `__next__` signature, since `Ty::Named` carries no type
+    /// arguments.
+    fn register_builtin_iteration_interfaces(&mut self) {
+        let iterable = InterfaceInfo {
+            generics: vec!["T".to_string()],
+            assoc_types: Vec::new(),
+            methods: vec![(
+                "__iter__".to_string(),
+                FnSig {
+                    params: vec![param(Ty::Named("Iterable".to_string()))],
+                    ret: Ty::Named("Iterator".to_string()),
+                },
+            )],
+            supertypes: Vec::new(),
+        };
+        let iterator = InterfaceInfo {
+            generics: vec!["T".to_string()],
+            assoc_types: Vec::new(),
+            methods: vec![(
+                "__next__".to_string(),
+                FnSig {
+                    params: vec![param(Ty::Named("Iterator".to_string()))],
+                    ret: Ty::Tuple(vec![Ty::Named("T".to_string()), Ty::Bool]),
+                },
+            )],
+            supertypes: Vec::new(),
+        };
+        for (name, info) in [("Iterable", iterable), ("Iterator", iterator)] {
+            self.user_types.insert(name.to_string());
+            self.interfaces.insert(name.to_string(), info);
         }
     }
 
@@ -17717,6 +17768,74 @@ def main():
         assert!(c.conforms_with_args("Ints", "Boxed", &[Ty::Int64]).is_ok());
         assert!(c.conforms_with_args("Strs", "Boxed", &[Ty::Int64]).is_err());
     }
+
+    // ---- #1382 / RFC #1417: built-in Iterator[T] / Iterable[T] interfaces ----
+
+    #[test]
+    fn builtin_iteration_interfaces_are_registered_generic() {
+        // Iterator[T] / Iterable[T] exist before any user item, as GENERIC
+        // interfaces (one type parameter `T`) — unlike the non-generic capability
+        // interfaces. `__next__` is the comma-ok `(T, bool)` form.
+        let c = checker_with_types("def main():\n    print(1)\n");
+        let it = c.interfaces.get("Iterator").expect("Iterator registered");
+        assert_eq!(it.generics, vec!["T".to_string()]);
+        let (_, next) = it.methods.iter().find(|(n, _)| n == "__next__").unwrap();
+        assert_eq!(
+            next.ret,
+            Ty::Tuple(vec![Ty::Named("T".to_string()), Ty::Bool])
+        );
+        let ib = c.interfaces.get("Iterable").expect("Iterable registered");
+        assert_eq!(ib.generics, vec!["T".to_string()]);
+        let (_, iter) = ib.methods.iter().find(|(n, _)| n == "__iter__").unwrap();
+        assert_eq!(iter.ret, Ty::Named("Iterator".to_string()));
+    }
+
+    #[test]
+    fn struct_with_comma_ok_next_conforms_to_iterator_at_element_type() {
+        // A type whose `__next__` returns `(T, bool)` conforms to `Iterator[T]`
+        // for the matching element type, and not for a different one — the
+        // element type is substituted per instantiation (#1205).
+        let src = "struct IntIt:\n\
+            \x20   def __next__(self) -> (int64, bool):\n        return (0, True)\n\n\
+            struct StrIt:\n\
+            \x20   def __next__(self) -> (str, bool):\n        return (\"\", True)\n\n\
+            def main():\n    print(1)\n";
+        let c = checker_with_types(src);
+        assert!(c
+            .conforms_with_args("IntIt", "Iterator", &[Ty::Int64])
+            .is_ok());
+        assert!(c
+            .conforms_with_args("IntIt", "Iterator", &[Ty::Str])
+            .is_err());
+        assert!(c
+            .conforms_with_args("StrIt", "Iterator", &[Ty::Str])
+            .is_ok());
+    }
+
+    #[test]
+    fn non_iterator_struct_does_not_conform_to_iterator() {
+        // A type without `__next__` fails, and the reason names the missing method.
+        let src = "struct NoNext:\n\
+            \x20   def value(self) -> int64:\n        return 0\n\n\
+            def main():\n    print(1)\n";
+        let c = checker_with_types(src);
+        let reasons = c
+            .conforms_with_args("NoNext", "Iterator", &[Ty::Int64])
+            .unwrap_err();
+        assert!(
+            reasons.iter().any(|r| r.contains("__next__")),
+            "got: {reasons:?}"
+        );
+    }
+
+    // NOTE: end-to-end `Iterator[int64]` *value-position* conformance (passing a
+    // conformer where an `Iterator[int64]` parameter is expected) is NOT wired
+    // yet: at an argument site the parameter's resolved `Ty` is `Ty::Named(
+    // "Iterator")` with the `[int64]` dropped (Ty::Named carries no args), and
+    // `coercible` -> `conforms(s, i)` checks the interface with no type arguments.
+    // Enforcing the element type at value positions needs generic-interface type
+    // arguments carried in the type representation (a #1205 follow-up affecting
+    // every generic interface), tracked as the next sub-phase of #1382.
 
     #[test]
     fn two_parameter_generic_interface_substitutes_each() {
