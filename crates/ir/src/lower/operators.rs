@@ -25,6 +25,15 @@ impl<'a> FnLower<'a> {
     ) -> Result<(Value, Ty), LowerError> {
         use AstBin::*;
         let lt = Ty::Struct(sid);
+        // `Optional[T]` defines `==`/`!=` (structural) and ordering (a total
+        // order with `None` before every `Some`) directly, not via a
+        // `__eq__`/`__cmp__` dunder (#1368). Intercept before the dunder dispatch
+        // below, which would otherwise bail with "does not define '__eq__'".
+        if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
+            if let Some(opt) = optional_layout(self.ctx, lt) {
+                return self.optional_binop(op, &opt, l, r, rt);
+            }
+        }
         match op {
             Eq | Ne => {
                 // Left `__eq__` by name wins; else reflected `__req__` on the
@@ -166,6 +175,198 @@ impl<'a> FnLower<'a> {
                 self.call_dunder(sid, dunder, vec![(l, lt), (r, rt)])
             }
         }
+    }
+
+    /// `==`/`!=`/ordering on `Optional[T]` (#1368). `==`/`!=` are structural
+    /// (`None == None`; `Some(x) == Some(y)` iff `x == y`; `Some` never equals
+    /// `None`); ordering is a total order with `None` before every `Some`
+    /// (`Option<T>`-style). A bare payload on the right (`opt == 7`) is compared
+    /// as `opt == Some(7)`. The `Some`/`Some` payload comparison recurses into
+    /// the ordinary `binop`, so the payload type's own operator — and its clean
+    /// "not equatable/ordered" diagnostic when it lacks one — is reused.
+    fn optional_binop(
+        &mut self,
+        op: AstBin,
+        opt: &OptionalLayout,
+        l: Value,
+        r: Value,
+        rt: Ty,
+    ) -> Result<(Value, Ty), LowerError> {
+        use AstBin::*;
+        let optty = Ty::Struct(opt.sid);
+        // Normalize the right operand to the Optional type: a bare payload
+        // (`opt == 7`) becomes `Some(7)`.
+        let r = if rt == optty {
+            r
+        } else {
+            let inner = self.coerce(r, rt, opt.payload_ty);
+            gen_opt_some(self, opt, inner)
+        };
+        match op {
+            Eq | Ne => {
+                let bit = self.optional_eq(opt, l, r)?;
+                if matches!(op, Ne) {
+                    let d = self.new_value(Ty::I1);
+                    self.emit(Inst::Un {
+                        dest: d,
+                        op: UnOp::Not,
+                        val: bit,
+                    });
+                    Ok((d, Ty::I1))
+                } else {
+                    Ok((bit, Ty::I1))
+                }
+            }
+            // `a > b` == `b < a`, `a >= b` == `b <= a` — the operands (both now
+            // `Optional[T]`) are swapped and routed through the `<` / `<=` forms.
+            Lt => Ok((self.optional_lt(opt, l, r)?, Ty::I1)),
+            Le => Ok((self.optional_le(opt, l, r)?, Ty::I1)),
+            Gt => Ok((self.optional_lt(opt, r, l)?, Ty::I1)),
+            Ge => Ok((self.optional_le(opt, r, l)?, Ty::I1)),
+            _ => unreachable!("optional_binop is only called for a comparison operator"),
+        }
+    }
+
+    /// Structural `Optional[T]` equality (#1368): true iff both are `None`, or
+    /// both are `Some` with equal payloads. Payloads are only compared (via the
+    /// ordinary `==` lowering) in the both-`Some` block, so a niche `None`'s
+    /// absent payload is never read.
+    fn optional_eq(
+        &mut self,
+        opt: &OptionalLayout,
+        l: Value,
+        r: Value,
+    ) -> Result<Value, LowerError> {
+        let l_none = gen_opt_is_none(self, opt, l);
+        let r_none = gen_opt_is_none(self, opt, r);
+        let either = self.new_value(Ty::I1);
+        self.emit(Inst::Bin {
+            dest: either,
+            op: BinOp::Or,
+            lhs: l_none,
+            rhs: r_none,
+        });
+        let both = self.new_value(Ty::I1);
+        self.emit(Inst::Bin {
+            dest: both,
+            op: BinOp::And,
+            lhs: l_none,
+            rhs: r_none,
+        });
+        let slot = self.alloca(Ty::I1);
+        let none_bb = self.new_block();
+        let some_bb = self.new_block();
+        let end_bb = self.new_block();
+        self.set_term(Term::BrIf {
+            cond: either,
+            then_bb: none_bb,
+            else_bb: some_bb,
+        });
+        // At least one operand is `None`: equal iff both are `None`.
+        self.position(none_bb);
+        self.store(slot, both);
+        self.set_term(Term::Br(end_bb));
+        // Both are `Some`: compare the payloads with the ordinary `==`.
+        self.position(some_bb);
+        let lp = gen_opt_payload(self, opt, l);
+        let rp = gen_opt_payload(self, opt, r);
+        let (pe, _) = self.binop(AstBin::Eq, lp, opt.payload_ty, rp, opt.payload_ty)?;
+        self.store(slot, pe);
+        self.set_term(Term::Br(end_bb));
+        self.position(end_bb);
+        Ok(self.load(slot, Ty::I1))
+    }
+
+    /// `l < r` for `Optional[T]`, `None` before every `Some` (#1368):
+    /// `r` is `None` -> false (nothing is `< None`); else `l` is `None` -> true
+    /// (`None < Some`); else `lp < rp`.
+    fn optional_lt(
+        &mut self,
+        opt: &OptionalLayout,
+        l: Value,
+        r: Value,
+    ) -> Result<Value, LowerError> {
+        let slot = self.alloca(Ty::I1);
+        let r_none = gen_opt_is_none(self, opt, r);
+        let rnone_bb = self.new_block();
+        let rsome_bb = self.new_block();
+        let ltrue_bb = self.new_block();
+        let payload_bb = self.new_block();
+        let end_bb = self.new_block();
+        self.set_term(Term::BrIf {
+            cond: r_none,
+            then_bb: rnone_bb,
+            else_bb: rsome_bb,
+        });
+        self.position(rnone_bb);
+        let f = self.iconst(Ty::I1, 0);
+        self.store(slot, f);
+        self.set_term(Term::Br(end_bb));
+        self.position(rsome_bb);
+        let l_none = gen_opt_is_none(self, opt, l);
+        self.set_term(Term::BrIf {
+            cond: l_none,
+            then_bb: ltrue_bb,
+            else_bb: payload_bb,
+        });
+        self.position(ltrue_bb);
+        let t = self.iconst(Ty::I1, 1);
+        self.store(slot, t);
+        self.set_term(Term::Br(end_bb));
+        self.position(payload_bb);
+        let lp = gen_opt_payload(self, opt, l);
+        let rp = gen_opt_payload(self, opt, r);
+        let (pc, _) = self.binop(AstBin::Lt, lp, opt.payload_ty, rp, opt.payload_ty)?;
+        self.store(slot, pc);
+        self.set_term(Term::Br(end_bb));
+        self.position(end_bb);
+        Ok(self.load(slot, Ty::I1))
+    }
+
+    /// `l <= r` for `Optional[T]`, `None` before every `Some` (#1368):
+    /// `l` is `None` -> true (`None <= anything`); else `r` is `None` -> false;
+    /// else `lp <= rp`.
+    fn optional_le(
+        &mut self,
+        opt: &OptionalLayout,
+        l: Value,
+        r: Value,
+    ) -> Result<Value, LowerError> {
+        let slot = self.alloca(Ty::I1);
+        let l_none = gen_opt_is_none(self, opt, l);
+        let ltrue_bb = self.new_block();
+        let lsome_bb = self.new_block();
+        let rnone_bb = self.new_block();
+        let payload_bb = self.new_block();
+        let end_bb = self.new_block();
+        self.set_term(Term::BrIf {
+            cond: l_none,
+            then_bb: ltrue_bb,
+            else_bb: lsome_bb,
+        });
+        self.position(ltrue_bb);
+        let t = self.iconst(Ty::I1, 1);
+        self.store(slot, t);
+        self.set_term(Term::Br(end_bb));
+        self.position(lsome_bb);
+        let r_none = gen_opt_is_none(self, opt, r);
+        self.set_term(Term::BrIf {
+            cond: r_none,
+            then_bb: rnone_bb,
+            else_bb: payload_bb,
+        });
+        self.position(rnone_bb);
+        let f = self.iconst(Ty::I1, 0);
+        self.store(slot, f);
+        self.set_term(Term::Br(end_bb));
+        self.position(payload_bb);
+        let lp = gen_opt_payload(self, opt, l);
+        let rp = gen_opt_payload(self, opt, r);
+        let (pc, _) = self.binop(AstBin::Le, lp, opt.payload_ty, rp, opt.payload_ty)?;
+        self.store(slot, pc);
+        self.set_term(Term::Br(end_bb));
+        self.position(end_bb);
+        Ok(self.load(slot, Ty::I1))
     }
 
     /// Lower `x is None` / `x is not None` (#611, D18). Exactly one operand is a
