@@ -3726,7 +3726,11 @@ impl Parser {
                 // like a standalone `import`.
                 items.extend(self.parse_import().into_iter().map(Item::Import))
             }
-            TokenKind::Keyword(Keyword::When) => {
+            // `when` is a soft keyword (#1412): the conditional-compilation item
+            // only when item-leading and followed by its `target.` predicate;
+            // an ordinary identifier otherwise (it then falls to the `_` arm's
+            // statement parser).
+            TokenKind::Ident(n) if n == "when" && self.at_when_pred() => {
                 if !decos.is_empty() {
                     self.error_here(ErrorCode::ZAP2003, "decorators must precede a declaration");
                 }
@@ -4526,7 +4530,14 @@ impl Parser {
         self.expect_kw(Keyword::Import, "'import'");
         // CPython interop (D-0012) is a single-module form only; the list and
         // grouped forms (D-0052) apply to logical-name modules.
-        if self.eat_kw(Keyword::Python) {
+        //
+        // `python` is a soft keyword (#1412): it introduces the interop form
+        // only here, immediately after `import` AND immediately followed by the
+        // module string literal. Otherwise it is an ordinary identifier — so
+        // `import python` / `import python as p` import a logical module named
+        // `python` (handled by the module-list parser below).
+        if self.is_soft_kw("python") && matches!(self.peek2(), TokenKind::Str { .. }) {
+            self.bump(); // the `python` identifier, the interop-form keyword here
             let module = self.string_lit();
             let alias = if self.eat_kw(Keyword::As) {
                 Some(self.ident("alias"))
@@ -4652,20 +4663,14 @@ impl Parser {
     }
 
     fn is_compound_start(&self) -> bool {
-        // `match`, `scope`, `select` are soft keywords lexed as identifiers, so
-        // they are NOT listed here — [`try_soft_keyword_stmt`] dispatches them
-        // (it runs before this in `parse_line`).
+        // The soft keywords `match`, `scope`, `select` (Tier 1) and `do`,
+        // `unsafe`, `when` (Tier 2, #1412) are lexed as identifiers, so they are
+        // NOT listed here — [`try_soft_keyword_stmt`] dispatches them (it runs
+        // before this in `parse_line`).
         matches!(
             self.peek(),
             TokenKind::Keyword(
-                Keyword::If
-                    | Keyword::While
-                    | Keyword::Do
-                    | Keyword::For
-                    | Keyword::Try
-                    | Keyword::With
-                    | Keyword::Unsafe
-                    | Keyword::When
+                Keyword::If | Keyword::While | Keyword::For | Keyword::Try | Keyword::With
             )
         )
     }
@@ -4674,50 +4679,88 @@ impl Parser {
         match self.peek() {
             TokenKind::Keyword(Keyword::If) => self.parse_if(),
             TokenKind::Keyword(Keyword::While) => self.parse_while(),
-            TokenKind::Keyword(Keyword::Do) => self.parse_do_while(),
             TokenKind::Keyword(Keyword::For) => self.parse_for(),
             TokenKind::Keyword(Keyword::Try) => self.parse_try(),
             TokenKind::Keyword(Keyword::With) => self.parse_with(),
-            TokenKind::Keyword(Keyword::Unsafe) => self.parse_unsafe(),
-            TokenKind::Keyword(Keyword::When) => Stmt::Cfg(self.parse_cfg_stmt()),
             _ => unreachable!("parse_compound called on non-compound token"),
         }
     }
 
-    /// Contextual-keyword statement dispatch (#1405/#1411, epic #1413).
+    /// Contextual-keyword statement dispatch (epic #1413; Tier 1 #1405/#1411,
+    /// Tier 2 #1412).
     ///
-    /// `scope`, `select`, `match` are soft keywords: a keyword only when
-    /// statement-leading in their slot, an ordinary identifier otherwise.
-    /// Called at statement start (before [`is_compound_start`]); returns the
-    /// parsed statement when the slot marker is present, else `None` so the
-    /// word falls through to the expression/declaration parser as a plain
-    /// identifier (so `match(x)`, `x = select`, `scope.foo`, a named arg
-    /// `f(match=1)`, a field `str scope`, etc. all keep their identifier
-    /// meaning).
+    /// `scope`, `select`, `match`, `do`, `unsafe`, `when` are soft keywords: a
+    /// keyword only when statement-leading in their slot, an ordinary
+    /// identifier otherwise. (`spawn` is also a soft keyword but a *simple*
+    /// statement, dispatched in [`parse_simple_stmt`]; `python` is softened in
+    /// [`parse_import`].) Called at statement start (before
+    /// [`is_compound_start`]); returns the parsed statement when the slot marker
+    /// is present, else `None` so the word falls through to the
+    /// expression/declaration parser as a plain identifier (so `match(x)`,
+    /// `x = select`, `scope.foo`, `do = 1`, a named arg `f(when=1)`, a field
+    /// `str unsafe`, etc. all keep their identifier meaning).
     ///
-    /// The disambiguating marker is always a trailing `:` + indented block.
-    /// `match` additionally backtracks over a trial scrutinee parse — the same
-    /// rule CPython uses for its soft `match`: resolve to the statement iff a
-    /// clean subject expression is followed by `:` NEWLINE INDENT, else
-    /// identifier. `case` is never dispatched here; it is recognized only
-    /// inside a `match`/`select` body (see [`parse_match`]/[`parse_select`]).
+    /// The disambiguating marker is always a trailing `:` + indented block:
+    /// `select`/`do`/`unsafe` require the `:` immediately; `scope` allows one
+    /// balanced `(...)` first; `when` requires its `target.` predicate; `match`
+    /// backtracks over a trial scrutinee parse — the same rule CPython uses for
+    /// its soft `match`: resolve to the statement iff a clean subject expression
+    /// is followed by `:` NEWLINE INDENT, else identifier. `case` is never
+    /// dispatched here; it is recognized only inside a `match`/`select` body
+    /// (see [`parse_match`]/[`parse_select`]).
     fn try_soft_keyword_stmt(&mut self) -> Option<Stmt> {
         enum Soft {
             Scope,
             Select,
             Match,
+            Do,
+            Unsafe,
+            When,
         }
         let which = match self.peek() {
             TokenKind::Ident(n) if n == "scope" => Soft::Scope,
             TokenKind::Ident(n) if n == "select" => Soft::Select,
             TokenKind::Ident(n) if n == "match" => Soft::Match,
+            TokenKind::Ident(n) if n == "do" => Soft::Do,
+            TokenKind::Ident(n) if n == "unsafe" => Soft::Unsafe,
+            TokenKind::Ident(n) if n == "when" => Soft::When,
             _ => return None,
         };
         match which {
             Soft::Scope => self.at_scope_stmt().then(|| self.parse_scope()),
             Soft::Select => self.at_select_stmt().then(|| self.parse_select()),
             Soft::Match => self.at_match_stmt().then(|| self.parse_match()),
+            Soft::Do => self.at_block_stmt("do").then(|| self.parse_do_while()),
+            Soft::Unsafe => self.at_block_stmt("unsafe").then(|| self.parse_unsafe()),
+            Soft::When => self
+                .at_when_pred()
+                .then(|| Stmt::Cfg(self.parse_cfg_stmt())),
         }
+    }
+
+    /// A soft block-leading keyword `word` (`do`, `unsafe`) opens its statement
+    /// iff it is immediately followed by `:` NEWLINE INDENT; otherwise it is an
+    /// identifier. Pure lookahead — as with `select`, no identifier use of the
+    /// word is statement-leading and `:`-and-block terminated, so the marker
+    /// admits no false positive.
+    fn at_block_stmt(&self, word: &str) -> bool {
+        self.is_soft_kw(word)
+            && matches!(self.peek_nth(1), TokenKind::Colon)
+            && matches!(self.peek_nth(2), TokenKind::Newline)
+            && matches!(self.peek_nth(3), TokenKind::Indent)
+    }
+
+    /// `when` opens the conditional-compilation statement/item (#1412) iff it is
+    /// followed by its `target .` predicate head; otherwise it is an identifier.
+    /// Pure lookahead: a `when` predicate always begins with the contextual word
+    /// `target` then `.` (see [`parse_cfg_predicate`]), so `when = v`,
+    /// `when(x)`, `when.attr` and a bare `when` stay identifier uses, and a
+    /// member access `when.target` (`.` before `target`) is never mistaken for
+    /// the predicate.
+    fn at_when_pred(&self) -> bool {
+        self.is_soft_kw("when")
+            && matches!(self.peek_nth(1), TokenKind::Ident(n) if n == "target")
+            && matches!(self.peek_nth(2), TokenKind::Dot)
     }
 
     /// `select` opens the channel-select statement iff it is immediately
@@ -4792,7 +4835,7 @@ impl Parser {
     /// the matching arm before any later phase runs.
     fn parse_cfg_items(&mut self) -> CfgItemBlock {
         let start = self.peek_span().start;
-        self.expect_kw(Keyword::When, "'when'");
+        self.expect_soft_kw("when");
         let mut arms = Vec::new();
         let pred = self.parse_cfg_predicate();
         let body = self.parse_item_block();
@@ -4831,7 +4874,7 @@ impl Parser {
     /// statement block, reusing [`Self::parse_block`].
     fn parse_cfg_stmt(&mut self) -> CfgStmtBlock {
         let start = self.peek_span().start;
-        self.expect_kw(Keyword::When, "'when'");
+        self.expect_soft_kw("when");
         let mut arms = Vec::new();
         let pred = self.parse_cfg_predicate();
         let body = self.parse_block();
@@ -4990,7 +5033,7 @@ impl Parser {
     /// options, no new scope — just a body whose statements may make such calls.
     fn parse_unsafe(&mut self) -> Stmt {
         let start = self.peek_span().start;
-        self.expect_kw(Keyword::Unsafe, "'unsafe'");
+        self.expect_soft_kw("unsafe");
         let body = self.parse_block();
         Stmt::Unsafe {
             body,
@@ -5037,7 +5080,7 @@ impl Parser {
 
     fn parse_do_while(&mut self) -> Stmt {
         let start = self.peek_span().start;
-        self.expect_kw(Keyword::Do, "'do'");
+        self.expect_soft_kw("do");
         let body = self.parse_block();
         self.expect_kw(Keyword::While, "'while'");
         let cond = self.parse_expr();
@@ -5439,11 +5482,12 @@ impl Parser {
         if self.eat_kw(Keyword::Continue) {
             return Stmt::Continue(self.span_from(start));
         }
-        if self.eat_kw(Keyword::Spawn) {
-            // `detached` is a contextual modifier (D-0044), not a reserved word:
-            // valid only immediately after `spawn` and only when it introduces a
-            // call (`spawn detached f(...)`). A bare `detached` identifier that is
-            // itself the callee (`spawn detached()`) stays an ordinary call.
+        if self.is_soft_kw("spawn") {
+            self.bump(); // the `spawn` identifier, the keyword at statement start
+                         // `detached` is a contextual modifier (D-0044), not a reserved word:
+                         // valid only immediately after `spawn` and only when it introduces a
+                         // call (`spawn detached f(...)`). A bare `detached` identifier that is
+                         // itself the callee (`spawn detached()`) stays an ordinary call.
             let detached = matches!(self.peek(), TokenKind::Ident(n) if n == "detached")
                 && !matches!(self.peek2(), TokenKind::LParen);
             if detached {
@@ -9421,5 +9465,333 @@ def main():
             panic!("select");
         };
         assert!(matches!(&cases[0].body.stmts[0], Stmt::Match { .. }));
+    }
+
+    // ----------------------------------------------------------------------
+    // Tier 2 soft (contextual) keywords: `spawn`, `when`, `do`, `unsafe`,
+    // `python` (#1412, epic #1413). Same walled-garden contract as Tier 1 —
+    // both meanings in one program per keyword.
+    // ----------------------------------------------------------------------
+
+    fn imports(m: &Module) -> Vec<&Import> {
+        m.items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Import(im) => Some(im),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn do_soft_keyword_both_meanings_coexist() {
+        let src = "\
+struct Job:
+    str do
+
+def run(str do) -> str:
+    return do
+
+def main():
+    auto j = Job(do=\"build\")
+    print(j.do)
+    auto do = run(do=\"x\")
+    print(do)
+    do:
+        step()
+    while go
+";
+        let m = parse_ok(src);
+        assert_eq!(only_struct(&m).fields[0].name, "do");
+        let st = fn_stmts(&m, "main");
+        let Stmt::Let { value, .. } = &st[0] else {
+            panic!("let j");
+        };
+        let Expr::Call { args, .. } = value else {
+            panic!("Job(...)");
+        };
+        assert_eq!(args[0].name.as_deref(), Some("do")); // named arg
+        let Stmt::Expr(Expr::Call { args, .. }) = &st[1] else {
+            panic!("print(j.do)");
+        };
+        assert!(matches!(&args[0].value, Expr::Attr { name, .. } if name == "do")); // attr
+        assert!(matches!(&st[2], Stmt::Let { name, .. } if name == "do")); // variable
+        assert!(matches!(&st[4], Stmt::DoWhile { .. })); // statement form
+    }
+
+    #[test]
+    fn unsafe_soft_keyword_both_meanings_coexist() {
+        let src = "\
+struct Cfg:
+    bool unsafe
+
+def run(bool unsafe) -> bool:
+    return unsafe
+
+def main():
+    auto c = Cfg(unsafe=True)
+    print(c.unsafe)
+    auto unsafe = c.unsafe
+    print(unsafe)
+    unsafe:
+        lowlevel()
+";
+        let m = parse_ok(src);
+        assert_eq!(only_struct(&m).fields[0].name, "unsafe");
+        let st = fn_stmts(&m, "main");
+        let Stmt::Let { value, .. } = &st[0] else {
+            panic!("let c");
+        };
+        let Expr::Call { args, .. } = value else {
+            panic!("Cfg(...)");
+        };
+        assert_eq!(args[0].name.as_deref(), Some("unsafe"));
+        let Stmt::Expr(Expr::Call { args, .. }) = &st[1] else {
+            panic!("print(c.unsafe)");
+        };
+        assert!(matches!(&args[0].value, Expr::Attr { name, .. } if name == "unsafe"));
+        assert!(matches!(&st[2], Stmt::Let { name, .. } if name == "unsafe"));
+        assert!(matches!(&st[4], Stmt::Unsafe { .. }));
+    }
+
+    #[test]
+    fn spawn_soft_keyword_both_meanings_coexist() {
+        let src = "\
+struct Job:
+    str spawn
+
+def run(str spawn) -> str:
+    return spawn
+
+def main():
+    auto j = Job(spawn=\"w\")
+    print(j.spawn)
+    auto spawn = j.spawn
+    print(spawn)
+    spawn worker()
+";
+        let m = parse_ok(src);
+        assert_eq!(only_struct(&m).fields[0].name, "spawn");
+        let st = fn_stmts(&m, "main");
+        let Stmt::Let { value, .. } = &st[0] else {
+            panic!("let j");
+        };
+        let Expr::Call { args, .. } = value else {
+            panic!("Job(...)");
+        };
+        assert_eq!(args[0].name.as_deref(), Some("spawn"));
+        let Stmt::Expr(Expr::Call { args, .. }) = &st[1] else {
+            panic!("print(j.spawn)");
+        };
+        assert!(matches!(&args[0].value, Expr::Attr { name, .. } if name == "spawn"));
+        assert!(matches!(&st[2], Stmt::Let { name, .. } if name == "spawn"));
+        // `print(spawn)` — `spawn` as a general expression (an argument value)
+        let Stmt::Expr(Expr::Call { args, .. }) = &st[3] else {
+            panic!("print(spawn)");
+        };
+        assert!(matches!(&args[0].value, Expr::Name(n, _) if n == "spawn"));
+        // statement-leading `spawn worker()` — the spawn statement
+        assert!(matches!(
+            &st[4],
+            Stmt::Spawn {
+                detached: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn spawn_statement_wins_at_statement_start_but_is_an_identifier_elsewhere() {
+        // Per #1412, `spawn` has no `:` marker: prefer the keyword at statement
+        // start, identifier elsewhere (RHS value, named-arg label).
+        let m = parse_ok("def main():\n    auto x = spawn\n    use(spawn=x)\n    spawn worker()\n");
+        let st = fn_stmts(&m, "main");
+        // `auto x = spawn` — `spawn` is an ordinary name on the RHS
+        let Stmt::Let { value, .. } = &st[0] else {
+            panic!("let x");
+        };
+        assert!(matches!(value, Expr::Name(n, _) if n == "spawn"));
+        // `use(spawn=x)` — a named-argument label `spawn`
+        let Stmt::Expr(Expr::Call { args, .. }) = &st[1] else {
+            panic!("use(spawn=x)");
+        };
+        assert_eq!(args[0].name.as_deref(), Some("spawn"));
+        // statement-leading `spawn worker()` — the keyword
+        assert!(matches!(&st[2], Stmt::Spawn { .. }));
+    }
+
+    #[test]
+    fn when_soft_keyword_both_meanings_coexist() {
+        let src = "\
+struct Rule:
+    str when
+
+def run(str when) -> str:
+    return when
+
+def main():
+    auto r = Rule(when=\"always\")
+    print(r.when)
+    auto when = r.when
+    print(when)
+    when target.os == .linux:
+        a()
+    else:
+        b()
+";
+        let m = parse_ok(src);
+        assert_eq!(only_struct(&m).fields[0].name, "when");
+        let st = fn_stmts(&m, "main");
+        let Stmt::Let { value, .. } = &st[0] else {
+            panic!("let r");
+        };
+        let Expr::Call { args, .. } = value else {
+            panic!("Rule(...)");
+        };
+        assert_eq!(args[0].name.as_deref(), Some("when"));
+        let Stmt::Expr(Expr::Call { args, .. }) = &st[1] else {
+            panic!("print(r.when)");
+        };
+        assert!(matches!(&args[0].value, Expr::Attr { name, .. } if name == "when"));
+        assert!(matches!(&st[2], Stmt::Let { name, .. } if name == "when"));
+        assert!(matches!(&st[4], Stmt::Cfg(_))); // conditional-compilation statement
+    }
+
+    #[test]
+    fn when_item_level_conditional_compilation_still_parses() {
+        // `when target.*:` at ITEM level stays the conditional-compilation item.
+        let m = parse_ok("when target.os == .linux:\n    import a\nelse:\n    import b\n");
+        assert!(
+            m.items.iter().any(|i| matches!(i, Item::Cfg(_))),
+            "expected a top-level cfg item"
+        );
+    }
+
+    #[test]
+    fn when_without_its_predicate_stays_an_identifier() {
+        // `when = v`, `when(x)`, `when.attr`, and a member access `when.target`
+        // are all identifier uses — only `when target.` opens the cfg.
+        let m = parse_ok(
+            "def main():\n    auto when = 1\n    when = 2\n    when(x)\n    when.target\n",
+        );
+        let st = fn_stmts(&m, "main");
+        let Stmt::Assign { target, .. } = &st[1] else {
+            panic!("when = 2, got {:?}", st[1]);
+        };
+        assert!(matches!(target, Expr::Name(n, _) if n == "when"));
+        let Stmt::Expr(Expr::Call { callee, .. }) = &st[2] else {
+            panic!("when(x)");
+        };
+        assert!(matches!(&**callee, Expr::Name(n, _) if n == "when"));
+        let Stmt::Expr(Expr::Attr { base, name, .. }) = &st[3] else {
+            panic!("when.target");
+        };
+        assert_eq!(name, "target");
+        assert!(matches!(&**base, Expr::Name(n, _) if n == "when"));
+    }
+
+    #[test]
+    fn do_and_unsafe_calls_without_block_stay_identifier_calls() {
+        // Statement-leading `do(x)` / `unsafe(x)` with no `:`+block are calls on
+        // variables named `do` / `unsafe`, not the block statements.
+        let m = parse_ok("def main():\n    do(x)\n    unsafe(y)\n");
+        let st = fn_stmts(&m, "main");
+        let Stmt::Expr(Expr::Call { callee, .. }) = &st[0] else {
+            panic!("do(x), got {:?}", st[0]);
+        };
+        assert!(matches!(&**callee, Expr::Name(n, _) if n == "do"));
+        let Stmt::Expr(Expr::Call { callee, .. }) = &st[1] else {
+            panic!("unsafe(y), got {:?}", st[1]);
+        };
+        assert!(matches!(&**callee, Expr::Name(n, _) if n == "unsafe"));
+    }
+
+    #[test]
+    fn python_soft_keyword_both_meanings_coexist() {
+        // `import python "mod"` is the CPython-interop form; `import python`
+        // imports a logical module named `python`; and `python` is a plain
+        // identifier as field / param / named arg / attribute / variable.
+        let src = "\
+import python \"numpy\" as np
+import python
+
+struct Shim:
+    str python
+
+def run(str python) -> str:
+    return python
+
+def main():
+    auto s = Shim(python=\"3.12\")
+    print(s.python)
+    auto python = s.python
+    print(python)
+";
+        let m = parse_ok(src);
+        let ims = imports(&m);
+        assert!(
+            matches!(&ims[0], Import::Python { module, alias, .. }
+                if module == "numpy" && alias.as_deref() == Some("np")),
+            "first import should be the python-interop form"
+        );
+        assert!(
+            matches!(&ims[1], Import::Module { path, alias, .. }
+                if path == "python" && alias.is_none()),
+            "second import should be a module literally named `python`"
+        );
+        assert_eq!(only_struct(&m).fields[0].name, "python");
+        let st = fn_stmts(&m, "main");
+        let Stmt::Let { value, .. } = &st[0] else {
+            panic!("let s");
+        };
+        let Expr::Call { args, .. } = value else {
+            panic!("Shim(...)");
+        };
+        assert_eq!(args[0].name.as_deref(), Some("python"));
+        let Stmt::Expr(Expr::Call { args, .. }) = &st[1] else {
+            panic!("print(s.python)");
+        };
+        assert!(matches!(&args[0].value, Expr::Attr { name, .. } if name == "python"));
+        assert!(matches!(&st[2], Stmt::Let { name, .. } if name == "python"));
+    }
+
+    #[test]
+    fn tier2_soft_keywords_coexist_in_one_program() {
+        // All five Tier-2 words as identifiers (fields + params) and their
+        // statement forms together, proving no cross-interference.
+        let src = "\
+struct Bag:
+    str spawn
+    str do
+    bool unsafe
+    str when
+    str python
+
+def tags(str spawn, str do, bool unsafe, str when, str python) -> str:
+    return spawn
+
+def main():
+    auto b = Bag(spawn=\"s\", do=\"d\", unsafe=False, when=\"w\", python=\"p\")
+    print(tags(spawn=b.spawn, do=b.do, unsafe=b.unsafe, when=b.when, python=b.python))
+    auto n = 0
+    do:
+        n = n + 1
+    while go
+    unsafe:
+        lowlevel()
+    spawn worker()
+    when target.os == .linux:
+        a()
+";
+        let m = parse_ok(src);
+        let s = only_struct(&m);
+        let names: Vec<&str> = s.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["spawn", "do", "unsafe", "when", "python"]);
+        let st = fn_stmts(&m, "main");
+        // st[0] = `auto b = ...`, st[1] = `print(tags(...))`, st[2] = `auto n = 0`
+        assert!(matches!(&st[3], Stmt::DoWhile { .. }));
+        assert!(matches!(&st[4], Stmt::Unsafe { .. }));
+        assert!(matches!(&st[5], Stmt::Spawn { .. }));
+        assert!(matches!(&st[6], Stmt::Cfg(_)));
     }
 }
