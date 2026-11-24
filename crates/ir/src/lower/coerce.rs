@@ -98,7 +98,14 @@ impl<'a> FnLower<'a> {
                         // null renderer slot rather than failing construction, so an
                         // interface used only for method dispatch is never regressed.
                         if !self.ctx.iface_renderers.borrow().contains_key(&from_sid) {
-                            if let Ok(sym) = self.struct_repr_fn(from_sid) {
+                            // One renderer slot per itable (#707): keep the
+                            // str-preferred renderer so `print`/`str` of an
+                            // interface value is unchanged. `repr()` of a bare
+                            // interface value therefore uses the concrete type's
+                            // str-preferred renderer for a dual-dunder type — a
+                            // narrow, documented #707 follow-up (a second repr
+                            // slot), not Iterator/#1384-blocking.
+                            if let Ok(sym) = self.struct_repr_fn(from_sid, false) {
                                 self.ctx.iface_renderers.borrow_mut().insert(from_sid, sym);
                             }
                         }

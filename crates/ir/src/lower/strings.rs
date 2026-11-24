@@ -127,7 +127,7 @@ impl<'a> FnLower<'a> {
                 if let Some(iid) = self.ctx.iid_of_fat_sid(sid) {
                     return self.render_iface_value(v, iid);
                 }
-                return self.struct_to_str(sid, v);
+                return self.struct_to_str(sid, v, matches!(mode, RenderMode::Repr));
             }
             // A tier-1 enum (D-0018): the qualified canonical variant name,
             // `EnumName.VARIANT`, reusing the `.name` discriminant→name chain. An

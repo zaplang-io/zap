@@ -17,8 +17,19 @@ impl<'a> FnLower<'a> {
     /// default field-wise form `TypeName(field=value, …)` — and invokes it. The
     /// call is `throwing` because a user-defined `__str__`/`__repr__` (or a
     /// `bytes` field in the default render) may raise.
-    pub(super) fn struct_to_str(&mut self, sid: u32, v: Value) -> Result<Value, LowerError> {
-        let f = self.struct_repr_fn(sid)?;
+    ///
+    /// `prefer_repr` selects the dunder preference for a type defining BOTH
+    /// `__str__` and `__repr__` (#1384): `false` (str contexts: top-level
+    /// `str()`/`print()`/f-string) prefers `__str__`; `true` (repr contexts:
+    /// `repr()` and every container element, Python-exact) prefers `__repr__`.
+    /// For a type defining only one dunder, or none, the choice is immaterial.
+    pub(super) fn struct_to_str(
+        &mut self,
+        sid: u32,
+        v: Value,
+        prefer_repr: bool,
+    ) -> Result<Value, LowerError> {
+        let f = self.struct_repr_fn(sid, prefer_repr)?;
         let d = self.new_value(Ty::Ptr);
         self.throwing_call(Some(d), &f, vec![v]);
         Ok(d)
@@ -70,7 +81,11 @@ impl<'a> FnLower<'a> {
     /// Only an interface value's fat struct still has no default and is rejected
     /// with a clean coded error pointing at the #707 follow-up — never an ICE or a
     /// nonsense render over synthetic `$data`/`$itable` slots.
-    pub(super) fn struct_repr_fn(&mut self, sid: u32) -> Result<String, LowerError> {
+    pub(super) fn struct_repr_fn(
+        &mut self,
+        sid: u32,
+        prefer_repr: bool,
+    ) -> Result<String, LowerError> {
         // Tuples have no `ctx.names` entry (their ids sit past `names.len()`), so
         // they MUST be handled before any `names[sid]` lookup — the same ordering
         // the tuple key-fn path relies on (#680).
@@ -122,11 +137,18 @@ impl<'a> FnLower<'a> {
                 self.ctx.names[sid as usize]
             )));
         }
-        // An explicit `__str__` (preferred) or `__repr__` / `@derive(Repr)` wins
-        // over the default — for a tier-3 enum too (its methods mangle to the
-        // same `{Name}__{dunder}`), so this is tested BEFORE the enum's default
-        // structural renderer below.
-        for dunder in ["__str__", "__repr__"] {
+        // An explicit `__str__`/`__repr__` / `@derive(Repr)` wins over the
+        // default — for a tier-3 enum too (its methods mangle to the same
+        // `{Name}__{dunder}`), so this is tested BEFORE the enum's default
+        // structural renderer below. `prefer_repr` flips the preference for a
+        // type defining BOTH (#1384): repr contexts try `__repr__` first, str
+        // contexts `__str__` first; each still falls back to the other.
+        let order = if prefer_repr {
+            ["__repr__", "__str__"]
+        } else {
+            ["__str__", "__repr__"]
+        };
+        for dunder in order {
             let mangled = format!("{}__{}", self.ctx.names[sid as usize], dunder);
             if self.sigs.contains_key(&mangled) {
                 return Ok(mangled);

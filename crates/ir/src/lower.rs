@@ -9507,6 +9507,71 @@ impl<'a> FnLower<'a> {
                 let (v, vt) = self.expr(&args[0].value)?;
                 return Ok((self.render_str(v, vt)?, Ty::Ptr));
             }
+            if fname == "repr" {
+                // repr(x) (#1384): the debug form — the `RenderMode::Repr` side of
+                // the one value-rendering protocol. A top-level `str` is quoted
+                // (`'hi'`), `bytes` is `b'…'`, containers render with element
+                // `repr`, and a user type resolves `__repr__` first (Python-exact,
+                // threaded through `render_value`/`struct_repr_fn`).
+                if args.len() != 1 {
+                    return Err(err("repr() takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                return Ok((self.render_value(v, vt, RenderMode::Repr)?, Ty::Ptr));
+            }
+            if fname == "ascii" {
+                // ascii(x) (#1384): `repr(x)` with every non-ASCII codepoint
+                // backslash-escaped (`\xNN` <= 0xff, `\uNNNN` <= 0xffff, else
+                // `\UNNNNNNNN`). The repr output already passes high bytes through
+                // as raw UTF-8, so the escape pass decodes and re-emits them.
+                if args.len() != 1 {
+                    return Err(err("ascii() takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                let r = self.render_value(v, vt, RenderMode::Repr)?;
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_ascii_escape".to_string(),
+                    args: vec![r],
+                });
+                return Ok((d, Ty::Ptr));
+            }
+            if fname == "bin" || fname == "oct" || fname == "hex" {
+                // bin/oct/hex(n) (#1384): an integer in Python sign-magnitude base
+                // form with the `0b`/`0o`/`0x` prefix. Signed ints sign-extend to
+                // i64 (`zap_int_to_base`), unsigned zero-extend to u64 (no phantom
+                // sign, `zap_uint_to_base`), and `bigint` formats from its limbs by
+                // short division (`zap_bigint_to_base`). The base is a compile-time
+                // constant, so these never raise (type errors are caught in sema).
+                if args.len() != 1 {
+                    return Err(err("base-format built-in takes exactly one argument"));
+                }
+                let base: i64 = match fname.as_str() {
+                    "bin" => 2,
+                    "oct" => 8,
+                    _ => 16,
+                };
+                let base_v = self.iconst(Ty::I32, base);
+                let (v, vt) = self.expr(&args[0].value)?;
+                let d = self.new_value(Ty::Ptr);
+                let (func, arg) = match vt {
+                    Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => {
+                        ("zap_int_to_base", self.coerce(v, vt, Ty::I64))
+                    }
+                    Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 => {
+                        ("zap_uint_to_base", self.coerce(v, vt, Ty::U64))
+                    }
+                    Ty::Bigint => ("zap_bigint_to_base", v),
+                    _ => return Err(err("bin()/oct()/hex() expect an integer argument")),
+                };
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: func.to_string(),
+                    args: vec![arg, base_v],
+                });
+                return Ok((d, Ty::Ptr));
+            }
             if fname == "bytes" {
                 // bytes(): empty; bytes(str): the UTF-8 bytes (shares the ZapStr
                 // buffer — both are immutable); bytes(list[int64]): one byte per

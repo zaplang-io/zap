@@ -3541,6 +3541,27 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // carries a phantom minus sign. Narrower unsigned values are zero-extended
         // into the `i64` word by lowering before the call.
         self.declare_rt("zap_u64_to_str", &[i.into()], Some(p.into()));
+        // Representation / base-formatting built-ins (#1384). `zap_ascii_escape`
+        // post-processes a `repr` string; the three base kernels render an
+        // integer in the `0b`/`0o`/`0x` sign-magnitude form (base passed as a
+        // compile-time i32): signed i64, unsigned u64, and a `bigint` (by limb
+        // short-division).
+        self.declare_rt("zap_ascii_escape", &[p.into()], Some(p.into()));
+        self.declare_rt(
+            "zap_int_to_base",
+            &[i.into(), self.ctx.i32_type().into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_uint_to_base",
+            &[i.into(), self.ctx.i32_type().into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_bigint_to_base",
+            &[p.into(), self.ctx.i32_type().into()],
+            Some(p.into()),
+        );
         self.declare_rt("zap_str_eq", &[p.into(), p.into()], Some(i.into()));
         // Power-assert value rendering (ticket #73, D-0054).
         self.declare_rt("zap_f64_to_str", &[f.into()], Some(p.into()));
