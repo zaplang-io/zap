@@ -56,18 +56,28 @@ impl<'a> FnLower<'a> {
             }
             Stmt::Assign { target, value, .. } => {
                 if let Expr::Name(n, span) = target {
-                    let (v, vt) = self.expr(value)?;
                     // A local slot, or a module-level mutable global's slot
-                    // (D-0112, #662) — stored into identically.
+                    // (D-0112, #662) — stored into identically. Resolve the slot
+                    // (and its declared type) first so the right-hand side is
+                    // lowered *against* that type.
                     let (ptr, ty) = self
                         .name_lvalue(n)
                         .ok_or_else(|| err(format!("unknown variable '{n}'")))?;
-                    // Reassigning a `fn(...)`-typed binding is still a coercion
-                    // into a function slot, so it must match structurally (I#465).
-                    if let Ty::Func(t_idx) = ty {
-                        self.check_fn_coercion(&vt, t_idx, zapc_diag::ErrorCode::ZAP4001)?;
-                    }
-                    let v = self.coerce(v, vt, ty);
+                    // Lower the value in the slot's type context via the shared
+                    // `expr_coerced` chokepoint — the same path constructor
+                    // fields, field assignment, index/key assignment, `.append`,
+                    // call arguments and returns use. That is what boxes a bare
+                    // payload `T` reassigned into an `Optional[T]` local as a
+                    // tagged/boxed `Some(T)` (#1262's symmetric partner, #1362)
+                    // and lowers a bare `None` to the slot's canonical empty
+                    // option, instead of storing the raw scalar/pointer straight
+                    // into the Optional slot (a later `.is_some()` / `.unwrap()`
+                    // would otherwise dereference the raw bits as an Optional and
+                    // SIGSEGV — a memory-safety violation in a checked program).
+                    // `expr_coerced` also performs the `fn(...)` signature check
+                    // (I#465) and the final `coerce`, so no behaviour is lost for
+                    // the non-Optional cases this path already handled.
+                    let v = self.expr_coerced(value, ty, zapc_diag::ErrorCode::ZAP4001)?;
                     // Value structs copy on assignment (D-0051).
                     let v = self.copy_if_value(v, ty, value);
                     self.store_name(n, ptr, ty, v, *span);
