@@ -682,6 +682,13 @@ const BUILTINS: &[&str] = &[
     // forms never route through float; divmod agrees with floored `//` and `%`.
     "abs",
     "divmod",
+    // Python-parity numeric built-ins (#1381): `round(x[, ndigits])` with
+    // banker's (ties-to-even) rounding, and `pow(base, exp[, mod])` whose
+    // two-argument form is exactly `**` (int-exact) and whose three-argument
+    // form is integer modular exponentiation. (`math.round`/`math.pow` are the
+    // float-domain module functions; these are the Python built-ins.)
+    "round",
+    "pow",
     // Idiomatic-loop built-ins (#1285): truth reductions and a non-mutating
     // reverse. `enumerate`/`zip` remain follow-ups.
     "any",
@@ -8526,6 +8533,178 @@ impl Checker {
                     // unsigned, `(float64, float64)` for floats.
                     let j = num_join(&ta, &tb);
                     return Ty::Tuple(vec![j.clone(), j]);
+                }
+                // `round(x[, ndigits])` (#1381): Python's built-in rounding with
+                // banker's (ties-to-even) semantics — distinct from the
+                // float-domain `math.round` (half-away-from-zero). With no
+                // `ndigits`, a float rounds to an `int64` (overflow raises a
+                // catchable ArithmeticError) and an integer is returned
+                // unchanged. With `ndigits`, a float rounds to a `float64` and an
+                // integer to an `int64` (negative `ndigits` rounds to a power of
+                // ten). `ndigits` must be an integer. bigint/complex are
+                // follow-ups, matching abs/divmod (#1283).
+                "round" => {
+                    if let Some(a) = args.iter().find(|a| a.name.is_some()) {
+                        self.error(
+                            ErrorCode::ZAP4023,
+                            format!(
+                                "round() takes no keyword arguments; unexpected '{}'",
+                                a.name.as_deref().unwrap_or_default()
+                            ),
+                            span,
+                        );
+                    }
+                    if args.is_empty() || args.len() > 2 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!(
+                                "round() takes one or two arguments (round(x[, ndigits])), got {}",
+                                args.len()
+                            ),
+                            span,
+                        );
+                        for a in args {
+                            self.infer(&a.value);
+                        }
+                        return Ty::Unknown;
+                    }
+                    let t = self.infer(&args[0].value);
+                    let numeric_scalar = matches!(t, Ty::Unknown)
+                        || matches!(t, Ty::Float64 | Ty::Float32 | Ty::UntypedFloat)
+                        || (t.is_int() && !matches!(t, Ty::Bigint));
+                    if !numeric_scalar {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "round() takes a numeric scalar first argument (int, uint, \
+                                 or float), got {} (bigint and complex are not supported yet)",
+                                t.display()
+                            ),
+                            span,
+                        );
+                        return Ty::Unknown;
+                    }
+                    let has_ndigits = args.len() == 2;
+                    if has_ndigits {
+                        let nt = self.infer(&args[1].value);
+                        if !nt.is_int() && !matches!(nt, Ty::Unknown) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!("round() ndigits must be an integer, got {}", nt.display()),
+                                span,
+                            );
+                        }
+                    }
+                    if matches!(t, Ty::Unknown) {
+                        return Ty::Unknown;
+                    }
+                    let is_float = matches!(t, Ty::Float64 | Ty::Float32 | Ty::UntypedFloat);
+                    return match (is_float, has_ndigits) {
+                        // round(float) -> int64 (banker's, overflow raises).
+                        (true, false) => Ty::Int64,
+                        // round(float, n) -> float64.
+                        (true, true) => Ty::Float64,
+                        // round(int) -> the integer unchanged (preserve signedness).
+                        (false, false) => {
+                            if t.is_unsigned() {
+                                Ty::Uint64
+                            } else {
+                                Ty::Int64
+                            }
+                        }
+                        // round(int, n) -> int64 (power-of-ten rounding for n<0).
+                        (false, true) => Ty::Int64,
+                    };
+                }
+                // `pow(base, exp[, mod])` (#1381). The two-argument form is
+                // exactly `base ** exp` over the numeric tower (int-exact via
+                // `zap_ipow`, float via `zap_powf`, plus bigint/complex), so its
+                // result type is the numeric join. The three-argument form is
+                // integer modular exponentiation `(base ** exp) % mod` — integer
+                // operands only (float/bigint/complex modular pow are follow-ups)
+                // — and returns `int64`.
+                "pow" => {
+                    if let Some(a) = args.iter().find(|a| a.name.is_some()) {
+                        self.error(
+                            ErrorCode::ZAP4023,
+                            format!(
+                                "pow() takes no keyword arguments; unexpected '{}'",
+                                a.name.as_deref().unwrap_or_default()
+                            ),
+                            span,
+                        );
+                    }
+                    if args.len() != 2 && args.len() != 3 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!(
+                                "pow() takes two or three arguments (pow(base, exp[, mod])), got {}",
+                                args.len()
+                            ),
+                            span,
+                        );
+                        for a in args {
+                            self.infer(&a.value);
+                        }
+                        return Ty::Unknown;
+                    }
+                    let tb = self.infer(&args[0].value);
+                    let te = self.infer(&args[1].value);
+                    if args.len() == 3 {
+                        let tm = self.infer(&args[2].value);
+                        let int_scalar = |t: &Ty| {
+                            matches!(t, Ty::Unknown) || (t.is_int() && !matches!(t, Ty::Bigint))
+                        };
+                        for (label, t) in [("base", &tb), ("exp", &te), ("mod", &tm)] {
+                            if !int_scalar(t) {
+                                self.error(
+                                    ErrorCode::ZAP4024,
+                                    format!(
+                                        "pow()'s three-argument modular form requires integer \
+                                         arguments; {label} is {} (float/bigint/complex modular \
+                                         pow is a follow-up)",
+                                        t.display()
+                                    ),
+                                    span,
+                                );
+                                return Ty::Unknown;
+                            }
+                        }
+                        return Ty::Int64;
+                    }
+                    // Two-argument form: same numeric-tower typing as `**`.
+                    let numeric = |t: &Ty| {
+                        matches!(t, Ty::Unknown)
+                            || t.is_numeric()
+                            || matches!(t, Ty::Bigint | Ty::Complex)
+                    };
+                    if !numeric(&tb) || !numeric(&te) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "pow() takes numeric arguments, got {} and {}",
+                                tb.display(),
+                                te.display()
+                            ),
+                            span,
+                        );
+                        return Ty::Unknown;
+                    }
+                    if matches!(tb, Ty::Unknown) || matches!(te, Ty::Unknown) {
+                        return Ty::Unknown;
+                    }
+                    if matches!(tb, Ty::Complex) || matches!(te, Ty::Complex) {
+                        return Ty::Complex;
+                    }
+                    if matches!(tb, Ty::Bigint) || matches!(te, Ty::Bigint) {
+                        return Ty::Bigint;
+                    }
+                    if matches!(tb, Ty::Float64 | Ty::Float32 | Ty::UntypedFloat)
+                        || matches!(te, Ty::Float64 | Ty::Float32 | Ty::UntypedFloat)
+                    {
+                        return Ty::Float64;
+                    }
+                    return num_join(&tb, &te);
                 }
                 "dot" => {
                     // `dot(a, b)` — matrix multiply / dot product (#509), the
@@ -19606,6 +19785,138 @@ def main():
         assert!(has_code(
             "def main():\n    uint64 u = 5\n    int64 s = 3\n    print(divmod(u, s))\n",
             ErrorCode::ZAP4015
+        ));
+    }
+
+    #[test]
+    fn round_float_result_type_depends_on_ndigits() {
+        // round(float) with no ndigits -> int64 (bindable to an int slot).
+        ok("def main():\n    int64 r = round(2.5)\n    print(r)\n");
+        ok("def main():\n    float64 x = 3.7\n    int64 r = round(x)\n    print(r)\n");
+        // The no-ndigits float result is an int, not a str (pins the type).
+        assert!(has_code(
+            "def main():\n    str r = round(2.5)\n    print(r)\n",
+            ErrorCode::ZAP4001
+        ));
+        // round(float, ndigits) -> float64 (bindable to a float slot).
+        ok("def main():\n    float64 r = round(3.14159, 2)\n    print(r)\n");
+        ok("def main():\n    float64 x = 2.675\n    float64 r = round(x, 2)\n    print(r)\n");
+        // The ndigits float result is a float, not a str (pins the type).
+        assert!(has_code(
+            "def main():\n    str r = round(3.14, 2)\n    print(r)\n",
+            ErrorCode::ZAP4001
+        ));
+    }
+
+    #[test]
+    fn round_int_identity_and_ndigits() {
+        // round(int) returns the integer unchanged, preserving signedness.
+        ok("def main():\n    int64 r = round(7)\n    print(r)\n");
+        ok("def main():\n    uint64 a = 5\n    uint64 r = round(a)\n    print(r)\n");
+        // round(int, ndigits) -> int64 (power-of-ten rounding for n<0).
+        ok("def main():\n    int64 r = round(12345, -2)\n    print(r)\n");
+        ok("def main():\n    int64 a = 12350\n    int64 r = round(a, -2)\n    print(r)\n");
+        // The int result is an int, not a str (pins the type).
+        assert!(has_code(
+            "def main():\n    str r = round(7)\n    print(r)\n",
+            ErrorCode::ZAP4001
+        ));
+    }
+
+    #[test]
+    fn round_arity_keyword_and_non_numeric_rejected() {
+        // Zero args and more than two args are arity errors.
+        assert!(has_code(
+            "def main():\n    print(round())\n",
+            ErrorCode::ZAP4025
+        ));
+        assert!(has_code(
+            "def main():\n    print(round(1.0, 2, 3))\n",
+            ErrorCode::ZAP4025
+        ));
+        // Keyword arguments are rejected.
+        assert!(has_code(
+            "def main():\n    print(round(1.5, ndigits=2))\n",
+            ErrorCode::ZAP4023
+        ));
+        // A non-numeric first argument is rejected.
+        assert!(has_code(
+            "def main():\n    print(round(\"a\"))\n",
+            ErrorCode::ZAP4024
+        ));
+        // A non-integer ndigits is rejected.
+        assert!(has_code(
+            "def main():\n    print(round(2.5, 1.5))\n",
+            ErrorCode::ZAP4024
+        ));
+        // bigint first argument is a follow-up (rejected for now).
+        assert!(has_code(
+            "def main():\n    bigint b = 10\n    print(round(b))\n",
+            ErrorCode::ZAP4024
+        ));
+    }
+
+    #[test]
+    fn pow_two_arg_result_follows_numeric_tower() {
+        // int ** int -> int64 (int-exact), bindable to an int slot.
+        ok("def main():\n    int64 r = pow(2, 10)\n    print(r)\n");
+        ok("def main():\n    int64 a = 2\n    int64 b = 10\n    int64 r = pow(a, b)\n    print(r)\n");
+        // The int result is an int, not a str (pins the type).
+        assert!(has_code(
+            "def main():\n    str r = pow(2, 10)\n    print(r)\n",
+            ErrorCode::ZAP4001
+        ));
+        // A float base or exponent lifts the result to float64.
+        ok("def main():\n    float64 r = pow(2.0, 10.0)\n    print(r)\n");
+        ok("def main():\n    float64 r = pow(2, 3.0)\n    print(r)\n");
+        // unsigned ** unsigned stays unsigned.
+        ok("def main():\n    uint64 a = 2\n    uint64 b = 10\n    uint64 r = pow(a, b)\n    print(r)\n");
+    }
+
+    #[test]
+    fn pow_three_arg_is_integer_modular() {
+        // Three-argument modular pow -> int64.
+        ok("def main():\n    int64 r = pow(2, 10, 1000)\n    print(r)\n");
+        ok(
+            "def main():\n    int64 a = 10\n    int64 b = 9\n    int64 m = 7\n    \
+            int64 r = pow(a, b, m)\n    print(r)\n",
+        );
+        // The modular result is an int, not a str (pins the type).
+        assert!(has_code(
+            "def main():\n    str r = pow(2, 10, 1000)\n    print(r)\n",
+            ErrorCode::ZAP4001
+        ));
+        // The modular form is integer-only: a float operand is rejected.
+        assert!(has_code(
+            "def main():\n    print(pow(2.0, 3, 5))\n",
+            ErrorCode::ZAP4024
+        ));
+        assert!(has_code(
+            "def main():\n    print(pow(2, 3, 5.0))\n",
+            ErrorCode::ZAP4024
+        ));
+    }
+
+    #[test]
+    fn pow_arity_keyword_and_non_numeric_rejected() {
+        // One arg and four args are arity errors.
+        assert!(has_code(
+            "def main():\n    print(pow(2))\n",
+            ErrorCode::ZAP4025
+        ));
+        assert!(has_code(
+            "def main():\n    print(pow(2, 3, 4, 5))\n",
+            ErrorCode::ZAP4025
+        ));
+        // Keyword arguments are rejected.
+        assert!(has_code(
+            "def main():\n    print(pow(2, 3, mod=4))\n",
+            ErrorCode::ZAP4023
+        ));
+        // A non-numeric operand is rejected in the two-argument form.
+        assert!(has_code(
+            "def main():\n    print(pow(\"a\", 2))\n",
+            ErrorCode::ZAP4024
         ));
     }
 

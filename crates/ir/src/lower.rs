@@ -9208,6 +9208,78 @@ impl<'a> FnLower<'a> {
                 });
                 return Ok((dest, Ty::Struct(sid)));
             }
+            // `round(x[, ndigits])` (#1381): Python's built-in rounding with
+            // banker's (ties-to-even) semantics. With no `ndigits`, a float
+            // rounds to `int64` via `zap_round_i64` (which raises a catchable
+            // ArithmeticError when the result has no int64), and an integer is
+            // returned unchanged. With `ndigits`, a float rounds to `float64`
+            // via `zap_round_nd`, and an integer via `zap_iround_nd` (a no-op for
+            // ndigits>=0, power-of-ten rounding for ndigits<0).
+            if fname == "round" {
+                if args.iter().any(|a| a.name.is_some()) || args.is_empty() || args.len() > 2 {
+                    return Err(err(
+                        "round() takes one or two positional arguments (round(x[, ndigits]))",
+                    ));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                let is_float = matches!(vt, Ty::F32 | Ty::F64);
+                if args.len() == 1 {
+                    if is_float {
+                        let f = self.as_f64(v, vt);
+                        let d = self.new_value(Ty::I64);
+                        self.throwing_call(Some(d), "zap_round_i64", vec![f]);
+                        return Ok((d, Ty::I64));
+                    }
+                    // round(int) is the integer unchanged (identity).
+                    if vt.is_unsigned() {
+                        let u = self.coerce(v, vt, Ty::U64);
+                        return Ok((u, Ty::U64));
+                    }
+                    let i = self.coerce(v, vt, Ty::I64);
+                    return Ok((i, Ty::I64));
+                }
+                let (nv, nt) = self.expr(&args[1].value)?;
+                let ni = self.coerce(nv, nt, Ty::I64);
+                if is_float {
+                    let f = self.as_f64(v, vt);
+                    let d = self.new_value(Ty::F64);
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_round_nd".to_string(),
+                        args: vec![f, ni],
+                    });
+                    return Ok((d, Ty::F64));
+                }
+                let xi = self.coerce(v, vt, Ty::I64);
+                let d = self.new_value(Ty::I64);
+                self.throwing_call(Some(d), "zap_iround_nd", vec![xi, ni]);
+                return Ok((d, Ty::I64));
+            }
+            // `pow(base, exp[, mod])` (#1381). Two args is exactly `base ** exp`
+            // (delegated to the `**` lowering, so it reuses the whole numeric
+            // tower: int-exact `zap_ipow`, `zap_powf`, bigint, complex). Three
+            // args is integer modular exponentiation via `zap_imodpow`, which
+            // raises a catchable ValueError on a zero modulus or a negative
+            // exponent.
+            if fname == "pow" {
+                if args.iter().any(|a| a.name.is_some()) || (args.len() != 2 && args.len() != 3) {
+                    return Err(err(
+                        "pow() takes two or three positional arguments (pow(base, exp[, mod]))",
+                    ));
+                }
+                let (bv, bt) = self.expr(&args[0].value)?;
+                let (ev, et) = self.expr(&args[1].value)?;
+                if args.len() == 2 {
+                    return self.binop(AstBin::Pow, bv, bt, ev, et);
+                }
+                let (mv, mt) = self.expr(&args[2].value)?;
+                let bi = self.coerce(bv, bt, Ty::I64);
+                let ei = self.coerce(ev, et, Ty::I64);
+                let mi = self.coerce(mv, mt, Ty::I64);
+                let d = self.new_value(Ty::I64);
+                self.throwing_call(Some(d), "zap_imodpow", vec![bi, ei, mi]);
+                return Ok((d, Ty::I64));
+            }
             // Truth reductions `any(xs)` / `all(xs)` over a `list[bool]` (#1285):
             // drain the list once, folding the `i1` accumulator with `or` (any)
             // or `and` (all). The accumulator's initial value is the empty-list

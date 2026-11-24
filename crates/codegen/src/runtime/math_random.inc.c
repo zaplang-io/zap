@@ -32,6 +32,74 @@ double zap_math_ceil(double x) { return ceil(x); }
 double zap_math_round(double x) { return round(x); } /* half away from zero */
 double zap_math_trunc(double x) { return trunc(x); }
 double zap_math_fabs(double x) { return fabs(x); }
+
+/* --- Python built-in round() (#1381) ---------------------------------------
+ * Distinct from math.round above: the built-in uses banker's rounding
+ * (ties-to-even) via `rint` under the default FE_TONEAREST mode, and the
+ * no-ndigits form returns an integer. These are the helpers the `round`
+ * built-in lowers to (declared with the scalar numeric helpers in lib.rs). */
+int64_t zap_round_i64(double x) {
+    double r = rint(x); /* ties to even */
+    /* int64 range is [-2^63, 2^63); 2^63 == 9223372036854775808.0 as a double.
+     * NaN and +/-inf fail both bounds and raise. */
+    if (!(r >= -9223372036854775808.0 && r < 9223372036854775808.0)) {
+        static const char m[] =
+            "round() result has no int64 value (NaN, infinity, or out of range)";
+        zap_panic_typed(ZAP_EXC_ARITHMETIC_ERROR, zap_str_new(m, sizeof(m) - 1));
+    }
+    return (int64_t)r;
+}
+double zap_round_nd(double x, int64_t n) {
+    if (x != x) return x;   /* NaN passes through */
+    if (x == 0.0) return x; /* preserve signed zero */
+    if (n >= 0) {
+        if (n > 323) return x; /* beyond double precision: already exact */
+        double p = pow(10.0, (double)n);
+        double scaled = x * p;
+        /* Overflow to infinity, or a magnitude so large it has no fractional
+         * part, means the value is already integral at this scale. */
+        if (scaled != scaled || scaled + 1.0 == scaled || scaled - 1.0 == scaled) {
+            return x;
+        }
+        return rint(scaled) / p;
+    }
+    /* Negative ndigits: DIVIDE by the integer 10^(-n) and multiply back, rather
+     * than multiply by the inexact fraction 10^n — so a clean power-of-ten
+     * result (e.g. round(12345.0, -2) == 12300.0) is exact for |n| <= 22, where
+     * 10^(-n) is representable exactly in f64. */
+    if (n < -308) return x < 0 ? -0.0 : 0.0; /* rounds to zero */
+    double p = pow(10.0, (double)(-n));       /* integer-valued */
+    double scaled = x / p;
+    return rint(scaled) * p;
+}
+int64_t zap_iround_nd(int64_t x, int64_t n) {
+    if (n >= 0) return x; /* an integer has no digits past the point */
+    int64_t k = -n;
+    if (k >= 19) {
+        /* 10^19 > INT64_MAX, so |x| (< 10^19) rounds to 0 — except |x| >=
+         * 5*10^18 at k==19 would round to +/-10^19, which overflows int64. */
+        if (k == 19 &&
+            (x >= 5000000000000000000LL || x <= -5000000000000000000LL)) {
+            static const char m[] = "round() result has no int64 value (out of range)";
+            zap_panic_typed(ZAP_EXC_ARITHMETIC_ERROR, zap_str_new(m, sizeof(m) - 1));
+        }
+        return 0;
+    }
+    int64_t p = 1;
+    for (int64_t i = 0; i < k; i++) p *= 10;
+    int64_t q = x / p;       /* truncated toward zero */
+    int64_t rem = x - q * p; /* sign of x, |rem| < p */
+    int64_t ar = rem < 0 ? -rem : rem;
+    int64_t half = p / 2; /* p is a power of ten >= 10, so even */
+    if (ar > half || (ar == half && (q & 1))) {
+        q += (x < 0) ? -1 : 1; /* half-to-even: step away when q is odd */
+    }
+    if (q > INT64_MAX / p || q < INT64_MIN / p) {
+        static const char m[] = "round() result has no int64 value (out of range)";
+        zap_panic_typed(ZAP_EXC_ARITHMETIC_ERROR, zap_str_new(m, sizeof(m) - 1));
+    }
+    return q * p;
+}
 double zap_math_atan2(double y, double x) { return atan2(y, x); }
 double zap_math_hypot(double a, double b) { return hypot(a, b); }
 double zap_math_fmod(double a, double b) { return fmod(a, b); }

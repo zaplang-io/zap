@@ -3445,6 +3445,17 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // to these, so codegen only declares their fixed C signatures.
         self.declare_rt("zap_ipow", &[i.into(), i.into()], Some(i.into()));
         self.declare_rt("zap_powf", &[f.into(), f.into()], Some(f.into()));
+        // Python built-in `round()` / 3-arg `pow()` helpers (#1381): modular
+        // exponentiation, and banker's (ties-to-even) rounding to an int64 / a
+        // float64 / an int64-with-power-of-ten.
+        self.declare_rt(
+            "zap_imodpow",
+            &[i.into(), i.into(), i.into()],
+            Some(i.into()),
+        );
+        self.declare_rt("zap_round_i64", &[f.into()], Some(i.into()));
+        self.declare_rt("zap_round_nd", &[f.into(), i.into()], Some(f.into()));
+        self.declare_rt("zap_iround_nd", &[i.into(), i.into()], Some(i.into()));
         self.declare_rt("zap_ifloordiv", &[i.into(), i.into()], Some(i.into()));
         self.declare_rt("zap_ffloordiv", &[f.into(), f.into()], Some(f.into()));
         self.declare_rt("zap_imod", &[i.into(), i.into()], Some(i.into()));
