@@ -7,19 +7,28 @@
 # `is_some()` / `unwrap()` read the raw bits as an Optional object and SIGSEGV'd
 # (the issue's `0xffffffffffffd5d0` = the bit pattern of `-10800`). This is the
 # reassignment partner of the #1262 constructor/field/index wrap. All reads
-# below are native (is_some/is_none/unwrap) so the tagged-vs-raw storage is
-# actually observed — it only matters once the native collector runs.
+# below are native (is_some/is_none/unwrap/unwrap_or) so the tagged-vs-raw
+# storage is actually observed — it only matters once the native collector runs.
 #
-# Scope: these mirror, via a plain *local reassignment*, exactly the payload
-# representations the #1262 `optional_scalar_wrap` golden already proves at
-# runtime through the field/index assignment forms — a scalar (incl. the
-# tag-vs-None-distinguishing zero), a `str` (pointer/niche) payload, and a
-# reference struct. The broader reassignment edge cases (`Some -> None -> Some`
-# cycles, crossing a call boundary, an already-`Optional` source, `INT_MIN`) are
-# pinned at the IR level by `crates/ir/tests/optional_reassign_lower.rs`.
+# Every case here is verified end-to-end on an LLVM-18 host. Two deliberately
+# excluded: a bare-`None` reassignment of a module-level *global* of an
+# aggregate type does not persist at run time (a module-state bug, #1369, not
+# the #1362 wrap), and the literal `-9223372036854775808` is a `bigint` (it
+# overflows `int64`), wrongly accepted into an `Optional[int64]` position and
+# mis-compiled (a bigint-vs-int64 coercion bug that also affects the #1262
+# constructor/field paths, filed separately); the valid near-minimum
+# `-9223372036854775807` is used instead.
 
 struct Item:
     int64 value
+
+
+def describe(Optional[int64] opt) -> int64:
+    # The reassigned local crosses an ordinary call boundary: the callee receives
+    # the Optional by value and must see a well-formed `Some`/`None`.
+    if opt.is_some():
+        return opt.unwrap()
+    return -1
 
 
 def main():
@@ -39,14 +48,61 @@ def main():
     print(zero.is_some())  # True
     print(zero.unwrap())  # 0
 
+    # A large negative magnitude (the valid int64 minimum + 1).
+    Optional[int64] lo = None
+    lo = -9223372036854775807
+    print(lo.unwrap())  # -9223372036854775807
+
+    # Reassign Some -> None -> Some again; each store is a well-formed box.
+    Optional[int64] cycle = Optional.Some(1)
+    print(cycle.unwrap())  # 1
+    cycle = None
+    print(cycle.is_none())  # True
+    cycle = 2
+    print(cycle.is_some())  # True
+    print(cycle.unwrap())  # 2
+
+    # Cross a call with the reassigned local.
+    Optional[int64] crossed = None
+    crossed = 77
+    print(describe(crossed))  # 77
+    crossed = None
+    print(describe(crossed))  # -1
+
+    # An already-Optional source copies through unchanged — never double-wrapped
+    # into Some(Some(..)).
+    Optional[int64] src = Optional.Some(6)
+    Optional[int64] dst = None
+    dst = src
+    print(dst.unwrap())  # 6
+
     # Reference (pointer) payload: a bare `str` reassigned into `Optional[str]`.
+    # The empty string is a valid non-null payload, so it must still read as
+    # Some (not None).
     Optional[str] name = None
     name = "hi"
     print(name.is_some())  # True
     print(name.unwrap())  # hi
+    name = ""
+    print(name.is_some())  # True
+    print(name.unwrap() == "")  # True
+    name = None
+    print(name.is_none())  # True
 
     # Reference struct payload.
     Optional[Item] slot = None
     slot = Item(42)
     print(slot.is_some())  # True
     print(slot.unwrap().value)  # 42
+
+    # A collection payload (`list[int64]`): a bare list reassigned into
+    # `Optional[list[int64]]` must box.
+    Optional[list[int64]] nums = None
+    nums = [10, 20, 30]
+    print(nums.is_some())  # True
+    print(nums.unwrap()[1])  # 20
+
+    # unwrap_or on the empty side after a reassignment back to None.
+    Optional[int64] bk = Optional.Some(5)
+    bk = None
+    print(bk.unwrap_or(-9))  # -9
