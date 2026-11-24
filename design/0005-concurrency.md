@@ -862,10 +862,15 @@ parks its G and frees its M.
   tick on a fixed schedule, dropping a tick when the consumer is behind; it is a
   prelude `Ticker` struct whose detached firing loop `select`s the fd-less timer
   against a `done` channel, so `stop()` wakes it promptly and a never-stopped
-  ticker is terminated at exit rather than joined. Still open: a deadline-keyed
-  timer heap for very many concurrent timers/sleepers (I#1410; the linear registry
-  scan is reused today), and a non-Linux (Windows/IOCP) timer backend. Scope
-  deadlines are integer milliseconds (`scope(timeout=<ms>)`, D-0094).
+  ticker is terminated at exit rather than joined. The **deadline min-heap**
+  (I#1410) and the **Windows (IOCP) timer backend** (I#1422 +
+  decisions/runtime/1422-windows-iocp-timer.md) are RESOLVED as well: deadlines
+  are tracked in an O(log n) min-heap that both the epoll and IOCP poll loops
+  drive (`np_compute_timeout` / `np_expire_deadlines`, with
+  `PostQueuedCompletionStatus` as the IOCP kick), so Windows coroutine timers free
+  their M exactly like Linux — only a platform with no deadline-scanning poller
+  keeps the blocking fallback. The core timer API is complete. Scope deadlines are
+  integer milliseconds (`scope(timeout=<ms>)`, D-0094).
 - **Blocking FFI.**
   How CPython interop (D-0012) and its GIL interact with coroutines that must not
   block an M (likely a dedicated M pool for FFI calls).

@@ -9549,10 +9549,15 @@ static void zap_netpoll_mark_roots(void) {
  * or ZAP_POLL_CLOSED (no poller available — the caller then blocks). The read
  * slot/`r_deadline` are the timer's; the write slot is unused.
  *
- * Linux (epoll) only in v1; elsewhere it returns CLOSED and the caller keeps the
- * blocking fallback (the IOCP poller does not run the deadline scan). */
+ * Both pollers that run the shared deadline machinery park here: Linux (epoll)
+ * and Windows (IOCP) — the IOCP loop also folds the min-heap's nearest deadline
+ * into its `GetQueuedCompletionStatusEx` timeout and runs `np_expire_deadlines`
+ * each iteration, and its `np_backend_kick` is `PostQueuedCompletionStatus`, so a
+ * fd-less timer rides it identically (#1422). On a platform with no
+ * deadline-scanning poller (the `#else` stub) it returns CLOSED and the caller
+ * keeps the blocking fallback. */
 static int64_t zap_time_timer_wait(int64_t deadline_ns) {
-#if defined(ZAP_NETPOLL_EPOLL)
+#if defined(ZAP_NETPOLL_EPOLL) || defined(ZAP_NETPOLL_IOCP)
     if (np_ensure() != 0) {
         return ZAP_POLL_CLOSED; /* poller unavailable: caller falls back to block */
     }
@@ -9596,7 +9601,8 @@ static int64_t zap_time_timer_wait(int64_t deadline_ns) {
         np_heap_push(deadline_ns, pd, 1); /* #1410: deadline-ordered expiry */
         /* A cancel before registration is observed above; one after it wakes w
          * via scope_cancel_io. Kick the poller so it folds our deadline into its
-         * next epoll_wait timeout. */
+         * next wait timeout (epoll_wait on Linux, GetQueuedCompletionStatusEx on
+         * Windows). */
         np_backend_kick();
         copark(&pd->mu, &w); /* releases pd->mu once fully parked */
         st = g_is_cancelled() ? ZAP_POLL_CANCELLED : (int64_t)w.val;
@@ -9615,7 +9621,7 @@ static int64_t zap_time_timer_wait(int64_t deadline_ns) {
     return st;
 #else
     (void)deadline_ns;
-    return ZAP_POLL_CLOSED; /* no epoll deadline scan on this platform */
+    return ZAP_POLL_CLOSED; /* no deadline-scanning poller on this platform */
 #endif
 }
 
