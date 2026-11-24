@@ -9352,6 +9352,86 @@ static void zap_netpoll_mark_roots(void) {
 }
 #endif
 
+/* Fd-less coroutine timer park (#1360). Park the current coroutine until an
+ * absolute CLOCK_MONOTONIC `deadline_ns`, FREEING its worker M so siblings run
+ * (the Go model; generalizes #1357's cancellable sleep to every coroutine sleep,
+ * scope or not, without an fd — so thousands of concurrent sleepers cannot
+ * exhaust file descriptors the way an fd-per-sleep park would).
+ *
+ * Mechanism: a `PollDesc` with NO fd. It is linked into the live registry
+ * (`g_np_all`) only so the poller's existing deadline scan (`np_compute_timeout`
+ * / `np_expire_deadlines`) wakes it at the deadline, `scope_cancel_io` wakes it
+ * when its owning scope is cancelled, and `zap_netpoll_mark_roots` pins its
+ * borrowed scope under Immix — but it is NEVER handed to `np_backend_add`, so no
+ * epoll/IOCP registration and no fd. Returns ZAP_POLL_TIMEOUT (deadline passed),
+ * ZAP_POLL_CANCELLED (scope cancelled), or ZAP_POLL_CLOSED (no poller available
+ * — the caller then blocks). The read slot/`r_deadline` are the timer's; the
+ * write slot is unused.
+ *
+ * Linux (epoll) only in v1; elsewhere it returns CLOSED and the caller keeps the
+ * blocking fallback (the IOCP poller does not run the deadline scan). The linear
+ * registry scan is reused as-is; a timer heap for very many concurrent sleepers
+ * is a documented optimization follow-up. */
+static int64_t zap_time_timer_wait(int64_t deadline_ns) {
+#if defined(ZAP_NETPOLL_EPOLL)
+    if (np_ensure() != 0) {
+        return ZAP_POLL_CLOSED; /* poller unavailable: caller falls back to block */
+    }
+    PollDesc *pd = np_pd_alloc(-1); /* fd = -1: never registered with the backend */
+    if (!pd) {
+        return ZAP_POLL_CLOSED;
+    }
+    /* Link into the live registry (deadline scan + scope cancel + GC roots). */
+    zap_np_lock(&g_np_mu);
+    pd->all_prev = NULL;
+    pd->all_next = g_np_all;
+    if (g_np_all) {
+        g_np_all->all_prev = pd;
+    }
+    g_np_all = pd;
+    zap_np_unlock(&g_np_mu);
+
+    int64_t st;
+    Waiter w = {0};
+    zap_np_lock(&pd->mu);
+    if (g_is_cancelled()) {
+        st = ZAP_POLL_CANCELLED;
+        zap_np_unlock(&pd->mu);
+    } else if (deadline_ns <= np_now_ns()) {
+        st = ZAP_POLL_TIMEOUT; /* deadline already past */
+        zap_np_unlock(&pd->mu);
+    } else {
+        w.val = ZAP_POLL_TIMEOUT;
+        G *g = cur_m ? cur_m->current : NULL;
+        if (g) g->park_reason = "sleep";
+        pd->rg = &w;
+        pd->r_scope = g ? g->scope : NULL;
+        pd->r_deadline = deadline_ns;
+        /* A cancel before registration is observed above; one after it wakes w
+         * via scope_cancel_io. Kick the poller so it folds our deadline into its
+         * next epoll_wait timeout. */
+        np_backend_kick();
+        copark(&pd->mu, &w); /* releases pd->mu once fully parked */
+        st = g_is_cancelled() ? ZAP_POLL_CANCELLED : (int64_t)w.val;
+    }
+    /* Unlink + recycle. No `np_backend_del`: the timer was never added to the
+     * backend. After a park wake the waker already cleared rg/r_scope/r_deadline,
+     * so a concurrent poller scan skips this pd; the unlink is still serialized
+     * under g_np_mu. */
+    zap_np_lock(&g_np_mu);
+    zap_np_lock(&pd->mu);
+    np_all_remove_locked(pd);
+    zap_np_unlock(&pd->mu);
+    pd->free_link = g_np_free;
+    g_np_free = pd;
+    zap_np_unlock(&g_np_mu);
+    return st;
+#else
+    (void)deadline_ns;
+    return ZAP_POLL_CLOSED; /* no epoll deadline scan on this platform */
+#endif
+}
+
 /* Saturating conversion used by all relative read budgets, not just new APIs. */
 static int64_t zap_deadline_after_ms(int64_t ms) {
     if (ms <= 0) return 0;
