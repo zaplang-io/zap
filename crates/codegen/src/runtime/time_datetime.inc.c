@@ -109,34 +109,44 @@ void zap_time_sleep_cancellable_ns(int64_t ns) {
         zap_checkpoint(); /* cancel-or-yield; never a no-op inside a scope */
         return;
     }
+#if defined(__linux__)
+    /* The cooperative timer park is the Linux epoll netpoller + a `pipe2`-created
+     * never-ready fd; both are Linux-specific (the netpoller's own backend is
+     * `#if defined(__linux__)`, and `pipe2` is a glibc extension absent on
+     * Windows/macOS). Elsewhere we fall through to the portable blocking path
+     * below. */
     int fds[2];
-    if (pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) {
-        zap_time_sleep_ns(ns); /* out of fds: degrade to a blocking sleep */
-        return;
-    }
-    void *pd = zap_netpoll_open(fds[0]);
-    if (!pd) {
-        /* Netpoller unavailable (non-Linux v1): no cooperative timer to park on. */
+    if (pipe2(fds, O_NONBLOCK | O_CLOEXEC) == 0) {
+        void *pd = zap_netpoll_open(fds[0]);
+        if (pd) {
+            int64_t now = np_now_ns();
+            /* Absolute CLOCK_MONOTONIC deadline; clamp so a very long duration
+             * cannot overflow to a past (or negative) deadline and wake early. */
+            int64_t deadline = (ns > INT64_MAX - now) ? INT64_MAX : now + ns;
+            int64_t st = zap_netpoll_wait(pd, ZAP_POLL_READ, deadline);
+            zap_netpoll_close(pd); /* only waiter: wakes nothing; recycles pd */
+            close(fds[0]);
+            close(fds[1]);
+            if (st == ZAP_POLL_CANCELLED) {
+                zap_raise(cancelled_exc());
+            }
+            /* ZAP_POLL_TIMEOUT (deadline passed) and ZAP_POLL_CLOSED (runtime
+             * shutdown) return normally; ZAP_POLL_OK cannot occur (the pipe read
+             * end is never written). A cancel that lands after a timeout wake is
+             * caught by the next cancellation point. */
+            return;
+        }
+        /* Netpoller registration failed: drop the pipe and block. */
         close(fds[0]);
         close(fds[1]);
-        zap_time_sleep_ns(ns);
-        return;
     }
-    int64_t now = np_now_ns();
-    /* Absolute CLOCK_MONOTONIC deadline; clamp so a very long duration cannot
-     * overflow to a past (or negative) deadline and wake immediately. */
-    int64_t deadline = (ns > INT64_MAX - now) ? INT64_MAX : now + ns;
-    int64_t st = zap_netpoll_wait(pd, ZAP_POLL_READ, deadline);
-    zap_netpoll_close(pd); /* wakes nothing (we are the only waiter) and recycles pd */
-    close(fds[0]);
-    close(fds[1]);
-    if (st == ZAP_POLL_CANCELLED) {
-        zap_raise(cancelled_exc());
-    }
-    /* ZAP_POLL_TIMEOUT (the deadline passed) and ZAP_POLL_CLOSED (runtime
-     * shutdown) return normally; ZAP_POLL_OK cannot occur (the pipe read end is
-     * never written). A cancel that lands after a timeout wake is caught by the
-     * next cancellation point. */
+    /* `pipe2`/netpoller unavailable: degrade to the blocking sleep. */
+#endif
+    /* Portable fallback (non-Linux, or no netpoller): observe a pending cancel,
+     * then block. Not cancellable mid-sleep here — the cooperative timer park is
+     * the Linux netpoller path above (#1360 generalizes it). */
+    zap_check_cancel();
+    zap_time_sleep_ns(ns);
 }
 
 /* Seconds entry for the cancellable sleep (mirrors `zap_time_sleep_seconds`).
