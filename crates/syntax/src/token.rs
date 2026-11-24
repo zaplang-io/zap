@@ -131,10 +131,11 @@ pub enum TokenKind {
 /// immediately followed by a delimiter, D-0010) and so are lexed as identifiers
 /// elsewhere — they are intentionally absent from this table.
 ///
-/// Likewise the *soft (contextual) keywords* `match`, `case`, `select`, `scope`
-/// (#1405/#1411, epic #1413) are absent: each is a keyword only in its single
-/// statement/clause slot and an ordinary identifier everywhere else, so the
-/// lexer emits them as `Ident` and the parser recognizes them in their slot.
+/// Likewise the *soft (contextual) keywords* are absent: each is a keyword only
+/// in its single statement/clause slot and an ordinary identifier everywhere
+/// else, so the lexer emits them as `Ident` and the parser recognizes them in
+/// their slot. Tier 1 (#1405/#1411, epic #1413): `match`, `case`, `select`,
+/// `scope`. Tier 2 (#1412): `spawn`, `when`, `do`, `unsafe`, `python`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Keyword {
     // Declarations / control flow
@@ -144,17 +145,15 @@ pub enum Keyword {
     Elif,
     Else,
     While,
-    Do,
     For,
     In,
     Range,
-    // NOTE: `match` and `case` are *contextual* (soft) keywords (#1405/#1411,
-    // epic #1413) — keyword only in the `match EXPR:` statement slot and its
-    // `case PATTERN:` arms, an ordinary identifier everywhere else. They are
-    // lexed as `Ident` (absent from this table, like `m`/`s`/`default`) and
-    // recognized by the parser in their slot. Hence no `Match`/`Case` variant.
-    /// `when target.*:` — compile-time conditional compilation (I#139, D-0079).
-    When,
+    // NOTE: the soft (contextual) keywords are absent from this table — lexed as
+    // `Ident` (like `m`/`s`/`default`) and recognized by the parser only in
+    // their slot. Tier 1 (#1405/#1411, epic #1413): `match`/`case` (the
+    // `match EXPR:` statement + its `case` arms), `select`/`scope`. Tier 2
+    // (#1412): `do` (the `do:`…`while` statement), `when` (the `when target.*:`
+    // conditional-compilation statement/item), `spawn`, `unsafe`, `python`.
     /// `comptime` — the compile-time evaluation surface (E2/E3, epic #1296):
     /// `comptime for f in …:` (a compile-time-unrolled loop) and `comptime <expr>`
     /// (force compile-time evaluation). Locked decision 4 of epic #1249.
@@ -173,17 +172,12 @@ pub enum Keyword {
     Yield,
     Lambda,
     Import,
-    Python,
     // Concurrency
-    Spawn,
     Channel,
-    // NOTE: `select` and `scope` are *contextual* (soft) keywords
-    // (#1411/#1405, epic #1413) — keyword only statement-leading in their
-    // `select:` / `scope(...):` slot, an ordinary identifier everywhere else.
-    // Lexed as `Ident` (absent from this table), recognized by the parser in
-    // the slot. Hence no `Select`/`Scope` variant.
+    // NOTE (continued): `spawn` (statement-leading `spawn <call>`), `select`,
+    // `scope`, `unsafe`, `python` (the `import python "mod"` interop slot) are
+    // soft keywords too — see the note above; none has a `Keyword` variant.
     Close,
-    Unsafe,
     // Type/decl keywords
     Struct,
     Interface,
@@ -249,12 +243,11 @@ impl Keyword {
             "elif" => Elif,
             "else" => Else,
             "while" => While,
-            "do" => Do,
             "for" => For,
             "in" => In,
             "range" => Range,
-            // `match`/`case` are soft keywords (#1411) — lexed as idents.
-            "when" => When,
+            // soft keywords lexed as idents: `do`/`when` (#1412), `match`/`case`
+            // (#1411).
             "comptime" => Comptime,
             "break" => Break,
             "continue" => Continue,
@@ -270,12 +263,10 @@ impl Keyword {
             "yield" => Yield,
             "lambda" => Lambda,
             "import" => Import,
-            "python" => Python,
-            "spawn" => Spawn,
             "channel" => Channel,
-            // `select`/`scope` are soft keywords (#1411/#1405) — lexed as idents.
+            // soft keywords lexed as idents: `spawn`/`unsafe`/`python` (#1412),
+            // `select`/`scope` (#1411/#1405).
             "close" => Close,
-            "unsafe" => Unsafe,
             "struct" => Struct,
             "interface" => Interface,
             "enum" => Enum,
@@ -372,11 +363,9 @@ impl Keyword {
             Elif => "elif",
             Else => "else",
             While => "while",
-            Do => "do",
             For => "for",
             In => "in",
             Range => "range",
-            When => "when",
             Comptime => "comptime",
             Break => "break",
             Continue => "continue",
@@ -392,11 +381,8 @@ impl Keyword {
             Yield => "yield",
             Lambda => "lambda",
             Import => "import",
-            Python => "python",
-            Spawn => "spawn",
             Channel => "channel",
             Close => "close",
-            Unsafe => "unsafe",
             Struct => "struct",
             Interface => "interface",
             Enum => "enum",
@@ -486,8 +472,8 @@ mod tests {
     fn keyword_roundtrip() {
         for kw in [
             Keyword::Def,
-            Keyword::Spawn,
-            Keyword::When,
+            Keyword::Channel,
+            Keyword::Comptime,
             Keyword::True,
             Keyword::Int64,
             Keyword::Array,
@@ -498,10 +484,14 @@ mod tests {
 
     #[test]
     fn soft_keywords_lex_as_identifiers() {
-        // `match`/`case`/`select`/`scope` are contextual (soft) keywords
-        // (#1405/#1411): never reserved words, so the lexer emits them as
-        // ordinary identifiers and the parser recognizes them only in-slot.
-        for w in ["match", "case", "select", "scope"] {
+        // Contextual (soft) keywords are never reserved words, so the lexer
+        // emits them as ordinary identifiers and the parser recognizes them
+        // only in-slot. Tier 1 (#1405/#1411): match/case/select/scope. Tier 2
+        // (#1412): spawn/when/do/unsafe/python.
+        for w in [
+            "match", "case", "select", "scope", // Tier 1
+            "spawn", "when", "do", "unsafe", "python", // Tier 2
+        ] {
             assert_eq!(Keyword::from_ident(w), None, "`{w}` must not be reserved");
         }
     }
