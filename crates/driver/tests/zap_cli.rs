@@ -1982,6 +1982,60 @@ def main():
 }
 
 #[test]
+fn a_library_generator_shadows_the_built_in_eq_without_replacing_it() {
+    // E4 (#1431): a library `@derivable` generator can express the compiler's
+    // structural equality. A struct derives BOTH the built-in `Eq` (reached via
+    // `==`) and a library `StructEq`, and both equality functions are emitted —
+    // the built-in `P____eq__` is untouched (this is a shadow proof, not a
+    // replacement) and the library stub forwards to the specialized generator.
+    // Runtime agreement between the two is pinned by the golden
+    // `derive_eq_shadow` under the CI LLVM matrix.
+    let src = "\
+@derivable(StructEq)
+def _derive_structeq[T](T a, T b) -> bool:
+    comptime for f in reflect.type_info(T).fields:
+        if reflect.field(a, comptime f.index) != reflect.field(b, comptime f.index):
+            return False
+    return True
+
+interface StructEq:
+    def structeq(self, Self other) -> bool
+
+@derive(Eq, StructEq)
+struct P:
+    int64 x
+    str s
+
+def main():
+    auto p = P(1, \"a\")
+    print(p == p)
+    print(p.structeq(p))
+";
+    let f = write_zap("e4-eq-shadow", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the shadow generator must lower alongside the built-in; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The built-in Eq is left in place (shadow, not replace)...
+    assert!(
+        stdout.contains("@P____eq__"),
+        "the built-in `__eq__` is untouched: {stdout}"
+    );
+    // ...and the library trait specializes its generator and forwards to it.
+    assert!(
+        stdout.contains("@_derive_structeq$P"),
+        "the library generator specializes at P: {stdout}"
+    );
+    assert!(
+        stdout.contains("@P__structeq"),
+        "the library forwarding stub is synthesized: {stdout}"
+    );
+}
+
+#[test]
 fn a_generator_bug_is_a_dual_span_error_not_a_crash() {
     // An engine fault inside a generator (here an out-of-range `reflect.field`)
     // is the library author's bug, not the consumer's: it renders as the
