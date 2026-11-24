@@ -69,20 +69,18 @@ fn arg1(lowerer: &mut FnLower, args: &[ast::Arg], to: Ty) -> Result<Value, Lower
     Ok(lowerer.coerce(v, vt, to))
 }
 
-/// Emit a one-argument void runtime call (statement position), yielding a
-/// throwaway `i32 0` so the call expression still has a value.
-fn call1_void(
+/// Emit a one-argument void runtime call that **may raise** (so it must be an
+/// `invoke`/`throwing_call`, not a plain `Call`, or an enclosing `try` could not
+/// catch the exception — see the cancellable sleeps below, which raise
+/// `Cancelled` when the owning scope is cancelled during the wait).
+fn call1_void_throwing(
     lowerer: &mut FnLower,
     func: &str,
     args: &[ast::Arg],
     at: Ty,
 ) -> Result<(Value, Ty), LowerError> {
     let a = arg1(lowerer, args, at)?;
-    lowerer.emit(Inst::Call {
-        dest: None,
-        func: func.to_string(),
-        args: vec![a],
-    });
+    lowerer.throwing_call(None, func, vec![a]);
     Ok((lowerer.iconst(Ty::I32, 0), Ty::I32))
 }
 
@@ -97,17 +95,28 @@ fn lower(
         "monotonic" => call0(lowerer, "zap_time_monotonic_seconds", Ty::F64),
         "time_ns" => call0(lowerer, "zap_time_wall_ns", Ty::I64),
         "time" => call0(lowerer, "zap_time_wall_seconds", Ty::F64),
-        // sleep (raw-number forms, unchanged)
-        "sleep" => return call1_void(lowerer, "zap_time_sleep_seconds", args, Ty::F64).map(Some),
-        "sleep_ns" => return call1_void(lowerer, "zap_time_sleep_ns", args, Ty::I64).map(Some),
-        // sleep_for(d: Duration): unwrap nanos, reuse the ns sleep (#1047).
+        // sleep (raw-number forms). Scheduler-aware + cancellable (#1357): on a
+        // coroutine with an owning scope these park the G (freeing the M) and
+        // raise `Cancelled` if the scope is cancelled mid-wait, so they are
+        // `throwing_call`s; on a native thread / no scope they fall back to the
+        // blocking nanosleep inside the runtime.
+        "sleep" => {
+            return call1_void_throwing(
+                lowerer,
+                "zap_time_sleep_cancellable_seconds",
+                args,
+                Ty::F64,
+            )
+            .map(Some)
+        }
+        "sleep_ns" => {
+            return call1_void_throwing(lowerer, "zap_time_sleep_cancellable_ns", args, Ty::I64)
+                .map(Some)
+        }
+        // sleep_for(d: Duration): unwrap nanos, reuse the cancellable ns sleep.
         "sleep_for" => {
             let nanos = unwrap_duration(lowerer, &args[0])?;
-            lowerer.emit(Inst::Call {
-                dest: None,
-                func: "zap_time_sleep_ns".to_string(),
-                args: vec![nanos],
-            });
+            lowerer.throwing_call(None, "zap_time_sleep_cancellable_ns", vec![nanos]);
             (lowerer.iconst(Ty::I32, 0), Ty::I32)
         }
         // duration unit constructors (-> Duration, #1047): compute nanoseconds

@@ -354,7 +354,12 @@ Cancelling a coroutine arms it; the cancel takes effect at the next
 coroutine:
 
 - any channel send/receive and any `select`;
-- `sleep`, timer, and I/O waits;
+- `sleep`, timer, and I/O waits — for `time.sleep*` this holds on a coroutine
+  with an owning `scope:` (I#1357): the sleep parks on the scheduler timer,
+  frees its M, and raises `Cancelled` on cancellation; a sleep on a native
+  thread (`main`) or a coroutine with no owning scope keeps the blocking,
+  non-cancellable path (generalizing M-freeing to every coroutine sleep is
+  I#1360);
 - entering or leaving a nested `scope:`;
 - an explicit `checkpoint()` call in long CPU-bound loops.
 
@@ -811,8 +816,13 @@ parks its G and frees its M.
   both paths.
 - **Formal memory-model spec** (D-0034) and the **race-detector** tool
   (both already tracked in OPEN-QUESTIONS).
-- **General timer API** — concrete `after()` and `sleep()` surfaces; scope
-  deadlines are integer milliseconds (`scope(timeout=<ms>)`, D-0094).
+- **General timer API** — the `sleep()` half is RESOLVED (I#1357,
+  decisions/runtime/1357-cancellable-coroutine-sleep.md): a coroutine
+  `time.sleep*` with an owning `scope:` parks on the netpoller timer (freeing its
+  M) and observes scope cancellation, raising `Cancelled`/`ScopeTimeout`. Still
+  open: a one-shot `after(d) -> chan` timer channel for `select`, and freeing the
+  M for *every* coroutine sleep (I#1360). Scope deadlines are integer
+  milliseconds (`scope(timeout=<ms>)`, D-0094).
 - **Blocking FFI.**
   How CPython interop (D-0012) and its GIL interact with coroutines that must not
   block an M (likely a dedicated M pool for FFI calls).
