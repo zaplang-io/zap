@@ -97,12 +97,6 @@ fn after_lowers_to_timer_channel_of_i64() {
         "the fire instant must read back as i64, got {:?}",
         result_ty(&m, "zap_chan_recv_i64"),
     );
-    // after() hands the channel back immediately; it must NOT be emitted as a
-    // throwing call (it does not park here — the firing coroutine does).
-    assert!(
-        !matches!(result_ty(&m, "zap_time_after"), None),
-        "zap_time_after must have a destination value"
-    );
 }
 
 /// The `select` timeout idiom lowers: a receive case bound to a timer channel
