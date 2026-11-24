@@ -119,6 +119,22 @@ fn lower(
             lowerer.throwing_call(None, "zap_time_sleep_cancellable_ns", vec![nanos]);
             (lowerer.iconst(Ty::I32, 0), Ty::I32)
         }
+        // after(d: Duration) -> channel[int64] (#1395): a one-shot timer channel.
+        // Unwrap nanos and hand to the runtime, which makes a cap-1 buffered
+        // channel and a detached firing coroutine that delivers the fire instant
+        // once. This returns the channel immediately (it does not park here), so
+        // it is a plain `Call`, not a `throwing_call`. The element is the fire
+        // monotonic-ns timestamp (`Elem::I64`).
+        "after" => {
+            let nanos = unwrap_duration(lowerer, &args[0])?;
+            let d = lowerer.new_value(Ty::Chan(Elem::I64));
+            lowerer.emit(Inst::Call {
+                dest: Some(d),
+                func: "zap_time_after".to_string(),
+                args: vec![nanos],
+            });
+            (d, Ty::Chan(Elem::I64))
+        }
         // duration unit constructors (-> Duration, #1047): compute nanoseconds
         // via the existing runtime entries, then wrap.
         "seconds" | "millis" | "micros" => {

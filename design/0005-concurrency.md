@@ -195,12 +195,19 @@ Semantics:
 A common timeout idiom composes `select` with a timer channel:
 
 ```python
+import time
+
 select:
     case v = <-ch:
         use(v)
-    case <-after(5.seconds):   # after() returns a channel that fires once
+    case fired = <-time.after(time.seconds(5)):  # a one-shot timer channel (#1395)
         raise TimeoutError()
 ```
+
+`time.after(d)` returns a `channel[int64]` that receives one value — the
+monotonic-ns instant it fired — after the duration, then blocks (Go `time.After`
+shape). A `select` receive case always binds a name, so the timer value is
+received into `fired` even when it is discarded.
 
 ### Sync primitives (D-0032)
 
@@ -444,9 +451,10 @@ This is new surface area; nothing existing changes behavior.
   §16).
   This proposal adds **`scope`** as a reserved word (used only as a block
   introducer); the coordinating session should add it to the keyword list.
-  `close`, `after`, `range`, and `checkpoint` are ordinary built-in functions,
-  not keywords; `Mutex`/`RWMutex`/`WaitGroup`/`Once`/`Atomic`/`Future` live in a
-  `sync` module and reserve no words.
+  `close`, `range`, and `checkpoint` are ordinary built-in functions, not
+  keywords; the one-shot timer channel is `time.after(d)` in the `time` module
+  (#1395), not a bare built-in; `Mutex`/`RWMutex`/`WaitGroup`/`Once`/`Atomic`/
+  `Future` live in a `sync` module and reserve no words.
 - **Operators.** `<-` (send/receive) is already in the SPEC grammar (§8); no new
   operator tokens.
 - **No breaking changes.** Programs that never use concurrency are unaffected,
@@ -820,11 +828,15 @@ parks its G and frees its M.
   decisions/runtime/1357-cancellable-coroutine-sleep.md; generalized by I#1360 +
   decisions/runtime/1360-coroutine-sleep-fd-less-timer-park.md): every coroutine
   `time.sleep*` parks on the fd-less scheduler timer (freeing its M), and with an
-  owning `scope:` observes cancellation, raising `Cancelled`/`ScopeTimeout`.
-  Still open: a one-shot `after(d) -> chan` timer channel for `select`, and a
-  deadline-keyed timer heap for very many concurrent sleepers (the linear
-  registry scan is reused today). Scope deadlines are integer milliseconds
-  (`scope(timeout=<ms>)`, D-0094).
+  owning `scope:` observes cancellation, raising `Cancelled`/`ScopeTimeout`. The
+  `after()` half is RESOLVED too (I#1395 +
+  decisions/runtime/1395-one-shot-timer-channel-after.md): `time.after(d)`
+  returns a `channel[int64]` that fires once after `d` (the monotonic-ns instant),
+  backed by a detached firing coroutine that reuses the same fd-less timer, for
+  the `select` timeout idiom. Still open: a periodic ticker, a deadline-keyed
+  timer heap for very many concurrent timers/sleepers (the linear registry scan
+  is reused today), and a non-Linux (Windows/IOCP) timer backend. Scope deadlines
+  are integer milliseconds (`scope(timeout=<ms>)`, D-0094).
 - **Blocking FFI.**
   How CPython interop (D-0012) and its GIL interact with coroutines that must not
   block an M (likely a dedicated M pool for FFI calls).

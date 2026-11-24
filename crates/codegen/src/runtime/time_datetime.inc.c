@@ -139,6 +139,75 @@ void zap_time_sleep_cancellable_seconds(double s) {
     zap_time_sleep_cancellable_ns(ins);
 }
 
+/* --- one-shot timer channel: `time.after(d) -> channel[int64]` (#1395) ---
+ * Returns a cap-1 buffered channel that receives exactly one value — the
+ * monotonic-clock instant (ns) at which the timer fired — after `ns`
+ * nanoseconds, then blocks on any further receive (the channel is never
+ * closed). This is the Go `time.After` shape and the `after()` half of the
+ * General timer API (design/0005; the `sleep()` half is #1357/#1360).
+ *
+ * The timer is a detached firing coroutine that parks on the same fd-less
+ * scheduler timer as the cancellable sleep (`zap_time_timer_wait`, #1360), so
+ * it frees its worker M while waiting and consumes no file descriptor — many
+ * concurrent `after` timers cannot exhaust fds. The cap-1 buffer means the
+ * single send never blocks, so a timer nobody receives neither leaks nor
+ * stalls; being `spawn detached` it is not joined at program exit, so a pending
+ * long timer never delays `main` returning (it is simply terminated).
+ * Resolution is millisecond-class (it rides the poller's epoll tick); on a
+ * non-epoll platform `zap_time_timer_wait` returns CLOSED and the firing
+ * coroutine falls back to a blocking sleep on its own M, exactly as
+ * `time.sleep` does there. */
+typedef struct ZapAfterArg {
+    void *chan;          /* ZapChan* (cap 1); receives the fire instant (i64 ns)  */
+    int64_t deadline_ns; /* absolute CLOCK_MONOTONIC deadline                      */
+} ZapAfterArg;
+static const int32_t zap_off_after_arg[] = {
+    (int32_t)offsetof(ZapAfterArg, chan),
+};
+static const ZapTypeDesc zap_desc_after_arg = {
+    (int64_t)sizeof(ZapAfterArg), ZAP_TD_PRECISE, 1, zap_off_after_arg};
+
+/* The detached firing coroutine: wait out the deadline, then deliver one
+ * timestamp. It must NEVER raise — a detached coroutine (no owning scope) that
+ * propagates an exception aborts the whole program (D-0044). A detached G has
+ * `scope == NULL`, so the park is not a cancellation target and the cap-1 send
+ * cannot block or be cancelled; the CANCELLED branch is therefore defensive and
+ * simply drops the timer without raising. */
+static void *zap_time_after_fire(void *arg) {
+    ZapAfterArg *a = (ZapAfterArg *)arg;
+    int64_t st = zap_time_timer_wait(a->deadline_ns);
+    if (st == ZAP_POLL_CANCELLED) {
+        return NULL; /* not expected for a detached timer; never raise here */
+    }
+    if (st == ZAP_POLL_CLOSED) {
+        /* No cooperative timer on this platform: block the remaining time on
+         * this M, matching the sleep fallback. */
+        int64_t rem = a->deadline_ns - np_now_ns();
+        if (rem > 0) {
+            zap_time_sleep_ns(rem);
+        }
+    }
+    /* ZAP_POLL_TIMEOUT (or the fallback above elapsed): deliver the fire instant
+     * once. Cap-1 buffer => the send never blocks; no scope => never cancelled. */
+    zap_chan_send_i64(a->chan, np_now_ns());
+    return NULL;
+}
+
+/* `ns <= 0` fires effectively immediately (the deadline is already in the past,
+ * so the firing coroutine's wait returns at once). Mirrors the cancellable
+ * sleep's overflow clamp so a very long duration cannot wrap to a past
+ * deadline. Channel-then-wrapper allocation order follows `zap_signal_notify`. */
+void *zap_time_after(int64_t ns) {
+    void *ch = zap_chan_new(1);
+    ZapAfterArg *a = (ZapAfterArg *)zap_obj(&zap_desc_after_arg);
+    a->chan = ch;
+    int64_t now = np_now_ns();
+    a->deadline_ns = (ns > 0 && ns > INT64_MAX - now) ? INT64_MAX
+                                                      : now + (ns > 0 ? ns : 0);
+    zap_spawn_detached(zap_time_after_fire, a);
+    return ch;
+}
+
 /* --- duration unit constructors (-> nanoseconds) --- */
 int64_t zap_time_seconds_to_ns(int64_t s) { return s * 1000000000LL; }
 int64_t zap_time_millis_to_ns(int64_t ms) { return ms * 1000000LL; }
