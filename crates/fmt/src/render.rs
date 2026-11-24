@@ -475,6 +475,18 @@ pub fn pattern_str(p: &Pattern) -> String {
             None => "*".to_string(),
         },
         Pattern::As { pattern, name, .. } => format!("{} as {name}", pattern_str(pattern)),
+        Pattern::ComptimeVariants {
+            loop_var,
+            iter,
+            bind,
+            ..
+        } => {
+            let base = format!("comptime {loop_var} in {}", pexpr(iter, P_LAMBDA));
+            match bind {
+                Some(b) => format!("{base} as {b}"),
+                None => base,
+            }
+        }
     }
 }
 

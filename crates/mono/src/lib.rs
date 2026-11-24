@@ -2467,6 +2467,110 @@ impl Mono<'_> {
         }
     }
 
+    /// Expand a `case comptime <v> in reflect.type_info(T).variants [as payload]:`
+    /// arm into one ordinary variant-pattern arm per variant of the concrete enum
+    /// (#1374, epic #1371). Each generated arm binds the variant's payload fields
+    /// positionally to the canonical captures the comptime-specialized body
+    /// references (`reflect.field(payload, i)` → the i-th capture), so the whole
+    /// lowers through the existing enum-match machinery — the runtime
+    /// discrimination is reused, not re-invented. Exhaustive by construction (one
+    /// arm per variant).
+    #[allow(clippy::too_many_arguments)]
+    fn expand_comptime_variant_arms(
+        &mut self,
+        loop_var: &str,
+        iter: &Expr,
+        payload: Option<&str>,
+        body: &Block,
+        sty: Option<&Type>,
+        cv_span: Span,
+        env: &mut Env,
+    ) -> Result<Vec<ast::MatchArm>, LowerError> {
+        // The iterator must be `reflect.type_info(T).variants`; resolve `T` to the
+        // concrete enum via the active substitution (as the `comptime for` path
+        // does for a generic generator).
+        let Expr::Attr {
+            base, name: member, ..
+        } = iter
+        else {
+            return Err(err(
+                "`case comptime <v> in …` expects `reflect.type_info(T).variants`",
+            ));
+        };
+        if member != "variants" {
+            return Err(err(format!(
+                "`case comptime <v> in …` iterates `.variants`, found `.{member}`"
+            )));
+        }
+        let Some(type_name) = reflect_type_info_arg(base) else {
+            return Err(err(
+                "`case comptime <v> in reflect.type_info(T).variants` expects a \
+                 `reflect.type_info(T)` iterator",
+            ));
+        };
+        let type_name = match self.cur_subst.get(&type_name) {
+            Some(Type::Named { name, .. }) => name.clone(),
+            _ => type_name,
+        };
+        let Some(def) = self.enums.get(type_name.as_str()).copied() else {
+            return Err(err(format!(
+                "a comptime-variant `match` requires `{type_name}` to be an enum in scope \
+                 (`reflect.type_info({type_name}).variants`)"
+            )));
+        };
+        // Comptime-specialize the shared arm body once per variant (binding the
+        // loop variable to each variant record; the payload handle lets
+        // `reflect.field` resolve to the per-field captures).
+        let bodies = comptime_for::specialize_variant_arms(
+            def,
+            loop_var,
+            payload,
+            body,
+            &[],
+            Some(&self.comptime_registry),
+        )?;
+        let mut arms = Vec::with_capacity(def.variants.len());
+        for (variant, sbody) in def.variants.iter().zip(bodies) {
+            // One variant pattern binding the payload fields positionally to the
+            // canonical captures the specialized body references; a unit variant
+            // carries no parentheses.
+            let pattern = if variant.fields.is_empty() {
+                Pattern::Struct {
+                    path: vec![type_name.clone(), variant.name.clone()],
+                    args: None,
+                    span: cv_span,
+                }
+            } else {
+                let pargs = (0..variant.fields.len())
+                    .map(|i| PatArg {
+                        name: None,
+                        pattern: Pattern::Capture {
+                            name: zapc_comptime::payload_capture_name(i),
+                            span: cv_span,
+                        },
+                        span: cv_span,
+                    })
+                    .collect();
+                Pattern::Struct {
+                    path: vec![type_name.clone(), variant.name.clone()],
+                    args: Some(pargs),
+                    span: cv_span,
+                }
+            };
+            env.push();
+            let rpat = self.rewrite_pattern(&pattern, sty, env)?;
+            let rbody = self.rewrite_block(&sbody, env)?;
+            env.pop();
+            arms.push(ast::MatchArm {
+                pattern: rpat,
+                guard: None,
+                body: rbody,
+                span: cv_span,
+            });
+        }
+        Ok(arms)
+    }
+
     /// Attach the active `@derive` context (trait + type) to a comptime failure
     /// raised during a generator's `comptime for` descent, so the driver renders
     /// it as a consumer `ZAP7003` "cannot derive `trait` for `type`" (E3d, #1293).
@@ -2698,6 +2802,27 @@ impl Mono<'_> {
                 let sty = cty_type(scty);
                 let mut narms = Vec::with_capacity(arms.len());
                 for arm in arms {
+                    // #1374: a `case comptime <v> in …variants [as payload]:` arm
+                    // expands into one ordinary variant-pattern arm per variant.
+                    if let Pattern::ComptimeVariants {
+                        loop_var,
+                        iter,
+                        bind,
+                        span: cv_span,
+                    } = &arm.pattern
+                    {
+                        let expanded = self.expand_comptime_variant_arms(
+                            loop_var,
+                            iter,
+                            bind.as_deref(),
+                            &arm.body,
+                            sty.as_ref(),
+                            *cv_span,
+                            env,
+                        )?;
+                        narms.extend(expanded);
+                        continue;
+                    }
                     env.push();
                     let pattern = self.rewrite_pattern(&arm.pattern, sty.as_ref(), env)?;
                     let guard = match &arm.guard {

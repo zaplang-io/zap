@@ -1552,6 +1552,60 @@ def main():
 }
 
 #[test]
+fn an_enum_derive_generator_discriminates_variants_via_comptime_match() {
+    // #1374 (epic #1371): the full enum-derive surface. A generator uses
+    // `match value: case comptime v in reflect.type_info(T).variants as payload:`
+    // to discriminate the active variant, with an inner `comptime for f in
+    // v.fields:` and `reflect.field(payload, i)` reading the payload. This must
+    // parse, type-check, and lower to IR on the host (the comptime arm expands to
+    // one ordinary variant-pattern arm per variant, reusing the existing
+    // enum-match lowering).
+    let src = "\
+@derivable(Sum)
+def _derive_sum[T](T value) -> int64:
+    match value:
+        case comptime v in reflect.type_info(T).variants as payload:
+            int64 acc = 0
+            comptime for f in v.fields:
+                acc = acc + reflect.field(payload, comptime f.index)
+            return acc
+    return 0
+
+interface Sum:
+    def sum(self) -> int64
+
+@derive(Sum)
+enum N:
+    Zero
+    One(int64 a)
+    Two(int64 a, int64 b)
+
+def main():
+    auto n = N.Two(3, 4)
+    print(n.sum())
+";
+    let f = write_zap("e3-enum-comptime-match", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the enum-derive comptime match must lower to IR; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The forwarding stub calls the specialized generator, which discriminates
+    // via the tag field and loads payload fields (the existing enum-match
+    // lowering) — no comptime construct survives to IR.
+    assert!(
+        stdout.contains("@_derive_sum$N") && stdout.contains("fieldget"),
+        "specialized generator discriminates + loads payload fields: {stdout}"
+    );
+    assert!(
+        !stderr.contains("not available") && !stderr.contains("reached lowering"),
+        "no comptime construct should survive to lowering: {stderr}"
+    );
+}
+
+#[test]
 fn a_generator_bug_is_a_dual_span_error_not_a_crash() {
     // An engine fault inside a generator (here an out-of-range `reflect.field`)
     // is the library author's bug, not the consumer's: it renders as the

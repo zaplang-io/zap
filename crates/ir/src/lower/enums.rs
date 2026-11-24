@@ -353,6 +353,9 @@ impl<'a> FnLower<'a> {
         match pat {
             // `<pat> as name` matches exactly when its inner pattern does.
             Pattern::As { pattern, .. } => self.pattern_statically_dead(sty, pattern),
+            // #1374: a comptime-generated variant arm is expanded by
+            // monomorphization before lowering, so it is never seen as dead here.
+            Pattern::ComptimeVariants { .. } => false,
             // An or-pattern is dead only when every alternative is dead.
             Pattern::Or(patterns, _) => {
                 !patterns.is_empty()
@@ -432,6 +435,10 @@ impl<'a> FnLower<'a> {
                 // binding is added in `bind_pattern` (D11, #603).
                 self.pattern_cond(sv, sty, pattern)
             }
+            Pattern::ComptimeVariants { .. } => Err(err(
+                "internal error: a comptime-variants match arm reached lowering; \
+                 monomorphization should have expanded it (#1374)",
+            )),
             Pattern::Struct {
                 path,
                 args,
@@ -762,6 +769,10 @@ impl<'a> FnLower<'a> {
                 self.declare(name, slot, sty);
                 Ok(())
             }
+            Pattern::ComptimeVariants { .. } => Err(err(
+                "internal error: a comptime-variants match arm reached lowering; \
+                 monomorphization should have expanded it (#1374)",
+            )),
             Pattern::Tuple(patterns, _) => {
                 let Ty::Struct(sid) = sty else {
                     return Ok(());

@@ -649,6 +649,9 @@ impl Rewriter<'_> {
                 }
             }
             Pattern::As { pattern, .. } => self.pattern(pattern, locals),
+            // #1374: rewrite imported names in the comptime iterator expression;
+            // the loop var and payload binding are locals, not rewritten.
+            Pattern::ComptimeVariants { iter, .. } => self.expr(iter, locals),
             Pattern::Wildcard(_) | Pattern::Capture { .. } | Pattern::Rest { .. } => {}
         }
     }
@@ -934,6 +937,14 @@ fn collect_pattern_bindings(p: &Pattern, s: &mut HashSet<String>) {
         Pattern::As { pattern, name, .. } => {
             collect_pattern_bindings(pattern, s);
             s.insert(name.clone());
+        }
+        // #1374: the comptime loop variable and the optional payload handle are
+        // locals introduced by the arm.
+        Pattern::ComptimeVariants { loop_var, bind, .. } => {
+            s.insert(loop_var.clone());
+            if let Some(b) = bind {
+                s.insert(b.clone());
+            }
         }
     }
 }
