@@ -8592,17 +8592,40 @@ impl<'a> FnLower<'a> {
                     return Err(err("sorted() takes the list to sort as its argument"));
                 };
                 let (lst, lt) = self.expr(list_expr)?;
-                let Ty::List(elem) = lt else {
-                    return Err(err("sorted() expects a list value"));
+                // `sorted(bytes)` sorts the byte values ascending, returning a
+                // fresh `list[int64]` (#1355) — materialize the bytes into a new
+                // list (already a private copy, so no `zap_list_copy`) and sort
+                // that. A `list` is copied first so the caller's list is left
+                // unchanged. Either way `copy` is a fresh, owned `list[elem]`.
+                let (copy, elem) = match lt {
+                    Ty::List(elem) => {
+                        let copy = self.new_value(Ty::List(elem));
+                        self.emit(Inst::Call {
+                            dest: Some(copy),
+                            func: "zap_list_copy".to_string(),
+                            args: vec![lst],
+                        });
+                        (copy, elem)
+                    }
+                    Ty::Bytes => {
+                        let list = self.new_value(Ty::List(Elem::I64));
+                        self.emit(Inst::Call {
+                            dest: Some(list),
+                            func: "zap_list_new".to_string(),
+                            args: vec![],
+                        });
+                        self.iterate_bytes(lst, |s, ev, _et| {
+                            s.emit(Inst::Call {
+                                dest: None,
+                                func: "zap_list_push_i64".to_string(),
+                                args: vec![list, ev],
+                            });
+                            Ok(())
+                        })?;
+                        (list, Elem::I64)
+                    }
+                    _ => return Err(err("sorted() expects a list or bytes value")),
                 };
-                // Copy first so the caller's list is left unchanged, then build
-                // the sort arguments against the copy and sort it in place.
-                let copy = self.new_value(Ty::List(elem));
-                self.emit(Inst::Call {
-                    dest: Some(copy),
-                    func: "zap_list_copy".to_string(),
-                    args: vec![lst],
-                });
                 let (keys, kind, reverse) = self.prepare_sort(copy, elem, "sorted", &rest)?;
                 self.emit(Inst::Call {
                     dest: None,

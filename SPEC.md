@@ -233,7 +233,11 @@ are **byte-based**: `len(b)` is the byte count, `b[i]` is an `int64` byte value
 in `0..=255` (not a `char`), a slice `b[lo:hi:step]` is `bytes`, and **iterating
 a `bytes` yields each byte as an `int64` in `0..=255`** in order (#1349) — a
 `for` loop, comprehension, or splat over `bytes` binds integers, not `char`s
-(byte-wise, not codepoint-wise). `==`/`!=`
+(byte-wise, not codepoint-wise). Because a `bytes` is a sequence of small
+integers, `sum(b)` reduces its byte values to an `int64` (optional start),
+`sorted(b)` returns a `list[int64]` of the byte values ascending, and `x in b`
+is membership — an `int` left operand tests byte-value membership, a `bytes`
+left operand tests subsequence membership (#1355). `==`/`!=`
 and ordering are byte-wise; `b1 + b2` concatenates. Construct it with the
 `b"..."` literal (its content is the UTF-8 encoding of the escaped text — there
 is no `\xNN` escape yet, so arbitrary non-UTF-8 bytes use `bytes([...])`),
@@ -252,7 +256,11 @@ auto raw = bytes(s)  # UTF-8 bytes (a `bytes` value)
 print(raw[0])        # 104   (a byte, as int64)
 print(str(raw))      # "héllo" (UTF-8 decode)
 auto blob = bytes([0, 255, 16])
-for b in blob:       # iterate bytes (int64 in 0..=255), in order
+print(sum(blob))      # 271  (byte values reduced to int64)
+print(sorted(blob))   # [0, 16, 255]  (a list[int64])
+print(255 in blob)    # True   (int: byte-value membership)
+print(b"TC" in b"UTC")  # True  (bytes: subsequence membership)
+for b in blob:        # iterate bytes (int64 in 0..=255), in order
     print(b)         # 0, then 255, then 16
 ```
 

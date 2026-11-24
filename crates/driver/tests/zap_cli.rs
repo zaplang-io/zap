@@ -685,6 +685,58 @@ fn test_bytes_iteration_1349() {
     assert!(stdout.contains("0 failed"), "stdout:\n{stdout}");
 }
 
+/// Operations that take a `bytes` value directly — the #1355 reproducer — run
+/// green under `zap test`: `sum(bytes)` (+ start), `sorted(bytes)` (ascending
+/// list[int64], `reverse=`), and `x in bytes` membership (int byte-value and
+/// bytes subsequence, with `not in`). These type-checked but failed code
+/// generation before this change. Complements the `tests/golden/bytes_value_ops.zap`
+/// `zap run` golden; exercises the native test path (empty `TypeMap`).
+#[cfg(feature = "codegen")]
+#[test]
+fn test_bytes_value_ops_1355() {
+    let dir = scratch("test_bytes_value_ops_1355");
+    write_file(
+        &dir,
+        "tests/bytes_ops_test.zap",
+        "@test\ndef sums_bytes():\n\
+         \x20   assert sum(b\"UTC\") == 236\n\
+         \x20   assert sum(b\"UTC\", 4) == 240\n\
+         \x20   assert sum(bytes()) == 0\n\n\
+         @test\ndef sorts_bytes():\n\
+         \x20   assert sorted(b\"cab\") == [97, 98, 99]\n\
+         \x20   assert sorted(b\"cab\", reverse=True) == [99, 98, 97]\n\
+         \x20   assert sorted(bytes()) == []\n\n\
+         @test\ndef int_membership():\n\
+         \x20   assert 85 in b\"UTC\"\n\
+         \x20   assert 0 not in b\"UTC\"\n\
+         \x20   assert 255 in bytes([0, 255])\n\n\
+         @test\ndef bytes_membership():\n\
+         \x20   assert b\"TC\" in b\"UTC\"\n\
+         \x20   assert b\"\" in b\"UTC\"\n\
+         \x20   assert b\"xy\" not in b\"UTC\"\n",
+    );
+
+    let out = zap().arg("test").current_dir(&dir).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "zap test should pass; exit {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        out.status.code()
+    );
+    assert!(stdout.contains("[PASS] sums_bytes"), "stdout:\n{stdout}");
+    assert!(stdout.contains("[PASS] sorts_bytes"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("[PASS] int_membership"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[PASS] bytes_membership"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("0 failed"), "stdout:\n{stdout}");
+}
+
 // --- `zap mcp` end-to-end (issue #72, D-0055) ---------------------------------
 
 /// Drive the real `zap mcp` server over stdio: spawn it rooted at `root`, feed
