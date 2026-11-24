@@ -10239,6 +10239,27 @@ impl<'a> FnLower<'a> {
     /// nested literals, but leave named values alone: a real type mismatch must
     /// still be rejected, never erased by relabelling its pointer.
     fn expr_collection_context(&mut self, e: &Expr, target: Ty) -> Result<(Value, Ty), LowerError> {
+        self.expr_collection_context_impl(e, target, true)
+    }
+
+    /// Core of [`expr_collection_context`]. `final_dest` is true when `target` is
+    /// the real destination type of the value — a typed binding / argument /
+    /// return / constructor field (via `expr_coerced`), a collection element
+    /// lowered against its element type, or a conditional branch whose value must
+    /// match `target`. It is false only for the internal `Optional`-unwrap
+    /// recursion, whose `target` is one *payload* level of an outer `Optional`:
+    /// there a correctly-formed *outer* `Optional` value (e.g. an
+    /// `Optional[Optional[T]]`) is lowered and passed back up to be resolved by
+    /// the outer frame's `it == target`, so the #1407 payload-mismatch reject must
+    /// NOT fire at that non-final frame (it would false-positive on nested
+    /// `Optional`s, whose inner frame sees `it`'s payload differ from the
+    /// one-level-unwrapped `target`).
+    fn expr_collection_context_impl(
+        &mut self,
+        e: &Expr,
+        target: Ty,
+        final_dest: bool,
+    ) -> Result<(Value, Ty), LowerError> {
         // A bare `None` collection element / contextual value materializes the
         // canonical value for `target` (#1075, #1080), the same way `expr_coerced`
         // does for arguments and returns. Routing it through `lower_none_expr`
@@ -10276,12 +10297,22 @@ impl<'a> FnLower<'a> {
         // an incompatible source passes through unchanged for the caller's
         // `coerce` / sema to reject (never silently wrapped).
         if let Some(opt) = optional_layout(self.ctx, target) {
-            let (iv, it) = self.expr_collection_context(e, opt.payload_ty)?;
+            let (iv, it) = self.expr_collection_context_impl(e, opt.payload_ty, false)?;
             // A bare `bigint` payload for a fixed-width-numeric `Optional[T]`
             // (e.g. `Optional[int64] x = <bigint>`) is not assignable (#1379):
             // sema's #1265 widening is payload-agnostic, so catch it here rather
             // than store the raw `bigint` pointer as the Optional's value.
             self.check_numeric_payload(&it, opt.payload_ty)?;
+            // A whole `Optional[U]` value supplied where `Optional[T]` is expected
+            // (e.g. `Optional[int64] x = Optional.Some(<bigint value>)`, or a
+            // `list[Optional[int64]]` element) must have a matching payload
+            // (#1407); reject a mismatch before the `it == target` /
+            // `opt_payload_source` paths relabel it. Only at a final destination:
+            // at the non-final `Optional`-unwrap recursion `it` may legitimately be
+            // a more-wrapped `Optional` handed up to an outer frame.
+            if final_dest {
+                self.check_optional_payload(&it, target)?;
+            }
             if it == target {
                 return Ok((iv, target));
             }
@@ -10459,6 +10490,53 @@ impl<'a> FnLower<'a> {
         Ok(())
     }
 
+    /// Reject an `Optional[U]` value flowing into an `Optional[T]` slot whose
+    /// payload type differs (#1407). Sema erases the `Optional` payload (it tracks
+    /// every `Optional[T]` as opaque `Named("Optional")`), so the #1265
+    /// bare-payload widening and the top-level `assignable` identity are
+    /// payload-agnostic: `Optional[U]` is "assignable" to `Optional[T]` for *any*
+    /// `U`, `T`. So an explicit `Optional.Some(v)` whose argument monomorphizes a
+    /// *different* payload — `Optional.Some(<bigint value>)` / `Optional.Some(x)`
+    /// for an `x: int32` / `str` — reaches lowering as `Optional$U` and, with no
+    /// `Optional`-to-`Optional` arm in `coerce`, has its `Optional$U` pointer
+    /// stored raw into an `Optional$T` slot. The two monomorphizations disagree on
+    /// both physical layout (a niche pointer-payload `Optional$bigint`/`str` vs a
+    /// tagged `Optional$int64`, or a narrower tagged payload) and method dispatch,
+    /// so a later `is_some()`/`unwrap()` reads garbage or raises — a memory-unsafe
+    /// miscompile in a checked program (the sibling of the bare-`bigint` case
+    /// #1379 fixed; see `decisions/lang/1379-bigint-optional-payload.md`).
+    ///
+    /// This must live in lowering, not sema, for the same reason as
+    /// `check_numeric_payload`: sema has already erased the payload by the time it
+    /// checks assignability (`coercible`), while lowering has the concrete,
+    /// monomorphized payload type (`OptionalLayout::payload_ty`). The check is
+    /// payload-aware but *not* a widening: payloads must be identical. A bare
+    /// payload (`from` is not itself an `Optional`) is untouched — that is the
+    /// #1265 bare-payload wrap, handled by `opt_payload_source`/`gen_opt_some`,
+    /// which still widens a *matching* numeric payload (`Optional[int64] x = n`
+    /// for an `int32 n`). `None` never reaches here (it is lowered by
+    /// `lower_none_expr` before any coercion).
+    fn check_optional_payload(&self, from: &Ty, to: Ty) -> Result<(), LowerError> {
+        if let (Some(fopt), Some(topt)) = (
+            optional_layout(self.ctx, *from),
+            optional_layout(self.ctx, to),
+        ) {
+            if fopt.payload_ty != topt.payload_ty {
+                return Err(err_code(
+                    zapc_diag::ErrorCode::ZAP4001,
+                    format!(
+                        "cannot assign value of type `{}` to `{}` (an `Optional[U]` is \
+                         not assignable to an `Optional[T]` with a different payload \
+                         type; build the target payload explicitly)",
+                        self.render_ty(from),
+                        self.render_ty(&to),
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn expr_coerced(
         &mut self,
         e: &Expr,
@@ -10479,7 +10557,10 @@ impl<'a> FnLower<'a> {
         }
         let (v, vt) = self.expr_collection_context(e, target)?;
         // A `bigint` is never implicitly assignable to a fixed-width numeric
-        // target (#1379); reject it rather than let `coerce` store it raw.
+        // target (#1379); reject it rather than let `coerce` store it raw. (The
+        // `Optional[U]` -> `Optional[T]` payload-mismatch reject #1407 is applied
+        // inside `expr_collection_context`, which every path here flows through,
+        // at its final destination frame.)
         self.check_numeric_payload(&vt, target)?;
         // A function value coerced to a `fn(...)` slot (argument / assignment /
         // return) must have the *exact* structural signature of that slot
