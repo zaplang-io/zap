@@ -45,14 +45,23 @@
 //! those fields' spans ([`GenericDeriveBounds`]), for E3d (#1293) to render an
 //! unsatisfied bound at the offending field. A `@skip` field attribute does not
 //! exist yet, so every field counts for now (its exclusion is a follow-up).
-//! Enum deriving and the diagnostics rendering itself remain E3d.
+//!
+//! **Enums (#1373, epic #1371):** an `enum` carrying a library `@derive(X)` is
+//! handled identically to a struct — the same thin forwarding stub, trait
+//! stripping, and inferred bounds — with the bound fields taken from the
+//! **variant payload fields** (a type parameter used in any variant's payload
+//! counts). The generator *body* for an enum (runtime variant discrimination via
+//! the Option-C `reflect.match` surface, decision #1372) is the codegen slice
+//! #1374; this module only wires the stub so an enum `@derive` is recognized and
+//! forwarded. The diagnostics rendering itself is E3d (#1293).
 
 use std::collections::HashMap;
 
 use zapc_diag::ErrorCode;
 use zapc_sema::TypeError;
 use zapc_syntax::ast::{
-    Arg, ArgSpread, Block, Expr, Function, Item, MethodSig, Module, Stmt, StructDef, Type,
+    Arg, ArgSpread, Block, Decorator, Expr, Function, Item, MethodSig, Module, Stmt, Type,
+    TypeParam,
 };
 use zapc_syntax::span::Span;
 
@@ -74,7 +83,8 @@ pub struct InferredBound {
 /// instantiation — this is the data E3d renders, not a bound the synthesis emits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenericDeriveBounds {
-    pub struct_name: String,
+    /// The derived type's name — a struct or (since #1373) an enum.
+    pub type_name: String,
     pub trait_name: String,
     pub params: Vec<InferredBound>,
 }
@@ -109,89 +119,144 @@ pub fn expand_library_derives(module: &mut Module) -> (Vec<TypeError>, Vec<Gener
         return (diags, bounds); // no library derivables -> nothing to do
     }
 
-    // Pass 2: for each struct, synthesize stubs for its library-trait derives and
-    // strip those traits from its `@derive(...)`.
+    // Pass 2: for each struct AND enum (#1373), synthesize stubs for its
+    // library-trait derives and strip those traits from its `@derive(...)`.
     for item in &mut module.items {
-        let Item::Struct(s) = item else { continue };
-        // Which library traits does this struct derive?
-        let derived: Vec<String> = s
-            .decorators
-            .iter()
-            .filter(|d| d.name == "derive")
-            .flat_map(|d| d.args.iter())
-            .filter_map(|a| match &a.value {
-                Expr::Name(n, _) if generators.contains_key(n) => Some(n.clone()),
-                _ => None,
-            })
-            .collect();
-        if derived.is_empty() {
-            continue;
-        }
-
-        let sp = s.span;
-        // The type the generator is specialized at: the bare name for a
-        // non-generic type, or the type applied to its own parameters for a
-        // generic one (`Pair[A, B]`), so each concrete `Pair[int64, str]`
-        // specializes the generator structurally (E3c, #1292).
-        let type_arg = self_type_arg_expr(s, sp);
-        let mut synthesized: Vec<String> = Vec::new();
-        for trait_name in &derived {
-            let generator = &generators[trait_name];
-            let Some(methods) = interfaces.get(trait_name) else {
-                diags.push(err(
-                    format!(
-                        "cannot derive `{trait_name}` for `{}`: `{trait_name}` is registered with \
-                         @derivable but has no `interface {trait_name}` declaring the method(s) to \
-                         synthesize (E3b, #1291)",
-                        s.name
-                    ),
-                    sp,
-                ));
-                continue;
-            };
-            for m in methods {
-                // A hand-written method of the same name wins (HQ7): skip.
-                if s.methods.iter().any(|existing| existing.name == m.name) {
-                    continue;
-                }
-                let stub = forwarding_stub(m, generator, &type_arg, sp);
-                s.methods.push(stub);
+        match item {
+            Item::Struct(s) => {
+                let bound_fields: Vec<(&Type, Span)> =
+                    s.fields.iter().map(|f| (&f.ty, f.span)).collect();
+                synthesize_for_type(
+                    &s.name,
+                    &s.generics,
+                    &mut s.decorators,
+                    &mut s.methods,
+                    &bound_fields,
+                    s.span,
+                    &generators,
+                    &interfaces,
+                    &mut diags,
+                    &mut bounds,
+                );
             }
-            synthesized.push(trait_name.clone());
-            // Record the inferred serde bounds for a generic derive (E3c, #1292):
-            // which of the type's parameters appear in a field, and where. A
-            // non-generic type has none.
-            if !s.generics.is_empty() {
-                let params = inferred_bound_params(s);
-                if !params.is_empty() {
-                    bounds.push(GenericDeriveBounds {
-                        struct_name: s.name.clone(),
-                        trait_name: trait_name.clone(),
-                        params,
-                    });
-                }
+            Item::Enum(e) => {
+                // An enum's bound fields are its variant payload fields (#1373):
+                // a type parameter used in any variant's payload contributes a
+                // bound, just as a struct field does.
+                let bound_fields: Vec<(&Type, Span)> = e
+                    .variants
+                    .iter()
+                    .flat_map(|v| v.fields.iter().map(|vf| (&vf.ty, vf.span)))
+                    .collect();
+                synthesize_for_type(
+                    &e.name,
+                    &e.generics,
+                    &mut e.decorators,
+                    &mut e.methods,
+                    &bound_fields,
+                    e.span,
+                    &generators,
+                    &interfaces,
+                    &mut diags,
+                    &mut bounds,
+                );
             }
+            _ => {}
         }
-
-        // Strip the synthesized library traits from `@derive(...)` so the
-        // lowering backstop no longer reports them as deferred; drop a `@derive`
-        // left empty. Built-in traits (and any not synthesized) are kept.
-        strip_derived(s, &synthesized);
     }
 
     (diags, bounds)
+}
+
+/// Synthesize the forwarding stubs for one type's library-trait derives, strip
+/// those traits, and record its inferred bounds — the shared body for a struct
+/// and an enum (#1373). `bound_fields` are the `(type, span)` pairs scanned for
+/// a generic parameter mention (struct fields, or an enum's variant payload
+/// fields). `decorators`/`methods` are the type's own, mutated in place.
+#[allow(clippy::too_many_arguments)]
+fn synthesize_for_type(
+    name: &str,
+    generics: &[TypeParam],
+    decorators: &mut Vec<Decorator>,
+    methods: &mut Vec<Function>,
+    bound_fields: &[(&Type, Span)],
+    sp: Span,
+    generators: &HashMap<String, String>,
+    interfaces: &HashMap<String, Vec<MethodSig>>,
+    diags: &mut Vec<TypeError>,
+    bounds: &mut Vec<GenericDeriveBounds>,
+) {
+    // Which library traits does this type derive?
+    let derived: Vec<String> = decorators
+        .iter()
+        .filter(|d| d.name == "derive")
+        .flat_map(|d| d.args.iter())
+        .filter_map(|a| match &a.value {
+            Expr::Name(n, _) if generators.contains_key(n) => Some(n.clone()),
+            _ => None,
+        })
+        .collect();
+    if derived.is_empty() {
+        return;
+    }
+
+    // The type the generator is specialized at: the bare name for a non-generic
+    // type, or the type applied to its own parameters for a generic one
+    // (`Pair[A, B]`), so each concrete instantiation specializes the generator
+    // structurally (E3c, #1292).
+    let type_arg = self_type_arg_expr(name, generics, sp);
+    let mut synthesized: Vec<String> = Vec::new();
+    for trait_name in &derived {
+        let generator = &generators[trait_name];
+        let Some(sigs) = interfaces.get(trait_name) else {
+            diags.push(err(
+                format!(
+                    "cannot derive `{trait_name}` for `{name}`: `{trait_name}` is registered with \
+                     @derivable but has no `interface {trait_name}` declaring the method(s) to \
+                     synthesize (E3b, #1291)"
+                ),
+                sp,
+            ));
+            continue;
+        };
+        for m in sigs {
+            // A hand-written method of the same name wins (HQ7): skip.
+            if methods.iter().any(|existing| existing.name == m.name) {
+                continue;
+            }
+            methods.push(forwarding_stub(m, generator, &type_arg, sp));
+        }
+        synthesized.push(trait_name.clone());
+        // Record the inferred serde bounds for a generic derive (E3c, #1292):
+        // which of the type's parameters appear in a bound field, and where. A
+        // non-generic type has none.
+        if !generics.is_empty() {
+            let params = inferred_bound_params(generics, bound_fields);
+            if !params.is_empty() {
+                bounds.push(GenericDeriveBounds {
+                    type_name: name.to_string(),
+                    trait_name: trait_name.clone(),
+                    params,
+                });
+            }
+        }
+    }
+
+    // Strip the synthesized library traits from `@derive(...)` so the lowering
+    // backstop no longer reports them as deferred; drop a `@derive` left empty.
+    // Built-in traits (and any not synthesized) are kept.
+    strip_derived(decorators, &synthesized);
 }
 
 /// The type the generator is specialized at for `s`: `Expr::Name(s.name)` for a
 /// non-generic type, or `s.name[p0, p1, …]` (an index/subscript expression that
 /// `expr_to_type` reads back as `Named { name, args }`) for a generic one — the
 /// same shape the parser produces for `generator[Pair[A, B]](…)`.
-fn self_type_arg_expr(s: &StructDef, sp: Span) -> Expr {
-    if s.generics.is_empty() {
-        return Expr::Name(s.name.clone(), sp);
+fn self_type_arg_expr(name: &str, generics: &[TypeParam], sp: Span) -> Expr {
+    if generics.is_empty() {
+        return Expr::Name(name.to_string(), sp);
     }
-    let params: Vec<Expr> = s
-        .generics
+    let params: Vec<Expr> = generics
         .iter()
         .map(|g| Expr::Name(g.name.clone(), sp))
         .collect();
@@ -203,28 +268,31 @@ fn self_type_arg_expr(s: &StructDef, sp: Span) -> Expr {
         Expr::Tuple(params, sp)
     };
     Expr::Index {
-        base: Box::new(Expr::Name(s.name.clone(), sp)),
+        base: Box::new(Expr::Name(name.to_string(), sp)),
         index: Box::new(index),
         span: sp,
     }
 }
 
-/// The inferred serde bounds (E3c, #1292) of a generic struct: each type
-/// parameter that appears in a field's type, with that/those fields' spans, in
-/// declaration order. A parameter used in no field (or only behind a concrete
-/// container such as `list[int64]`) is omitted; a parameter mentioned by several
-/// fields collects every such field's span. `@skip` does not exist yet, so every
-/// field counts.
-fn inferred_bound_params(s: &StructDef) -> Vec<InferredBound> {
-    let param_names: Vec<&str> = s.generics.iter().map(|g| g.name.as_str()).collect();
-    s.generics
+/// The inferred serde bounds (E3c, #1292) of a generic type: each type parameter
+/// that appears in a bound field's type, with that/those fields' spans, in
+/// declaration order. `bound_fields` are the `(type, span)` pairs to scan — a
+/// struct's fields, or (since #1373) an enum's variant payload fields. A
+/// parameter used in no field (or only behind a concrete container such as
+/// `list[int64]`) is omitted; a parameter mentioned by several fields collects
+/// every such field's span. `@skip` does not exist yet, so every field counts.
+fn inferred_bound_params(
+    generics: &[TypeParam],
+    bound_fields: &[(&Type, Span)],
+) -> Vec<InferredBound> {
+    let param_names: Vec<&str> = generics.iter().map(|g| g.name.as_str()).collect();
+    generics
         .iter()
         .filter_map(|g| {
-            let field_spans: Vec<Span> = s
-                .fields
+            let field_spans: Vec<Span> = bound_fields
                 .iter()
-                .filter(|f| type_mentions_param(&f.ty, &g.name, &param_names))
-                .map(|f| f.span)
+                .filter(|(ty, _)| type_mentions_param(ty, &g.name, &param_names))
+                .map(|(_, span)| *span)
                 .collect();
             (!field_spans.is_empty()).then(|| InferredBound {
                 param: g.name.clone(),
@@ -321,10 +389,11 @@ fn derivable_trait(f: &Function) -> Option<String> {
     }
 }
 
-/// Remove `synthesized` trait names from the struct's `@derive(...)` decorators,
-/// dropping any `@derive` left with no arguments.
-fn strip_derived(s: &mut zapc_syntax::ast::StructDef, synthesized: &[String]) {
-    for d in &mut s.decorators {
+/// Remove `synthesized` trait names from a type's `@derive(...)` decorators,
+/// dropping any `@derive` left with no arguments. Operates on the decorator list
+/// directly, so it serves both a struct and an enum (#1373).
+fn strip_derived(decorators: &mut Vec<Decorator>, synthesized: &[String]) {
+    for d in decorators.iter_mut() {
         if d.name == "derive" {
             d.args.retain(|a| match &a.value {
                 Expr::Name(n, _) => !synthesized.contains(n),
@@ -332,8 +401,7 @@ fn strip_derived(s: &mut zapc_syntax::ast::StructDef, synthesized: &[String]) {
             });
         }
     }
-    s.decorators
-        .retain(|d| d.name != "derive" || !d.args.is_empty());
+    decorators.retain(|d| d.name != "derive" || !d.args.is_empty());
 }
 
 fn err(message: String, span: Span) -> TypeError {
@@ -585,7 +653,7 @@ interface Dump:
         ));
         let (_diags, bounds) = expand_library_derives(&mut m);
         assert_eq!(bounds.len(), 1);
-        assert_eq!(bounds[0].struct_name, "Pair");
+        assert_eq!(bounds[0].type_name, "Pair");
         assert_eq!(bounds[0].trait_name, "Dump");
         let params: Vec<&str> = bounds[0].params.iter().map(|b| b.param.as_str()).collect();
         assert_eq!(params, vec!["A", "B"]);
@@ -736,5 +804,226 @@ interface Show:
         assert!(diags.is_empty());
         assert_eq!(m.items.len(), before, "no items added or removed");
         assert!(get_struct(&m, "Point").methods.is_empty());
+    }
+
+    // --- #1373 (epic #1371): enums derive the same way structs do -----------
+
+    fn get_enum<'a>(m: &'a Module, name: &str) -> &'a zapc_syntax::ast::EnumDef {
+        m.items
+            .iter()
+            .find_map(|it| match it {
+                Item::Enum(e) if e.name == name => Some(e),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no enum `{name}`"))
+    }
+
+    fn enum_method<'a>(e: &'a zapc_syntax::ast::EnumDef, name: &str) -> Option<&'a Function> {
+        e.methods.iter().find(|f| f.name == name)
+    }
+
+    fn enum_derive_args(e: &zapc_syntax::ast::EnumDef) -> Vec<String> {
+        e.decorators
+            .iter()
+            .filter(|d| d.name == "derive")
+            .flat_map(|d| d.args.iter())
+            .filter_map(|a| match &a.value {
+                Expr::Name(n, _) => Some(n.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn synthesizes_a_forwarding_stub_for_a_payload_enum_and_strips_the_trait() {
+        // A tier-3 payload enum derives the library trait: the forwarding stub is
+        // spliced onto the enum's methods and the trait is stripped, exactly as
+        // for a struct.
+        let mut m = module(&format!(
+            "{LIB}@derive(Dump)\nenum Shape:\n    Circle(float64 r)\n    Rect(float64 w, float64 h)\n    Unit\n"
+        ));
+        let (diags, _bounds) = expand_library_derives(&mut m);
+        assert!(diags.is_empty(), "no diagnostics: {diags:?}");
+
+        let shape = get_enum(&m, "Shape");
+        let dump = enum_method(shape, "dump").expect("synthesized `dump` stub on the enum");
+        assert!(dump.generics.is_empty() && dump.decorators.is_empty());
+        assert_eq!(dump.params.len(), 1, "self only");
+        // Body forwards `_derive_dump[Shape](self)`.
+        let Stmt::Expr(Expr::Call { callee, args, .. }) = &dump.body.stmts[0] else {
+            panic!("expected a forwarding call, got {:?}", dump.body.stmts[0]);
+        };
+        let Expr::Index { base, index, .. } = &**callee else {
+            panic!("expected `gen[Type](...)`, got {callee:?}");
+        };
+        assert!(matches!(&**base, Expr::Name(n, _) if n == "_derive_dump"));
+        assert!(matches!(&**index, Expr::Name(n, _) if n == "Shape"));
+        assert_eq!(args.len(), 1);
+        assert!(matches!(&args[0].value, Expr::Name(n, _) if n == "self"));
+        assert!(enum_derive_args(shape).is_empty(), "library trait stripped");
+        assert!(
+            !shape.decorators.iter().any(|d| d.name == "derive"),
+            "empty @derive removed"
+        );
+    }
+
+    #[test]
+    fn a_tier1_constant_enum_synthesizes_a_stub() {
+        // A no-payload (tier-1) enum still gets a forwarding stub.
+        let mut m = module(&format!(
+            "{LIB}@derive(Dump)\nenum Color:\n    RED\n    GREEN\n    BLUE\n"
+        ));
+        let (diags, _bounds) = expand_library_derives(&mut m);
+        assert!(diags.is_empty(), "no diagnostics: {diags:?}");
+        assert!(
+            enum_method(get_enum(&m, "Color"), "dump").is_some(),
+            "stub synthesized for a constant enum"
+        );
+        assert!(enum_derive_args(get_enum(&m, "Color")).is_empty());
+    }
+
+    #[test]
+    fn a_hand_written_enum_method_of_the_same_name_wins() {
+        // HQ7: the user's own `dump` on the enum is kept; no stub over it; the
+        // trait is still stripped.
+        let mut m = module(&format!(
+            "{LIB}@derive(Dump)\nenum Color:\n    RED\n    GREEN\n    def dump(self):\n        print(\"custom\")\n"
+        ));
+        let (diags, _bounds) = expand_library_derives(&mut m);
+        assert!(diags.is_empty(), "no diagnostics: {diags:?}");
+        let color = get_enum(&m, "Color");
+        let dumps: Vec<_> = color.methods.iter().filter(|f| f.name == "dump").collect();
+        assert_eq!(dumps.len(), 1, "exactly one `dump` (the user's)");
+        assert!(matches!(
+            &dumps[0].body.stmts[0],
+            Stmt::Expr(Expr::Call { callee, .. }) if matches!(&**callee, Expr::Name(n, _) if n == "print")
+        ));
+        assert!(enum_derive_args(color).is_empty(), "trait still stripped");
+    }
+
+    #[test]
+    fn a_builtin_derive_on_an_enum_is_left_untouched() {
+        let mut m = module(&format!(
+            "{LIB}@derive(Dump, Eq)\nenum Color:\n    RED\n    GREEN\n"
+        ));
+        let (diags, _bounds) = expand_library_derives(&mut m);
+        assert!(diags.is_empty(), "no diagnostics: {diags:?}");
+        let color = get_enum(&m, "Color");
+        assert!(
+            enum_method(color, "dump").is_some(),
+            "library stub synthesized"
+        );
+        assert_eq!(
+            enum_derive_args(color),
+            vec!["Eq".to_string()],
+            "only the library trait is stripped; the built-in survives"
+        );
+    }
+
+    #[test]
+    fn a_library_trait_without_an_interface_is_an_error_for_an_enum() {
+        let mut m = module(
+            "@derivable(Dump)\ndef _derive_dump[T](T self):\n    pass\n@derive(Dump)\nenum Color:\n    RED\n",
+        );
+        let (diags, _bounds) = expand_library_derives(&mut m);
+        assert_eq!(diags.len(), 1, "one diagnostic");
+        assert_eq!(diags[0].code, ErrorCode::ZAP5035);
+        assert!(
+            diags[0].message.contains("`Color`") && diags[0].message.contains("interface Dump"),
+            "names the enum and the missing interface: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn a_generic_enum_infers_bounds_from_variant_payload_fields() {
+        // `Tree[T]`: `T` is used in the `Leaf(T value)` payload, so it is bounded;
+        // the self-applied type arg is `Tree[T]`.
+        let mut m = module(&format!(
+            "{LIB}@derive(Dump)\nenum Tree[T]:\n    Leaf(T value)\n    Empty\n"
+        ));
+        let (diags, bounds) = expand_library_derives(&mut m);
+        assert!(diags.is_empty(), "no diagnostics: {diags:?}");
+
+        // Self-applied type arg on the stub: `_derive_dump[Tree[T]](self)`.
+        let dump = enum_method(get_enum(&m, "Tree"), "dump").expect("stub");
+        let Stmt::Expr(Expr::Call { callee, .. }) = &dump.body.stmts[0] else {
+            panic!("forwarding call");
+        };
+        let Expr::Index { index, .. } = &**callee else {
+            panic!("gen[Type]");
+        };
+        // `Tree[T]` is a single-param subscript: `Tree` indexed by bare `T`.
+        let Expr::Index {
+            base, index: inner, ..
+        } = &**index
+        else {
+            panic!("expected `Tree[T]` subscript, got {index:?}");
+        };
+        assert!(matches!(&**base, Expr::Name(n, _) if n == "Tree"));
+        assert!(matches!(&**inner, Expr::Name(n, _) if n == "T"));
+
+        // Exactly one inferred bound: `T`, from the `Leaf` payload.
+        assert_eq!(bounds.len(), 1);
+        assert_eq!(bounds[0].type_name, "Tree");
+        assert_eq!(bounds[0].trait_name, "Dump");
+        assert_eq!(bounds[0].params.len(), 1);
+        assert_eq!(bounds[0].params[0].param, "T");
+        assert_eq!(
+            bounds[0].params[0].field_spans.len(),
+            1,
+            "one payload field mentions T"
+        );
+    }
+
+    #[test]
+    fn a_generic_enum_param_in_no_payload_contributes_no_bound() {
+        // A phantom param (used in no variant payload) yields no bounds record.
+        let mut m = module(&format!(
+            "{LIB}@derive(Dump)\nenum Phantom[T]:\n    A\n    B\n"
+        ));
+        let (diags, bounds) = expand_library_derives(&mut m);
+        assert!(diags.is_empty(), "no diagnostics: {diags:?}");
+        assert!(
+            enum_method(get_enum(&m, "Phantom"), "dump").is_some(),
+            "stub still synthesized"
+        );
+        assert!(
+            bounds.is_empty(),
+            "a param used in no payload contributes no bound: {bounds:?}"
+        );
+    }
+
+    #[test]
+    fn a_generic_enum_param_behind_a_concrete_container_contributes_no_bound() {
+        // `T` appears only as `list[int64]`-style concrete payload: here the
+        // payload mentions a *different* concrete type, so `T` is unbounded.
+        let mut m = module(&format!(
+            "{LIB}@derive(Dump)\nenum Holder[T]:\n    Ints(list[int64] xs)\n    None\n"
+        ));
+        let (diags, bounds) = expand_library_derives(&mut m);
+        assert!(diags.is_empty(), "no diagnostics: {diags:?}");
+        assert!(
+            bounds.is_empty(),
+            "no param mentioned in a payload: {bounds:?}"
+        );
+    }
+
+    #[test]
+    fn a_param_used_by_several_variant_payloads_collects_each_span() {
+        // `T` in two variants' payloads → one bound with two field spans.
+        let mut m = module(&format!(
+            "{LIB}@derive(Dump)\nenum Two[T]:\n    First(T a)\n    Second(T b)\n"
+        ));
+        let (diags, bounds) = expand_library_derives(&mut m);
+        assert!(diags.is_empty(), "no diagnostics: {diags:?}");
+        assert_eq!(bounds.len(), 1);
+        assert_eq!(bounds[0].params.len(), 1);
+        assert_eq!(bounds[0].params[0].param, "T");
+        assert_eq!(
+            bounds[0].params[0].field_spans.len(),
+            2,
+            "both payload fields' spans collected"
+        );
     }
 }

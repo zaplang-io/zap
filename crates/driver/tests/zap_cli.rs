@@ -1513,6 +1513,45 @@ def main():
 }
 
 #[test]
+fn an_enum_library_derive_wires_through_to_the_generator() {
+    // #1373 (epic #1371): `@derive(X)` on an enum is recognized, the library
+    // trait is stripped, a forwarding stub is synthesized, and the generator
+    // specialized at the enum compiles end-to-end (here a trivial generator —
+    // the variant-iterating body is the codegen slice #1374). This must not
+    // error as an unknown/deferred derive, and must not crash.
+    let src = "\
+@derivable(Dump)
+def _derive_dump[T](T self):
+    pass
+
+interface Dump:
+    def dump(self)
+
+@derive(Dump)
+enum Shape:
+    Circle(float64 r)
+    Rect(float64 w, float64 h)
+    Unit
+
+def main():
+    auto s = Shape.Circle(1.0)
+    s.dump()
+";
+    let f = write_zap("e3b-enum-wire", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "enum @derive must compile through to IR; stderr: {stderr}"
+    );
+    // Not left as a deferred/unknown derive, and no comptime-internal leak.
+    assert!(
+        !stderr.contains("cannot derive") && !stderr.contains("ZAP5035"),
+        "enum derive must be recognized, not deferred: {stderr}"
+    );
+}
+
+#[test]
 fn a_generator_bug_is_a_dual_span_error_not_a_crash() {
     // An engine fault inside a generator (here an out-of-range `reflect.field`)
     // is the library author's bug, not the consumer's: it renders as the
