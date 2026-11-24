@@ -1363,11 +1363,15 @@ def main():
         stderr.contains("the generator reported: `Ser`: list element type is not serializable"),
         "the library's own message as the root cause: {stderr}"
     );
-    // The chain still attributes to the enclosing field (mono matches the field
-    // whose declaration contains the nested cause span, #1346).
+    // The chain attributes to the enclosing field and the container level it
+    // crossed (mono walks the field's declared type to the cause, #1293).
     assert!(
         stderr.contains("required because of field `items` of `Bag`"),
         "backtrace frame at the enclosing field: {stderr}"
+    );
+    assert!(
+        stderr.contains("required because of the element type of `list[Widget]`"),
+        "backtrace frame at the list element level: {stderr}"
     );
     // Precision: the primary span is the element `Widget` (col 10 of the
     // `    list[Widget] items` line), strictly deeper than the field frame,
@@ -1390,6 +1394,121 @@ def main():
     assert!(
         !stderr.contains("_derive_ser") && !stderr.contains('$'),
         "no comptime-internal symbol in the diagnostic: {stderr}"
+    );
+}
+
+#[test]
+fn a_deeply_nested_derive_failure_renders_the_full_required_because_chain() {
+    // #1293 multi-level chain: when a generator rejects a type buried in a
+    // container-of-containers (`dict[str, list[Widget]]`, element struct), the
+    // diagnostic is a `required because of …` chain with one frame per level
+    // crossed, ordered inner-first (nearest the failure), climbing out to the
+    // field — then the library's own root cause.
+    let src = "\
+@derivable(Ser)
+def _derive_ser[T](T value):
+    comptime for f in reflect.type_info(T).fields:
+        if f.ty.kind.name == \"dict\":
+            if f.ty.value.kind.name == \"list\":
+                if f.ty.value.elem.kind.name == \"struct\":
+                    comptime.error(f.ty.value.elem.span, \"`Ser` is not implemented for this type\")
+
+interface Ser:
+    def ser(self)
+
+@derive(Ser)
+struct Widget:
+    int64 w
+@derive(Ser)
+struct Bag:
+    dict[str, list[Widget]] buckets
+
+def main():
+    auto b = Bag({})
+    b.ser()
+";
+    let f = write_zap("e3d-deep-chain", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(!out.status.success(), "the derive must fail to compile");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error[ZAP7003]: cannot derive `Ser` for `Bag`"),
+        "consumer header: {stderr}"
+    );
+    // Every container level crossed is a frame, each naming its container type.
+    for needle in [
+        "required because of the element type of `list[Widget]`",
+        "required because of the value type of `dict[str, list[Widget]]`",
+        "required because of field `buckets` of `Bag`",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "missing frame `{needle}`: {stderr}"
+        );
+    }
+    // The dict *key* (`str`) is not on the path to the cause, so no key frame.
+    assert!(
+        !stderr.contains("key type of"),
+        "the unrelated dict key must not appear in the chain: {stderr}"
+    );
+    // Ordering: inner-first — element type, then value type, then the field,
+    // then the library's own root cause last.
+    let pos = |s: &str| {
+        stderr
+            .find(s)
+            .unwrap_or_else(|| panic!("missing `{s}`: {stderr}"))
+    };
+    let elem = pos("the element type of `list[Widget]`");
+    let value = pos("the value type of `dict[str, list[Widget]]`");
+    let field = pos("field `buckets` of `Bag`");
+    let cause = pos("the generator reported: `Ser` is not implemented");
+    assert!(
+        elem < value && value < field && field < cause,
+        "chain must read inner-first (element < value < field < root cause): \
+         elem={elem} value={value} field={field} cause={cause}\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("_derive_ser") && !stderr.contains('$'),
+        "no comptime-internal symbol: {stderr}"
+    );
+}
+
+#[test]
+fn a_tuple_element_derive_failure_names_the_element_position() {
+    // #1293: a tuple element on the path gives a positional frame
+    // (`element 2 of (int64, Widget)`), 1-based, naming the tuple type.
+    let src = "\
+@derivable(Ser)
+def _derive_ser[T](T value):
+    comptime for f in reflect.type_info(T).fields:
+        if f.ty.kind.name == \"tuple\":
+            comptime.error(f.ty.elems[1].span, \"`Ser` is not implemented for this type\")
+
+interface Ser:
+    def ser(self)
+
+@derive(Ser)
+struct Widget:
+    int64 w
+@derive(Ser)
+struct Bag:
+    (int64, Widget) pair
+
+def main():
+    auto b = Bag((1, Widget(2)))
+    b.ser()
+";
+    let f = write_zap("e3d-tuple-chain", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(!out.status.success(), "the derive must fail to compile");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("required because of element 2 of `(int64, Widget)`"),
+        "positional tuple frame (1-based): {stderr}"
+    );
+    assert!(
+        stderr.contains("required because of field `pair` of `Bag`"),
+        "field frame: {stderr}"
     );
 }
 

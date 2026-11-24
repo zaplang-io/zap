@@ -411,6 +411,93 @@ fn span_contains(outer: Span, inner: Span) -> bool {
     outer.start <= inner.start && inner.end <= outer.end
 }
 
+/// Render a declared [`Type`] to a canonical label string (`list[Widget]`,
+/// `dict[str, list[Widget]]`, `(int64, str)`) for a `required because of …`
+/// backtrace frame. Mono has no source text, so the label is reconstructed from
+/// the AST (#1293).
+fn render_type(t: &Type) -> String {
+    match t {
+        Type::Named { name, args, .. } => {
+            if args.is_empty() {
+                name.clone()
+            } else {
+                let inner: Vec<String> = args.iter().map(render_type).collect();
+                format!("{name}[{}]", inner.join(", "))
+            }
+        }
+        Type::Tuple { elems, .. } => {
+            let inner: Vec<String> = elems.iter().map(render_type).collect();
+            format!("({})", inner.join(", "))
+        }
+        Type::Func { params, ret, .. } => {
+            let ps: Vec<String> = params.iter().map(render_type).collect();
+            match ret {
+                Some(r) => format!("fn({}) -> {}", ps.join(", "), render_type(r)),
+                None => format!("fn({})", ps.join(", ")),
+            }
+        }
+    }
+}
+
+/// One step of the descent toward `cause` inside a container type: the
+/// `required because of …` label for the level crossed and the child type to
+/// continue into. `None` when `cur` is not a container, or no immediate child's
+/// declared span contains `cause` (so the walk stops cleanly) (#1293).
+fn descend_toward(cur: &Type, cause: Span) -> Option<(String, &Type)> {
+    match cur {
+        Type::Named { name, args, .. } => match (name.as_str(), args.as_slice()) {
+            ("list" | "List", [e]) if span_contains(e.span(), cause) => {
+                Some((format!("the element type of `{}`", render_type(cur)), e))
+            }
+            ("dict" | "Dict", [k, v]) => {
+                if span_contains(k.span(), cause) {
+                    Some((format!("the key type of `{}`", render_type(cur)), k))
+                } else if span_contains(v.span(), cause) {
+                    Some((format!("the value type of `{}`", render_type(cur)), v))
+                } else {
+                    None
+                }
+            }
+            ("Optional", [e]) if span_contains(e.span(), cause) => {
+                Some((format!("the element type of `{}`", render_type(cur)), e))
+            }
+            _ => None,
+        },
+        Type::Tuple { elems, .. } => elems
+            .iter()
+            .position(|e| span_contains(e.span(), cause))
+            .map(|i| {
+                (
+                    format!("element {} of `{}`", i + 1, render_type(cur)),
+                    &elems[i],
+                )
+            }),
+        Type::Func { .. } => None,
+    }
+}
+
+/// Walk a field's declared type from the outside in toward the cause span,
+/// pushing one `required because of …` frame per container level crossed (list
+/// element, dict key/value, optional element, tuple element). Stops at the node
+/// the generator pointed at (`span == cause`) or when no child contains the
+/// cause. Frames are appended outermost-first — the renderer prints them
+/// inner-first (nearest the failure, climbing to the field) (#1293). The depth
+/// is bounded defensively; a declared type is finite, so the bound is never hit
+/// in practice.
+fn push_container_frames(frames: &mut Vec<(String, Span)>, field_ty: &Type, cause: Span) {
+    let mut cur = field_ty;
+    for _ in 0..64 {
+        if cur.span() == cause {
+            return;
+        }
+        let Some((label, next)) = descend_toward(cur, cause) else {
+            return;
+        };
+        frames.push((label, cur.span()));
+        cur = next;
+    }
+}
+
 /// The trait a free function registers via `@derivable(Trait)` (one positional
 /// identifier), or `None` (E3a, #1290). Mirrors the driver's synthesis scan.
 fn derivable_trait(f: &Function) -> Option<String> {
@@ -2401,20 +2488,24 @@ impl Mono<'_> {
             di.instantiation_span = Some(instantiation_span);
             le.code = zapc_diag::ErrorCode::ZAP7003;
             if di.frames.is_empty() {
-                // Attribute the failure to the field the generator pointed at.
-                // The cause span is either the field itself (`comptime.error(
-                // f.span, …)`) or — now that nested types carry use-site spans
-                // (#1346) — a type *inside* the field's declared type (e.g. the
-                // `Widget` element of `list[Widget] items`, via
-                // `comptime.error(f.ty.elem.span, …)`). In both cases the right
-                // `required because of …` frame is the enclosing field, so match
-                // the field whose declaration contains the cause span.
+                // Build the `required because of …` chain for the field the
+                // generator pointed at. The cause span is either the field
+                // itself (`comptime.error(f.span, …)`) or — now that nested
+                // types carry use-site spans (#1346) — a type *inside* the
+                // field's declared type (the `Widget` element of
+                // `list[Widget] items`, via `comptime.error(f.ty.elem.span, …)`).
+                // Match the field whose declaration contains the cause span,
+                // then walk its declared type from the field inward, emitting one
+                // frame per container level crossed — the multi-level chain
+                // (#1293). Frames are outermost-first; the renderer prints them
+                // inner-first.
                 if let Some(f) = fields
                     .iter()
                     .find(|f| f.span == di.cause_span || span_contains(f.ty.span(), di.cause_span))
                 {
                     di.frames
                         .push((format!("field `{}` of `{}`", f.name, ty), f.span));
+                    push_container_frames(&mut di.frames, &f.ty, di.cause_span);
                 }
             }
         }
@@ -4842,6 +4933,119 @@ mod tests {
             Item::Struct(s) if s.name == name => Some(s),
             _ => None,
         })
+    }
+
+    // ---- derive `required because of …` chain builder (#1293) -------------
+
+    /// Parse a one-field struct and return (the field, the module) so a test can
+    /// navigate the field's declared type AST (with real spans).
+    fn one_field_struct(src: &str) -> Module {
+        let (module, perrs, lerrs) = parse_str(src);
+        assert!(perrs.is_empty() && lerrs.is_empty(), "{perrs:?} {lerrs:?}");
+        module
+    }
+
+    #[test]
+    fn render_type_reconstructs_container_labels() {
+        let m = one_field_struct(
+            "struct Widget:\n    int64 w\nstruct Bag:\n    dict[str, list[Widget]] b\n",
+        );
+        let field = &struct_named(&m, "Bag").unwrap().fields[0];
+        assert_eq!(render_type(&field.ty), "dict[str, list[Widget]]");
+    }
+
+    #[test]
+    fn chain_is_built_outermost_first_with_nested_spans() {
+        // `dict[str, list[Widget]] buckets`, cause = the inner `Widget`.
+        let m = one_field_struct(
+            "struct Widget:\n    int64 w\nstruct Bag:\n    dict[str, list[Widget]] buckets\n",
+        );
+        let field = &struct_named(&m, "Bag").unwrap().fields[0];
+        // Navigate dict -> value `list[Widget]` -> element `Widget`.
+        let Type::Named { args: dargs, .. } = &field.ty else {
+            panic!("dict");
+        };
+        let Type::Named { args: largs, .. } = &dargs[1] else {
+            panic!("list");
+        };
+        let cause = largs[0].span();
+
+        let mut frames = vec![(format!("field `{}` of `Bag`", field.name), field.span)];
+        push_container_frames(&mut frames, &field.ty, cause);
+
+        let labels: Vec<&str> = frames.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "field `buckets` of `Bag`",
+                "the value type of `dict[str, list[Widget]]`",
+                "the element type of `list[Widget]`",
+            ],
+            "frames are outermost-first; the renderer prints them inner-first"
+        );
+        // Spans zoom inward: each frame encloses the next, and the innermost
+        // encloses the cause.
+        for w in frames.windows(2) {
+            assert!(
+                span_contains(w[0].1, w[1].1),
+                "{:?} should enclose {:?}",
+                w[0],
+                w[1]
+            );
+        }
+        assert!(span_contains(frames.last().unwrap().1, cause));
+    }
+
+    #[test]
+    fn chain_names_tuple_element_position_one_based() {
+        let m = one_field_struct(
+            "struct Widget:\n    int64 w\nstruct Bag:\n    (int64, Widget) pair\n",
+        );
+        let field = &struct_named(&m, "Bag").unwrap().fields[0];
+        let Type::Tuple { elems, .. } = &field.ty else {
+            panic!("tuple");
+        };
+        let cause = elems[1].span(); // the `Widget`, second element
+
+        let mut frames = Vec::new();
+        push_container_frames(&mut frames, &field.ty, cause);
+        assert_eq!(
+            frames.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
+            vec!["element 2 of `(int64, Widget)`"],
+        );
+    }
+
+    #[test]
+    fn chain_follows_only_the_child_on_the_path() {
+        // dict key `str` is off the path; only the value branch is walked.
+        let m =
+            one_field_struct("struct Widget:\n    int64 w\nstruct Bag:\n    dict[str, Widget] m\n");
+        let field = &struct_named(&m, "Bag").unwrap().fields[0];
+        let Type::Named { args, .. } = &field.ty else {
+            panic!("dict");
+        };
+        let cause = args[1].span(); // the value `Widget`
+
+        let mut frames = Vec::new();
+        push_container_frames(&mut frames, &field.ty, cause);
+        assert_eq!(
+            frames.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
+            vec!["the value type of `dict[str, Widget]`"],
+        );
+    }
+
+    #[test]
+    fn chain_is_empty_when_cause_is_the_whole_field_type() {
+        // A generator pointing at a plain struct field (`comptime.error(f.span)`
+        // or `f.ty.span`) crosses no container level.
+        let m = one_field_struct("struct Widget:\n    int64 w\nstruct Bag:\n    Widget w\n");
+        let field = &struct_named(&m, "Bag").unwrap().fields[0];
+        let mut frames = Vec::new();
+        push_container_frames(&mut frames, &field.ty, field.ty.span());
+        assert!(
+            frames.is_empty(),
+            "no container levels for a bare struct field"
+        );
     }
 
     // ---- transparent type aliases (#606, D-0105) --------------------------
