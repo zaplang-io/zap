@@ -28,11 +28,6 @@ def describe(Optional[int64] opt) -> int64:
     return -1
 
 
-def set_global(int64 v):
-    # A bare payload reassigned into the module global.
-    g_offset = v
-
-
 def main():
     # The issue's exact minimal repro: a negative payload.
     int64 seconds = -10800
@@ -109,8 +104,10 @@ def main():
     bk = None
     print(bk.unwrap_or(-9))  # -9
 
-    # The module-level global, reassigned through a bare payload in a callee.
+    # A module-level mutable global reassigned in place with a bare payload
+    # (D-0112): the `Stmt::Assign` to a `Name` path covers a global's slot the
+    # same way, so it must box `Some` too.
     print(g_offset.is_none())  # True
-    set_global(-10800)
+    g_offset = -10800
     print(g_offset.is_some())  # True
     print(g_offset.unwrap())  # -10800
