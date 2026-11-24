@@ -411,6 +411,28 @@ fn span_contains(outer: Span, inner: Span) -> bool {
     outer.start <= inner.start && inner.end <= outer.end
 }
 
+/// An enum's variant payload fields, flattened to [`ast::Field`]s (#1375, E3d):
+/// so a derive failure a generator points at inside a variant payload
+/// (`comptime.error(f.span, …)`) is attributed to that field in the
+/// `required because of …` chain, exactly as a struct field is. Carries each
+/// payload field's type, name, and span (decorators/bitfield/default are not
+/// part of a variant payload).
+fn variant_payload_fields(def: &EnumDef) -> Vec<ast::Field> {
+    def.variants
+        .iter()
+        .flat_map(|v| {
+            v.fields.iter().map(|vf| ast::Field {
+                decorators: Vec::new(),
+                ty: vf.ty.clone(),
+                name: vf.name.clone(),
+                bits: None,
+                default: None,
+                span: vf.span,
+            })
+        })
+        .collect()
+}
+
 /// Render a declared [`Type`] to a canonical label string (`list[Widget]`,
 /// `dict[str, list[Widget]]`, `(int64, str)`) for a `required because of …`
 /// backtrace frame. Mono has no source text, so the label is reconstructed from
@@ -2499,6 +2521,11 @@ impl Mono<'_> {
             },
             "variants" => match self.enums.get(type_name.as_str()) {
                 Some(def) => {
+                    // Flatten the variant payload fields so a derive failure the
+                    // generator points at (`comptime.error(f.span, …)` for a
+                    // variant payload) is attributed to that field in the
+                    // `required because of …` chain (#1375, E3d).
+                    let payload_fields = variant_payload_fields(def);
                     let out = comptime_for::unroll_enum_variants(
                         def,
                         loop_var,
@@ -2506,7 +2533,7 @@ impl Mono<'_> {
                         &[],
                         Some(&self.comptime_registry),
                     )
-                    .map_err(|e| self.enrich_derive_error(e, &[], def.span))?;
+                    .map_err(|e| self.enrich_derive_error(e, &payload_fields, def.span))?;
                     Ok(Some(out))
                 }
                 None => Ok(None),
