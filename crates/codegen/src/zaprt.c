@@ -739,15 +739,26 @@ typedef struct {
      * `eg.exceptions` iterates. Traced precisely (the list in turn traces its
      * elements), so the whole group stays live while it is in flight. */
     void *children;
+    /* `payload` carries the declared struct instance of a package-defined
+     * exception (#1432): a `raise TokenEndpointError("m", "invalid_client", 401)`
+     * constructs the real `@exception` struct and stashes it here, so a typed
+     * catch can read its fields (`failure.error`, `failure.status`) off the
+     * payload without parsing the message. NULL for a message-only raise, a
+     * built-in exception, or `raise "str"`. Traced precisely, so the struct (and
+     * in turn its own pointer fields) stays live while the exception is in
+     * flight. The `message` slot still drives `str(e)` and the diagnostic, so
+     * existing message-only catches are unchanged. */
+    void *payload;
 } ZapException;
 #define ZAP_EXCEPTION_MAGIC UINT64_C(0x5a41504558434550)
 static const int32_t zap_exc_ptr_offsets[] = {
     (int32_t)offsetof(ZapException, message),
     (int32_t)offsetof(ZapException, cause),
     (int32_t)offsetof(ZapException, children),
+    (int32_t)offsetof(ZapException, payload),
 };
 static const ZapTypeDesc zap_desc_exception = {
-    (int64_t)sizeof(ZapException), ZAP_TD_PRECISE, 3, zap_exc_ptr_offsets};
+    (int64_t)sizeof(ZapException), ZAP_TD_PRECISE, 4, zap_exc_ptr_offsets};
 static void *zap_current_exc;
 
 enum {
@@ -815,12 +826,28 @@ void *zap_exception_new(int64_t type_id, void *message) {
     e->message = message;
     e->cause = NULL;
     e->children = NULL;
+    e->payload = NULL;
     return e;
 }
 
 void *zap_exception_message(void *exc) {
     ZapException *e = (ZapException *)exc;
     return e && e->magic == ZAP_EXCEPTION_MAGIC ? e->message : NULL;
+}
+
+/* Attach / read the declared struct instance of a package-defined exception
+ * (#1432). `payload` is the `@exception` struct built at the raise site; a typed
+ * catch reads its fields off this slot. A null/untyped exc is a no-op / NULL. */
+void zap_exception_set_payload(void *exc, void *payload) {
+    ZapException *e = (ZapException *)exc;
+    if (e && e->magic == ZAP_EXCEPTION_MAGIC) {
+        e->payload = payload;
+    }
+}
+
+void *zap_exception_payload(void *exc) {
+    ZapException *e = (ZapException *)exc;
+    return e && e->magic == ZAP_EXCEPTION_MAGIC ? e->payload : NULL;
 }
 
 /* Record the explicit `raise ... from <cause>` chain (#604, D-0103). `cause`

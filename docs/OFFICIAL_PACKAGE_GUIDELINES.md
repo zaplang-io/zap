@@ -156,6 +156,15 @@ If you build an evaluator, interpreter, or query/filter engine:
   wrap every entry point or a crafted input becomes an uncaught crash. If callers
   will routinely hit a condition on untrusted input, consider returning a result
   instead of throwing — and if you throw, document it prominently on the public API.
+- **Prefer a typed `@exception` when callers must branch on structured detail.**
+  A string exception matched by prefix is fine for a single human-facing message,
+  but when a caller needs to read a machine-parseable code, a status, or an
+  optional field (e.g. an OAuth token-endpoint error's `error` code and HTTP
+  `status`), declare an `@exception` struct (I#1278) with those fields and raise
+  it with them populated (I#1432). The catcher reads them as typed fields —
+  `except E as e: e.error` / `e.status` — without parsing the message, and
+  `str(e)` / `print(e)` still yield the message, so a plain `print(e)` consumer is
+  unaffected. Keep the human-readable summary in a `str message` field.
 - **Never put secrets or raw wire bytes in an error message.** redis raises only
   the *stage* name on an auth failure (`"…AUTH"`), never the password or the
   server's text, and masks credentials in its debug/`describe` output. Audit every

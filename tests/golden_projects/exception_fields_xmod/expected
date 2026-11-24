@@ -1,0 +1,7 @@
+xmod typed (local):
+invalid_client
+400
+xmod typed (dep raise):
+unauthorized_client
+401
+request refused

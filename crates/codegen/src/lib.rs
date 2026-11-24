@@ -2574,6 +2574,12 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[ptr.into()],
             Some(ptr.into()),
         );
+        // Structured-field payload on a package-defined exception (#1432): attach
+        // the declared `@exception` struct instance at the raise site and read it
+        // back in a typed catch, so `failure.error` resolves off the struct
+        // without parsing the message. The `message` slot is unaffected.
+        self.declare_rt("zap_exception_set_payload", &[ptr.into(), ptr.into()], None);
+        self.declare_rt("zap_exception_payload", &[ptr.into()], Some(ptr.into()));
         // `except*` ExceptionGroup split / inspect (#605, D-0129). The group
         // carries its real sub-exceptions; `remaining` yields a mutable working
         // set, `split` peels the matches of a type into a sub-group (or null),
