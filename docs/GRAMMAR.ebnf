@@ -396,6 +396,30 @@ target_elem   ::= [ "*" ] target                (* at most one "*" per tuple (se
                      a `<-ch` receive expr; multiple return destructures a
                      tuple-returning call the same way. *)
 
+(* ---------- Soft (contextual) keywords: scope / select / match / case ----------
+   #1405 (`scope`) and #1411 (`select`, `match`, `case`), epic #1413. Each of
+   these four words is a keyword ONLY in its single statement/clause slot below
+   and an ordinary IDENT everywhere else — struct field, parameter, named-
+   argument label, `.member` read, and general expression (variable / call
+   target). They are therefore NOT in the reserved-word set: the lexer emits
+   them as IDENT (like the contextual `pass`/`from`/`del`/`value`/`default` and
+   the soft `type`/`fn`), and the parser recognizes one only at the head of its
+   slot. This is strictly widening — every program that parsed before still
+   parses — so it is backward-compatible.
+
+   The disambiguating marker is a trailing ":" + indented block in every case:
+     scope  — statement-leading `scope` + optional "(" arg_list ")" + ":"-block.
+     select — statement-leading `select` IMMEDIATELY followed by ":"-block.
+     match  — statement-leading `match`, then a subject expr, then ":"-block;
+              distinguished from a call `match(x)` / name use `match`,
+              `match = v`, `match.attr`, `match[i]` by a bounded backtracking
+              trial parse (the subject expr must be followed by ":" NEWLINE
+              INDENT) — the same rule CPython uses for its soft `match`.
+              Resolve toward the statement iff the ":"+block marker is present,
+              otherwise IDENT.
+     case   — a keyword ONLY inside a `match`/`select` body (case_clause /
+              select_case); an IDENT anywhere else, including inside an arm
+              body. *)
 compound_stmt ::= if_stmt
                 | while_stmt
                 | do_while_stmt
@@ -465,6 +489,9 @@ with_item     ::= expr [ "as" IDENT ] ;
 (* ---------- Structured concurrency (D-0044) ---------- *)
 
 scope_stmt    ::= "scope" [ "(" [ arg_list ] ")" ] block ;
+                  (* `scope` is a SOFT keyword (#1405, epic #1413): the statement
+                     only when statement-leading with the ":"+block marker;
+                     an ordinary IDENT otherwise. See the soft-keyword note above. *)
 unsafe_stmt   ::= "unsafe" block ;
                   (* I#139, D-0200. An ordinary block (its own lexical scope, no
                      runtime effect) that additionally permits calling a
@@ -519,7 +546,11 @@ arch_name     ::= "x86_64" | "aarch64" ;
 os_name       ::= "linux" | "windows" | "macos" ;
 
 select_stmt   ::= "select" ":" NEWLINE INDENT { select_case } DEDENT ;  (* D-0031 *)
-select_case   ::= "case" select_op block
+                  (* `select` is a SOFT keyword (#1411, epic #1413): the statement
+                     only when statement-leading and IMMEDIATELY followed by the
+                     ":"+block marker; an ordinary IDENT otherwise. See the
+                     soft-keyword note above. *)
+select_case   ::= "case" select_op block               (* `case` soft here (#1411) *)
                 | "default" block ;                    (* `default` => non-blocking *)
 select_op     ::= IDENT "=" "<-" postfix               (* receive case, binds IDENT *)
                 | IDENT "," IDENT "=" "<-" postfix      (* comma-ok receive case *)
@@ -528,7 +559,13 @@ select_op     ::= IDENT "=" "<-" postfix               (* receive case, binds ID
 (* ---------- Pattern matching (D-0040) ---------- *)
 
 match_stmt    ::= "match" expr ":" NEWLINE INDENT { case_clause } DEDENT ;
-case_clause   ::= "case" pattern [ "if" expr ] block ;
+                  (* `match` is a SOFT keyword (#1411, epic #1413): the statement
+                     only when a statement-leading `match` is followed by a
+                     subject expr and the ":"+block marker (bounded backtracking
+                     trial parse, CPython's soft-`match` rule); an ordinary IDENT
+                     otherwise (`match(x)`, `match = v`, `match.attr`, ...). See
+                     the soft-keyword note above. *)
+case_clause   ::= "case" pattern [ "if" expr ] block ; (* `case` soft here (#1411) *)
 
 pattern       ::= or_pattern [ "as" IDENT ] ;    (* D11, #603: the "as" capture
                                                     binds the WHOLE matched value
