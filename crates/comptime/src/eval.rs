@@ -680,9 +680,29 @@ impl<'a> Evaluator<'a> {
                         span,
                     ));
                 }
-                let ty = expr_as_type(&args[0].value).ok_or_else(|| {
+                let mut ty = expr_as_type(&args[0].value).ok_or_else(|| {
                     CtError::value("`reflect.type_info(T)` expects a type name", span)
                 })?;
+                // Resolve a generic type parameter to the concrete instantiation
+                // (#1394): inside a specialized generic generator, `T` maps to the
+                // concrete type via the evaluator's type substitution, so
+                // `reflect.type_info(T).kind` is evaluable (e.g. for a top-level
+                // kind-dispatch `if`).
+                if let zapc_syntax::ast::Type::Named {
+                    name, args: targs, ..
+                } = &ty
+                {
+                    if targs.is_empty() {
+                        let resolved = self.resolve_type_param(name);
+                        if resolved != name {
+                            ty = zapc_syntax::ast::Type::Named {
+                                name: resolved.to_string(),
+                                args: Vec::new(),
+                                span: crate::eval::expr_span(&args[0].value),
+                            };
+                        }
+                    }
+                }
                 // A top-level `type_info(T)` has no single use-site span (the
                 // type is named abstractly, often a generator's type parameter),
                 // so it carries no `decl` (#1346). Use-site spans begin at a

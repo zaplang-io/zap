@@ -2386,6 +2386,41 @@ impl Mono<'_> {
                     continue;
                 }
             }
+            // #1394: inside a specialized generic (a derive generator), an `if`
+            // whose condition chain is a comptime constant — a
+            // `reflect.type_info(T).kind` kind dispatch — is pruned to its taken
+            // branch, so one generator can dispatch on `T`'s kind at its top
+            // level and the dead-kind branch (e.g. an enum comptime `match` when
+            // `T` is a struct) never reaches lowering. Gated on an active
+            // substitution so ordinary (non-generic) code is untouched; a
+            // non-comptime condition stays a runtime `if`.
+            if !self.cur_subst.is_empty() {
+                if let Stmt::If {
+                    branches,
+                    else_block,
+                    ..
+                } = st
+                {
+                    let type_subst = self.type_subst_names();
+                    if let Some(taken) = comptime_for::select_comptime_if(
+                        branches,
+                        else_block,
+                        &self.comptime_registry,
+                        type_subst,
+                    )? {
+                        // Rewrite the taken branch through the block path so any
+                        // nested `comptime for` / `comptime if` inside it is
+                        // unrolled/pruned too, then splice its statements in.
+                        let taken_block = Block {
+                            stmts: taken.to_vec(),
+                            span: b.span,
+                        };
+                        let rewritten = self.rewrite_block(&taken_block, env)?;
+                        stmts.extend(rewritten.stmts);
+                        continue;
+                    }
+                }
+            }
             stmts.push(self.rewrite_stmt(st, env)?);
         }
         Ok(Block {
@@ -2401,6 +2436,21 @@ impl Mono<'_> {
     /// here (left for a later pass / the lowering backstop). Drives the E2
     /// engine through the `comptime_for` bridge (unroll #1251 + `reflect.field`
     /// desugar #1252).
+    /// The active type-parameter substitution as parameter-name → concrete
+    /// type-name pairs (#1394), for the comptime evaluator to resolve
+    /// `reflect.type_info(T)` when pruning a generator's kind-dispatch `if`. Only
+    /// `Named` concrete types are carried (a container/tuple instantiation is not
+    /// a nominal kind-dispatch target).
+    fn type_subst_names(&self) -> HashMap<String, String> {
+        self.cur_subst
+            .iter()
+            .filter_map(|(k, v)| match v {
+                Type::Named { name, .. } => Some((k.clone(), name.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn try_unroll_comptime_for(
         &self,
         target: &Expr,
