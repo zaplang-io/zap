@@ -583,17 +583,32 @@ fn subst_method_sig(m: &MethodSig, subst: &HashMap<&str, &Type>) -> MethodSig {
 }
 
 /// A zero-value literal expression for a field type, for `reflect.construct`
-/// (#1454): the throwaway initial value a field-set builder overwrites. v1
-/// covers the scalar / `str` / `bytes` field kinds a codec record uses; a
-/// generic/container/nested type yields `None` (a clean "unsupported yet" error
-/// at the call site), mirroring the derive codegen's field-type restrictions.
-fn zero_expr(ty: &Type, span: Span) -> Option<Expr> {
-    let Type::Named { name, args, .. } = ty else {
-        return None;
-    };
-    if !args.is_empty() {
-        return None;
-    }
+/// (#1454, widened by #1490): the throwaway initial value a field-set builder
+/// overwrites before populating each field with `reflect.set_field`.
+///
+/// Covers, in order:
+/// - scalar / `str` / `bytes` (the #1454 v1 set — byte-for-byte unchanged);
+/// - `Optional[T]` → the empty optional (`None`);
+/// - `list[T]` / `set[T]` / `dict[K, V]` → the empty literal (`[]` / `{}`);
+/// - tuple `(A, B, …)` → zero of each element;
+/// - a non-generic nested struct → recurse into `NestedType(zero(f0), …)`.
+///
+/// A by-value struct cycle (a struct that transitively contains itself as a
+/// nested-struct field) is a clean error, not an infinite recursion:
+/// `visiting` holds the struct names on the current by-value recursion path.
+/// Only a direct nested-struct field recurses — an `Optional[Self]` /
+/// `list[Self]` field is broken by its own empty zero, so it is not a cycle.
+///
+/// A genuinely unsupported field type — a function type, a generic/enum/unknown
+/// name the cases above do not reach — is an `Err`, the user-facing
+/// "unsupported yet" error, mirroring the derive codegen's field-type
+/// restrictions.
+fn zero_expr(
+    ty: &Type,
+    span: Span,
+    structs: &HashMap<String, &StructDef>,
+    visiting: &mut Vec<String>,
+) -> Result<Expr, LowerError> {
     let empty_str = |bytes: bool| Expr::Str {
         value: String::new(),
         raw: false,
@@ -602,17 +617,76 @@ fn zero_expr(ty: &Type, span: Span) -> Option<Expr> {
         span,
         fstring_fields: Vec::new(),
     };
-    Some(match name.as_str() {
-        "int" | "int64" | "i64" | "int32" | "i32" | "int16" | "i16" | "int8" | "i8" | "uint8"
-        | "u8" | "uint16" | "u16" | "uint32" | "u32" | "uint64" | "u64" | "usize" => {
-            Expr::Int("0".to_string(), span)
+    match ty {
+        // tuple `(A, B, …)` → zero of each element (recurses, so a tuple of a
+        // nested struct is caught by the same cycle guard).
+        Type::Tuple { elems, .. } => {
+            let mut zs = Vec::with_capacity(elems.len());
+            for e in elems {
+                zs.push(zero_expr(e, span, structs, visiting)?);
+            }
+            Ok(Expr::Tuple(zs, span))
         }
-        "float" | "float64" | "f64" | "float32" | "f32" => Expr::Float("0.0".to_string(), span),
-        "bool" => Expr::Bool(false, span),
-        "str" => empty_str(false),
-        "bytes" => empty_str(true),
-        _ => return None,
-    })
+        // A function-typed field has no zero value.
+        Type::Func { .. } => Err(err(format!(
+            "no zero-initializer for type `{}` \
+             (function types are unsupported, #1454/#1490)",
+            type_name(ty)
+        ))),
+        Type::Named { name, args, .. } => match (name.as_str(), args.len()) {
+            (
+                "int" | "int64" | "i64" | "int32" | "i32" | "int16" | "i16" | "int8" | "i8"
+                | "uint8" | "u8" | "uint16" | "u16" | "uint32" | "u32" | "uint64" | "u64" | "usize",
+                0,
+            ) => Ok(Expr::Int("0".to_string(), span)),
+            ("float" | "float64" | "f64" | "float32" | "f32", 0) => {
+                Ok(Expr::Float("0.0".to_string(), span))
+            }
+            ("bool", 0) => Ok(Expr::Bool(false, span)),
+            ("str", 0) => Ok(empty_str(false)),
+            ("bytes", 0) => Ok(empty_str(true)),
+            // `Optional[T]` → the empty optional. No recursion into `T`, so an
+            // `Optional[Self]` field breaks a would-be cycle.
+            ("Optional", 1) => Ok(Expr::None(span)),
+            // Empty collection literals; their element/pair types come from the
+            // field's declared type at the call site (#1342 expected-type sink).
+            ("list", 1) => Ok(Expr::List(Vec::new(), span)),
+            ("set", 1) => Ok(Expr::Set(Vec::new(), span)),
+            ("dict", 2) => Ok(Expr::Dict(Vec::new(), span)),
+            // A non-generic nested struct → recurse. Guard a by-value cycle.
+            (nm, 0) if structs.contains_key(nm) => {
+                if visiting.iter().any(|v| v == nm) {
+                    return Err(err(format!(
+                        "struct `{nm}` contains itself by value \
+                         (a zero-initializer cycle); break it with an `Optional`, \
+                         `list`, `dict` or `set` field (#1490)"
+                    )));
+                }
+                let def = structs[nm];
+                visiting.push(nm.to_string());
+                let mut zargs = Vec::with_capacity(def.fields.len());
+                for f in &def.fields {
+                    let z = zero_expr(&f.ty, span, structs, visiting)?;
+                    zargs.push(Arg {
+                        name: None,
+                        value: z,
+                        spread: ArgSpread::None,
+                        span,
+                    });
+                }
+                visiting.pop();
+                Ok(Expr::Call {
+                    callee: Box::new(Expr::Name(nm.to_string(), span)),
+                    args: zargs,
+                    span,
+                })
+            }
+            _ => Err(err(format!(
+                "no zero-initializer for type `{}` yet (#1454/#1490)",
+                type_name(ty)
+            ))),
+        },
+    }
 }
 
 /// Extract the type name from a `reflect.type_info(<TypeName>)` call expression
@@ -4530,11 +4604,14 @@ impl Mono<'_> {
         out
     }
 
-    /// Rewrite `reflect.construct(T)` (#1454) to a zero-initialized construction
-    /// of the concrete type `T` is substituted to: `ConcreteName(zero(f0), …)`.
-    /// v1 supports a **non-generic struct** whose fields are scalars / str /
-    /// bytes; a generic instance or an unsupported field type is a clean error
-    /// (deferred, like the derive codegen's field-type restrictions).
+    /// Rewrite `reflect.construct(T)` (#1454, widened by #1490) to a
+    /// zero-initialized construction of the concrete type `T` is substituted to:
+    /// `ConcreteName(zero(f0), …)`. `T` must be a **non-generic struct**; each
+    /// field's zero is built by `zero_expr`, which now covers scalar / str /
+    /// bytes, `Optional`, `list` / `dict` / `set`, tuple, and nested-struct
+    /// fields (recursing, with a by-value cycle guard). A generic instance of
+    /// `T`, or a field type `zero_expr` still cannot build (e.g. a function
+    /// type), is a clean error.
     fn rewrite_reflect_construct(
         &self,
         ty_arg: &Expr,
@@ -4560,12 +4637,15 @@ impl Mono<'_> {
             )));
         };
         let mut zargs = Vec::with_capacity(def.fields.len());
+        // The by-value recursion path starts at `concrete` itself, so a struct
+        // with a direct field of its own type (`struct S: S inner`) is caught as
+        // a cycle rather than recursing forever (#1490).
+        let mut visiting = vec![concrete.clone()];
         for f in &def.fields {
-            let z = zero_expr(&f.ty, span).ok_or_else(|| {
+            let z = zero_expr(&f.ty, span, &self.structs, &mut visiting).map_err(|e| {
                 err(format!(
-                    "reflect.construct: field `{}` of `{concrete}` has a type the zero-initializer \
-                     does not support yet (scalars / str / bytes only in v1, #1454)",
-                    f.name
+                    "reflect.construct: field `{}` of `{concrete}`: {}",
+                    f.name, e.message
                 ))
             })?;
             zargs.push(Arg {
