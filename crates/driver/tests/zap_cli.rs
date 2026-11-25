@@ -2580,3 +2580,132 @@ def main():
         "both library forwarding stubs are synthesized on Row: {stdout}"
     );
 }
+
+#[test]
+fn a_library_generator_shadows_the_built_in_yaml_codec_without_replacing_it() {
+    // E4 (#1484): library `@derivable` generators can express the built-in
+    // `@derive(Yaml)` *codec* — both encode and decode — over the
+    // source-accessible YAML DOM. YAML 1.2 is a JSON superset, so the public
+    // `yaml` module reuses the shared `JsonValue` DOM (`yaml.load(str) ->
+    // JsonValue` / `yaml.dump(JsonValue) -> str`), exactly as json.loads/dumps —
+    // this is the Json codec shadow (#1470) with those two swapped. Uses the two
+    // E4 enablers: `reflect.construct` / `reflect.set_field` (#1454) and
+    // derived-method `Self`-return typing (#1455). A struct derives BOTH the
+    // built-in `Yaml` (`to_yaml`/`from_yaml`) and the library `YamlEncode`
+    // (`to_yamlcodec`) + `YamlDecode` (`from_yamlcodec`); all four are emitted,
+    // the built-in `Flat__to_yaml`/`Flat__from_yaml` untouched (shadow, not
+    // replace). Round-trip agreement is pinned by the golden
+    // `derive_yaml_codec_shadow` under the CI LLVM matrix.
+    let src = "\
+@derivable(YamlEncode)
+def _derive_yamlencode[T](T value) -> str:
+    dict[str, JsonValue] m = {}
+    comptime for f in reflect.type_info(T).fields:
+        if f.ty.kind.name == \"struct\":
+            m[f.name] = yaml.load(reflect.field(value, comptime f.index).to_yamlcodec())
+        elif f.ty.name == \"int64\":
+            m[f.name] = JsonValue.Int(reflect.field(value, comptime f.index))
+        elif f.ty.name == \"str\":
+            m[f.name] = JsonValue.Str(reflect.field(value, comptime f.index))
+        elif f.ty.name == \"bool\":
+            m[f.name] = JsonValue.Bool(reflect.field(value, comptime f.index))
+        elif f.ty.name == \"float64\":
+            m[f.name] = JsonValue.Float(reflect.field(value, comptime f.index))
+        else:
+            comptime.error(f.span, \"YamlEncode: unsupported field kind\")
+    return yaml.dump(JsonValue.Object(m))
+
+interface YamlEncode:
+    def to_yamlcodec(self) -> str
+
+def _yc_int(JsonValue v) -> int64:
+    match v:
+        case JsonValue.Int(i):
+            return i
+        case _:
+            return 0
+
+def _yc_str(JsonValue v) -> str:
+    match v:
+        case JsonValue.Str(x):
+            return x
+        case _:
+            return \"\"
+
+@derivable(YamlDecode)
+def _derive_yamldecode[T](str s) -> T:
+    auto out = reflect.construct(T)
+    dict[str, JsonValue] m = {}
+    match yaml.load(s):
+        case JsonValue.Object(fields):
+            m = fields
+        case _:
+            m = {}
+    comptime for f in reflect.type_info(T).fields:
+        if f.ty.name == \"int64\":
+            reflect.set_field(out, comptime f.index, _yc_int(m[f.name]))
+        elif f.ty.name == \"str\":
+            reflect.set_field(out, comptime f.index, _yc_str(m[f.name]))
+        else:
+            comptime.error(f.span, \"YamlDecode: unsupported field kind\")
+    return out
+
+interface YamlDecode:
+    def from_yamlcodec(str s) -> Self
+
+@derive(Hash, Eq, Yaml, YamlEncode)
+struct Inner:
+    int64 a
+
+@derive(Eq, Yaml, YamlEncode, YamlDecode)
+struct Flat:
+    int64 x
+    str s
+
+@derive(Eq, Yaml, YamlEncode)
+struct Nested:
+    int64 n
+    Inner inner
+
+def main():
+    auto p = Flat(7, \"hi\")
+    print(Flat.from_yamlcodec(p.to_yamlcodec()) == p)
+    auto o = Nested(3, Inner(9))
+    print(Nested.from_yaml(o.to_yamlcodec()) == o)
+";
+    let f = write_zap("e4-yaml-codec-shadow", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the shadow Yaml codec generators must lower alongside the built-in; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The built-in Yaml codec is left in place (shadow, not replace).
+    assert!(
+        stdout.contains("@Flat__to_yaml") && stdout.contains("@Flat__from_yaml"),
+        "the built-in Yaml codec is untouched: {stdout}"
+    );
+    // The library encode + decode specialize their generators and forward.
+    assert!(
+        stdout.contains("@_derive_yamlencode$Flat") && stdout.contains("@_derive_yamldecode$Flat"),
+        "both library generators specialize at Flat: {stdout}"
+    );
+    assert!(
+        stdout.contains("@Flat__to_yamlcodec") && stdout.contains("@Flat__from_yamlcodec"),
+        "both library forwarding stubs are synthesized on Flat: {stdout}"
+    );
+    // A nested derived struct: library encode recurses (both specialize)...
+    assert!(
+        stdout.contains("@Nested__to_yamlcodec")
+            && stdout.contains("@_derive_yamlencode$Nested")
+            && stdout.contains("@_derive_yamlencode$Inner"),
+        "the library encode recurses through the nested derived struct: {stdout}"
+    );
+    // ...and decode is NOT derived on the nested struct (it derives YamlEncode
+    // only; nested-struct decode via reflect.construct is a documented follow-up).
+    assert!(
+        !stdout.contains("@Nested__from_yamlcodec"),
+        "the nested struct does not synthesize a decoder: {stdout}"
+    );
+}
