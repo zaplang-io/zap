@@ -1306,13 +1306,28 @@ fn espan(e: &Expr) -> Span {
         | Expr::ChanRecv { span, .. }
         | Expr::Yield { span, .. }
         | Expr::IfElse { span, .. }
-        | Expr::Named { span, .. } => *span,
+        | Expr::Named { span, .. }
+        | Expr::TypeArg { span, .. } => *span,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::format_source;
+
+    #[test]
+    fn fn_type_as_generic_type_argument_round_trips() {
+        // A function type used as an explicit generic type argument (#1488)
+        // re-emits byte-for-byte through the shared type renderer, in both the
+        // free-function and method call forms.
+        let src = "def main():\n    auto f = run[fn(int64) -> int64](g)\n";
+        assert_eq!(format_source(src).unwrap(), src);
+        let method = "def main():\n    auto f = b.run[fn(int64, str) -> bytes](g)\n";
+        assert_eq!(format_source(method).unwrap(), method);
+        // A function type with no return renders without the `->` clause.
+        let void = "def main():\n    auto f = run[fn(int64)](g)\n";
+        assert_eq!(format_source(void).unwrap(), void);
+    }
 
     #[test]
     fn type_aliases_are_formatted_stably() {

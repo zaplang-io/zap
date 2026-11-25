@@ -758,7 +758,8 @@ fn expr_span(e: &Expr) -> Span {
         | ChanRecv { span, .. }
         | Yield { span, .. }
         | IfElse { span, .. }
-        | Named { span, .. } => *span,
+        | Named { span, .. }
+        | TypeArg { span, .. } => *span,
     }
 }
 

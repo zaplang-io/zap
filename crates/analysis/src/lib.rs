@@ -1516,12 +1516,14 @@ impl Walk {
                 self.expr(then);
                 self.expr(els);
             }
-            // Literals carry no name references.
+            // Literals and a type argument (`g[fn(A) -> B]`, #1488) carry no
+            // name references.
             Expr::Int(..)
             | Expr::Float(..)
             | Expr::Imaginary(..)
             | Expr::Str { .. }
             | Expr::Bool(..)
+            | Expr::TypeArg { .. }
             | Expr::None(_) => {}
         }
     }
@@ -1589,6 +1591,7 @@ fn expr_span(e: &Expr) -> Span {
         | Expr::ChanRecv { span, .. }
         | Expr::Yield { span, .. }
         | Expr::IfElse { span, .. }
-        | Expr::Named { span, .. } => *span,
+        | Expr::Named { span, .. }
+        | Expr::TypeArg { span, .. } => *span,
     }
 }

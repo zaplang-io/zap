@@ -739,6 +739,8 @@ fn child_exprs<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
         | Expr::Name(..)
         | Expr::RegexMatch { .. }
         | Expr::RegexSubst { .. }
+        // A type argument (`g[fn(A) -> B]`, #1488) has no child expressions.
+        | Expr::TypeArg { .. }
         | Expr::Lambda { .. } => {}
         Expr::Str { fstring_fields, .. } => {
             for f in fstring_fields {

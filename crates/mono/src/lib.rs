@@ -243,7 +243,8 @@ fn expr_span(e: &Expr) -> Span {
         | Expr::ChanRecv { span, .. }
         | Expr::Yield { span, .. }
         | Expr::IfElse { span, .. }
-        | Expr::Named { span, .. } => *span,
+        | Expr::Named { span, .. }
+        | Expr::TypeArg { span, .. } => *span,
     }
 }
 
@@ -3736,6 +3737,13 @@ impl Mono<'_> {
                     vcty,
                 ))
             }
+            // A type argument (`g[fn(A) -> B]`, #1488) is consumed by the
+            // explicit-type-argument paths in `rewrite_call` (via
+            // `type_args_from_index` / `expr_to_type`) before the subscript is
+            // ever rewritten structurally. If one reaches here it is in a
+            // non-generic position; leave it unchanged (it is a type, not a
+            // value, and carries no sub-expressions to rewrite).
+            Expr::TypeArg { .. } => Ok((e.clone(), CTy::Unknown)),
             Expr::Slice {
                 base,
                 lo,
@@ -4131,6 +4139,11 @@ impl Mono<'_> {
                 }
                 Some(Type::Tuple { elems, span: *span })
             }
+            // A function type written as a generic type argument, `g[fn(A) ->
+            // B]` (#1488). The parser already carries the parsed `Type::Func`
+            // here, so just unwrap it; the caller (`type_args_from_index`)
+            // applies the current substitution, exactly as for the arms above.
+            Expr::TypeArg { ty, .. } => Some((**ty).clone()),
             _ => None,
         }
     }
@@ -5692,6 +5705,42 @@ mod tests {
                 .iter()
                 .any(|n| n == "run$tuple$Optional$bytes$Optional$bytes"),
             "the specialized free function must carry one tuple type argument: {names:?}"
+        );
+    }
+
+    // ---- #1488: a function type as an explicit generic type argument. The
+    // parser carries `fn(A) -> B` as an `Expr::TypeArg`, which `expr_to_type`
+    // unwraps to a `Type::Func`; the specialized symbol mangles it as
+    // `fn$<params>$to$<ret>`.
+
+    #[test]
+    fn fn_type_as_explicit_type_arg_specializes() {
+        let m = mono_ok(
+            "def inc(int64 x) -> int64:\n    return x + 1\n\
+             def run[T](T fallback) -> T:\n    return fallback\n\
+             def main():\n\
+             \x20   auto f = run[fn(int64) -> int64](inc)\n    print(f(41))\n",
+        );
+        let names = fn_names(&m);
+        assert!(
+            names.iter().any(|n| n == "run$fn$int64$to$int64"),
+            "the specialized function must carry the fn-type argument: {names:?}"
+        );
+    }
+
+    #[test]
+    fn fn_type_as_explicit_method_type_arg_specializes() {
+        let m = mono_ok(
+            "def inc(int64 x) -> int64:\n    return x + 1\n\
+             struct Box:\n    int64 unused\n\
+             \x20   def run[T](self, T fallback) -> T:\n        return fallback\n\
+             def main():\n    Box b = Box(0)\n\
+             \x20   auto f = b.run[fn(int64) -> int64](inc)\n    print(f(41))\n",
+        );
+        let syms = method_call_syms(&m);
+        assert!(
+            syms.iter().any(|s| s == "run$fn$int64$to$int64"),
+            "the generic method call must carry the fn-type argument: {syms:?}"
         );
     }
 

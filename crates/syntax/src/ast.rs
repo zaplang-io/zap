@@ -1076,6 +1076,20 @@ pub enum Expr {
         value: Box<Expr>,
         span: Span,
     },
+
+    /// A **type** written where an expression is syntactically expected — only
+    /// a function type in a generic type-argument subscript, `g[fn(A) -> B]`
+    /// (#1488). The parser produces it solely in index-element position when the
+    /// element begins with the `fn(` function-type form, which can never be a
+    /// value expression, so it never shadows ordinary indexing. It carries no
+    /// sub-expressions (a type has none), and `mono`'s `expr_to_type` unwraps it
+    /// to its `Type` when resolving the explicit type arguments of a generic
+    /// call. It is not a runtime value: reaching value positions (inference,
+    /// lowering) it is treated as unknown / rejected.
+    TypeArg {
+        ty: Box<Type>,
+        span: Span,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

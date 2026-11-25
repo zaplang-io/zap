@@ -199,7 +199,9 @@ fn each_yield_in_expr<'a>(e: &'a Expr, visit: &mut dyn FnMut(&'a Expr)) {
         | Expr::None(..)
         | Expr::Name(..)
         | Expr::RegexMatch { .. }
-        | Expr::RegexSubst { .. } => {}
+        | Expr::RegexSubst { .. }
+        // A type argument (`g[fn(A) -> B]`, #1488) carries no sub-expressions.
+        | Expr::TypeArg { .. } => {}
         // A lambda is its own scope — do not attribute its `yield`s here.
         Expr::Lambda { .. } => {}
         Expr::Tuple(es, _) | Expr::List(es, _) | Expr::Set(es, _) => {

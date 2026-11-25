@@ -6457,6 +6457,22 @@ impl Parser {
     /// `[lo]:[hi][:step]` (#502). A slice spec is returned as a baseless
     /// `Expr::SliceSpec`; `parse_subscript` attaches the base for a lone slice.
     fn parse_index_elem(&mut self, start: u32) -> Expr {
+        // A function type written as a generic type argument, `g[fn(A) -> B]`
+        // (#1488). `fn(` begins the `func_type` grammar and can never start a
+        // value index expression, so recognizing it here does not disturb
+        // ordinary subscripting; it is parsed as a type and carried as a
+        // `TypeArg` for `mono`'s `expr_to_type` to unwrap. (Other type forms —
+        // names, generic instantiations, tuples — already round-trip through
+        // ordinary expression parsing, so only the `fn` form needs this.)
+        if matches!(self.peek(), TokenKind::Ident(n) if n == "fn")
+            && *self.peek2() == TokenKind::LParen
+        {
+            let ty = self.parse_type();
+            return Expr::TypeArg {
+                ty: Box::new(ty),
+                span: self.span_from(start),
+            };
+        }
         let lo = if self.is(&TokenKind::Colon)
             || self.is(&TokenKind::RBracket)
             || self.is(&TokenKind::Comma)
