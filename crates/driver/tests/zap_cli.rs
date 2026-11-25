@@ -2190,6 +2190,132 @@ def main():
 }
 
 #[test]
+fn a_library_generator_shadows_the_built_in_json_codec_without_replacing_it() {
+    // E4 (#1470): library `@derivable` generators can express the built-in
+    // `@derive(Json)` *codec* — both encode and decode — over the
+    // source-accessible JSON DOM (`JsonValue` + public `json.dumps`/`json.loads`),
+    // using the two enablers that landed for E4: `reflect.construct` /
+    // `reflect.set_field` (#1454) and derived-method `Self`-return typing (#1455).
+    // A struct derives BOTH the built-in `Json` (`to_json`/`from_json`) and the
+    // library `JsonEncode` (`to_jsoncodec`) + `JsonDecode` (`from_jsoncodec`); all
+    // four functions are emitted, the built-in `Flat__to_json`/`Flat__from_json`
+    // untouched (shadow, not replace). Round-trip agreement is pinned by the
+    // golden `derive_json_codec_shadow` under the CI LLVM matrix.
+    let src = "\
+@derivable(JsonEncode)
+def _derive_jsonencode[T](T value) -> str:
+    dict[str, JsonValue] m = {}
+    comptime for f in reflect.type_info(T).fields:
+        if f.ty.kind.name == \"struct\":
+            m[f.name] = json.loads(reflect.field(value, comptime f.index).to_jsoncodec())
+        elif f.ty.name == \"int64\":
+            m[f.name] = JsonValue.Int(reflect.field(value, comptime f.index))
+        elif f.ty.name == \"str\":
+            m[f.name] = JsonValue.Str(reflect.field(value, comptime f.index))
+        elif f.ty.name == \"bool\":
+            m[f.name] = JsonValue.Bool(reflect.field(value, comptime f.index))
+        elif f.ty.name == \"float64\":
+            m[f.name] = JsonValue.Float(reflect.field(value, comptime f.index))
+        else:
+            comptime.error(f.span, \"JsonEncode: unsupported field kind\")
+    return json.dumps(JsonValue.Object(m))
+
+interface JsonEncode:
+    def to_jsoncodec(self) -> str
+
+def _jc_int(JsonValue v) -> int64:
+    match v:
+        case JsonValue.Int(i):
+            return i
+        case _:
+            return 0
+
+def _jc_str(JsonValue v) -> str:
+    match v:
+        case JsonValue.Str(x):
+            return x
+        case _:
+            return \"\"
+
+@derivable(JsonDecode)
+def _derive_jsondecode[T](str s) -> T:
+    auto out = reflect.construct(T)
+    dict[str, JsonValue] m = {}
+    match json.loads(s):
+        case JsonValue.Object(fields):
+            m = fields
+        case _:
+            m = {}
+    comptime for f in reflect.type_info(T).fields:
+        if f.ty.name == \"int64\":
+            reflect.set_field(out, comptime f.index, _jc_int(m[f.name]))
+        elif f.ty.name == \"str\":
+            reflect.set_field(out, comptime f.index, _jc_str(m[f.name]))
+        else:
+            comptime.error(f.span, \"JsonDecode: unsupported field kind\")
+    return out
+
+interface JsonDecode:
+    def from_jsoncodec(str s) -> Self
+
+@derive(Hash, Eq, Json, JsonEncode)
+struct Inner:
+    int64 a
+
+@derive(Eq, Json, JsonEncode, JsonDecode)
+struct Flat:
+    int64 x
+    str s
+
+@derive(Eq, Json, JsonEncode)
+struct Nested:
+    int64 n
+    Inner inner
+
+def main():
+    auto p = Flat(7, \"hi\")
+    print(Flat.from_jsoncodec(p.to_jsoncodec()) == p)
+    auto o = Nested(3, Inner(9))
+    print(Nested.from_json(o.to_jsoncodec()) == o)
+";
+    let f = write_zap("e4-json-codec-shadow", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the shadow Json codec generators must lower alongside the built-in; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The built-in Json codec is left in place (shadow, not replace).
+    assert!(
+        stdout.contains("@Flat__to_json") && stdout.contains("@Flat__from_json"),
+        "the built-in Json codec is untouched: {stdout}"
+    );
+    // The library encode + decode specialize their generators and forward.
+    assert!(
+        stdout.contains("@_derive_jsonencode$Flat") && stdout.contains("@_derive_jsondecode$Flat"),
+        "both library generators specialize at Flat: {stdout}"
+    );
+    assert!(
+        stdout.contains("@Flat__to_jsoncodec") && stdout.contains("@Flat__from_jsoncodec"),
+        "both library forwarding stubs are synthesized on Flat: {stdout}"
+    );
+    // A nested derived struct: library encode recurses (both specialize)...
+    assert!(
+        stdout.contains("@Nested__to_jsoncodec")
+            && stdout.contains("@_derive_jsonencode$Nested")
+            && stdout.contains("@_derive_jsonencode$Inner"),
+        "the library encode recurses through the nested derived struct: {stdout}"
+    );
+    // ...and decode is NOT derived on the nested struct (it derives JsonEncode
+    // only; nested-struct decode via reflect.construct is a documented follow-up).
+    assert!(
+        !stdout.contains("@Nested__from_jsoncodec"),
+        "the nested struct does not synthesize a decoder: {stdout}"
+    );
+}
+
+#[test]
 fn reflect_construct_and_set_field_build_a_value() {
     // #1454 (E4 enabler): the reflect value-construction + field-write surface.
     // A generator zero-constructs a value of T (`reflect.construct(T)`), writes
