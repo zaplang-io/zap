@@ -103,6 +103,20 @@ impl<'a> FnLower<'a> {
                     // field-reassignment twin of the #1400 construction/enum-
                     // payload/Optional-wrap stores already using this chokepoint).
                     let v = self.copy_field_value(v, fty, value);
+                    // A field store on a null non-`Optional` reference raises a
+                    // located `NullReferenceError` (#1489/#1493), the write twin
+                    // of the field-read guard. Value structs are inline, not
+                    // nullable, so they need no guard.
+                    if !self.ctx.is_value_struct(sid) {
+                        let owner = self.ctx.names[sid as usize].clone();
+                        self.null_deref_guard(
+                            bv,
+                            NullDerefSite::FieldStore,
+                            Some(name),
+                            Some(&owner),
+                            *span,
+                        );
+                    }
                     // --race (#684): a write of a shared heap struct field.
                     self.emit_race_field(bv, sid, idx, name, true, *span);
                     self.emit(Inst::FieldSet {

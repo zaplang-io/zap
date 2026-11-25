@@ -264,6 +264,15 @@ mod run_impl {
 
         // Compile the harness to a temporary executable.
         let exe = super::temp_exe_path(path);
+        // Entry source for located runtime diagnostics (#1493): a null-deref
+        // `NullReferenceError` in a test body carries `... at <file>:<line>`,
+        // resolved against the test file's source. Best-effort (unreadable →
+        // `<unknown>:0`).
+        let entry_src = std::fs::read_to_string(path).unwrap_or_default();
+        let loc = (!entry_src.is_empty()).then_some(zapc_ir::SourceLoc {
+            file: display.as_str(),
+            src: entry_src.as_str(),
+        });
         // Test harnesses always use the full (non-portable) link: they run on the
         // build host, where CPython and the dynamic libs are present (I#287). The
         // harness binary builds with the optimized (`-O2`) runtime — the default,
@@ -291,6 +300,7 @@ mod run_impl {
             race,
             false,
             zapc_ir::FpPolicy::default(),
+            loc,
         ) {
             results.push(file_error(&display, format!("codegen error: {e}")));
             return;

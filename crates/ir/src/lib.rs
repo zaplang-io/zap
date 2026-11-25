@@ -15,7 +15,10 @@ pub mod lower;
 // re-export it as the `mono` module so `crate::mono::monomorphize` is unchanged.
 pub use zapc_mono as mono;
 
-pub use lower::{lower_module, lower_module_opts, lower_module_opts_with_types};
+pub use lower::{
+    lower_module, lower_module_opts, lower_module_opts_with_types,
+    lower_module_opts_with_types_located, SourceLoc,
+};
 pub use zapc_ir_core::{
     ArrayMathOp, AtomicOrd, AtomicRmwOp, BinOp, Block, BlockId, CastKind, CmpPred, Dtype, Elem,
     FpPolicy, Func, Inst, Module, MvGroup, MvTier, Owner, Term, Ty, UnOp, Value,

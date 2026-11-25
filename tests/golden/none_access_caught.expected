@@ -1,6 +1,7 @@
 before
-caught
-member access on None
+caught NullReferenceError
 cleanup
+caught as Exception
+propagated past ValueError
 3
 after

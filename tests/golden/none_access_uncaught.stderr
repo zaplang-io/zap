@@ -1,1 +1,1 @@
-member access on None
+null dereference reading field 'x' of 'Point' at none_access_uncaught.zap:14

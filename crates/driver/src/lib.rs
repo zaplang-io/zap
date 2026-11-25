@@ -562,7 +562,19 @@ fn backend(
         }
     };
 
-    if let Err(e) = zapc_codegen::build_executable(module, types, &exe, portable, race, debug, fp) {
+    // Entry source for located runtime diagnostics (#1489/#1493): a null
+    // dereference raises a `NullReferenceError` carrying `... at <file>:<line>`,
+    // whose line is resolved against the entry source (the same entry-source
+    // span convention sema diagnostics use, #571). Best-effort: an unreadable
+    // entry degrades the location to `<unknown>:0`.
+    let entry_src = std::fs::read_to_string(file).unwrap_or_default();
+    let loc = (!entry_src.is_empty()).then_some(zapc_ir::SourceLoc {
+        file,
+        src: entry_src.as_str(),
+    });
+    if let Err(e) =
+        zapc_codegen::build_executable(module, types, &exe, portable, race, debug, fp, loc)
+    {
         eprintln!("{file}: codegen error: {e}");
         cleanup();
         return ExitCode::from(1);
