@@ -216,3 +216,67 @@ fn len_of_null_list_guards_builtin_len() {
         messages(src)
     );
 }
+
+// --- #1493 part B: method-call receiver on a null reference ---
+
+#[test]
+fn method_call_on_null_user_struct_is_not_guarded_at_call_site() {
+    // A user-struct method call is deliberately NOT guarded at the call site
+    // (#1493): a `Ty::Struct` receiver here is not reliably a nullable heap
+    // pointer (tier-3 enums, `Optional$T`, and erased-generic receivers also
+    // arrive as `Ty::Struct`), so an `IsNull` guard would spuriously raise. A
+    // null user receiver is instead caught transitively by the field read/store
+    // guards inside the method body (here `self.n = …` emits the field-store
+    // guard). So no MethodReceiver message is produced for the receiver, but the
+    // field-store guard is present.
+    let src = "struct Counter:\n    int64 n\n\n    def bump(self):\n        self.n = self.n + 1\n\ndef main():\n    Counter c = None\n    c.bump()\n";
+    let msgs = messages(src);
+    assert!(
+        !msgs.iter().any(|m| m.contains("calling method 'bump'")),
+        "a user-struct method call must NOT emit a MethodReceiver guard; got {msgs:?}"
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("writing field 'n' of 'Counter'")),
+        "the method body's field store is still guarded; got {msgs:?}"
+    );
+}
+
+#[test]
+fn method_call_on_null_builtin_list_guards_receiver() {
+    let src =
+        "struct L:\n    list[int64] xs = None\n\ndef main():\n    L l = L()\n    l.xs.append(5)\n";
+    assert!(
+        messages(src)
+            .iter()
+            .any(|m| m == "null dereference calling method 'append' on 'list' at <unknown>:0"),
+        "method call on a null list must carry the MethodReceiver message; got {:?}",
+        messages(src)
+    );
+}
+
+#[test]
+fn method_call_on_null_str_guards_receiver() {
+    let src = "struct S:\n    str name = None\n\ndef main():\n    S s = S()\n    auto u = s.name.upper()\n    print(u)\n";
+    assert!(
+        messages(src)
+            .iter()
+            .any(|m| m == "null dereference calling method 'upper' on 'str' at <unknown>:0"),
+        "method call on a null str must carry the MethodReceiver message; got {:?}",
+        messages(src)
+    );
+}
+
+#[test]
+fn value_struct_method_call_is_not_guarded_as_receiver() {
+    // A `value struct` is inline, never null; its method call must not emit a
+    // null-dereference guard (and `IsNull` on an inline aggregate would be wrong).
+    let src = "value struct V:\n    int64 x\n\n    def get(self) -> int64:\n        return self.x\n\ndef main():\n    V v = V(x=1)\n    print(v.get())\n";
+    assert!(
+        !messages(src)
+            .iter()
+            .any(|m| m.starts_with("null dereference")),
+        "a value-struct method call must emit no null-dereference message; got {:?}",
+        messages(src)
+    );
+}

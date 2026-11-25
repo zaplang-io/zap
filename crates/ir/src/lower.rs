@@ -10848,9 +10848,25 @@ impl<'a> FnLower<'a> {
                 return self.lower_py_call(callable, args);
             }
             Err(err(format!("call to unknown function '{fname}'")))
-        } else if let Expr::Attr { base, name, .. } = callee {
+        } else if let Expr::Attr { base, name, span } = callee {
             // Method call: `recv.method(args)`.
             let (recv, bty) = self.expr(base)?;
+            // A method call on a null built-in reference (`str`/`list`/`dict`/…)
+            // raises a located `NullReferenceError` instead of a SIGSEGV
+            // (#1489/#1493): the receiver is dereferenced to read its object
+            // header / dispatch. Guard before the per-type dispatch below. The
+            // user-struct receiver is guarded separately at its dispatch site
+            // (after the inline strview/arena/atomic/interface receivers, which
+            // are never null, are peeled off). `Optional[T]` is out of scope.
+            if let Some(owner) = Self::builtin_ref_owner(&bty) {
+                self.null_deref_guard(
+                    recv,
+                    NullDerefSite::MethodReceiver,
+                    Some(name),
+                    Some(owner),
+                    *span,
+                );
+            }
             if let Ty::List(elem) = bty {
                 return self.lower_list_method(recv, elem, name, args);
             }
@@ -11003,6 +11019,18 @@ impl<'a> FnLower<'a> {
             if let Some(iid) = self.ctx.iid_of_fat_sid(sid) {
                 return self.lower_iface_call(recv, iid, name, args);
             }
+            // NOTE (#1493): a method call on a null USER-struct receiver
+            // (`n.method()`) is NOT guarded here. Such a receiver is transitively
+            // covered by the field read/store guards (PR#1511): a method that
+            // dereferences `self` raises `NullReferenceError` at that field
+            // access. A struct's `Ty::Struct(sid)` at this site is not reliably a
+            // nullable heap pointer — tier-3 enums, `Optional$T`, and
+            // erased-generic receivers also arrive as `Ty::Struct` but are
+            // inline / have their own None path, and guarding them with `IsNull`
+            // spuriously raises. An eager, call-site-located guard for genuine
+            // reference-struct receivers needs a precise "nullable heap reference"
+            // predicate and is deferred. The built-in reference receivers
+            // (`list`/`str`/… — real heap pointers) are guarded above.
             let mangled = format!("{}__{}", self.ctx.names[sid as usize], name);
             self.call_resolved_method(recv, name, mangled, args)
         } else {
