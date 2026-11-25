@@ -923,6 +923,31 @@ mod import_resolution_tests {
             })
     }
 
+    /// Resolve an entry file AND lower the merged module to ZIR, returning the
+    /// rendered ZIR text. Lowering runs monomorphization (reading sema's inferred
+    /// types), so a generic instantiated by a type value — e.g. `option[T]` bound
+    /// at `Type[int64]` — appears here as the mangled `option$Type$int64` (it is
+    /// still the bare generic in the pre-lowering AST module `resolve` returns).
+    fn resolve_and_lower_zir(entry: &std::path::Path, pkg_roots: Vec<PathBuf>) -> String {
+        let (module, types, _warns) = match crate::front_end_reports_with(
+            &entry.display().to_string(),
+            &Target::host(),
+            pkg_roots,
+        ) {
+            Ok(ok) => ok,
+            Err(reports) => {
+                let msgs: Vec<String> = reports
+                    .iter()
+                    .map(|r| format!("error[{}]: {}", r.code, r.message))
+                    .collect();
+                panic!("front end must resolve, got: {msgs:?}");
+            }
+        };
+        let (zir, errs) = zapc_ir::lower_module_opts_with_types(&module, false, &types);
+        assert!(errs.is_empty(), "the program must lower, got: {errs:?}");
+        format!("{zir}")
+    }
+
     /// Whether any top-level function's name CONTAINS `needle` — used to prove an
     /// imported dependency's symbols were actually merged into the linked module
     /// (they arrive module-qualified/mangled, e.g. `__zm1_sample__answer__`, not
@@ -1369,6 +1394,117 @@ mod import_resolution_tests {
         assert!(
             i_cmd < i_opt && i_opt < i_arg,
             "chain must nest command(option(argument(...))) outer-to-inner, got: {main}"
+        );
+    }
+
+    /// THE #1527 repro (from the issue): a library-defined returning decorator
+    /// `@factory.option("--count", int64)` accepts the concrete type `int64` as a
+    /// first-class **type value** argument. Before #1527 this was
+    /// `ZAP3001: unknown name 'int64'` at the decorator argument. It must now
+    /// resolve (sema) AND lower end-to-end: the type value flows through the
+    /// imported returning-decorator desugar to the generic `option[T]`, binding
+    /// `T = Type[int64]`, and `greet` is rebound to the returned `Command`.
+    #[test]
+    fn imported_decorator_accepts_type_argument() {
+        let p = Project::new("typearg_repro");
+        p.write(
+            "zenv/pkg/factory/src/factory.zap",
+            "struct Command:\n\
+             \x20   fn(str) -> str handler\n\n\
+             \x20   def run(self) -> str:\n\
+             \x20       auto handler = self.handler\n\
+             \x20       return handler(\"Ada\")\n\n\
+             def option[T](str name, T kind, fn(str) -> str handler) -> Command:\n\
+             \x20   return Command(handler=handler)\n",
+        );
+        let entry = p.write(
+            "src/main.zap",
+            "import factory\n\n\
+             @factory.option(\"--count\", int64)\n\
+             def greet(str name) -> str:\n\
+             \x20   return \"Hello \" + name\n\n\
+             def main():\n\
+             \x20   assert greet.run() == \"Hello Ada\"\n",
+        );
+
+        let module = resolve(&entry, vec![p.pkg_root()]).expect(
+            "a concrete type argument to an imported returning decorator must resolve (#1527)",
+        );
+        assert!(
+            has_fn_containing(&module, "greet$impl"),
+            "the decorated name must be rebound (greet$impl), the #1509/#1519 path"
+        );
+        // End-to-end: the whole program lowers to ZIR, and the type value binds
+        // the generic parameter `T = Type[int64]`, monomorphizing the callee (the
+        // mangled name appears only after lowering runs monomorphization). The
+        // `int64` token lowers to its `int64` type-id; no residual `unknown name`.
+        let zir = resolve_and_lower_zir(&entry, vec![p.pkg_root()]);
+        assert!(
+            zir.contains("option$Type$int64"),
+            "the type value must bind `T = Type[int64]`, monomorphizing \
+             option$Type$int64, got:\n{zir}"
+        );
+    }
+
+    /// The #1527 golden surface: a primitive type reaches a STACKED imported
+    /// decorator carrying the named metadata `default=`, and a second type reaches
+    /// the innermost decorator. Two type values (`int64`, `str`) flow through the
+    /// nested-call desugar alongside `default=7`; the chain composes and lowers.
+    #[test]
+    fn imported_type_decorator_stacked_with_default_metadata() {
+        let p = Project::new("typearg_stacked");
+        p.write(
+            "zenv/pkg/cli/src/cli.zap",
+            "struct Command:\n\
+             \x20   str flag\n\
+             \x20   int64 deflt\n\
+             \x20   fn(str) -> str handler\n\n\
+             \x20   def run(self) -> str:\n\
+             \x20       auto handler = self.handler\n\
+             \x20       return handler(self.flag)\n\n\
+             def argument[T](str name, T kind, fn(str) -> str handler) -> Command:\n\
+             \x20   return Command(flag=name, deflt=0, handler=handler)\n\n\
+             def option[T](str flag, T kind, Command c, int64 default) -> Command:\n\
+             \x20   return Command(flag=flag, deflt=default, handler=c.handler)\n\n\
+             def command(Command c) -> Command:\n\
+             \x20   return Command(flag=c.flag, deflt=c.deflt, handler=c.handler)\n",
+        );
+        let entry = p.write(
+            "src/main.zap",
+            "import cli\n\n\
+             @cli.command\n\
+             @cli.option(\"--count\", int64, default=7)\n\
+             @cli.argument(\"name\", str)\n\
+             def greet(str flag) -> str:\n\
+             \x20   return \"greet \" + flag\n\n\
+             def main():\n\
+             \x20   assert greet.run() == \"greet --count\"\n\
+             \x20   assert greet.deflt == 7\n",
+        );
+
+        let module = resolve(&entry, vec![p.pkg_root()]).expect(
+            "stacked type-carrying imported decorators with default= metadata must resolve (#1527)",
+        );
+        let main = main_body_debug(&module);
+        assert!(
+            main.contains("command") && main.contains("option") && main.contains("argument"),
+            "the stacked chain must compose all three imported functions, got: {main}"
+        );
+        assert!(
+            main.contains("--count") && main.contains("name"),
+            "stacked metadata arguments must be retained, got: {main}"
+        );
+        // Lower end-to-end: both type values are monomorphized — int64 at option,
+        // str at argument — proving each reached its decorator through the stacked
+        // nested-call desugar alongside the `default=` metadata.
+        let zir = resolve_and_lower_zir(&entry, vec![p.pkg_root()]);
+        assert!(
+            zir.contains("option$Type$int64"),
+            "int64 must reach option as Type[int64], got:\n{zir}"
+        );
+        assert!(
+            zir.contains("argument$Type$str"),
+            "str must reach argument as Type[str], got:\n{zir}"
         );
     }
 

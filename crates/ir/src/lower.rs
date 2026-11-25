@@ -2423,6 +2423,11 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
             "bigint" => Ok(Ty::Bigint),
             "complex" => Ok(Ty::Complex),
             "pyobject" => Ok(Ty::Py),
+            // A first-class type value `Type[T]` (#1527) erases to a plain `int64`
+            // type-id token at the IR level — no runtime reflection graph, no new
+            // IR type, no GC root. The represented type is a compile-time-only
+            // distinction (sema `Ty::TypeVal`); every `Type[..]` is one scalar id.
+            "Type" => Ok(Ty::I64),
             "list" => {
                 let e = match args.first() {
                     Some(a) => list_elem_of(a, env)?,
@@ -8383,6 +8388,17 @@ impl<'a> FnLower<'a> {
                 // so a reference lowers to a `zap_py_import` (ticket #27, D-0012).
                 if let Some(module) = self.ctx.py.get(n).cloned() {
                     return Ok((self.lower_py_import(&module), Ty::Py));
+                }
+                // A bare primitive type name in value position is a first-class
+                // **type value** `Type[T]` (#1527): it lowers to its stable `int64`
+                // type-id token (`type_value_id`). Reached only as a value use — a
+                // `str(x)` / `int64(x)` conversion is a `Call` whose callee is
+                // matched structurally, never lowered through here. Symmetric with
+                // sema's `infer(Expr::Name)` type-value branch.
+                if let Some(inner) = zapc_sema_types::primitive_type_value_ty(n) {
+                    if let Some(id) = zapc_sema_types::type_value_id(&inner) {
+                        return Ok((self.iconst(Ty::I64, id), Ty::I64));
+                    }
                 }
                 Err(err(format!("unknown variable '{n}'")))
             }
