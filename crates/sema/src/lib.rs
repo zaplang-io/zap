@@ -10034,18 +10034,26 @@ impl Checker {
                     }
                     // Struct construction: `StructName(fields...)`.
                     if self.user_types.contains(fname) {
-                        // Arena (#553, D-0158): reject a statically-known
-                        // `size > cap` at compile time — the arena could never
-                        // satisfy its own initial reservation (ZAP5132). A runtime
-                        // `size`/`cap` is bounds-checked at `arena()` open instead.
+                        // Arena (#553, D-0158) is a builtin pseudo-struct, not an
+                        // ordinary field constructor: its `size=`/`cap=` keyword
+                        // arguments are a special sizing form (checked by
+                        // `check_arena_sizing` — including the statically-known
+                        // `size > cap` reject, ZAP5132), NOT declared fields. So it
+                        // bypasses the generic constructor field/arity check (#1464/
+                        // #1467), which would otherwise reject `size`/`cap` as
+                        // unknown fields; the args are still inferred here.
                         if fname == "arena" {
                             self.check_arena_sizing(args, span);
+                            for a in args {
+                                self.infer(&a.value);
+                            }
+                            return Ty::Named(fname.clone());
                         }
-                        // #1464 (Phase 2 of #1452): type-check the constructor's
-                        // field arguments against their declared types, bringing
-                        // struct construction in line with direct bindings. A
-                        // user type that is not a registered struct (rare) keeps
-                        // the former loose behaviour.
+                        // #1464 (Phase 2 of #1452) + #1467: type/arity/unknown-field
+                        // check an ordinary struct constructor, bringing it in line
+                        // with direct bindings and enum-variant construction. A user
+                        // type that is not a registered struct (rare) keeps the
+                        // former loose behaviour.
                         if let Some(info) = self.structs.get(fname).cloned() {
                             self.check_struct_field_types(fname, &info, args);
                         } else {
@@ -18246,6 +18254,17 @@ def main():
             def main():\n    P p = P(1, 2)\n    print(p.x)\n");
         ok("struct P:\n    int64 x\n    int64 y\n\
             def main():\n    P p = P(y=2, x=1)\n    print(p.x)\n");
+    }
+
+    #[test]
+    fn sema_arena_sizing_kwargs_not_flagged_as_unknown_fields() {
+        // #1467 regression: `arena(size=, cap=)` is a builtin sizing form, not an
+        // ordinary field constructor, so its keyword arguments must NOT trip the
+        // unknown-field check (ZAP4063). (The arena golden fixtures exercise this.)
+        ok("def main():\n    \
+            with arena(size=64, cap=65536) as a:\n        \
+            auto b = a.alloc(bytes, 64)\n");
+        ok("def main():\n    with arena(size=1024) as a:\n        pass\n");
     }
 
     #[test]
