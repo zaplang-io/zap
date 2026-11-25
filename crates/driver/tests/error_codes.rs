@@ -735,3 +735,21 @@ fn vartuple_key_codes() {
     );
     assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
 }
+
+#[test]
+fn vartuple_ops_codes() {
+    // tuple[T] ordering types as bool; concat and slice type as tuple[T] (#1475).
+    let ok = check_source(
+        "def main():\n\
+         \x20   auto a = tuple([1, 2, 3])\n\
+         \x20   auto b = tuple([4, 5])\n\
+         \x20   bool lt = a < b\n\
+         \x20   bool le = a <= b\n\
+         \x20   bool gt = a > b\n\
+         \x20   tuple[int64] cat = a + b\n\
+         \x20   tuple[int64] sl = a[0:2]\n\
+         \x20   tuple[int64] rev = a[::-1]\n\
+         \x20   int64 n = len(cat)\n",
+    );
+    assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
+}

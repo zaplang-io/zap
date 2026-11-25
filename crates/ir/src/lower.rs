@@ -16760,6 +16760,21 @@ impl<'a> FnLower<'a> {
                 });
                 Ok((d, out))
             }
+            // A `tuple[T]` slice is a fresh `tuple[T]` (#1475): the buffer is a
+            // frozen list, so reuse `zap_list_slice` and relabel the result.
+            Ty::VarTuple(elem) => {
+                let (lo_v, has_lo) = self.slice_bound(lo)?;
+                let (hi_v, has_hi) = self.slice_bound(hi)?;
+                let (st_v, has_st) = self.slice_bound(step)?;
+                let out = Ty::VarTuple(elem);
+                let d = self.new_value(out);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_list_slice".to_string(),
+                    args: vec![bv, lo_v, hi_v, st_v, has_lo, has_hi, has_st],
+                });
+                Ok((d, out))
+            }
             // `array[T]` slice -> a VIEW sharing the buffer (D-0030, #502). A
             // 1-D contiguous (absent or literal-`1` step) slice stays the fast
             // `zap_array_slice` (NULL strides); a stepped/reversed 1-D slice or

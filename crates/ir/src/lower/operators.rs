@@ -516,6 +516,34 @@ impl<'a> FnLower<'a> {
             }
         }
 
+        // Lexicographic ordering `< <= > >=` on two `tuple[T]` values (#1475):
+        // reuse the list comparator over the frozen buffers (shorter-is-less on a
+        // common prefix, element-wise otherwise).
+        if matches!(op, Lt | Le | Gt | Ge) {
+            if let (Ty::VarTuple(le), Ty::VarTuple(re)) = (&lt, &rt) {
+                return self.list_order_cmp(op, l, *le, r, *re);
+            }
+        }
+
+        // `tuple[T] + tuple[T]` concatenation (#1475): a fresh frozen buffer with
+        // both operands' elements, by element-kind tag.
+        if matches!(op, Add) {
+            if let (Ty::VarTuple(le), Ty::VarTuple(_)) = (&lt, &rt) {
+                let le = *le;
+                let tag = vartuple_elem_tag(le).ok_or_else(|| {
+                    err("tuple[...] of this element type does not support + yet (#1475)")
+                })?;
+                let kind = self.iconst(Ty::I32, tag);
+                let d = self.new_value(Ty::VarTuple(le));
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_vartuple_concat".to_string(),
+                    args: vec![l, r, kind],
+                });
+                return Ok((d, Ty::VarTuple(le)));
+            }
+        }
+
         // Channel send `ch <- v` (ticket #25, D-0031): handled before the
         // generic reference-type guard below, since the channel operand is a
         // reference type. Blocks until the value can be delivered; the element
