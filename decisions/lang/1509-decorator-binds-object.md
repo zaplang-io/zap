@@ -107,12 +107,14 @@ type-checked binding, not a silent miscompile.
   a known struct — participates; an **unresolvable receiver falls back to
   registering** (no guess, no crash), so nothing that compiles today changes.
 - **Imported-module receivers** (`import cli; @cli.command`, where `cli` is a
-  module, not a local struct value) are **not yet** resolved here and fall back
-  to registering. This is the documented extension for the package consumer
-  surface and **gates zaplang-io/cli#4**: it needs the desugar to read an
-  imported free function's return type (or the decision lifted into sema). The
-  issue's reproduction deliberately uses a local receiver to isolate the binding
-  mechanism from package imports; this ADR covers that mechanism.
+  module, not a local struct value) were **not yet** resolved here when this ADR
+  was first written and fell back to registering. That was the documented
+  extension for the package consumer surface, gating zaplang-io/cli#4; it is now
+  implemented in [#1519](1519-imported-decorator-receiver.md), which resolves the
+  imported free function's return type in the desugar from the linker's import
+  alias→prefix map and applies this same mechanism A. The issue's reproduction
+  deliberately uses a local receiver to isolate the binding mechanism from
+  package imports; this ADR covers that mechanism.
 - Stacked dotted decorators on a rebinding head compose into one chain; a stack
   whose head is a void method keeps registering each decorator as before.
 - `@request_source` / `Depends(...)` adapter synthesis stays on the registering

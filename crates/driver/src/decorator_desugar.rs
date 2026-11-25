@@ -86,7 +86,10 @@ struct Registration {
 /// handler that declares injected parameters. In place; a no-op when there are
 /// no registering decorators, so an ordinary program is unchanged. Returns any
 /// diagnostics raised while building adapters (invalid `Depends`, ZAP5048).
-pub fn desugar_registering_decorators(module: &mut Module) -> Vec<TypeError> {
+pub fn desugar_registering_decorators(
+    module: &mut Module,
+    import_prefixes: &HashMap<String, String>,
+) -> Vec<TypeError> {
     let mut regs: Vec<Registration> = Vec::new();
     let mut diags: Vec<TypeError> = Vec::new();
 
@@ -137,6 +140,26 @@ pub fn desugar_registering_decorators(module: &mut Module) -> Vec<TypeError> {
     let struct_names: HashSet<String> = struct_ret.keys().cloned().collect();
     let recv_struct = collect_receiver_struct_types(module, &struct_names);
 
+    // Imported-module receivers (#1519, the cli#4 surface): a dotted decorator
+    // whose root is an IMPORTED module (`import factory; @factory.command`)
+    // resolves to the package's exported FREE FUNCTION, not a struct method. The
+    // merge already rewrote every ordinary `factory.command(x)` call to the
+    // mangled symbol (`__zm1_factory__command`), but a decorator name is a plain
+    // string the merge leaves untouched, so we resolve it here from the entry
+    // module's import alias → mangle-prefix map (`import_prefixes`) plus a
+    // snapshot of every top-level function's declared return type (keyed by its
+    // already-mangled name). The same return-type-driven rule (mechanism A) then
+    // decides rebind (non-void) vs register (void), exactly as for a local
+    // struct receiver. Taken before the mutable loop renames the decorated `def`.
+    let fn_rets: HashMap<String, Option<Type>> = module
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Function(f) => Some((f.name.clone(), f.ret.clone())),
+            _ => None,
+        })
+        .collect();
+
     // Pass 1: strip dotted decorators off free functions, building a registration
     // per decorator in source order (so routes register in declaration order).
     for item in &mut module.items {
@@ -151,7 +174,8 @@ pub fn desugar_registering_decorators(module: &mut Module) -> Vec<TypeError> {
         // renaming the original function to `<name>$impl` (the typed callable the
         // decorator receives). A void or unresolvable method falls through to the
         // registering logic below, unchanged.
-        if let Some(reg) = try_build_rebind(f, &struct_ret, &recv_struct) {
+        if let Some(reg) = try_build_rebind(f, &struct_ret, &recv_struct, import_prefixes, &fn_rets)
+        {
             regs.push(reg);
             continue;
         }
@@ -182,9 +206,39 @@ pub fn desugar_registering_decorators(module: &mut Module) -> Vec<TypeError> {
 
         let mut kept = Vec::with_capacity(f.decorators.len());
         for d in std::mem::take(&mut f.decorators) {
-            let Some((recv_expr, method, recv_root)) = split_registering(&d.name, d.span) else {
+            // A bare (non-dotted) decorator is a declared annotation/decorator —
+            // left for the metadata path, untouched.
+            if !is_registering(&d.name) {
                 kept.push(d);
                 continue;
+            }
+            // Resolve the dotted receiver to its call form: a local struct
+            // method (`recv.method`, an `Attr` callee) or an imported-module free
+            // function (`__zmN_pkg__method`, a bare `Name` callee, #1519). An
+            // unresolvable receiver (truly unknown) falls back to the literal
+            // `recv.method` form so sema reports a precise "unknown name" at the
+            // synthesized call rather than this pass guessing.
+            let (callee, recv_root) = match resolve_dotted(
+                &d.name,
+                d.span,
+                &recv_struct,
+                &struct_ret,
+                import_prefixes,
+                &fn_rets,
+            ) {
+                Some(r) => (r.callee, r.root),
+                None => {
+                    let (recv_expr, method, root) =
+                        split_registering(&d.name, d.span).expect("a dotted decorator name splits");
+                    (
+                        Expr::Attr {
+                            base: Box::new(recv_expr),
+                            name: method,
+                            span: d.span,
+                        },
+                        root,
+                    )
+                }
             };
             // recv.method(<decorator args>, <registered fn value>)
             let mut args = d.args.clone();
@@ -195,11 +249,7 @@ pub fn desugar_registering_decorators(module: &mut Module) -> Vec<TypeError> {
                 span: d.span,
             });
             let call = Expr::Call {
-                callee: Box::new(Expr::Attr {
-                    base: Box::new(recv_expr),
-                    name: method,
-                    span: d.span,
-                }),
+                callee: Box::new(callee),
                 args,
                 span: d.span,
             };
@@ -340,14 +390,23 @@ fn try_build_rebind(
     f: &mut Function,
     struct_ret: &HashMap<String, HashMap<String, Option<Type>>>,
     recv_struct: &HashMap<String, String>,
+    import_prefixes: &HashMap<String, String>,
+    fn_rets: &HashMap<String, Option<Type>>,
 ) -> Option<Registration> {
     // The outermost dotted decorator (first in source order) decides the form
     // and produces the value bound to the name.
     let d0 = f.decorators.iter().find(|d| is_registering(&d.name))?;
-    let (_, method0, root0) = split_registering(&d0.name, d0.span)?;
-    let struct0 = recv_struct.get(&root0)?;
-    // Non-void return → rebind; void or unknown method → registering.
-    match struct_ret.get(struct0).and_then(|mm| mm.get(&method0)) {
+    let r0 = resolve_dotted(
+        &d0.name,
+        d0.span,
+        recv_struct,
+        struct_ret,
+        import_prefixes,
+        fn_rets,
+    )?;
+    // Non-void return → rebind; void or unknown/unresolvable receiver →
+    // registering (mechanism A, return-type-driven).
+    match r0.ret {
         Some(Some(_)) => {}
         _ => return None,
     }
@@ -372,11 +431,21 @@ fn try_build_rebind(
 
     // Build the chain innermost-first: start from the renamed implementation,
     // then wrap with each dotted decorator from the one closest to `def`
-    // (last listed) outward to the outermost (first listed). Each wrap is
-    // `recv.method(<decorator args...>, <inner value>)`.
+    // (last listed) outward to the outermost (first listed). Each wrap is the
+    // receiver's call form — `recv.method(<args...>, <inner>)` for a local
+    // struct method, or `<mangled free fn>(<args...>, <inner>)` for an imported
+    // module function (#1519) — with the decorator's own arguments (stacked
+    // `@option`/`@argument` metadata) kept as that call's leading arguments.
     let mut chain = Expr::Name(impl_name, f.span);
     for d in dotted.iter().rev() {
-        let Some((recv_expr, method, _)) = split_registering(&d.name, d.span) else {
+        let Some(rd) = resolve_dotted(
+            &d.name,
+            d.span,
+            recv_struct,
+            struct_ret,
+            import_prefixes,
+            fn_rets,
+        ) else {
             continue;
         };
         let mut args = d.args.clone();
@@ -387,18 +456,14 @@ fn try_build_rebind(
             span: d.span,
         });
         chain = Expr::Call {
-            callee: Box::new(Expr::Attr {
-                base: Box::new(recv_expr),
-                name: method,
-                span: d.span,
-            }),
+            callee: Box::new(rd.callee),
             args,
             span: d.span,
         };
     }
 
     Some(Registration {
-        recv_root: root0,
+        recv_root: r0.root,
         stmt: Stmt::Let {
             is_const: false,
             ty: None,
@@ -407,6 +472,72 @@ fn try_build_rebind(
             span: f.span,
         },
     })
+}
+
+/// A dotted decorator's resolved receiver: the call form it desugars to and the
+/// declared return type that decides rebind vs register (mechanism A).
+struct ResolvedRecv {
+    /// The callee expression for the synthesized call: `recv.method` (an `Attr`,
+    /// for a local struct receiver) or a bare, already-mangled free-function
+    /// `Name` (for an imported-module receiver, #1519).
+    callee: Expr,
+    /// The receiver root used to anchor the splice. For a local struct receiver
+    /// this is the variable name (the splice lands right after its `let`); for an
+    /// imported module it is the import alias, which is never `let`-bound, so the
+    /// splice lands at the top of `main` (the fallback) — exactly where the
+    /// decorated name is used.
+    root: String,
+    /// The target's declared return type: `None` = the symbol could not be
+    /// resolved (unknown receiver); `Some(None)` = void; `Some(Some(T))` =
+    /// non-void. Only a non-void target rebinds.
+    ret: Option<Option<Type>>,
+}
+
+/// Resolve a dotted decorator name `root.method` to the call it desugars to.
+///
+/// A **local struct receiver** (`cli` bound to a `Cli` value) resolves to the
+/// struct method `recv.method` and reads the method's return type from the
+/// struct's declared methods. An **imported-module receiver** (`factory`, an
+/// import alias in `import_prefixes`) resolves to the package's exported free
+/// function under its merged, mangled name `{prefix}{method}`, reading that
+/// function's return type from `fn_rets` (#1519). A struct receiver is tried
+/// first, so a local value shadows an import of the same name. Returns `None`
+/// when the root is neither — the receiver is unresolvable here, and the caller
+/// keeps the registering behavior (no guess, no crash), unchanged by #1519.
+fn resolve_dotted(
+    name: &str,
+    span: Span,
+    recv_struct: &HashMap<String, String>,
+    struct_ret: &HashMap<String, HashMap<String, Option<Type>>>,
+    import_prefixes: &HashMap<String, String>,
+    fn_rets: &HashMap<String, Option<Type>>,
+) -> Option<ResolvedRecv> {
+    let (recv_expr, method, root) = split_registering(name, span)?;
+    if let Some(struct_name) = recv_struct.get(&root) {
+        let ret = struct_ret
+            .get(struct_name)
+            .and_then(|mm| mm.get(&method))
+            .cloned();
+        return Some(ResolvedRecv {
+            callee: Expr::Attr {
+                base: Box::new(recv_expr),
+                name: method,
+                span,
+            },
+            root,
+            ret,
+        });
+    }
+    if let Some(prefix) = import_prefixes.get(&root) {
+        let fn_name = format!("{prefix}{method}");
+        let ret = fn_rets.get(&fn_name).cloned();
+        return Some(ResolvedRecv {
+            callee: Expr::Name(fn_name, span),
+            root,
+            ret,
+        });
+    }
+    None
 }
 
 /// How a handler/provider parameter is bound by the adapter.
@@ -924,7 +1055,7 @@ mod tests {
              @app.get(\"/x\")\ndef h() -> int64:\n    return 0\n\
              def main():\n    auto app = App()\n    print(\"ready\")\n",
         );
-        let diags = desugar_registering_decorators(&mut m);
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
 
         // The dotted decorator is stripped off `h`.
@@ -959,7 +1090,7 @@ mod tests {
              @app.get(\"/b\")\ndef hb() -> int64:\n    return 2\n\
              def main():\n    auto app = App()\n",
         );
-        desugar_registering_decorators(&mut m);
+        desugar_registering_decorators(&mut m, &HashMap::new());
         let stmts = main_stmts(&m);
         // app binding, then /a registration, then /b registration.
         assert_eq!(registration(&stmts[1]), Some(("app".into(), "get".into())));
@@ -978,7 +1109,7 @@ mod tests {
              @audited\ndef h() -> int64:\n    return 0\n\
              def main():\n    print(\"x\")\n",
         );
-        desugar_registering_decorators(&mut m);
+        desugar_registering_decorators(&mut m, &HashMap::new());
         // The bare `@audited` is not a registering target; it stays on `h` for
         // the declared-decorator metadata path, and main is unchanged.
         let kept = m
@@ -1007,7 +1138,7 @@ mod tests {
              @app.get(\"/items\")\ndef list_items(Req req, DB db = Depends(get_db)) -> Resp:\n    return Resp(db.conn)\n\
              def main():\n    auto app = App()\n",
         );
-        let diags = desugar_registering_decorators(&mut m);
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
 
         // The registration passes the ADAPTER, not the handler.
@@ -1060,7 +1191,7 @@ mod tests {
              @app.get(\"/x\")\ndef hx(Req req, DB db = Depends(get_db)) -> Resp:\n    return Resp(db.conn)\n\
              def main():\n    auto app = App()\n",
         );
-        let diags = desugar_registering_decorators(&mut m);
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
         let adapter = func(&m, "hx$adapter").expect("adapter");
         let b = body(adapter);
@@ -1092,7 +1223,7 @@ mod tests {
              @app.get(\"/x\")\ndef hx(Req req, DB a = Depends(get_db), DB b = Depends(get_db)) -> Resp:\n    return Resp(a.conn)\n\
              def main():\n    auto app = App()\n",
         );
-        let diags = desugar_registering_decorators(&mut m);
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
         let adapter = func(&m, "hx$adapter").expect("adapter");
         let b = body(adapter);
@@ -1120,7 +1251,7 @@ mod tests {
              @app.get(\"/x\")\ndef hx(Req req, DB db = Depends(missing)) -> Resp:\n    return Resp(db.conn)\n\
              def main():\n    auto app = App()\n",
         );
-        let diags = desugar_registering_decorators(&mut m);
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert_eq!(diags.len(), 1, "one diagnostic");
         assert_eq!(diags[0].code, ErrorCode::ZAP5048);
         assert!(diags[0].message.contains("missing"));
@@ -1137,7 +1268,7 @@ mod tests {
              @app.get(\"/x\")\ndef hx(Req req, DB db = Depends(get_db)) -> Resp:\n    return Resp(db.conn)\n\
              def main():\n    auto app = App()\n",
         );
-        let diags = desugar_registering_decorators(&mut m);
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, ErrorCode::ZAP5048);
         assert!(diags[0].message.contains("request-derived"));
@@ -1155,7 +1286,7 @@ mod tests {
              @app.get(\"/x\")\ndef hx(Req req, A a = Depends(pa)) -> Resp:\n    return Resp(a.n)\n\
              def main():\n    auto app = App()\n",
         );
-        let diags = desugar_registering_decorators(&mut m);
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert!(
             diags
                 .iter()
@@ -1173,7 +1304,7 @@ mod tests {
              @app.get(\"/x\")\ndef hx(Req req) -> Resp:\n    return Resp(0)\n\
              def main():\n    auto app = App()\n",
         );
-        let diags = desugar_registering_decorators(&mut m);
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert!(diags.is_empty());
         assert!(
             func(&m, "hx$adapter").is_none(),
@@ -1227,7 +1358,7 @@ mod tests {
              @app.get(\"/x\")\ndef hx(Req req, str tag = Query(\"def\")) -> Resp:\n    return Resp(0)\n\
              def main():\n    auto app = App()\n",
         );
-        let diags = desugar_registering_decorators(&mut m);
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
 
         // Registration binds the adapter.
@@ -1288,7 +1419,7 @@ mod tests {
              @app.get(\"/x\")\ndef hx(Req req, str id = Path(), DB db = Depends(get_db)) -> Resp:\n    return Resp(0)\n\
              def main():\n    auto app = App()\n",
         );
-        let diags = desugar_registering_decorators(&mut m);
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
         let adapter = func(&m, "hx$adapter").expect("adapter");
         assert_eq!(adapter.params.len(), 1, "only the Request is a seam param");
@@ -1328,7 +1459,7 @@ mod tests {
              @app.get(\"/x\")\ndef hx(str id = Path()) -> Resp:\n    return Resp(0)\n\
              def main():\n    auto app = App()\n",
         );
-        let diags = desugar_registering_decorators(&mut m);
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert_eq!(diags.len(), 1, "one diagnostic: {diags:?}");
         assert_eq!(diags[0].code, ErrorCode::ZAP5048);
         assert!(
@@ -1353,7 +1484,7 @@ mod tests {
              @app.get(\"/x\")\ndef hx(Req req, DB db = Depends(get_db)) -> Resp:\n    return Resp(0)\n\
              def main():\n    auto app = App()\n",
         );
-        let diags = desugar_registering_decorators(&mut m);
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert!(
             diags.iter().any(|d| d.code == ErrorCode::ZAP5048
                 && d.message.contains("resolved only in the handler")),
@@ -1373,7 +1504,7 @@ mod tests {
              @app.get(\"/x\")\ndef hx(Req req, str tag = Query(fallback=\"d\")) -> Resp:\n    return Resp(0)\n\
              def main():\n    auto app = App()\n",
         );
-        let diags = desugar_registering_decorators(&mut m);
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert_eq!(diags.len(), 1, "one diagnostic: {diags:?}");
         assert_eq!(diags[0].code, ErrorCode::ZAP5048);
         assert!(
@@ -1396,7 +1527,7 @@ mod tests {
              @app.get(\"/x\")\ndef hx(Req req, str tag = mk()) -> Resp:\n    return Resp(0)\n\
              def main():\n    auto app = App()\n",
         );
-        let diags = desugar_registering_decorators(&mut m);
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
         assert!(
             func(&m, "hx$adapter").is_none(),
@@ -1461,7 +1592,7 @@ mod tests {
              @cli.command\ndef greet(str name) -> str:\n    return \"Hello \" + name\n\
              def main():\n    auto cli = Cli()\n    greet.run()\n",
         );
-        let diags = desugar_registering_decorators(&mut m);
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
 
         // The original `greet` is renamed to the typed callable `greet$impl`,
@@ -1515,7 +1646,7 @@ mod tests {
              def greet(str name) -> str:\n    return name\n\
              def main():\n    auto cli = Cli()\n    greet.run()\n",
         );
-        let diags = desugar_registering_decorators(&mut m);
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
 
         assert!(func(&m, "greet").is_none());
@@ -1568,7 +1699,7 @@ mod tests {
              @app.get(\"/x\")\ndef h() -> int64:\n    return 0\n\
              def main():\n    auto app = App()\n",
         );
-        let diags = desugar_registering_decorators(&mut m);
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
         // The handler stays a top-level function; it is not rebound.
         assert!(
@@ -1604,7 +1735,7 @@ mod tests {
              @cli.command\ndef h() -> int64:\n    return 0\n\
              def main():\n    print(\"cli never bound here\")\n",
         );
-        let diags = desugar_registering_decorators(&mut m);
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
         assert!(
             func(&m, "h").is_some(),

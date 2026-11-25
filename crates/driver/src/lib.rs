@@ -275,8 +275,9 @@ fn front_end_reports(
     entry: &str,
     target: &Target,
 ) -> Result<(Module, zapc_sema::TypeMap, Vec<Report>), Vec<Report>> {
-    let module = modlink::load_program(entry, target).map_err(modlink_reports)?;
-    front_end_tail(entry, module)
+    let pkg_roots = zapc_pkg::zenv::module_search_paths_from_env();
+    let linked = modlink::load_program_linked(entry, target, pkg_roots).map_err(modlink_reports)?;
+    front_end_tail(entry, linked.module, &linked.import_prefixes)
 }
 
 /// Like [`front_end_reports`], but with explicit dependency package-search roots
@@ -290,8 +291,8 @@ fn front_end_reports_with(
     target: &Target,
     pkg_roots: Vec<PathBuf>,
 ) -> Result<(Module, zapc_sema::TypeMap, Vec<Report>), Vec<Report>> {
-    let module = modlink::load_program_with(entry, target, pkg_roots).map_err(modlink_reports)?;
-    front_end_tail(entry, module)
+    let linked = modlink::load_program_linked(entry, target, pkg_roots).map_err(modlink_reports)?;
+    front_end_tail(entry, linked.module, &linked.import_prefixes)
 }
 
 /// Turn module-linker diagnostics into the uniform [`Report`] shape.
@@ -314,6 +315,7 @@ fn modlink_reports(diags: Vec<modlink::ModDiag>) -> Vec<Report> {
 fn front_end_tail(
     entry: &str,
     mut module: Module,
+    import_prefixes: &std::collections::HashMap<String, String>,
 ) -> Result<(Module, zapc_sema::TypeMap, Vec<Report>), Vec<Report>> {
     // Desugar registering (dotted) function decorators — `@app.get("/x")` — into
     // the method-call registration the receiver already accepts, before sema, so
@@ -321,7 +323,8 @@ fn front_end_tail(
     // `@app.get(...)` + `Depends(...)` adapter synthesis (I#457/D-0087,
     // I#466/D-0092); any invalid-injection diagnostics are reported as sema-
     // style errors before type-checking.
-    let deco_diags = decorator_desugar::desugar_registering_decorators(&mut module);
+    let deco_diags =
+        decorator_desugar::desugar_registering_decorators(&mut module, import_prefixes);
     if !deco_diags.is_empty() {
         return Err(sema_reports(entry, deco_diags));
     }
