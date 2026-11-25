@@ -3582,6 +3582,12 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), p.into(), self.ctx.i32_type().into()],
             Some(i.into()),
         );
+        // tuple[T] structural hash (#1474, dict/set key): (buf, kind) -> i64.
+        self.declare_rt(
+            "zap_vartuple_hash",
+            &[p.into(), self.ctx.i32_type().into()],
+            Some(i.into()),
+        );
         // Power-assert value rendering (ticket #73, D-0054).
         self.declare_rt("zap_f64_to_str", &[f.into()], Some(p.into()));
         self.declare_rt("zap_bool_to_str", &[i.into()], Some(p.into()));

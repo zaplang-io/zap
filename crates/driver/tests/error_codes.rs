@@ -717,3 +717,21 @@ fn vartuple_codes() {
     );
     assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
 }
+
+#[test]
+fn vartuple_key_codes() {
+    // A tuple[T] is hashable (iff its element is a scalar/str) and can be a dict
+    // key / set member (#1474). These well-typed uses are clean.
+    let ok = check_source(
+        "def main():\n\
+         \x20   dict[tuple[int64], str] d = dict[tuple[int64], str]()\n\
+         \x20   d[tuple([1, 2])] = \"a\"\n\
+         \x20   str v = d[tuple([1, 2])]\n\
+         \x20   bool has = tuple([1, 2]) in d\n\
+         \x20   auto s = set([tuple([1, 2]), tuple([3, 4])])\n\
+         \x20   bool m = tuple([3, 4]) in s\n\
+         \x20   dict[tuple[str], int64] w = dict[tuple[str], int64]()\n\
+         \x20   w[tuple([\"x\", \"y\"])] = 7\n",
+    );
+    assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
+}

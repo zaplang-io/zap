@@ -10,19 +10,6 @@
 
 use super::*;
 
-/// The element-kind tag passed to `zap_vartuple_eq` (#1474): 0 = plain 64-bit
-/// word (int/bool/char/enum), 1 = `f64`, 2 = `str`/`bytes` (`ZapStr` pointer).
-/// `None` for an element kind `==` does not support yet (nested collection,
-/// struct, complex, function) — reported as a clean error.
-fn vartuple_elem_tag(elem: Elem) -> Option<i64> {
-    match elem {
-        Elem::I64 | Elem::Bool | Elem::Char | Elem::Enum(_) => Some(0),
-        Elem::F64 => Some(1),
-        Elem::Ptr | Elem::Bytes => Some(2),
-        _ => None,
-    }
-}
-
 impl<'a> FnLower<'a> {
     /// Desugar a binary operator whose left operand is a user struct to the
     /// matching dunder (D-0047). Equality/relational operators derive from

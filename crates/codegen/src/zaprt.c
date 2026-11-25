@@ -2807,6 +2807,37 @@ int64_t zap_hash_combine(int64_t acc, int64_t h) {
     return (int64_t)zap_wymix((uint64_t)acc ^ 0x9e3779b97f4a7c15ULL,
                               (uint64_t)h);
 }
+
+/* Structural hash of a variadic `tuple[T]` (#1474): fold the per-element hashes
+ * (by element-kind tag: 0 = i64 word, 1 = f64, 2 = str/bytes `ZapStr`) with
+ * `zap_hash_combine`, in order — so two tuples equal under `zap_vartuple_eq`
+ * hash equal (a == b => hash(a) == hash(b); collisions are acceptable). An f64
+ * element canonicalises -0.0 -> +0.0 before hashing, matching the `==` that
+ * treats them equal. */
+int64_t zap_vartuple_hash(void *buf, int32_t kind) {
+    int64_t n = zap_list_len(buf);
+    int64_t acc = 0;
+    for (int64_t i = 0; i < n; i++) {
+        uint64_t h;
+        switch (kind) {
+        case 1: {
+            double d = zap_list_get_f64(buf, i) + 0.0; /* -0.0 -> +0.0 */
+            int64_t bits;
+            memcpy(&bits, &d, sizeof bits);
+            h = zap_hash_i64(bits);
+            break;
+        }
+        case 2:
+            h = zap_hash_str((const ZapStr *)zap_list_get_ptr(buf, i));
+            break;
+        default: /* 0: plain 64-bit word */
+            h = zap_hash_i64(zap_list_get_i64(buf, i));
+            break;
+        }
+        acc = zap_hash_combine(acc, (int64_t)h);
+    }
+    return acc;
+}
 /* Lexicographic byte comparison of two strings, returning -1 / 0 / +1. */
 int64_t zap_str_cmp(void *ap, void *bp) {
     const ZapStr *a = (const ZapStr *)ap;
