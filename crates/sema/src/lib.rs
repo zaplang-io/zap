@@ -7130,26 +7130,94 @@ impl Checker {
     /// container iterators (`iter([1, 2])`, `iter("ab")`, …) are #1382 phase 3,
     /// so a built-in container returns `None` here (a clean error at the call).
     /// `Unknown` / `Py` stay permissive.
-    fn iter_result_ty(&self, x: &Ty) -> Option<Ty> {
+    fn iter_result_ty(&mut self, x: &Ty) -> Option<Ty> {
+        // Protocol iterators / iterables (phase 2): a generator / genexpr / user
+        // type, or an `Iterator[T]` / `Iterable[T]` interface value. `iter` is
+        // idempotent on an iterator; an `Iterable` yields its `__iter__` result.
         match x {
-            Ty::Unknown | Ty::Py => Some(Ty::Unknown),
-            // Idempotent on an iterator; an `Iterable[T]` produces `Iterator[T]`.
-            Ty::Iface(n, _) if n == "Iterator" => Some(x.clone()),
+            Ty::Unknown | Ty::Py => return Some(Ty::Unknown),
+            Ty::Iface(n, _) if n == "Iterator" => return Some(x.clone()),
             Ty::Iface(n, args) if n == "Iterable" => {
-                Some(Ty::Iface("Iterator".to_string(), args.clone()))
+                return Some(Ty::Iface("Iterator".to_string(), args.clone()))
             }
             Ty::Named(_) => {
-                let info = self.struct_info(x)?;
-                if let Some(sig) = info.methods.get("__iter__") {
-                    Some(sig.ret.clone())
-                } else if info.methods.contains_key("__next__") {
-                    Some(x.clone())
-                } else {
-                    None
-                }
+                let ret = self.struct_info(x).and_then(|info| {
+                    if let Some(sig) = info.methods.get("__iter__") {
+                        Some(sig.ret.clone())
+                    } else if info.methods.contains_key("__next__") {
+                        Some(x.clone())
+                    } else {
+                        None
+                    }
+                });
+                // A `Named` that is not a protocol struct is not iterable; a
+                // user struct/enum reaches `iter()` only via the protocol.
+                return ret;
             }
-            _ => None,
+            _ => {}
         }
+        // A built-in container (#1382 phase 3): a precise **reified** iterator
+        // carrying the container's element type, so `next(iter(xs))` is the exact
+        // `T`. `iterable_elem` gives `T` for list/set/dict(keys)/str/bytes/range/
+        // tuple/…; a non-iterable scalar yields `None` (a clean "not iterable"
+        // error at the call). The representation is a typed synthesized generator
+        // (lowering), surfaced here as a concrete `$iter:T` iterator type.
+        // Default any untyped-literal element (`[1, 2]` → `int64`, not the
+        // untyped `int`) so the reified iterator conforms to the concrete
+        // `Iterator[int64]` and `next()` yields the concrete type.
+        let elem = default_type(self.iterable_elem(x)?);
+        Some(self.reified_iter_type(&elem))
+    }
+
+    /// The concrete sema type of the **reified** iterator `iter()` produces for a
+    /// built-in container whose element type is `elem` (#1382 phase 3). A
+    /// synthetic, `$`-prefixed struct type `$iter:<elem>` with the two `Iterator`
+    /// dunders — `__iter__(self) -> Self` and comma-ok `__next__(self) ->
+    /// (elem, bool)` — registered on demand (shared across containers with the
+    /// same element type). The `$` prefix makes it unspellable and keeps
+    /// `to_ast_type` returning `None` (so monomorphization never forces an
+    /// interface-fat-pointer coercion), exactly like the generator / genexpr
+    /// synthetic types; it still conforms structurally to `Iterator[elem]`, so an
+    /// `iter()` result flows into an `Iterator[T]` annotation (#1428). The
+    /// precise iterator struct is emitted at lowering (`lower_iter_builtin`).
+    fn reified_iter_type(&mut self, elem: &Ty) -> Ty {
+        let name = format!("$iter:{}", elem.display());
+        if !self.structs.contains_key(&name) {
+            let self_param = |ty: Ty| ParamInfo {
+                name: "self".to_string(),
+                ty,
+                has_default: false,
+                variadic: false,
+                kwargs: false,
+                keyword_only: false,
+                positional_only: false,
+            };
+            let mut methods = HashMap::new();
+            methods.insert(
+                "__iter__".to_string(),
+                FnSig {
+                    params: vec![self_param(Ty::Named(name.clone()))],
+                    ret: Ty::Named(name.clone()),
+                },
+            );
+            methods.insert(
+                "__next__".to_string(),
+                FnSig {
+                    params: vec![self_param(Ty::Named(name.clone()))],
+                    ret: Ty::Tuple(vec![elem.clone(), Ty::Bool]),
+                },
+            );
+            self.user_types.insert(name.clone());
+            self.structs.insert(
+                name.clone(),
+                StructInfo {
+                    methods,
+                    is_value: false,
+                    fields: Vec::new(),
+                },
+            );
+        }
+        Ty::Named(name)
     }
 
     /// The element type `next(it)` yields (#1382 phase 2), or `None` when `it` is
@@ -19506,14 +19574,64 @@ def main():
         );
     }
 
+    // ---- #1382 phase 3: reified per-container iterators ----
+    //
+    // `iter()` over a built-in container returns a precise reified iterator, so
+    // `next(iter(xs))` is the exact element type and `for`/`next`/`default` keep
+    // their typing. The element type matches the container's `for` element:
+    // list/set/heap/deque/oset/tuple → `T`, dict → key, str → char, bytes/range
+    // → int64.
+
     #[test]
-    fn iter_over_a_container_is_phase_3() {
-        // Reified per-container iterators are #1382 phase 3: `iter([1, 2])` is a
-        // clean error pointing there (not a silent accept), and `for` still works.
-        let msg = err_text("def main():\n    auto it = iter([1, 2, 3])\n");
+    fn iter_over_a_list_yields_the_precise_element_type() {
+        // `next(iter([1, 2, 3]))` is exactly `int64`; the reified iterator also
+        // feeds `for` and `next(it, default)`.
+        ok(
+            "def main():\n    auto it = iter([1, 2, 3])\n    int64 a = next(it)\n    \
+            int64 b = next(it, -1)\n    for x in iter([4, 5]):\n        print(x)\n    \
+            print(a)\n    print(b)\n",
+        );
+        // The exact element type is enforced: binding to the wrong type errors.
         assert!(
-            msg.contains("phase 3") && msg.contains("iter()"),
-            "iter() over a container must point at phase 3; got:\n{msg}"
+            !errors("def main():\n    auto it = iter([1, 2, 3])\n    str s = next(it)\n")
+                .is_empty(),
+            "next(iter(list[int64])) bound to str must be rejected"
+        );
+    }
+
+    #[test]
+    fn iter_over_str_bytes_range_yield_precise_elements() {
+        // str → char, bytes → int64, range → int64.
+        ok("def main():\n    char c = next(iter(\"abc\"))\n    print(c)\n");
+        ok("def main():\n    int64 b = next(iter(b\"xy\"))\n    print(b)\n");
+        ok("def main():\n    int64 r = next(iter(range(3)))\n    print(r)\n");
+    }
+
+    #[test]
+    fn iter_over_a_dict_yields_keys_and_a_set_its_elements() {
+        // A dict iterates its keys (Python semantics); a set its elements.
+        ok("def main():\n    dict[str, int64] d = {\"a\": 1}\n    \
+            str k = next(iter(d))\n    print(k)\n");
+        ok("def main():\n    set[int64] s = set([1, 2, 3])\n    \
+            int64 e = next(iter(s))\n    print(e)\n");
+    }
+
+    #[test]
+    fn iter_of_a_container_conforms_to_iterator_interface() {
+        // The reified iterator conforms to `Iterator[T]` (#1428), so an `iter()`
+        // result flows into an `Iterator[int64]` parameter.
+        ok(
+            "def take(Iterator[int64] it) -> int64:\n    return next(it)\n\n\
+            def main():\n    print(take(iter([1, 2, 3])))\n",
+        );
+    }
+
+    #[test]
+    fn iter_over_a_non_iterable_scalar_is_rejected() {
+        // `iter(5)` is not iterable — a clean error (no reified iterator).
+        assert!(
+            !errors("def main():\n    auto it = iter(5)\n").is_empty(),
+            "iter() of a non-iterable scalar must be rejected"
         );
     }
 
