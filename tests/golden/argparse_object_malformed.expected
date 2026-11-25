@@ -1,0 +1,10 @@
+known-opt-caught
+unknown-opt-caught
+end-caught
+store-true-caught
+store-false-caught
+empty-attached-caught
+--verbose
+[]
+-3
+-

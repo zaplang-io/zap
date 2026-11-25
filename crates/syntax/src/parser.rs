@@ -2412,12 +2412,18 @@ struct ArgumentParser:
         auto pos_i = 0
         auto i = start
         auto n = len(argv)
+        auto end_of_opts = False
         while i < n:
             auto tok = argv[i]
-            if tok == \"-h\" or tok == \"--help\":
+            if not end_of_opts and (tok == \"-h\" or tok == \"--help\"):
                 ns._help = True
                 i = i + 1
-            elif tok.startswith(\"-\") and tok != \"-\" and not __argparse_is_negnum(tok):
+            elif not end_of_opts and tok == \"--\":
+                # End-of-options sentinel (#1507): consume it and treat every
+                # remaining token as a literal positional, like Python argparse.
+                end_of_opts = True
+                i = i + 1
+            elif not end_of_opts and tok.startswith(\"-\") and tok != \"-\" and not __argparse_is_negnum(tok):
                 auto name = tok
                 auto inlinev = \"\"
                 auto has_inline = False
@@ -2435,6 +2441,10 @@ struct ArgumentParser:
                         raise \"argument \" + name + \": not allowed with another argument in the same group\"
                     mx_seen[a.mx_group] = True
                 if a.is_flag:
+                    if has_inline:
+                        # A zero-arity flag takes no value (#1508); an attached
+                        # value (including an empty `--flag=`) is a usage error.
+                        raise \"argument \" + name + \": ignored explicit argument '\" + inlinev + \"'\"
                     if a.store_val:
                         ns._vals[a.dest] = \"true\"
                     else:
@@ -2449,7 +2459,12 @@ struct ArgumentParser:
                     else:
                         if i + 1 >= n:
                             raise \"argument \" + name + \": expected one argument\"
-                        val = argv[i + 1]
+                        auto nxt = argv[i + 1]
+                        if nxt.startswith(\"-\") and nxt != \"-\" and not __argparse_is_negnum(nxt):
+                            # A following option-like token (known or unknown)
+                            # does not satisfy a value-taking option (#1508).
+                            raise \"argument \" + name + \": expected one argument\"
+                        val = nxt
                         i = i + 2
                     __argparse_check(a, val)
                     ns._vals[a.dest] = val
