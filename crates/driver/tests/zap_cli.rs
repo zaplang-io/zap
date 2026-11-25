@@ -2208,6 +2208,15 @@ def _derive_jsonencode[T](T value) -> str:
     comptime for f in reflect.type_info(T).fields:
         if f.ty.kind.name == \"struct\":
             m[f.name] = json.loads(reflect.field(value, comptime f.index).to_jsoncodec())
+        elif f.ty.kind.name == \"optional\":
+            Optional[int64] ov = reflect.field(value, comptime f.index)
+            JsonValue jv = JsonValue.Null
+            match ov:
+                case Optional.Some(x):
+                    jv = JsonValue.Int(x)
+                case Optional.None:
+                    jv = JsonValue.Null
+            m[f.name] = jv
         elif f.ty.name == \"int64\":
             m[f.name] = JsonValue.Int(reflect.field(value, comptime f.index))
         elif f.ty.name == \"str\":
@@ -2249,6 +2258,15 @@ def _derive_jsondecode[T](str s) -> T:
     comptime for f in reflect.type_info(T).fields:
         if f.ty.kind.name == \"struct\":
             reflect.set_field(out, comptime f.index, _derive_jsondecode(json.dumps(m[f.name])))
+        elif f.ty.kind.name == \"optional\":
+            Optional[int64] dv = None
+            if f.name in m:
+                match m[f.name]:
+                    case JsonValue.Int(i):
+                        dv = Optional.Some(i)
+                    case _:
+                        dv = None
+            reflect.set_field(out, comptime f.index, dv)
         elif f.ty.name == \"int64\":
             reflect.set_field(out, comptime f.index, _jc_int(m[f.name]))
         elif f.ty.name == \"str\":
@@ -2273,13 +2291,16 @@ struct Flat:
 struct Nested:
     int64 n
     Inner inner
+    Optional[int64] opt
 
 def main():
     auto p = Flat(7, \"hi\")
     print(Flat.from_jsoncodec(p.to_jsoncodec()) == p)
-    auto o = Nested(3, Inner(9))
+    auto o = Nested(3, Inner(9), Optional.Some(5))
     print(Nested.from_jsoncodec(o.to_jsoncodec()) == o)
     print(Nested.from_json(o.to_jsoncodec()) == o)
+    auto e = Nested(1, Inner(0), None)
+    print(Nested.from_jsoncodec(e.to_jsoncodec()) == e)
 ";
     let f = write_zap("e4-json-codec-shadow", src);
     let out = zap().arg("ir").arg(&f).output().unwrap();
@@ -2318,6 +2339,14 @@ def main():
             && stdout.contains("@_derive_jsondecode$Nested")
             && stdout.contains("@_derive_jsondecode$Inner"),
         "the library decode recurses through the nested derived struct (#1490): {stdout}"
+    );
+    // #1522: the `Optional` decode is null-safe — the presence check (`in`)
+    // lowers to a dict-membership test before the DOM read, so an absent key
+    // (the built-in omits a `None` optional) maps to `None` rather than
+    // dereferencing a missing entry.
+    assert!(
+        stdout.contains("@zap_dict_contains_str"),
+        "the Optional decode presence-checks the key (#1522): {stdout}"
     );
 }
 
@@ -2609,6 +2638,15 @@ def _derive_yamlencode[T](T value) -> str:
     comptime for f in reflect.type_info(T).fields:
         if f.ty.kind.name == \"struct\":
             m[f.name] = yaml.load(reflect.field(value, comptime f.index).to_yamlcodec())
+        elif f.ty.kind.name == \"optional\":
+            Optional[int64] ov = reflect.field(value, comptime f.index)
+            JsonValue jv = JsonValue.Null
+            match ov:
+                case Optional.Some(x):
+                    jv = JsonValue.Int(x)
+                case Optional.None:
+                    jv = JsonValue.Null
+            m[f.name] = jv
         elif f.ty.name == \"int64\":
             m[f.name] = JsonValue.Int(reflect.field(value, comptime f.index))
         elif f.ty.name == \"str\":
@@ -2650,6 +2688,15 @@ def _derive_yamldecode[T](str s) -> T:
     comptime for f in reflect.type_info(T).fields:
         if f.ty.kind.name == \"struct\":
             reflect.set_field(out, comptime f.index, _derive_yamldecode(yaml.dump(m[f.name])))
+        elif f.ty.kind.name == \"optional\":
+            Optional[int64] dv = None
+            if f.name in m:
+                match m[f.name]:
+                    case JsonValue.Int(i):
+                        dv = Optional.Some(i)
+                    case _:
+                        dv = None
+            reflect.set_field(out, comptime f.index, dv)
         elif f.ty.name == \"int64\":
             reflect.set_field(out, comptime f.index, _yc_int(m[f.name]))
         elif f.ty.name == \"str\":
@@ -2674,13 +2721,16 @@ struct Flat:
 struct Nested:
     int64 n
     Inner inner
+    Optional[int64] opt
 
 def main():
     auto p = Flat(7, \"hi\")
     print(Flat.from_yamlcodec(p.to_yamlcodec()) == p)
-    auto o = Nested(3, Inner(9))
+    auto o = Nested(3, Inner(9), Optional.Some(5))
     print(Nested.from_yamlcodec(o.to_yamlcodec()) == o)
     print(Nested.from_yaml(o.to_yamlcodec()) == o)
+    auto e = Nested(1, Inner(0), None)
+    print(Nested.from_yamlcodec(e.to_yamlcodec()) == e)
 ";
     let f = write_zap("e4-yaml-codec-shadow", src);
     let out = zap().arg("ir").arg(&f).output().unwrap();
@@ -2719,6 +2769,11 @@ def main():
             && stdout.contains("@_derive_yamldecode$Nested")
             && stdout.contains("@_derive_yamldecode$Inner"),
         "the library decode recurses through the nested derived struct (#1490): {stdout}"
+    );
+    // #1522: the `Optional` decode presence-checks the key before the DOM read.
+    assert!(
+        stdout.contains("@zap_dict_contains_str"),
+        "the Optional decode presence-checks the key (#1522): {stdout}"
     );
 }
 
