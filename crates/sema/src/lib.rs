@@ -19667,6 +19667,33 @@ def main():
     }
 
     #[test]
+    fn iter_over_heap_deque_oset_tuple_types_precisely() {
+        // #1382 phase 4: the remaining container kinds reify with the precise
+        // element type, so `next(iter(c))` is the exact `T`.
+        ok(
+            "def main():\n    auto h = heap[int64]()\n    h.push(1)\n    \
+            int64 x = next(iter(h))\n    print(x)\n",
+        );
+        ok(
+            "def main():\n    auto d = deque[int64]()\n    d.append(1)\n    \
+            int64 x = next(iter(d))\n    print(x)\n",
+        );
+        ok(
+            "def main():\n    auto s = oset[int64]()\n    s.add(1)\n    \
+            int64 x = next(iter(s))\n    print(x)\n",
+        );
+        ok("def main():\n    auto t = tuple([1, 2, 3])\n    \
+            int64 x = next(iter(t))\n    print(x)\n");
+        // The exact element type is enforced: a str binding of an int64 element
+        // element is rejected.
+        assert!(
+            !errors("def main():\n    auto t = tuple([1, 2, 3])\n    str s = next(iter(t))\n")
+                .is_empty(),
+            "next(iter(tuple[int64])) bound to str must be rejected"
+        );
+    }
+
+    #[test]
     fn next_on_a_non_iterator_is_rejected() {
         // `next` of a non-iterator value is ZAP4024, naming the missing protocol.
         let msg = err_text("def main():\n    auto x = next(5)\n");
