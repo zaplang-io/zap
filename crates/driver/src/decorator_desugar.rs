@@ -124,6 +124,19 @@ pub fn desugar_registering_decorators(module: &mut Module) -> Vec<TypeError> {
     let mut adapters: Vec<Function> = Vec::new();
     let mut adapter_name: HashMap<String, String> = HashMap::new();
 
+    // Object-binding decorators (#1509): whether a dotted decorator *rebinds* the
+    // decorated name to its receiver method's returned object (Click command
+    // objects) — as opposed to registering-and-discarding — is decided by that
+    // method's declared return type (mechanism A, return-type-driven; recorded in
+    // decisions/lang/1509-decorator-binds-object.md). We read the return type
+    // from the already-linked AST before the mutable loop: a map of every
+    // struct's method return types, and a map of each resolvable receiver
+    // variable to the struct type it holds. A void method, or a receiver whose
+    // type we cannot resolve here, keeps the registering behavior.
+    let struct_ret = collect_struct_method_rets(module);
+    let struct_names: HashSet<String> = struct_ret.keys().cloned().collect();
+    let recv_struct = collect_receiver_struct_types(module, &struct_names);
+
     // Pass 1: strip dotted decorators off free functions, building a registration
     // per decorator in source order (so routes register in declaration order).
     for item in &mut module.items {
@@ -131,6 +144,18 @@ pub fn desugar_registering_decorators(module: &mut Module) -> Vec<TypeError> {
         if f.decorators.iter().all(|d| !is_registering(&d.name)) {
             continue;
         }
+
+        // Object-binding path (#1509): if the OUTERMOST dotted decorator targets
+        // a receiver method with a non-void return type, rebind the decorated
+        // name to the (possibly stacked) decorator chain's returned object,
+        // renaming the original function to `<name>$impl` (the typed callable the
+        // decorator receives). A void or unresolvable method falls through to the
+        // registering logic below, unchanged.
+        if let Some(reg) = try_build_rebind(f, &struct_ret, &recv_struct) {
+            regs.push(reg);
+            continue;
+        }
+
         let fn_name = f.name.clone();
 
         // Does this handler declare injected parameters — a `Depends(...)`
@@ -233,6 +258,155 @@ pub fn desugar_registering_decorators(module: &mut Module) -> Vec<TypeError> {
     }
 
     diags
+}
+
+/// Map each struct's method name to its declared return type (`None` = void),
+/// read from the already-linked module AST. Used by the object-binding
+/// decorator path (#1509) to decide, before sema, whether a dotted decorator
+/// rebinds the decorated name to its returned object (non-void) or registers
+/// and discards (void). A later method with the same name on the same struct
+/// (not legal, but harmless here) simply overwrites — sema is the authority.
+fn collect_struct_method_rets(module: &Module) -> HashMap<String, HashMap<String, Option<Type>>> {
+    let mut out: HashMap<String, HashMap<String, Option<Type>>> = HashMap::new();
+    for it in &module.items {
+        if let Item::Struct(s) = it {
+            let methods = out.entry(s.name.clone()).or_default();
+            for m in &s.methods {
+                methods.insert(m.name.clone(), m.ret.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Map a receiver variable name to the struct type it holds, for the forms we
+/// can resolve syntactically before sema: a typed parameter or `let`
+/// (`Cli cli`), or an `auto cli = Cli()` whose initializer calls a known
+/// struct's constructor. First binding found wins; a receiver we cannot resolve
+/// this way (e.g. an imported module value — the cli#4 extension) is simply
+/// absent, and its decorator keeps the registering behavior. Only top-level
+/// function statements are scanned, matching where [`splice_after_bindings`]
+/// can anchor the synthesized binding.
+fn collect_receiver_struct_types(
+    module: &Module,
+    structs: &HashSet<String>,
+) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    for it in &module.items {
+        let Item::Function(f) = it else { continue };
+        for p in &f.params {
+            if let Some(Type::Named { name, .. }) = &p.ty {
+                if structs.contains(name) {
+                    out.entry(p.name.clone()).or_insert_with(|| name.clone());
+                }
+            }
+        }
+        for stmt in &f.body.stmts {
+            let Stmt::Let {
+                name, ty, value, ..
+            } = stmt
+            else {
+                continue;
+            };
+            if let Some(Type::Named { name: tn, .. }) = ty {
+                if structs.contains(tn) {
+                    out.entry(name.clone()).or_insert_with(|| tn.clone());
+                }
+            } else if let Expr::Call { callee, .. } = value {
+                if let Expr::Name(ctor, _) = callee.as_ref() {
+                    if structs.contains(ctor) {
+                        out.entry(name.clone()).or_insert_with(|| ctor.clone());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Object-binding desugar (#1509). If `f`'s OUTERMOST dotted decorator targets a
+/// receiver method with a non-void declared return type, this is a *replacing*
+/// decorator: rebind the decorated name to the returned object. All of `f`'s
+/// dotted decorators compose, bottom-up, into one nested call chain whose
+/// innermost argument is the original function (renamed `<name>$impl`, kept as
+/// the typed callable the decorator receives); stacked `@option`/`@argument`
+/// arguments ride along as the library methods' arguments, so their metadata is
+/// retained for a later dispatcher. Returns the `auto <name> = <chain>` splice
+/// (anchored on the outermost receiver's root, reusing [`splice_after_bindings`])
+/// and mutates `f` in place (rename + strip dotted decorators). Returns `None`
+/// — leaving `f` untouched for the registering logic — when the outermost method
+/// is void or its receiver/return type cannot be resolved here.
+fn try_build_rebind(
+    f: &mut Function,
+    struct_ret: &HashMap<String, HashMap<String, Option<Type>>>,
+    recv_struct: &HashMap<String, String>,
+) -> Option<Registration> {
+    // The outermost dotted decorator (first in source order) decides the form
+    // and produces the value bound to the name.
+    let d0 = f.decorators.iter().find(|d| is_registering(&d.name))?;
+    let (_, method0, root0) = split_registering(&d0.name, d0.span)?;
+    let struct0 = recv_struct.get(&root0)?;
+    // Non-void return → rebind; void or unknown method → registering.
+    match struct_ret.get(struct0).and_then(|mm| mm.get(&method0)) {
+        Some(Some(_)) => {}
+        _ => return None,
+    }
+
+    let orig_name = f.name.clone();
+    let impl_name = format!("{orig_name}$impl");
+
+    // Dotted decorators are consumed into the binding chain; any bare decorator
+    // stays on the renamed implementation function (the behavioral-decorator
+    // pass, which runs next, still sees it there).
+    let mut dotted = Vec::new();
+    let mut kept = Vec::new();
+    for d in std::mem::take(&mut f.decorators) {
+        if is_registering(&d.name) {
+            dotted.push(d);
+        } else {
+            kept.push(d);
+        }
+    }
+    f.decorators = kept;
+    f.name = impl_name.clone();
+
+    // Build the chain innermost-first: start from the renamed implementation,
+    // then wrap with each dotted decorator from the one closest to `def`
+    // (last listed) outward to the outermost (first listed). Each wrap is
+    // `recv.method(<decorator args...>, <inner value>)`.
+    let mut chain = Expr::Name(impl_name, f.span);
+    for d in dotted.iter().rev() {
+        let Some((recv_expr, method, _)) = split_registering(&d.name, d.span) else {
+            continue;
+        };
+        let mut args = d.args.clone();
+        args.push(Arg {
+            name: None,
+            value: chain,
+            spread: ArgSpread::None,
+            span: d.span,
+        });
+        chain = Expr::Call {
+            callee: Box::new(Expr::Attr {
+                base: Box::new(recv_expr),
+                name: method,
+                span: d.span,
+            }),
+            args,
+            span: d.span,
+        };
+    }
+
+    Some(Registration {
+        recv_root: root0,
+        stmt: Stmt::Let {
+            is_const: false,
+            ty: None,
+            name: orig_name,
+            value: chain,
+            span: f.span,
+        },
+    })
 }
 
 /// How a handler/provider parameter is bound by the adapter.
@@ -1235,5 +1409,218 @@ mod tests {
             _ => panic!(),
         };
         assert!(matches!(trailing, Expr::Name(n, _) if n == "hx"));
+    }
+
+    // ---- object-binding (replacing) decorators (#1509) ---------------------
+    //
+    // A dotted decorator whose receiver method RETURNS a value (non-void) binds
+    // the decorated name to that returned object (Click-style command objects),
+    // instead of registering-and-discarding. The decision is return-type-driven
+    // (chosen mechanism A): a void method keeps the registering behavior. The
+    // desugar pass runs before sema, so these tests only assert the AST
+    // transform; the synthesized `auto name = recv.method(..., name$impl)` is
+    // type-checked by sema like any other binding.
+
+    // An `auto <name> = <callee>(args...)` let whose value is a call: returns the
+    // bound name, the call's trailing-argument expression, and the receiver
+    // root + method of the (outermost) call, if the stmt is that shape.
+    fn rebind_let<'a>(stmt: &'a Stmt, name: &str) -> Option<(&'a Expr, String, String)> {
+        let Stmt::Let {
+            name: n,
+            value: Expr::Call { callee, args, .. },
+            is_const: false,
+            ..
+        } = stmt
+        else {
+            return None;
+        };
+        if n != name {
+            return None;
+        }
+        let Expr::Attr {
+            base, name: method, ..
+        } = callee.as_ref()
+        else {
+            return None;
+        };
+        let Expr::Name(root, _) = base.as_ref() else {
+            return None;
+        };
+        Some((&args.last().unwrap().value, root.clone(), method.clone()))
+    }
+
+    #[test]
+    fn returning_dotted_decorator_rebinds_name_to_the_object() {
+        // The issue's minimal reproduction: `@cli.command` on `greet`, where
+        // `Cli.command(...) -> Command` returns a value. After desugar the name
+        // `greet` must be bound to `cli.command(greet$impl)` (the Command), and
+        // the original function kept, renamed, as the typed callable `greet$impl`.
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran command\")\n\
+             struct Cli:\n    def command(self, fn(str) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(str name) -> str:\n    return \"Hello \" + name\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m);
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+
+        // The original `greet` is renamed to the typed callable `greet$impl`,
+        // keeping its parameters and return type; there is no top-level `greet`.
+        assert!(
+            func(&m, "greet").is_none(),
+            "greet must be rebound, not a fn"
+        );
+        let impl_fn = func(&m, "greet$impl").expect("original kept as greet$impl");
+        assert_eq!(impl_fn.params.len(), 1, "impl keeps the handler params");
+        assert_eq!(impl_fn.params[0].name, "name");
+        assert!(
+            impl_fn.decorators.is_empty(),
+            "the dotted decorator is consumed into the binding"
+        );
+
+        // main: `auto cli = Cli()`, then `auto greet = cli.command(greet$impl)`,
+        // then `greet.run()` — the binding is spliced after the receiver and
+        // before the use.
+        let stmts = main_stmts(&m);
+        assert!(matches!(&stmts[0], Stmt::Let { name, .. } if name == "cli"));
+        let (trailing, root, method) =
+            rebind_let(&stmts[1], "greet").expect("greet rebound to a command object");
+        assert_eq!((root.as_str(), method.as_str()), ("cli", "command"));
+        assert!(
+            matches!(trailing, Expr::Name(n, _) if n == "greet$impl"),
+            "the decorator receives the original function as a typed callable"
+        );
+        // The use site is preserved, after the binding.
+        assert!(matches!(
+            &stmts[2],
+            Stmt::Expr(Expr::Call { callee, .. })
+                if matches!(callee.as_ref(), Expr::Attr { name, .. } if name == "run")
+        ));
+    }
+
+    #[test]
+    fn stacked_returning_decorators_compose_bottom_up() {
+        // Stacked `@cli.command` / `@cli.option` / `@cli.argument` compose into a
+        // nested call chain, innermost = the decorator closest to `def`. The
+        // decorator arguments (the option/argument metadata) are retained
+        // verbatim as call arguments, so a later dispatcher can read them.
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Spec:\n    int64 n\n\
+             struct Cli:\n\
+             \x20   def argument(self, str name, fn(str) -> str handler) -> Spec:\n        return Spec(0)\n\
+             \x20   def option(self, str flag, Spec s) -> Spec:\n        return s\n\
+             \x20   def command(self, Spec s) -> Command:\n        return Command()\n\
+             @cli.command\n@cli.option(\"--count\")\n@cli.argument(\"name\")\n\
+             def greet(str name) -> str:\n    return name\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m);
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+
+        assert!(func(&m, "greet").is_none());
+        assert!(func(&m, "greet$impl").is_some());
+
+        // Outermost call is `cli.command(...)`.
+        let stmts = main_stmts(&m);
+        let (command_inner, root, method) = rebind_let(&stmts[1], "greet").expect("greet rebound");
+        assert_eq!((root.as_str(), method.as_str()), ("cli", "command"));
+
+        // Its trailing arg is `cli.option("--count", <inner>)`.
+        let Expr::Call { callee, args, .. } = command_inner else {
+            panic!("command's arg must be the option call: {command_inner:?}");
+        };
+        assert!(
+            matches!(callee.as_ref(), Expr::Attr { name, .. } if name == "option"),
+            "second layer is option"
+        );
+        assert!(
+            matches!(&args[0].value, Expr::Str { value, .. } if value == "--count"),
+            "option metadata retained"
+        );
+
+        // Its trailing arg is `cli.argument("name", greet$impl)` — innermost.
+        let option_inner = &args.last().unwrap().value;
+        let Expr::Call { callee, args, .. } = option_inner else {
+            panic!("option's arg must be the argument call: {option_inner:?}");
+        };
+        assert!(
+            matches!(callee.as_ref(), Expr::Attr { name, .. } if name == "argument"),
+            "innermost layer is argument"
+        );
+        assert!(
+            matches!(&args[0].value, Expr::Str { value, .. } if value == "name"),
+            "argument metadata retained"
+        );
+        assert!(
+            matches!(&args.last().unwrap().value, Expr::Name(n, _) if n == "greet$impl"),
+            "the original function is the innermost argument"
+        );
+    }
+
+    #[test]
+    fn void_dotted_decorator_still_registers() {
+        // A dotted decorator whose method returns VOID keeps the registering
+        // behavior (fastzap `@app.get`): the name is NOT rebound, the return is
+        // discarded, and a `app.get(...)` statement is spliced after the binding.
+        let mut m = module(
+            "struct App:\n    def get(self, str path, fn() -> int64 h):\n        print(path)\n\
+             @app.get(\"/x\")\ndef h() -> int64:\n    return 0\n\
+             def main():\n    auto app = App()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m);
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        // The handler stays a top-level function; it is not rebound.
+        assert!(
+            func(&m, "h").is_some(),
+            "void method must not rebind the name"
+        );
+        assert!(
+            func(&m, "h$impl").is_none(),
+            "no impl rename for a void method"
+        );
+        let stmts = main_stmts(&m);
+        assert_eq!(
+            registration(&stmts[1]),
+            Some(("app".to_string(), "get".to_string())),
+            "a void dotted decorator registers as before"
+        );
+        assert!(
+            rebind_let(&stmts[1], "h").is_none(),
+            "a registration is a bare expr statement, not a rebinding let"
+        );
+    }
+
+    #[test]
+    fn unresolvable_receiver_falls_back_to_registering() {
+        // When the receiver's type cannot be resolved (never bound by a `let`,
+        // or an imported module — the latter is the cli#4 extension), the pass
+        // cannot read the method's return type, so it falls back to the
+        // registering behavior rather than guessing a rebind. No crash, no
+        // rename; sema later reports the unbound receiver precisely.
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, fn() -> int64 h) -> Command:\n        return Command()\n\
+             @cli.command\ndef h() -> int64:\n    return 0\n\
+             def main():\n    print(\"cli never bound here\")\n",
+        );
+        let diags = desugar_registering_decorators(&mut m);
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        assert!(
+            func(&m, "h").is_some(),
+            "unresolved receiver must not rebind"
+        );
+        assert!(
+            func(&m, "h$impl").is_none(),
+            "no rename on the fallback path"
+        );
+        // The registration landed (at the top of main, the unbound-receiver
+        // fallback) as a bare `cli.command(h)` statement.
+        assert!(
+            main_stmts(&m)
+                .iter()
+                .any(|s| registration(s) == Some(("cli".into(), "command".into()))),
+            "falls back to a registration statement"
+        );
     }
 }
