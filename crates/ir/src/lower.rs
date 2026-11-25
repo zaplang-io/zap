@@ -8791,9 +8791,9 @@ impl<'a> FnLower<'a> {
                         d
                     };
                     let mut acc = rendered.first().copied().unwrap_or_else(|| strc(self, b""));
-                    for i in 1..rendered.len() {
+                    for &v in rendered.iter().skip(1) {
                         acc = concat(self, acc, sep);
-                        acc = concat(self, acc, rendered[i]);
+                        acc = concat(self, acc, v);
                     }
                     acc = concat(self, acc, end);
                     if let Some(fd) = file_v {
