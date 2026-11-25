@@ -497,6 +497,36 @@ key and a `None` key works, and a bare `None` literal is accepted in key positio
 (`d[None]`, `None in d`). An `Optional` of an unhashable `T` (e.g.
 `Optional[float]`) is rejected at compile time (`ZAP6001`), never an ICE.
 
+#### Variadic `tuple[T]` (#1461)
+
+Distinct from the fixed heterogeneous tuple above, **`tuple[T]`** (the `tuple`
+keyword with a single type argument) is a **dynamic-length, homogeneous,
+immutable** sequence — the type Python's `tuple(iterable)` returns. `(A, B)` stays
+the fixed form; `tuple[T]` / `tuple(iterable)` is the variadic one.
+
+```python
+auto t  = tuple([1, 2, 3])        # tuple[int64], from any iterable
+auto t2 = tuple(range(3))         # (0, 1, 2)
+tuple[int64] e = tuple[int64]()   # empty; tuple[int64](xs) is the typed form
+print(t[0], t[-1], len(t))        # runtime index (negative ok), len
+for x in t: ...                   # iterate
+print(t)                          # repr: (1, 2, 3) ; (7,) ; ()
+```
+
+It is **immutable** (no element assignment, no `append`) and a GC-managed
+reference type like `list`. The full sequence surface is supported: indexing
+(`t[i]`, runtime, negative allowed) and slicing (`t[a:b:c]` → a `tuple[T]`),
+iteration and `len`, element-wise `==` / `!=`, lexicographic `< <= > >=`
+(shorter-is-less on a common prefix), and concatenation `t + u` → a fresh
+`tuple[T]`. Its repr is the Python-tuple form `(1, 2, 3)` / `(1,)` / `()`.
+
+A `tuple[T]` is **hashable** — usable as a `dict` key or `set` member
+(`d[tuple(path)]`, `set[tuple[int64]]`) — when its element is a directly-hashable
+scalar (`int*`/`bool`/`char`/`f64`/a tier-1 enum) or `str`/`bytes`; the hash folds
+the element hashes so a same-content tuple built separately hits the same entry.
+A `tuple[T]` whose element is itself an aggregate (a nested `tuple`/`list`/…) is
+not hashable yet, reported cleanly rather than as an ICE.
+
 ### 4.9 Transparent type aliases (D-0105, #606)
 
 A **type alias** gives an existing type a second name. It is **transparent**: it
