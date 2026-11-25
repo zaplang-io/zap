@@ -2605,6 +2605,9 @@ impl<'a> FnLower<'a> {
     ) -> Result<(), LowerError> {
         match ty {
             Ty::List(elem) => self.iterate_list(val, elem, body),
+            // A variadic `tuple[T]` (#1461) is a frozen list buffer: iterate it
+            // element-wise exactly like a list.
+            Ty::VarTuple(elem) => self.iterate_list(val, elem, body),
             Ty::Set(elem) => {
                 let items = self.new_value(Ty::List(elem));
                 self.emit(Inst::Call {
@@ -3319,6 +3322,11 @@ impl<'a> FnLower<'a> {
                 // `for x in <list>` — iterate by index over the list's length.
                 let (lst, lty) = self.expr(iter)?;
                 if let Ty::List(elem) = lty {
+                    return self.lower_for_list(target, lst, elem, body);
+                }
+                // A variadic `tuple[T]` (#1461) is a frozen list buffer: the
+                // statement `for x in t` walks it exactly like a list.
+                if let Ty::VarTuple(elem) = lty {
                     return self.lower_for_list(target, lst, elem, body);
                 }
                 if let Ty::Set(elem) = lty {

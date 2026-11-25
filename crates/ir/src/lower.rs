@@ -2384,6 +2384,16 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
                 };
                 Ok(Ty::Set(e))
             }
+            // `tuple[T]` (#1461): the variadic immutable tuple, a frozen list
+            // buffer. A value position (any storable element, like `list`), so
+            // `value_elem_of` admits `f64`.
+            "tuple" => {
+                let e = match args.first() {
+                    Some(a) => value_elem_of(a, env)?,
+                    None => Elem::I64,
+                };
+                Ok(Ty::VarTuple(e))
+            }
             "heap" => {
                 let e = match args.first() {
                     Some(a) => heap_elem_of(a, env)?,
@@ -2759,7 +2769,8 @@ fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError
         | Ty::AtomicArray(_)
         | Ty::ContextVar(_)
         | Ty::Deque(_)
-        | Ty::OSet(_) => Ok(Elem::Nested(nested.borrow_mut().intern(t))),
+        | Ty::OSet(_)
+        | Ty::VarTuple(_) => Ok(Elem::Nested(nested.borrow_mut().intern(t))),
         // A `bytes` element is a `ZapStr` pointer word — the same storage, GC
         // tracing, and byte-wise key hashing as a `str` (`Elem::Ptr`) — but it is
         // a dedicated `Elem::Bytes` (#1074, D-0241) so read-back (`rows[i]`,
@@ -8563,6 +8574,9 @@ impl<'a> FnLower<'a> {
             if is_name(base, "list") {
                 return self.lower_list_new(index, args);
             }
+            if is_name(base, "tuple") {
+                return self.lower_vartuple_new(index, args);
+            }
             if is_name(base, "dict") {
                 return self.lower_dict_new(index, args);
             }
@@ -8897,7 +8911,7 @@ impl<'a> FnLower<'a> {
                         vals.push(s);
                     } else if matches!(
                         vt,
-                        Ty::Struct(_) | Ty::List(_) | Ty::Dict(_, _) | Ty::Set(_)
+                        Ty::Struct(_) | Ty::List(_) | Ty::Dict(_, _) | Ty::Set(_) | Ty::VarTuple(_)
                     ) || vt == Ty::Complex
                         || vt == Ty::Bigint
                         || vt.is_float()
@@ -9174,6 +9188,8 @@ impl<'a> FnLower<'a> {
                 }
                 let func = match vt {
                     Ty::List(_) => "zap_list_len",
+                    // A variadic `tuple[T]` (#1461) is a frozen list buffer.
+                    Ty::VarTuple(_) => "zap_list_len",
                     Ty::Dict(..) => "zap_dict_len",
                     Ty::Set(_) => "zap_set_len",
                     Ty::Heap(_) => "zap_heap_len",
@@ -9822,6 +9838,16 @@ impl<'a> FnLower<'a> {
                     ));
                 }
                 return self.lower_list_from_iterable(&args[0].value);
+            }
+            if fname == "tuple" {
+                // tuple(iterable) (#1461): a fresh immutable variadic tuple[T] of
+                // the iterable's elements, physically a frozen list buffer.
+                if args.len() != 1 || args[0].name.is_some() {
+                    return Err(err(
+                        "tuple(iterable) takes exactly one positional argument; use tuple[T]() for an empty tuple",
+                    ));
+                }
+                return self.lower_vartuple_from_iterable(&args[0].value);
             }
             if fname == "dict" {
                 // dict(pairs) | dict(other_dict) | dict(k=v, ...) (#1460).
@@ -13114,6 +13140,46 @@ impl<'a> FnLower<'a> {
         Ok((list, Ty::List(elem)))
     }
 
+    /// `tuple[T]()` (empty) / `tuple[T](iterable)` (typed) construction (#1461):
+    /// the generic-context forms of the variadic tuple, with the element type
+    /// declared rather than inferred. The runtime object is a frozen list buffer,
+    /// typed `Ty::VarTuple(elem)`.
+    fn lower_vartuple_new(
+        &mut self,
+        elem_expr: &Expr,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let ety = resolve_ty(&expr_to_type(elem_expr)?, &self.ctx.tyenv())?;
+        let elem = list_elem_kind(ety, &self.ctx.nested)?;
+        if args.len() > 1 || args.iter().any(|a| a.name.is_some()) {
+            return Err(err(
+                "tuple[T]() takes no arguments, or a single iterable: tuple[T](iterable)",
+            ));
+        }
+        let buf = self.new_value(Ty::VarTuple(elem));
+        self.emit(Inst::Call {
+            dest: Some(buf),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        if let Some(a) = args.first() {
+            self.iterate(&a.value, |s, v, t| {
+                if list_elem_kind(t, &s.ctx.nested)? != elem {
+                    return Err(err("tuple[T](iterable) element type does not match T"));
+                }
+                let v = s.coerce(v, t, elem.ty());
+                let v = s.box_elem_for_store(v, elem.ty());
+                s.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_list_push_{}", elem.val_suffix()),
+                    args: vec![buf, v],
+                });
+                Ok(())
+            })?;
+        }
+        Ok((buf, Ty::VarTuple(elem)))
+    }
+
     /// Empty `dict[K, V]()` construction (#1004): the generic-context synonym for
     /// the `{}` literal — same `zap_dict_new` the literal lowers to. The subscript
     /// carries the two type arguments (`Expr::Tuple`). Takes no arguments.
@@ -13271,6 +13337,46 @@ impl<'a> FnLower<'a> {
         let ek = elem.get().unwrap_or(Elem::I64);
         self.func.value_types[list as usize] = Ty::List(ek);
         Ok((list, Ty::List(ek)))
+    }
+
+    /// tuple(iterable) (#1461): build the elements into a `zap_list_*` buffer
+    /// exactly like `list(iterable)`, but type the result as the immutable
+    /// `Ty::VarTuple(ek)` so it renders `(…)`, stays non-mutable, and (later)
+    /// hashes. The runtime object is the same frozen list buffer.
+    fn lower_vartuple_from_iterable(&mut self, iterable: &Expr) -> Result<(Value, Ty), LowerError> {
+        let buf = self.new_value(Ty::List(Elem::I64));
+        self.emit(Inst::Call {
+            dest: Some(buf),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        let elem: std::cell::Cell<Option<Elem>> = std::cell::Cell::new(None);
+        self.iterate(iterable, |s, v, t| {
+            let ek = match elem.get() {
+                Some(e) => {
+                    if list_elem_kind(t, &s.ctx.nested)? != e {
+                        return Err(err("tuple elements must all have the same representation"));
+                    }
+                    e
+                }
+                None => {
+                    let e = list_elem_kind(t, &s.ctx.nested)?;
+                    elem.set(Some(e));
+                    e
+                }
+            };
+            let v = s.coerce(v, t, ek.ty());
+            let v = s.box_elem_for_store(v, ek.ty());
+            s.emit(Inst::Call {
+                dest: None,
+                func: format!("zap_list_push_{}", ek.val_suffix()),
+                args: vec![buf, v],
+            });
+            Ok(())
+        })?;
+        let ek = elem.get().unwrap_or(Elem::I64);
+        self.func.value_types[buf as usize] = Ty::VarTuple(ek);
+        Ok((buf, Ty::VarTuple(ek)))
     }
 
     /// dict(...) (#1460): `dict(k=v, ...)` -> a str-keyed dict; `dict(other_dict)`
@@ -16462,7 +16568,9 @@ impl<'a> FnLower<'a> {
             }
         }
         match bty {
-            Ty::List(elem) => {
+            // A variadic `tuple[T]` (#1461) reads back exactly like a list — its
+            // buffer is a frozen `zap_list_*` object.
+            Ty::List(elem) | Ty::VarTuple(elem) => {
                 let (iv, it) = self.expr(index)?;
                 let iv = self.coerce_index(iv, it);
                 // --race (#684): a read of a shared heap list element, keyed on

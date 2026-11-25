@@ -154,7 +154,7 @@ impl<'a> FnLower<'a> {
             // `{v0, v1}` with Python-exact empty forms `[]`, `{}`, `set()`.
             // Elements/keys/values render in `repr` mode (so string elements are
             // quoted), via a synthesized per-container-type renderer.
-            Ty::List(_) | Ty::Dict(_, _) | Ty::Set(_) => {
+            Ty::List(_) | Ty::Dict(_, _) | Ty::Set(_) | Ty::VarTuple(_) => {
                 let f = self.container_repr_fn(vt)?;
                 let d = self.new_value(Ty::Ptr);
                 self.throwing_call(Some(d), &f, vec![v]);

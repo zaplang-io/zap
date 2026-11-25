@@ -5069,6 +5069,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             | Ty::Heap(_)
             | Ty::Deque(_)
             | Ty::OSet(_)
+            | Ty::VarTuple(_)
             | Ty::Array(..)
             | Ty::Chan(_)
             | Ty::AtomicArray(_)

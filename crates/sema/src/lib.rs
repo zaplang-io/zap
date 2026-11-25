@@ -3114,6 +3114,9 @@ impl Checker {
                     "heap" => Ty::Heap(Box::new(elem(0))),
                     "deque" => Ty::Deque(Box::new(elem(0))),
                     "oset" => Ty::OSet(Box::new(elem(0))),
+                    // `tuple[T]` (one arg) is the variadic homogeneous tuple
+                    // (#1461); `(A, B)` stays the fixed heterogeneous tuple.
+                    "tuple" => Ty::VarTuple(Box::new(elem(0))),
                     "channel" => Ty::Chan(Box::new(elem(0))),
                     "AtomicArray" => Ty::AtomicArray(Box::new(elem(0))),
                     "ContextVar" => Ty::ContextVar(Box::new(elem(0))),
@@ -3371,6 +3374,15 @@ impl Checker {
                         .map(|a| self.resolve_type(a))
                         .unwrap_or(Ty::Unknown);
                     Ty::Set(Box::new(el))
+                }
+                // `tuple[T]` (one arg) is the variadic homogeneous tuple (#1461);
+                // the fixed heterogeneous tuple keeps the `(A, B)` literal syntax.
+                "tuple" => {
+                    let el = args
+                        .first()
+                        .map(|a| self.resolve_type(a))
+                        .unwrap_or(Ty::Unknown);
+                    Ty::VarTuple(Box::new(el))
                 }
                 "heap" => {
                     let el = args
@@ -6409,6 +6421,9 @@ impl Checker {
                 }
                 match b {
                     Ty::List(t) => *t,
+                    // `tuple[T]` is runtime-indexed like a list (unlike the fixed
+                    // `Ty::Tuple` above, which needs a const index), yielding `T`.
+                    Ty::VarTuple(t) => *t,
                     // `deque[T]` supports `d[i]` (left-indexed), yielding `T`.
                     Ty::Deque(t) => *t,
                     Ty::Dict(_, v) => *v,
@@ -6964,9 +6979,12 @@ impl Checker {
     fn iterable_elem(&self, it: &Ty) -> Option<Ty> {
         match it {
             Ty::Range => Some(Ty::Int64),
-            Ty::List(t) | Ty::Set(t) | Ty::Heap(t) | Ty::Deque(t) | Ty::OSet(t) => {
-                Some((**t).clone())
-            }
+            Ty::List(t)
+            | Ty::Set(t)
+            | Ty::Heap(t)
+            | Ty::Deque(t)
+            | Ty::OSet(t)
+            | Ty::VarTuple(t) => Some((**t).clone()),
             // Iterating a dict yields its keys (Python semantics, ticket #299);
             // `for k, v` uses `d.items()`. Order is unspecified (hash order).
             Ty::Dict(k, _) => Some((**k).clone()),
@@ -8303,6 +8321,26 @@ impl Checker {
                 self.check_numeric_container_value(&ty, span);
                 return ty;
             }
+            if matches!(base.as_ref(), Expr::Name(n, _) if n == "tuple") {
+                // tuple[T]() (empty) / tuple[T](iterable) (typed) (#1473). A
+                // single argument is the iterable; its element type must match T
+                // (enforced in lowering).
+                let elem = self.chan_elem_from_expr(index);
+                if args.len() > 1 || args.iter().any(|a| a.name.is_some()) {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "tuple[T]() takes no arguments, or a single iterable: tuple[T](iterable)"
+                            .to_string(),
+                        span,
+                    );
+                }
+                for a in args {
+                    let _ = self.infer(&a.value);
+                }
+                let ty = Ty::VarTuple(Box::new(elem));
+                self.check_numeric_container_value(&ty, span);
+                return ty;
+            }
             if matches!(base.as_ref(), Expr::Name(n, _) if n == "dict") {
                 let (k, v) = match index.as_ref() {
                     Expr::Tuple(elems, _) if elems.len() == 2 => (
@@ -9612,6 +9650,32 @@ impl Checker {
                     let at = self.infer(&args[0].value);
                     let elem = self.iter_element(&at, expr_span(&args[0].value));
                     let ty = Ty::List(Box::new(elem));
+                    self.check_numeric_container_value(&ty, span);
+                    return ty;
+                }
+                "tuple" => {
+                    // tuple(iterable): a new immutable, hashable variadic tuple[T]
+                    // of the iterable's elements in order (#1461). An empty one is
+                    // tuple[T]() (sema points there, as for set()/list()).
+                    if args.is_empty() {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "tuple() needs an iterable; build an empty tuple with tuple[T]() (e.g. tuple[int64]())"
+                                .to_string(),
+                            span,
+                        );
+                        return Ty::VarTuple(Box::new(Ty::Unknown));
+                    }
+                    if args.len() != 1 || args[0].name.is_some() {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "tuple(iterable) takes exactly one positional argument".to_string(),
+                            span,
+                        );
+                    }
+                    let at = self.infer(&args[0].value);
+                    let elem = self.iter_element(&at, expr_span(&args[0].value));
+                    let ty = Ty::VarTuple(Box::new(elem));
                     self.check_numeric_container_value(&ty, span);
                     return ty;
                 }

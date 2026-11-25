@@ -327,6 +327,59 @@ impl<'a> FnLower<'a> {
                 let a2 = gen_concat(&mut b, a, close);
                 b.set_term(Term::Ret(Some(a2)));
             }
+            // A variadic `tuple[T]` (#1461) renders Python-tuple style: `(a, b)`,
+            // `(x,)` for a single element (the trailing comma), `()` empty. Its
+            // buffer is a frozen list, so it reuses `iterate_list`.
+            Ty::VarTuple(elem) => {
+                let elem = *elem;
+                let acc = b.alloca(Ty::Ptr);
+                let first = b.alloca(Ty::I64);
+                let open = b.strconst("(");
+                b.store(acc, open);
+                let one = b.iconst(Ty::I64, 1);
+                b.store(first, one);
+                // Length drives the single-element `(x,)` trailing comma.
+                let len = b.new_value(Ty::I64);
+                b.emit(Inst::Call {
+                    dest: Some(len),
+                    func: "zap_list_len".to_string(),
+                    args: vec![c],
+                });
+                b.iterate_list(c, elem, |s, e, _ety| {
+                    gen_seq_sep(s, acc, first);
+                    let es = render_elem_repr(s, e, elem)?;
+                    let a = s.load(acc, Ty::Ptr);
+                    let a2 = gen_concat(s, a, es);
+                    s.store(acc, a2);
+                    Ok(())
+                })?;
+                // if len == 1 { acc += "," }
+                let is_one = b.new_value(Ty::I1);
+                b.emit(Inst::ICmp {
+                    dest: is_one,
+                    pred: CmpPred::Eq,
+                    lhs: len,
+                    rhs: one,
+                });
+                let then_bb = b.new_block();
+                let join_bb = b.new_block();
+                b.set_term(Term::BrIf {
+                    cond: is_one,
+                    then_bb,
+                    else_bb: join_bb,
+                });
+                b.position(then_bb);
+                let a = b.load(acc, Ty::Ptr);
+                let comma = b.strconst(",");
+                let a2 = gen_concat(&mut b, a, comma);
+                b.store(acc, a2);
+                b.set_term(Term::Br(join_bb));
+                b.position(join_bb);
+                let a = b.load(acc, Ty::Ptr);
+                let close = b.strconst(")");
+                let a2 = gen_concat(&mut b, a, close);
+                b.set_term(Term::Ret(Some(a2)));
+            }
             Ty::Set(elem) => {
                 let elem = *elem;
                 // `zap_set_items` snapshots the set's elements as a `list[elem]`
