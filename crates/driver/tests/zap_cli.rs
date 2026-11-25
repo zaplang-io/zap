@@ -3022,3 +3022,99 @@ def main():
         "it is a clean diagnostic, not a panic: {stderr}"
     );
 }
+
+#[test]
+fn reflect_set_field_and_field_desugar_inside_a_match_arm() {
+    // #1506: a reflection intrinsic (`reflect.set_field` / `reflect.field`) used
+    // inside a `match` case arm must be desugared like one at the top level of a
+    // `comptime for` body. Before the fix the desugar walk recursed into
+    // `if`/`while`/`for` blocks but fell through for `match`, so the `reflect`
+    // receiver leaked to lowering and the program failed with a span-less
+    // `error[ZAP6001]: unknown variable 'reflect'`. The shape below is the one a
+    // DOM codec decoder uses: inspect a value with `match`, then populate a field
+    // from within an arm.
+    let src = "\
+@derivable(Zero)
+def _derive_zero[T](T self) -> int64:
+    auto out = reflect.construct(T)
+    int64 total = 0
+    comptime for f in reflect.type_info(T).fields:
+        if f.ty.name == \"int64\":
+            match self:
+                case _:
+                    reflect.set_field(out, comptime f.index, 5)
+                    total = total + reflect.field(out, comptime f.index)
+    return total
+
+interface Zero:
+    def zero(self) -> int64
+
+@derive(Zero)
+struct S:
+    int64 n
+
+def main():
+    print(S(1).zero())
+";
+    let f = write_zap("reflect-setfield-in-match-arm", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a reflect intrinsic inside a match arm must lower; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown variable 'reflect'"),
+        "the reflect receiver must not leak out of a match arm: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("fieldset struct") && !stdout.contains("call @reflect"),
+        "the arm-local set_field/field desugar to ordinary field ops: {stdout}"
+    );
+}
+
+#[test]
+fn reflect_set_field_desugars_in_every_arm_of_an_optional_match() {
+    // #1506, the realistic codec-decoder shape: both arms of an `Optional` match
+    // write the field via `reflect.set_field` (the value is computed in the arm,
+    // then set), and the scrutinee is a `reflect.field`-bound local. Every arm
+    // body — and the scrutinee — must be desugared.
+    let src = "\
+@derivable(Zero)
+def _derive_zero[T](T self) -> int64:
+    auto out = reflect.construct(T)
+    int64 total = 0
+    comptime for f in reflect.type_info(T).fields:
+        if f.ty.kind.name == \"optional\":
+            Optional[int64] ov = reflect.field(self, comptime f.index)
+            match ov:
+                case Optional.Some(x):
+                    reflect.set_field(out, comptime f.index, Optional.Some(x))
+                    total = total + x
+                case Optional.None:
+                    reflect.set_field(out, comptime f.index, None)
+    return total
+
+interface Zero:
+    def zero(self) -> int64
+
+@derive(Zero)
+struct S:
+    Optional[int64] opt
+
+def main():
+    print(S(Optional.Some(7)).zero())
+";
+    let f = write_zap("reflect-setfield-in-both-match-arms", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "reflect.set_field in every arm of an Optional match must lower; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown variable 'reflect'"),
+        "no reflect receiver leaks out of any match arm: {stderr}"
+    );
+}
