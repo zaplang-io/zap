@@ -634,3 +634,30 @@ fn overload_parity_a_codes() {
     );
     assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
 }
+
+#[test]
+fn str_decode_codes() {
+    // str(bytes, encoding[, errors]) (#1459): one to three positional args. A
+    // keyword argument or wrong arity -> ZAP4025; the decode form requires a
+    // bytes value and str encoding/errors -> ZAP4024 otherwise.
+    assert_code(
+        "def main():\n    auto s = str(b\"x\", \"u\", \"strict\", \"x\")\n",
+        "ZAP4025",
+    );
+    assert_code(
+        "def main():\n    auto s = str(b\"x\", encoding=\"utf-8\")\n",
+        "ZAP4025",
+    );
+    assert_code("def main():\n    auto s = str(5, \"utf-8\")\n", "ZAP4024");
+    assert_code("def main():\n    auto s = str(b\"x\", 5)\n", "ZAP4024");
+
+    // The well-typed forms are clean: 1-arg render, and the 2-/3-arg decode.
+    let ok = check_source(
+        "def main():\n\
+         \x20   str a = str(42)\n\
+         \x20   str b = str(b\"hi\", \"utf-8\")\n\
+         \x20   str c = str(b\"hi\", \"ascii\", \"replace\")\n\
+         \x20   str d = str(b\"hi\", \"latin-1\")\n",
+    );
+    assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
+}

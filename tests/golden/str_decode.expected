@@ -1,0 +1,15 @@
+hi
+1
+233
+utf8-strict:valueerror
+1
+0
+65533
+hi
+ascii-strict:valueerror
+0
+65533
+233
+255
+unknown-encoding:valueerror
+unknown-errors:valueerror

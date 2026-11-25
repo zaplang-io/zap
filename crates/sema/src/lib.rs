@@ -9388,15 +9388,50 @@ impl Checker {
                 }
                 "str" => {
                     // str(x): the textual form of a scalar or string.
-                    if args.len() != 1 {
+                    // str(bytes, encoding[, errors]): explicit decode (#1459) —
+                    // encoding in {utf-8, ascii, latin-1}, errors in {strict,
+                    // replace, ignore}. Only the `bytes` operand takes the extra
+                    // arguments; 1-arg `str(bytes)` stays UTF-8/strict (I#337).
+                    let argc = args.len();
+                    if argc == 0 || argc > 3 || args.iter().any(|a| a.name.is_some()) {
                         self.error(
                             ErrorCode::ZAP4025,
-                            "str() takes exactly one argument".to_string(),
+                            "str() takes one to three positional arguments \
+                             (value[, encoding[, errors]])"
+                                .to_string(),
                             span,
                         );
                     }
-                    for a in args {
-                        let at = self.infer(&a.value);
+                    let at = args
+                        .first()
+                        .map(|a| self.infer(&a.value))
+                        .unwrap_or(Ty::Unknown);
+                    if argc >= 2 {
+                        // The decode form only applies to `bytes`.
+                        if !matches!(at, Ty::Bytes | Ty::Unknown) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "str(value, encoding) requires a bytes value, found {}",
+                                    at.display()
+                                ),
+                                expr_span(&args[0].value),
+                            );
+                        }
+                        for a in &args[1..] {
+                            let et = self.infer(&a.value);
+                            if !matches!(et, Ty::Str | Ty::Unknown) {
+                                self.error(
+                                    ErrorCode::ZAP4024,
+                                    format!(
+                                        "str() encoding/errors must be a str, found {}",
+                                        et.display()
+                                    ),
+                                    expr_span(&a.value),
+                                );
+                            }
+                        }
+                    } else {
                         // `str(bytes)` decodes UTF-8 (I#337); invalid UTF-8 faults
                         // at runtime. A user struct/enum (`Named`), a tuple, and a
                         // `list`/`dict`/`set` all render through the general
@@ -9424,7 +9459,7 @@ impl Checker {
                             self.error(
                                 ErrorCode::ZAP4024,
                                 format!("str() cannot render {}", at.display()),
-                                expr_span(&a.value),
+                                expr_span(&args[0].value),
                             );
                         }
                     }
