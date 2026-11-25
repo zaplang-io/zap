@@ -4630,10 +4630,14 @@ enum DeriveFieldKind {
     /// nested-collection element (`Elem::Nested`/`VarTuple`) is a follow-up
     /// (#1533) and is rejected by the codec arm.
     List(Elem),
+    /// A `dict[K, V]` field; carries the key and value representations (#1531). A
+    /// JSON object has string keys, so only a `str` key (`Elem::Ptr`) is
+    /// supported; the value element follows the same allowlist as a list element.
+    Dict(Elem, Elem),
 }
 
 /// Classify a derived field's type for the shared codec walk, or `None` if no
-/// derived codec supports it yet (dict/set/enum/tuple, …).
+/// derived codec supports it yet (set/enum/tuple, …).
 fn derive_field_kind(fty: Ty) -> Option<DeriveFieldKind> {
     match fty {
         Ty::I1 => Some(DeriveFieldKind::Bool),
@@ -4642,6 +4646,7 @@ fn derive_field_kind(fty: Ty) -> Option<DeriveFieldKind> {
         Ty::Ptr => Some(DeriveFieldKind::Str),
         Ty::Struct(s) => Some(DeriveFieldKind::Nested(s)),
         Ty::List(elem) => Some(DeriveFieldKind::List(elem)),
+        Ty::Dict(k, v) => Some(DeriveFieldKind::Dict(k, v)),
         _ => None,
     }
 }
@@ -4666,6 +4671,20 @@ fn list_elem_json_ty(elem: Elem) -> Result<Ty, LowerError> {
              nested-collection element are a follow-up, #1533)",
         )),
     }
+}
+
+/// The value read-back `Ty` for a `dict[K, V]` codec field (#1531). A JSON
+/// object has string keys, so the key must be `str` (`Elem::Ptr`); a non-str key
+/// (`dict[int64, V]`, …) is a clean error. The value follows the same element
+/// allowlist as a list element (`list_elem_json_ty`).
+fn dict_value_json_ty(key: Elem, value: Elem) -> Result<Ty, LowerError> {
+    if key != Elem::Ptr {
+        return Err(err(
+            "@derive(Json) dict key must be `str` (a JSON object has string keys); \
+             a non-str dict key is a follow-up",
+        ));
+    }
+    list_elem_json_ty(value)
 }
 
 /// Layout facts for a monomorphized `Optional[T]` instance used as a
@@ -5104,11 +5123,106 @@ fn gen_json_encode_field(
             let close = b.strconst("]");
             gen_concat(b, acc, close)
         }
+        // A `dict[str, V]` field (#1531) — string-build a JSON object `{"k":v,…}`
+        // by iterating the keys and recursing into the per-value encoder. Keys
+        // are JSON-escaped strings; the object analog of the list arm above.
+        Some(DeriveFieldKind::Dict(kelem, velem)) => {
+            let value_ty = dict_value_json_ty(kelem, velem)?;
+            let keys = b.new_value(Ty::List(Elem::Ptr));
+            b.emit(Inst::Call {
+                dest: Some(keys),
+                func: format!("zap_dict_keys_{}", kelem.val_suffix()),
+                args: vec![fv],
+            });
+            let parts = b.new_value(Ty::List(Elem::Ptr));
+            b.emit(Inst::Call {
+                dest: Some(parts),
+                func: "zap_list_new".to_string(),
+                args: vec![],
+            });
+            let len = b.new_value(Ty::I64);
+            b.emit(Inst::Call {
+                dest: Some(len),
+                func: "zap_list_len".to_string(),
+                args: vec![keys],
+            });
+            let idx = b.alloca(Ty::I64);
+            let zero = b.iconst(Ty::I64, 0);
+            b.store(idx, zero);
+            let cond_bb = b.new_block();
+            let body_bb = b.new_block();
+            let end_bb = b.new_block();
+            b.set_term(Term::Br(cond_bb));
+            b.position(cond_bb);
+            let cur = b.load(idx, Ty::I64);
+            let c = b.new_value(Ty::I1);
+            b.emit(Inst::ICmp {
+                dest: c,
+                pred: CmpPred::Lt,
+                lhs: cur,
+                rhs: len,
+            });
+            b.set_term(Term::BrIf {
+                cond: c,
+                then_bb: body_bb,
+                else_bb: end_bb,
+            });
+            b.position(body_bb);
+            let i = b.load(idx, Ty::I64);
+            let k = b.new_value(Ty::Ptr);
+            b.emit(Inst::Call {
+                dest: Some(k),
+                func: "zap_list_get_ptr".to_string(),
+                args: vec![keys, i],
+            });
+            let v = b.new_value(value_ty);
+            b.emit(Inst::Call {
+                dest: Some(v),
+                func: format!("zap_dict_get_str_{}", velem.val_suffix()),
+                args: vec![fv, k],
+            });
+            let kq = b.new_value(Ty::Ptr);
+            b.emit(Inst::Call {
+                dest: Some(kq),
+                func: "zap_json_escape".to_string(),
+                args: vec![k],
+            });
+            let colon = b.strconst(":");
+            let kc = gen_concat(b, kq, colon);
+            let vstr = gen_json_encode_field(b, v, value_ty, opts, ctx)?;
+            let frag = gen_concat(b, kc, vstr);
+            b.emit(Inst::Call {
+                dest: None,
+                func: "zap_list_push_ptr".to_string(),
+                args: vec![parts, frag],
+            });
+            let next = b.new_value(Ty::I64);
+            let one = b.iconst(Ty::I64, 1);
+            b.emit(Inst::Bin {
+                dest: next,
+                op: BinOp::Add,
+                lhs: i,
+                rhs: one,
+            });
+            b.store(idx, next);
+            b.set_term(Term::Br(cond_bb));
+            b.position(end_bb);
+            let body = b.new_value(Ty::Ptr);
+            b.emit(Inst::Call {
+                dest: Some(body),
+                func: "zap_csv_join".to_string(),
+                args: vec![parts],
+            });
+            let open = b.strconst("{");
+            let acc = gen_concat(b, open, body);
+            let close = b.strconst("}");
+            gen_concat(b, acc, close)
+        }
         None => {
             return Err(err(format!(
                 "@derive(Json) does not support field type {fty} yet \
                  (scalars, str, and nested @derive(Json) structs are; \
-                 dict / set / enum fields are a follow-up)"
+                 set / enum fields are a follow-up)"
             )));
         }
     };
@@ -5680,11 +5794,89 @@ fn gen_json_decode_field(
             b.position(end_bb);
             out
         }
+        // A `dict[str, V]` field (#1531) — read the DOM object (`__json_as_object`
+        // yields a `dict[str, JsonValue]`), then decode each value through the
+        // same per-value decoder, keyed by the object's own string keys.
+        Some(DeriveFieldKind::Dict(kelem, velem)) => {
+            let value_ty = dict_value_json_ty(kelem, velem)?;
+            let obj = call1(b, "__json_as_object", Ty::Dict(Elem::Ptr, Elem::Ptr), jf);
+            let keys = b.new_value(Ty::List(Elem::Ptr));
+            b.emit(Inst::Call {
+                dest: Some(keys),
+                func: "zap_dict_keys_ptr".to_string(),
+                args: vec![obj],
+            });
+            let out = b.new_value(Ty::Dict(kelem, velem));
+            b.emit(Inst::Call {
+                dest: Some(out),
+                func: "zap_dict_new".to_string(),
+                args: vec![],
+            });
+            let len = b.new_value(Ty::I64);
+            b.emit(Inst::Call {
+                dest: Some(len),
+                func: "zap_list_len".to_string(),
+                args: vec![keys],
+            });
+            let idx = b.alloca(Ty::I64);
+            let zero = b.iconst(Ty::I64, 0);
+            b.store(idx, zero);
+            let cond_bb = b.new_block();
+            let body_bb = b.new_block();
+            let end_bb = b.new_block();
+            b.set_term(Term::Br(cond_bb));
+            b.position(cond_bb);
+            let cur = b.load(idx, Ty::I64);
+            let c = b.new_value(Ty::I1);
+            b.emit(Inst::ICmp {
+                dest: c,
+                pred: CmpPred::Lt,
+                lhs: cur,
+                rhs: len,
+            });
+            b.set_term(Term::BrIf {
+                cond: c,
+                then_bb: body_bb,
+                else_bb: end_bb,
+            });
+            b.position(body_bb);
+            let i = b.load(idx, Ty::I64);
+            let k = b.new_value(Ty::Ptr);
+            b.emit(Inst::Call {
+                dest: Some(k),
+                func: "zap_list_get_ptr".to_string(),
+                args: vec![keys, i],
+            });
+            let jv = b.new_value(Ty::Ptr);
+            b.emit(Inst::Call {
+                dest: Some(jv),
+                func: "zap_dict_get_str_ptr".to_string(),
+                args: vec![obj, k],
+            });
+            let v = gen_json_decode_field(b, jv, value_ty, opts, ctx)?;
+            b.emit(Inst::Call {
+                dest: None,
+                func: format!("zap_dict_set_str_{}", velem.val_suffix()),
+                args: vec![out, k, v],
+            });
+            let next = b.new_value(Ty::I64);
+            let one = b.iconst(Ty::I64, 1);
+            b.emit(Inst::Bin {
+                dest: next,
+                op: BinOp::Add,
+                lhs: i,
+                rhs: one,
+            });
+            b.store(idx, next);
+            b.set_term(Term::Br(cond_bb));
+            b.position(end_bb);
+            out
+        }
         None => {
             return Err(err(format!(
                 "@derive(Json) from_json does not support field type {fty} yet \
                  (scalars, str, and nested @derive(Json) structs are; \
-                 dict / set / enum fields are a follow-up)"
+                 set / enum fields are a follow-up)"
             )));
         }
     };
@@ -5849,7 +6041,10 @@ fn gen_yaml_encode_scalar(b: &mut FnLower, fv: Value, fty: Ty) -> Result<Value, 
             call1(b, "zap_i64_to_str", i)
         }
         Some(DeriveFieldKind::Str) => call1(b, "zap_json_escape", fv),
-        Some(DeriveFieldKind::Nested(_)) | Some(DeriveFieldKind::List(_)) | None => {
+        Some(DeriveFieldKind::Nested(_))
+        | Some(DeriveFieldKind::List(_))
+        | Some(DeriveFieldKind::Dict(_, _))
+        | None => {
             return Err(err(format!(
                 "@derive(Yaml) does not support field type {fty} yet \
                  (scalars, str, and nested @derive(Yaml) structs are; \
@@ -5971,7 +6166,10 @@ fn gen_csv_encode_field(b: &mut FnLower, fv: Value, fty: Ty) -> Result<Value, Lo
             call1(b, "zap_i64_to_str", i)
         }
         Some(DeriveFieldKind::Str) => call1(b, "zap_csv_quote", fv),
-        Some(DeriveFieldKind::Nested(_)) | Some(DeriveFieldKind::List(_)) | None => {
+        Some(DeriveFieldKind::Nested(_))
+        | Some(DeriveFieldKind::List(_))
+        | Some(DeriveFieldKind::Dict(_, _))
+        | None => {
             return Err(err(format!(
                 "@derive(Csv) does not support field type {fty} \
                  (a CSV record is flat: scalars and str only; nested structs, \
@@ -6072,7 +6270,10 @@ fn gen_csv_decode_field(b: &mut FnLower, col: Value, fty: Ty) -> Result<Value, L
         }
         // The column is already the string value.
         Some(DeriveFieldKind::Str) => col,
-        Some(DeriveFieldKind::Nested(_)) | Some(DeriveFieldKind::List(_)) | None => {
+        Some(DeriveFieldKind::Nested(_))
+        | Some(DeriveFieldKind::List(_))
+        | Some(DeriveFieldKind::Dict(_, _))
+        | None => {
             return Err(err(format!(
                 "@derive(Csv) does not support field type {fty} \
                  (a CSV record is flat: scalars and str only; nested structs, \

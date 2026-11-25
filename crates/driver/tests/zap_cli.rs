@@ -3235,7 +3235,7 @@ fn derive_json_rejects_unsupported_list_elements_and_other_collections_cleanly()
     let cases = [
         ("list[list[int64]] x", "nested-collection"),
         ("list[bool] x", "bool element"),
-        ("dict[str, int64] x", "dict field"),
+        ("set[int64] x", "set field"),
     ];
     for (field, what) in cases {
         let src = format!("@derive(Json)\nstruct S:\n    {field}\n\ndef main():\n    print(0)\n");
@@ -3248,6 +3248,82 @@ fn derive_json_rejects_unsupported_list_elements_and_other_collections_cleanly()
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.contains("@derive(Json)") && stderr.contains("follow-up"),
+            "{what} errors cleanly via the derive codec: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn derive_json_supports_dict_fields() {
+    // #1531 (epic #1529): the built-in `@derive(Json)` codec encodes a
+    // `dict[str, V]` field as a JSON object and decodes it back, for value types
+    // int / str / nested @derive(Json) struct. Encode string-builds the object
+    // recursing into the per-value encoder; decode reads the DOM object via the
+    // `__json_as_object` prelude accessor and decodes each value keyed by the
+    // object's own string keys. Round-trip output is pinned by the golden
+    // `derive_json_dict_field` under the CI LLVM matrix.
+    let src = "\
+@derive(Json)
+struct Item:
+    int64 id
+
+@derive(Json)
+struct M:
+    dict[str, int64] scores
+    dict[str, Item] items
+
+def main():
+    auto m = M({\"a\": 1}, {\"i\": Item(7)})
+    auto d = M.from_json(m.to_json())
+    print(d.scores[\"a\"])
+    print(d.items[\"i\"].id)
+";
+    let f = write_zap("derive-json-dict-field", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a @derive(Json) struct with dict[str,V] fields must lower; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("@M__to_json") && stdout.contains("@M__from_json_value"),
+        "the built-in dict-field codec methods are emitted: {stdout}"
+    );
+    // Decode reads the DOM object through the prelude accessor + the str keys...
+    assert!(
+        stdout.contains("__json_as_object") && stdout.contains("zap_dict_keys_ptr"),
+        "dict decode reads the object via __json_as_object + str keys (#1531): {stdout}"
+    );
+    // ...and a nested-struct value recurses into its own codec both ways.
+    assert!(
+        stdout.contains("@Item__to_json") && stdout.contains("@Item__from_json_value"),
+        "a nested-struct dict value recurses into its own codec: {stdout}"
+    );
+}
+
+#[test]
+fn derive_json_rejects_non_str_dict_keys_and_unsupported_dict_values() {
+    // #1531: a JSON object has string keys, so only `dict[str, V]` is supported —
+    // a non-str key is a clean error. The value follows the same element allowlist
+    // as a list, so a bool value or a nested-collection value (`dict[str, list[...]]`)
+    // is also a clean error, not a miscompile.
+    let cases = [
+        ("dict[int64, int64] m", "non-str key"),
+        ("dict[str, bool] m", "bool value"),
+        ("dict[str, list[int64]] m", "nested-collection value"),
+    ];
+    for (field, what) in cases {
+        let src = format!("@derive(Json)\nstruct S:\n    {field}\n\ndef main():\n    print(0)\n");
+        let f = write_zap("derive-json-dict-reject", &src);
+        let out = zap().arg("ir").arg(&f).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "{what} must be a clean error, not success"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("@derive(Json)"),
             "{what} errors cleanly via the derive codec: {stderr}"
         );
     }

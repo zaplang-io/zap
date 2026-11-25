@@ -1390,6 +1390,13 @@ def __json_as_array(JsonValue v) -> list[JsonValue]:
         case _:
             return []
 
+def __json_as_object(JsonValue v) -> dict[str, JsonValue]:
+    match v:
+        case JsonValue.Object(m):
+            return m
+        case _:
+            return {}
+
 def __yaml_obj_empty(dict[str, JsonValue] m) -> bool:
     for k in json._obj_keys(m):
         return False
