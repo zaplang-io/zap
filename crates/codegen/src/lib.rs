@@ -4788,6 +4788,24 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         if slot < 0 {
             return Ok(None);
         }
+        // Materialize the slot address in the ENTRY block, exactly as
+        // `entry_alloca` hoists a plain stack slot (ticket #91). This pointer is
+        // cached as the reference local's storage and reused by every `Load` /
+        // `Store` of it across all blocks, so it must dominate them. The `Alloca`
+        // inst is codegen'd wherever it appears in the ZIR; when that is a block
+        // that does not dominate all uses — e.g. an invoke-continuation block
+        // introduced by a #1493 null-dereference guard on a `len`/index/`for` —
+        // a GEP built at the current position would not dominate its uses and the
+        // module fails verification ("Instruction does not dominate all uses").
+        // Building it in the entry block (where the frame pointer is live) makes
+        // it dominate unconditionally. Restore the insertion point afterward.
+        let saved = self.builder.get_insert_block();
+        if let Some(entry) = self.entry_block {
+            match entry.get_terminator() {
+                Some(term) => self.builder.position_before(&term),
+                None => self.builder.position_at_end(entry),
+            }
+        }
         let roots = self
             .builder
             .build_struct_gep(frame.frame_ty, frame.frame_ptr, 3, "gc.local.roots")
@@ -4805,6 +4823,9 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             )
         }
         .map_err(|e| e.to_string())?;
+        if let Some(bb) = saved {
+            self.builder.position_at_end(bb);
+        }
         Ok(Some(local))
     }
 
