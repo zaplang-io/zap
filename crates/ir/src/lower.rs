@@ -7333,7 +7333,12 @@ impl<'a> FnLower<'a> {
             }
             return self.gen_entry_slot(name, ty);
         }
-        let slot = self.alloca(ty);
+        // A plain (non-generator) walrus slot is hoisted to the entry block so it
+        // dominates the enclosing construct's merge block in codegen's block
+        // order even when lowering the operand split the current block (#1493
+        // null-deref guard on a `len`/index/for inside the condition). See
+        // [`entry_alloca`].
+        let slot = self.entry_alloca(ty);
         self.declare(name, slot, ty);
         slot
     }
@@ -7415,6 +7420,29 @@ impl<'a> FnLower<'a> {
     fn alloca(&mut self, pointee: Ty) -> Value {
         let d = self.new_value(Ty::Ptr);
         self.emit(Inst::Alloca { dest: d, pointee });
+        d
+    }
+
+    /// Reserve a stack slot in the **entry block** (block 0) rather than the
+    /// current block. Codegen walks a function's blocks in their stored order and
+    /// requires every value's defining block to precede its uses in that order;
+    /// the entry block precedes (and dominates) all of them, so an entry slot is
+    /// always safe to load anywhere.
+    ///
+    /// A condition-position walrus (`(n := expr)` in an `if`/`while`) outlives the
+    /// construct and is read in the merge block the construct created *before*
+    /// lowering the condition. If lowering the condition splits the current block
+    /// — e.g. a `#1493` null-dereference guard on `len(xs)` / `xs[i]` branches to
+    /// a raising continuation — the binding would otherwise land in that late
+    /// continuation block, after the merge in block order, and codegen would see
+    /// the slot "used before definition". Hoisting the slot to the entry block
+    /// keeps it dominating and correctly ordered. (A terminator lives in a block's
+    /// separate `term` field, so appending to `insts` never lands after it.)
+    fn entry_alloca(&mut self, pointee: Ty) -> Value {
+        let d = self.new_value(Ty::Ptr);
+        self.func.blocks[0]
+            .insts
+            .push(Inst::Alloca { dest: d, pointee });
         d
     }
     fn store(&mut self, ptr: Value, val: Value) {
