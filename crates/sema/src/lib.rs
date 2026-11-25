@@ -10133,18 +10133,26 @@ impl Checker {
                     }
                     // Struct construction: `StructName(fields...)`.
                     if self.user_types.contains(fname) {
-                        // Arena (#553, D-0158): reject a statically-known
-                        // `size > cap` at compile time — the arena could never
-                        // satisfy its own initial reservation (ZAP5132). A runtime
-                        // `size`/`cap` is bounds-checked at `arena()` open instead.
+                        // Arena (#553, D-0158) is a builtin pseudo-struct, not an
+                        // ordinary field constructor: its `size=`/`cap=` keyword
+                        // arguments are a special sizing form (checked by
+                        // `check_arena_sizing` — including the statically-known
+                        // `size > cap` reject, ZAP5132), NOT declared fields. So it
+                        // bypasses the generic constructor field/arity check (#1464/
+                        // #1467), which would otherwise reject `size`/`cap` as
+                        // unknown fields; the args are still inferred here.
                         if fname == "arena" {
                             self.check_arena_sizing(args, span);
+                            for a in args {
+                                self.infer(&a.value);
+                            }
+                            return Ty::Named(fname.clone());
                         }
-                        // #1464 (Phase 2 of #1452): type-check the constructor's
-                        // field arguments against their declared types, bringing
-                        // struct construction in line with direct bindings. A
-                        // user type that is not a registered struct (rare) keeps
-                        // the former loose behaviour.
+                        // #1464 (Phase 2 of #1452) + #1467: type/arity/unknown-field
+                        // check an ordinary struct constructor, bringing it in line
+                        // with direct bindings and enum-variant construction. A user
+                        // type that is not a registered struct (rare) keeps the
+                        // former loose behaviour.
                         if let Some(info) = self.structs.get(fname).cloned() {
                             self.check_struct_field_types(fname, &info, args);
                         } else {
@@ -12463,31 +12471,64 @@ impl Checker {
         matches!(t, Ty::Named(n) if self.enums.get(n).is_some_and(|e| !e.is_sum))
     }
 
-    /// Type-check a struct field constructor `StructName(args)` — Phase 2 of
-    /// #1452 (#1464). Each positional/named argument that maps to a declared field
-    /// must be [`coercible`](Self::coercible) to that field's type, exactly as the
-    /// equivalent direct binding (`int64 x = <value>`) already is, so construction
-    /// is brought in line with the rest of the language. A mismatch is `ZAP4064`,
-    /// mirroring enum-variant construction ([`check_variant_construction`]).
+    /// Type-check and arity-check a struct field constructor `StructName(args)`
+    /// — Phase 2 (#1464) + Phase 3 (#1467) of #1452. Brings struct construction in
+    /// line with the rest of the language and with enum-variant construction
+    /// ([`check_variant_construction`]):
     ///
-    /// This is a deliberate language tightening (decided in #1464): before, sema
-    /// did not type-check struct fields at all, so `S("x")` into an `int64 x` field
-    /// — and `float64`/narrowing/`Optional`-payload mismatches — compiled and
-    /// silently mis-compiled (the `bigint`/`Optional` cases are the memory-safety
-    /// defects #1379/#1407, previously caught only in lowering). Every argument is
-    /// still inferred (for the type map / nested checks) even when it maps to no
-    /// field. **Arity and unknown-field-name stay as they were** (reported by IR
-    /// lowering, `ZAP6001`), so this adds only the field *type* check. A field
-    /// typed by a generic type parameter resolves to [`Ty::Unknown`], which
-    /// `coercible` admits, so generic-struct fields stay permissive.
+    /// - **Field type** (#1464): each argument that maps to a declared field must
+    ///   be [`coercible`](Self::coercible) to that field's type, like the direct
+    ///   binding `int64 x = <value>`. Mismatch → `ZAP4064`.
+    /// - **Unknown field name** (#1467): a named argument that matches no field →
+    ///   `ZAP4063`, as for enum variants.
+    /// - **Too many positional arguments** (#1467): more positionals than fields →
+    ///   `ZAP4062` (reported once).
+    ///
+    /// Missing-required-field enforcement is intentionally **not** done here
+    /// (#1467): the language permits constructing with an undefaulted field omitted
+    /// and setting it later (e.g. a `@scoped` owner that assigns its field in
+    /// `__enter__`), so requiring every undefaulted field would reject that
+    /// supported pattern — a separate design decision.
+    ///
+    /// A deliberate language tightening (decided in #1464/#1467): these cases
+    /// compiled before (field type silently mis-compiled; too many and unknown
+    /// field were caught only in IR lowering, `ZAP6001`). The lowering checks stay
+    /// as defense in depth. Every argument is still inferred (for the type map /
+    /// nested checks). A field typed by a generic type parameter resolves to
+    /// [`Ty::Unknown`], which `coercible` admits, so generic-struct fields stay
+    /// permissive. A struct with a user-defined designated constructor takes a
+    /// different path ([`check_user_call`]) and is unaffected.
     fn check_struct_field_types(&mut self, struct_name: &str, info: &StructInfo, args: &[Arg]) {
         let mut pos = 0usize;
+        let mut too_many_reported = false;
         for a in args {
             let at = self.infer(&a.value);
             let field = match &a.name {
-                Some(fname) => info.fields.iter().find(|f| &f.name == fname),
+                Some(fname) => {
+                    let f = info.fields.iter().find(|f| &f.name == fname);
+                    if f.is_none() {
+                        self.error(
+                            ErrorCode::ZAP4063,
+                            format!("'{struct_name}' has no field '{fname}'"),
+                            expr_span(&a.value),
+                        );
+                    }
+                    f
+                }
                 None => {
                     let f = info.fields.get(pos);
+                    if f.is_none() && !too_many_reported {
+                        self.error(
+                            ErrorCode::ZAP4062,
+                            format!(
+                                "'{struct_name}' takes {} field(s), but more positional \
+                                 arguments were given",
+                                info.fields.len()
+                            ),
+                            expr_span(&a.value),
+                        );
+                        too_many_reported = true;
+                    }
                     pos += 1;
                     f
                 }
@@ -18251,6 +18292,78 @@ def main():
             struct Holder:\n    Shape s\n\
             def main():\n    Holder h = Holder(NotShape(1))\n    print(h.s.area())\n",
         );
+    }
+
+    // --- #1467 (Phase 3 of #1452): struct constructor arity / unknown field ---
+    //
+    // Sema now also reports too-many positional args (ZAP4062) and an unknown
+    // named field (ZAP4063) at construction, bringing structs to parity with enum
+    // variants. Missing-required-field is intentionally NOT enforced: the language
+    // allows omitting an undefaulted field and setting it later (e.g. a @scoped
+    // owner assigns its field in __enter__).
+
+    fn rejects_code(src: &str, code: ErrorCode) {
+        let errs = errors(src);
+        assert!(
+            errs.iter().any(|e| e.code == code),
+            "expected {code:?}, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn sema_rejects_struct_constructor_too_many_positional() {
+        rejects_code(
+            "struct P:\n    int64 x\n    int64 y\n\
+             def main():\n    P p = P(1, 2, 3)\n    print(p.x)\n",
+            ErrorCode::ZAP4062,
+        );
+    }
+
+    #[test]
+    fn sema_rejects_struct_constructor_unknown_field() {
+        rejects_code(
+            "struct P:\n    int64 x\n\
+             def main():\n    P p = P(bogus=1)\n    print(p.x)\n",
+            ErrorCode::ZAP4063,
+        );
+        // A valid field mixed with an unknown one still flags the unknown one.
+        rejects_code(
+            "struct P:\n    int64 x\n\
+             def main():\n    P p = P(x=1, nope=2)\n    print(p.x)\n",
+            ErrorCode::ZAP4063,
+        );
+    }
+
+    #[test]
+    fn sema_struct_constructor_omitted_undefaulted_field_still_accepted() {
+        // #1467: missing-required-field is NOT enforced — an undefaulted field may
+        // be omitted at construction and set later. The @scoped owner pattern
+        // (field assigned in __enter__) must keep type-checking clean.
+        ok("struct P:\n    int64 x\n    int64 y\n\
+            def main():\n    P p = P(1)\n    print(p.x)\n");
+        ok("@scoped\nstruct Arena:\n    int64 id = 0\n    \
+            def __enter__(self) -> Arena:\n        return self\n    \
+            def __exit__(self):\n        pass\n\
+            struct Pool:\n    Arena a\n    \
+            def __enter__(self) -> Pool:\n        self.a = Arena()\n        return self\n    \
+            def __exit__(self):\n        pass\n\
+            def main():\n    with Pool() as p:\n        pass\n");
+        // Arity checks don't false-positive on exactly-right or all-named forms.
+        ok("struct P:\n    int64 x\n    int64 y\n\
+            def main():\n    P p = P(1, 2)\n    print(p.x)\n");
+        ok("struct P:\n    int64 x\n    int64 y\n\
+            def main():\n    P p = P(y=2, x=1)\n    print(p.x)\n");
+    }
+
+    #[test]
+    fn sema_arena_sizing_kwargs_not_flagged_as_unknown_fields() {
+        // #1467 regression: `arena(size=, cap=)` is a builtin sizing form, not an
+        // ordinary field constructor, so its keyword arguments must NOT trip the
+        // unknown-field check (ZAP4063). (The arena golden fixtures exercise this.)
+        ok("def main():\n    \
+            with arena(size=64, cap=65536) as a:\n        \
+            auto b = a.alloc(bytes, 64)\n");
+        ok("def main():\n    with arena(size=1024) as a:\n        pass\n");
     }
 
     #[test]
