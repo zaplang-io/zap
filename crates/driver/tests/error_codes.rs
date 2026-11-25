@@ -788,8 +788,14 @@ fn iter_next_builtin_codes() {
          int64 a = next(it)\n    int64 b = next(it, -1)\n    print(a)\n    print(b)\n"
     ));
     assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
-    // ... reject iter() over a built-in container (reified iterators are phase 3)
-    assert_code("def main():\n    auto it = iter([1, 2, 3])\n", "ZAP4024");
+    // ... iter() over a built-in container is a precise reified iterator (#1382
+    // phase 3): `next(iter([1,2,3]))` is int64 and binds cleanly ...
+    let ok2 = check_source(
+        "def main():\n    auto it = iter([1, 2, 3])\n    int64 a = next(it)\n    print(a)\n",
+    );
+    assert!(ok2.ok, "unexpected diagnostics: {:?}", ok2.diagnostics);
+    // ... reject iter() of a non-iterable scalar ...
+    assert_code("def main():\n    auto it = iter(5)\n", "ZAP4024");
     // ... reject next() of a non-iterator value ...
     assert_code("def main():\n    auto x = next(5)\n", "ZAP4024");
     // ... and a next() default whose type does not match the element type.

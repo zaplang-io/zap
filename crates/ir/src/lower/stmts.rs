@@ -2413,17 +2413,58 @@ impl<'a> FnLower<'a> {
     /// per-container iterator (`iter([1, 2])`, `iter("ab")`) is #1382 phase 3; a
     /// non-struct value is rejected here (sema already reports it precisely).
     pub(super) fn lower_iter_builtin(&mut self, arg: &Expr) -> Result<(Value, Ty), LowerError> {
+        // `range`/`enumerate`/`zip` have no first-class value — they are
+        // for-loop-header only (`range() can only be used in a for-loop`) — so
+        // they cannot be pre-lowered to a value. Build the reified iterator
+        // directly as the generator expression `(x for x in <arg>)`, whose body's
+        // `for` uses the very header path that makes them work (#1382 phase 3).
+        if is_for_header_only_iterable(arg) {
+            return self.lower_iter_genexpr(arg.clone());
+        }
         let (v, vt) = self.expr(arg)?;
-        let Ty::Struct(sid) = vt else {
-            return Err(err(
-                "iter() over a built-in container (list/str/dict/…) is a reified \
-                 iterator — #1382 phase 3; iter() currently accepts a generator, a \
-                 generator expression, or a type implementing the iterator protocol \
-                 (D-0048)",
-            ));
+        // A value that is already a protocol iterator (a generator / genexpr /
+        // user `__iter__`/`__next__` struct) keeps phase-2's idempotent behavior:
+        // `setup_iter` returns the same iterator (or calls `__iter__`), preserving
+        // its identity as a live view.
+        if let Ty::Struct(sid) = vt {
+            let (it, iter_sid) = self.setup_iter(v, sid)?;
+            return Ok((it, Ty::Struct(iter_sid)));
+        }
+        // A built-in container value (#1382 phase 3): the reified iterator is a
+        // typed synthesized generator carrying the precise element type. `for x in
+        // c` already lowers every container kind (list/set/dict/str/bytes/array/…)
+        // through the D-0048 protocol, so `iter(c)` is exactly the generator
+        // expression `(x for x in c)` — reusing the genexpr pipeline, which
+        // computes the precise `(T, bool)` element type and registers the result
+        // as its own iterator. The already-lowered container value is bound to a
+        // temporary local so the genexpr captures it by value (evaluated once,
+        // like Python's `iter(x)`), then iterates it.
+        let span = zapc_syntax::span::Span::new(0, 0);
+        let src = self.alloca(vt);
+        self.store(src, v);
+        self.push_scope();
+        self.declare("$iter_src", src, vt);
+        let result = self.lower_iter_genexpr(Expr::Name("$iter_src".to_string(), span));
+        self.pop_scope();
+        result
+    }
+
+    /// Build the reified iterator for `iter()` as the generator expression
+    /// `(x for x in <iter_expr>)` (#1382 phase 3), reusing [`lower_genexpr`] so
+    /// the result is a typed synthesized generator with the precise `(T, bool)`
+    /// element type. `iter_expr` is either the original argument (for a
+    /// for-header-only iterable like `range(...)`) or a temporary local holding an
+    /// already-lowered container value.
+    fn lower_iter_genexpr(&mut self, iter_expr: Expr) -> Result<(Value, Ty), LowerError> {
+        let span = zapc_syntax::span::Span::new(0, 0);
+        let clause = CompClause {
+            var: "$iter_v".to_string(),
+            iter: Box::new(iter_expr),
+            ifs: Vec::new(),
+            span,
         };
-        let (it, iter_sid) = self.setup_iter(v, sid)?;
-        Ok((it, Ty::Struct(iter_sid)))
+        let elem_e = Expr::Name("$iter_v".to_string(), span);
+        self.lower_genexpr(&elem_e, std::slice::from_ref(&clause))
     }
 
     /// `next(it)` / `next(it, default)` (#1382 phase 2): step an iterator one
@@ -4645,4 +4686,17 @@ impl<'a> FnLower<'a> {
         });
         self.lower_for_list(target, items, elem, body)
     }
+}
+
+/// Is `e` an iterable that exists **only** as a for-loop header, with no
+/// first-class value form (#1382 phase 3)? `range(...)` / `enumerate(...)` /
+/// `zip(...)` cannot be lowered to a standalone value (they error "can only be
+/// used in a for-loop"), so `iter()` builds their reified iterator from the
+/// original call expression rather than pre-lowering it.
+fn is_for_header_only_iterable(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Call { callee, .. }
+            if is_name(callee, "range") || is_name(callee, "enumerate") || is_name(callee, "zip")
+    )
 }
