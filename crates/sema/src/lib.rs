@@ -174,6 +174,14 @@ fn subst_ty(ty: &Ty, subst: &HashMap<&str, &Ty>) -> Ty {
         Ty::ContextVar(e) => Ty::ContextVar(Box::new(subst_ty(e, subst))),
         Ty::Dict(k, v) => Ty::Dict(Box::new(subst_ty(k, subst)), Box::new(subst_ty(v, subst))),
         Ty::Tuple(elems) => Ty::Tuple(elems.iter().map(|e| subst_ty(e, subst)).collect()),
+        // A generic interface instantiation substitutes inside its type
+        // arguments (#1428), so a nested type variable — `Container[list[E]]`
+        // with `E := int64` → `Container[list[int64]]` — is carried through
+        // conformance substitution rather than frozen.
+        Ty::Iface(name, args) => Ty::Iface(
+            name.clone(),
+            args.iter().map(|a| subst_ty(a, subst)).collect(),
+        ),
         _ => ty.clone(),
     }
 }
@@ -2300,6 +2308,15 @@ impl Checker {
             // pointer, a tier-1 enum boxes its scalar tag into a heap cell. All
             // boxing is emitted in lowering.
             (Ty::Named(s), Ty::Named(i)) if self.is_interface(i) => self.conforms(s, i).is_ok(),
+            // A concrete struct/enum used where a GENERIC interface instantiation
+            // `Iface[Arg]` is expected (#1428): conformance is checked against the
+            // real instantiation — `conforms_with_args(s, i, args)` substitutes the
+            // interface's type parameters, so a struct conforms to `Container[int64]`
+            // iff it provides `Container`'s methods with `E := int64`, and a wrong
+            // instantiation (`Container[str]`) is rejected.
+            (Ty::Named(s), Ty::Iface(i, args)) if self.is_interface(i) => {
+                self.conforms_with_args(s, i, args).is_ok()
+            }
             // Element-wise interface coercion at collection VALUE positions
             // (#831, a D-0016 clarification): admit a concrete conformer where an
             // interface element is expected — a `list`/`array` element or a
@@ -2372,6 +2389,20 @@ impl Checker {
                 }
                 String::new()
             }
+            // A generic interface instantiation names the exact instantiation
+            // (`Container[str]`) alongside the per-method reasons (#1428), so a
+            // rejected value-position conformance says which instantiation it
+            // failed and why.
+            (Ty::Named(s), Ty::Iface(i, args)) if self.is_interface(i) => {
+                if let Err(reasons) = self.conforms_with_args(s, i, args) {
+                    return format!(
+                        " ({s} does not satisfy '{}': {})",
+                        to.display(),
+                        reasons.join("; ")
+                    );
+                }
+                String::new()
+            }
             // Descend collection VALUE positions (#831) so a rejected
             // `list[Bad] -> list[Shape]` / `dict[K, Bad] -> dict[K, Shape]`
             // still explains *why* the element does not conform. Keys are not a
@@ -2416,6 +2447,10 @@ impl Checker {
     fn ty_mentions_interface(&self, t: &Ty) -> bool {
         match t {
             Ty::Named(n) => self.is_interface(n),
+            // A generic interface instantiation at a value position is an
+            // interface mention too (#1428), so an `Unknown`-widened literal
+            // element against `list[Container[int64]]` is re-verified.
+            Ty::Iface(n, _) => self.is_interface(n),
             Ty::List(e) => self.ty_mentions_interface(e),
             Ty::Dict(_, v) => self.ty_mentions_interface(v),
             _ => false,
@@ -2463,7 +2498,12 @@ impl Checker {
             (Expr::List(_, _), Ty::List(_)) | (Expr::Dict(_, _), Ty::Dict(_, _)) => {
                 self.verify_collection_literal_conformance(el, elem_ty);
             }
-            (_, Ty::Named(iname)) if self.is_interface(iname) => {
+            // A leaf declared as a bare interface OR a generic interface
+            // instantiation (#831/#1428) must structurally conform; the
+            // instantiation's arguments flow through `coercible`/
+            // `conformance_detail` so a wrong `list[Container[str]]` element is
+            // rejected with the instantiation named.
+            (_, Ty::Named(iname) | Ty::Iface(iname, _)) if self.is_interface(iname) => {
                 let et = self.infer(el);
                 if !self.coercible(&et, elem_ty) {
                     self.error(
@@ -3486,6 +3526,17 @@ impl Checker {
                         return self.resolve_type(&expanded);
                     }
                     if self.user_types.contains(other) {
+                        // A **generic interface** annotation at a value position
+                        // carries its type arguments as `Ty::Iface` (#1428), so
+                        // the value-position conformance check recovers `[Arg]`
+                        // and calls `conforms_with_args` with the real
+                        // instantiation. A bare (non-generic) interface, or a
+                        // struct/enum name, stays the opaque `Ty::Named` — only a
+                        // *parametrized interface* needs its arguments carried.
+                        if !args.is_empty() && self.is_interface(other) {
+                            let resolved = args.iter().map(|a| self.resolve_type(a)).collect();
+                            return Ty::Iface(other.to_string(), resolved);
+                        }
                         return Ty::Named(other.to_string());
                     }
                     // An associated-type projection `T.Out` (#1207): a bounded
@@ -5515,9 +5566,10 @@ impl Checker {
                         self.error(
                             ErrorCode::ZAP4003,
                             format!(
-                                "return type mismatch: expected {}, found {}",
+                                "return type mismatch: expected {}, found {}{}",
                                 ret.display(),
-                                vt.display()
+                                vt.display(),
+                                self.conformance_detail(&vt, &ret),
                             ),
                             expr_span(e),
                         );
@@ -12151,11 +12203,12 @@ impl Checker {
                     self.error(
                         ErrorCode::ZAP4022,
                         format!(
-                            "keyword argument '{}' to '{}' has type {}, expected {}",
+                            "keyword argument '{}' to '{}' has type {}, expected {}{}",
                             name,
                             fname,
                             at.display(),
-                            p.ty.display()
+                            p.ty.display(),
+                            self.conformance_detail(at, &p.ty),
                         ),
                         at_span,
                     );
@@ -12267,11 +12320,12 @@ impl Checker {
                     self.error(
                         ErrorCode::ZAP4021,
                         format!(
-                            "argument {} to '{}' has type {}, expected {}",
+                            "argument {} to '{}' has type {}, expected {}{}",
                             i + 1,
                             fname,
                             at.display(),
-                            pt.display()
+                            pt.display(),
+                            self.conformance_detail(&at, &pt),
                         ),
                         expr_span(&a.value),
                     );
@@ -18904,14 +18958,194 @@ def main():
         );
     }
 
-    // NOTE: end-to-end `Iterator[int64]` *value-position* conformance (passing a
-    // conformer where an `Iterator[int64]` parameter is expected) is NOT wired
-    // yet: at an argument site the parameter's resolved `Ty` is `Ty::Named(
-    // "Iterator")` with the `[int64]` dropped (Ty::Named carries no args), and
-    // `coercible` -> `conforms(s, i)` checks the interface with no type arguments.
-    // Enforcing the element type at value positions needs generic-interface type
-    // arguments carried in the type representation (a #1205 follow-up affecting
-    // every generic interface), tracked as the next sub-phase of #1382.
+    // ---- #1428: generic-interface conformance ENFORCED at value positions ----
+    //
+    // A value-position annotation `Iface[Arg]` resolves to `Ty::Iface(name,
+    // args)` (not the arg-dropping `Ty::Named`), so `coercible` calls
+    // `conforms_with_args` with the REAL instantiation. A conformer binds at the
+    // right instantiation and is rejected at a wrong one, across argument /
+    // return / variable positions; the rejection names the method and the
+    // instantiation. This supersedes the pre-#1428 limitation (value-position
+    // conformance checked with no type arguments, so `[Arg]` was dropped).
+
+    /// `interface Container[E]` + conformers `IntBox` (`get -> int64`) / `StrBox`
+    /// (`get -> str`), with NO trailing `main` — each value-position test appends
+    /// its own `take`/`make` function and `main`.
+    const IFACE_VALUE_PREFIX: &str = "interface Container[E]:\n    def get(self) -> E\n\n\
+        struct IntBox:\n    int64 v\n\
+        \x20   def get(self) -> int64:\n        return self.v\n\n\
+        struct StrBox:\n    str s\n\
+        \x20   def get(self) -> str:\n        return self.s\n\n";
+
+    /// The concatenated message text of a batch of type errors, for asserting a
+    /// diagnostic names the method and the instantiation.
+    fn err_text(src: &str) -> String {
+        errors(src)
+            .iter()
+            .map(|e| e.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn iface_value_argument_position_accepts_right_instantiation() {
+        // The #1428 repro: `IntBox` conforms to `Container[int64]`, so the call
+        // `take(IntBox())` is accepted at the argument position (rejected before
+        // the value-position fix).
+        ok(&format!(
+            "{IFACE_VALUE_PREFIX}def take(Container[int64] c):\n    print(1)\n\n\
+             def main():\n    take(IntBox())\n"
+        ));
+        // A str conformer binds at `Container[str]` too.
+        ok(&format!(
+            "{IFACE_VALUE_PREFIX}def take(Container[str] c):\n    print(1)\n\n\
+             def main():\n    take(StrBox())\n"
+        ));
+    }
+
+    #[test]
+    fn iface_value_argument_position_rejects_wrong_instantiation() {
+        // `IntBox` does NOT conform to `Container[str]` — the wrong instantiation
+        // is rejected, and the diagnostic names the method (`get`) and the
+        // instantiation (`Container[str]`).
+        let msg = err_text(&format!(
+            "{IFACE_VALUE_PREFIX}def take(Container[str] c):\n    print(1)\n\n\
+             def main():\n    take(IntBox())\n"
+        ));
+        assert!(
+            msg.contains("get") && msg.contains("Container[str]"),
+            "diagnostic must name the method and the instantiation; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn iface_value_return_position_enforced() {
+        // Accept: `make() -> Container[int64]` returning an `IntBox`.
+        ok(&format!(
+            "{IFACE_VALUE_PREFIX}def make() -> Container[int64]:\n    return IntBox()\n\n\
+             def main():\n    auto c = make()\n"
+        ));
+        // Reject: returning an `IntBox` where `Container[str]` is declared.
+        let msg = err_text(&format!(
+            "{IFACE_VALUE_PREFIX}def make() -> Container[str]:\n    return IntBox()\n\n\
+             def main():\n    auto c = make()\n"
+        ));
+        assert!(
+            msg.contains("get") && msg.contains("Container[str]"),
+            "return-position rejection must name method + instantiation; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn iface_value_variable_position_enforced() {
+        // Accept: a typed binding `Container[int64] c = IntBox()`.
+        ok(&format!(
+            "{IFACE_VALUE_PREFIX}def main():\n    Container[int64] c = IntBox()\n    print(1)\n"
+        ));
+        // Reject: `Container[str] c = IntBox()`.
+        let msg = err_text(&format!(
+            "{IFACE_VALUE_PREFIX}def main():\n    Container[str] c = IntBox()\n    print(1)\n"
+        ));
+        assert!(
+            msg.contains("get") && msg.contains("Container[str]"),
+            "variable-position rejection must name method + instantiation; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn iface_value_nested_type_var_enforced() {
+        // A nested type variable in the method signature — `items(self) ->
+        // list[E]` — is substituted at the value position: `Boxed[int64]`
+        // requires `list[int64]`, so `Ints` (`-> list[int64]`) binds and `Strs`
+        // (`-> list[str]`) does not.
+        let prefix = "interface Boxed[E]:\n    def items(self) -> list[E]\n\n\
+            struct Ints:\n    int64 n\n\
+            \x20   def items(self) -> list[int64]:\n        return [self.n]\n\n\
+            struct Strs:\n    str s\n\
+            \x20   def items(self) -> list[str]:\n        return [self.s]\n\n";
+        ok(&format!(
+            "{prefix}def take(Boxed[int64] b):\n    print(1)\n\n\
+             def main():\n    take(Ints())\n"
+        ));
+        let msg = err_text(&format!(
+            "{prefix}def take(Boxed[int64] b):\n    print(1)\n\n\
+             def main():\n    take(Strs())\n"
+        ));
+        assert!(
+            msg.contains("items") && msg.contains("Boxed[int64]"),
+            "nested-type-var rejection must name method + instantiation; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn iface_value_two_parameter_instantiation_enforced() {
+        // A two-parameter generic interface is enforced per-parameter at a value
+        // position: `Pairish[int64, str]` accepts `IS`, and the swapped
+        // `Pairish[str, int64]` rejects it.
+        let prefix =
+            "interface Pairish[A, B]:\n    def first(self) -> A\n    def second(self) -> B\n\n\
+            struct IS:\n    int64 i\n    str s\n\
+            \x20   def first(self) -> int64:\n        return self.i\n\
+            \x20   def second(self) -> str:\n        return self.s\n\n";
+        ok(&format!(
+            "{prefix}def take(Pairish[int64, str] p):\n    print(1)\n\n\
+             def main():\n    take(IS())\n"
+        ));
+        let msg = err_text(&format!(
+            "{prefix}def take(Pairish[str, int64] p):\n    print(1)\n\n\
+             def main():\n    take(IS())\n"
+        ));
+        assert!(
+            msg.contains("Pairish[str, int64]"),
+            "swapped-instantiation rejection must name the instantiation; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn iface_value_refined_generic_interface_enforced() {
+        // A generic interface that REFINES a (non-generic) supertype requires the
+        // supertype's methods too (D-0139/#806): `Container[int64]` refining
+        // `Display` accepts a conformer that provides both `get -> int64` and
+        // `show -> str`, and rejects one missing `show`.
+        let prefix = "interface Display:\n    def show(self) -> str\n\n\
+            interface Shown[E]: Display\n    def get(self) -> E\n\n\
+            struct Good:\n    int64 v\n\
+            \x20   def get(self) -> int64:\n        return self.v\n\
+            \x20   def show(self) -> str:\n        return \"g\"\n\n\
+            struct NoShow:\n    int64 v\n\
+            \x20   def get(self) -> int64:\n        return self.v\n\n";
+        ok(&format!(
+            "{prefix}def take(Shown[int64] s):\n    print(1)\n\n\
+             def main():\n    take(Good())\n"
+        ));
+        let msg = err_text(&format!(
+            "{prefix}def take(Shown[int64] s):\n    print(1)\n\n\
+             def main():\n    take(NoShow())\n"
+        ));
+        assert!(
+            msg.contains("show") && msg.contains("Shown[int64]"),
+            "refined-interface rejection must name the missing method + instantiation; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn iface_value_collection_element_position_enforced() {
+        // A generic-interface instantiation nested at a collection VALUE position
+        // (`list[Container[int64]]`, #831 + #1428): a conforming element binds, a
+        // non-conforming one is rejected.
+        ok(&format!(
+            "{IFACE_VALUE_PREFIX}def take(list[Container[int64]] cs):\n    print(1)\n\n\
+             def main():\n    take([IntBox()])\n"
+        ));
+        let msg = err_text(&format!(
+            "{IFACE_VALUE_PREFIX}def take(list[Container[int64]] cs):\n    print(1)\n\n\
+             def main():\n    take([StrBox()])\n"
+        ));
+        assert!(
+            !msg.is_empty(),
+            "a non-conforming list element must be rejected; got no error"
+        );
+    }
 
     #[test]
     fn two_parameter_generic_interface_substitutes_each() {

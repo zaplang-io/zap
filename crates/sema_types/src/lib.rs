@@ -144,6 +144,23 @@ pub enum Ty {
     CtxToken,
     /// A user-defined type (struct/enum), treated opaquely for now.
     Named(String),
+    /// A **generic interface instantiated at value positions** (#1428):
+    /// `SomeIface[Arg, ...]` as a parameter / return / typed-binding type,
+    /// carrying the interface name and its concrete type arguments. A bare
+    /// (non-generic) interface stays a plain [`Ty::Named`]; only an interface
+    /// *with* type arguments resolves here, so the value-position conformance
+    /// check can recover `[Arg]` and call `conforms_with_args` with the real
+    /// instantiation (otherwise every generic-interface annotation checked
+    /// conformance with **no** type arguments, dropping `[Arg]` at resolution —
+    /// so a struct that conforms at the right instantiation was wrongly
+    /// rejected). An interface-typed *value* then carries its element type
+    /// onward, which `next()` / `map` / `filter` need (#1382/#1390). It erases
+    /// to the same `{data, itable}` fat pointer a bare `Ty::Named(iface)` does,
+    /// so IR lowering / codegen need nothing new (the interface registry lookup
+    /// in `resolve_ty` already ignores the arguments). The decision to add a
+    /// dedicated variant (vs. extending the pervasive `Ty::Named`) is recorded
+    /// in `decisions/lang/1428-iface-value-position-conformance.md`.
+    Iface(String, Vec<Ty>),
     /// A regex match object (result of `subject =~ m/.../`, D-0010). Truthy on
     /// success; carries captured groups accessed via `.group(...)`.
     Match,
@@ -274,6 +291,17 @@ impl Ty {
             Ty::ContextVar(t) => format!("ContextVar[{}]", t.display()),
             Ty::CtxToken => "ContextToken".into(),
             Ty::Named(n) => n.clone(),
+            // A generic interface instantiation prints `Iface[A, B]` (#1428),
+            // the spelling a diagnostic names so a conformance failure points at
+            // the exact instantiation that was expected.
+            Ty::Iface(n, args) => {
+                let inner = args
+                    .iter()
+                    .map(|a| a.display())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{n}[{inner}]")
+            }
             Ty::Match => "Match".into(),
             Ty::Py => "py".into(),
             Ty::Unknown => "<unknown>".into(),
@@ -361,6 +389,19 @@ impl Ty {
             // before the #1167 backfill (#1190).
             Ty::Named(n) if n.starts_with('$') => return None,
             Ty::Named(n) => named(n, vec![]),
+            // A generic interface instantiation bridges back to the AST
+            // annotation `Iface[A, ...]` (#1428). IR `resolve_ty` erases an
+            // interface annotation to its fat-pointer `Ty::Struct(fat_sid)`
+            // regardless of the arguments (the registry lookup ignores them), so
+            // the arguments are carried only for fidelity; a non-bridgeable
+            // argument fails closed exactly like any other composite element.
+            Ty::Iface(n, args) => {
+                let mut out = Vec::with_capacity(args.len());
+                for a in args {
+                    out.push(a.to_ast_type()?);
+                }
+                named(n, out)
+            }
             Ty::Unit | Ty::StrView | Ty::BytesView | Ty::Match | Ty::Py | Ty::Unknown => {
                 return None
             }
@@ -654,6 +695,10 @@ pub fn default_type(t: Ty) -> Ty {
         // literal), which is what the payload-aware assignability compares (#1452).
         Ty::Optional(t) => Ty::Optional(Box::new(default_type(*t))),
         Ty::VarTuple(e) => Ty::VarTuple(Box::new(default_type(*e))),
+        // Defaulting is element-wise for an interface instantiation's arguments
+        // too (#1428), so `Container[1-typed-literal]` never carries a lingering
+        // untyped literal into the conformance check.
+        Ty::Iface(n, args) => Ty::Iface(n, args.into_iter().map(default_type).collect()),
         other => other,
     }
 }
