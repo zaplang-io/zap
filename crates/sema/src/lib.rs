@@ -1897,6 +1897,31 @@ impl Checker {
             | Ty::UntypedInt
             | Ty::UntypedFloat => true,
             Ty::Tuple(elems) => elems.iter().all(|e| self.ty_auto_hashable(e, visited)),
+            // A variadic `tuple[T]` is hashable (#1474) when its element is a
+            // directly-hashable scalar / str / bytes / tier-1 enum — the kinds
+            // the runtime `zap_vartuple_hash`/`eq` support. A nested aggregate
+            // element (another `tuple`, `list`, struct, …) is not hashable yet, so
+            // sema matches the lowering instead of over-accepting.
+            Ty::VarTuple(e) => {
+                matches!(
+                    e.as_ref(),
+                    Ty::Int64
+                        | Ty::Int32
+                        | Ty::Uint8
+                        | Ty::Uint16
+                        | Ty::Uint32
+                        | Ty::Uint64
+                        | Ty::Usize
+                        | Ty::Bool
+                        | Ty::Char
+                        | Ty::Str
+                        | Ty::Bytes
+                        | Ty::Float64
+                        | Ty::Float32
+                        | Ty::UntypedInt
+                        | Ty::UntypedFloat
+                ) || matches!(e.as_ref(), Ty::Named(n) if self.enums.get(n).is_some_and(|en| !en.is_sum))
+            }
             Ty::Named(n) => {
                 if let Some(e) = self.enums.get(n) {
                     // Tier-1 enums hash as their backing int; tier-3 (sum) enums

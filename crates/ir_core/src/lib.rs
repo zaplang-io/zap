@@ -68,6 +68,14 @@ pub enum Elem {
     /// interner, so it falls back to [`Ty::Ptr`]; the lowering resolves the real
     /// nested type through its interner instead.
     Nested(u32),
+    /// A variadic `tuple[T]` element/key (#1474). Physically a pointer word like
+    /// [`Elem::Nested`] (same `_ptr` storage, GC tracing, and the same lowering
+    /// interner `u32` recovering its full `Ty::VarTuple(...)` for read-back) — but
+    /// a DISTINCT kind so, unlike a plain nested collection, it is **hashable**:
+    /// its [`Elem::key_suffix`] is `fn` (the content-hash key path), and the
+    /// lowering synthesizes its `__hash__`/`__eq__` on demand. The fixed
+    /// heterogeneous tuple is a [`Elem::Struct`], unrelated.
+    VarTuple(u32),
     /// A `complex` element (#928). Physically a pointer word to a heap `ZapComplex`
     /// — exactly like [`Elem::Ptr`], so it pushes/reads through the `_ptr` runtime
     /// entry points and GC-traces as a pointer — but it retains `complex` identity
@@ -125,6 +133,9 @@ impl Elem {
             // A nested collection flows as a pointer when the interner is out of
             // reach; lowering resolves the precise `list`/`dict`/... type itself.
             Elem::Nested(_) => Ty::Ptr,
+            // A variadic `tuple[T]` element flows as a pointer when the interner
+            // is out of reach; lowering resolves the precise `Ty::VarTuple(...)`.
+            Elem::VarTuple(_) => Ty::Ptr,
             // A complex element reads back as the scalar `complex` (#928): its
             // physical pointer word is reinterpreted as a `ZapComplex *`.
             Elem::Complex => Ty::Complex,
@@ -153,6 +164,7 @@ impl Elem {
             Elem::Ptr
             | Elem::Struct(_)
             | Elem::Nested(_)
+            | Elem::VarTuple(_)
             | Elem::Complex
             | Elem::Bytes
             | Elem::Func(_) => "ptr",
@@ -167,7 +179,10 @@ impl Elem {
             // `bytes` is a `ZapStr`, hashed/compared byte-wise exactly like a
             // `str` key (#1074), so it shares the `str` key path.
             Elem::Ptr | Elem::Bytes => "str",
-            Elem::Struct(_) => "fn",
+            // A `tuple[T]` key hashes/compares by content via synthesized
+            // `__hash__`/`__eq__` (#1474) — the same fn-pointer key path as a
+            // struct/fixed-tuple key.
+            Elem::Struct(_) | Elem::VarTuple(_) => "fn",
             // A float dict KEY / set MEMBER (#803) routes to the `_f64` key entry
             // points (`zap_dict_set_f64_*`, `zap_set_add_f64`, …), which take the
             // key as a `double`, canonicalise `-0.0`, and reject NaN (D-0138).

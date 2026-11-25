@@ -450,6 +450,10 @@ struct StructCtx {
     /// type cannot contain itself, so nested containers resolve to distinct
     /// functions and synthesis terminates.
     synth_container_reprfns: RefCell<HashMap<String, String>>,
+    /// Synthesized `tuple[T]` key `(__hash__, __eq__)` wrapper pair, memoized by
+    /// the element-kind tag (0 word / 1 f64 / 2 str) so one pair is emitted per
+    /// hashable element kind across the module (#1474).
+    synth_vartuple_keyfns: RefCell<HashMap<i64, (String, String)>>,
     /// Display-protocol renderer per concrete type used behind an interface
     /// (#707, D-0124), keyed by `concrete_sid`: the symbol of the function that
     /// renders a value of that type to a `str`. Populated at each concrete->
@@ -1654,6 +1658,7 @@ pub fn lower_module_opts_with_types(
         synth_keyfns: RefCell::new(HashMap::new()),
         synth_reprfns: RefCell::new(HashMap::new()),
         synth_container_reprfns: RefCell::new(HashMap::new()),
+        synth_vartuple_keyfns: RefCell::new(HashMap::new()),
         iface_renderers: RefCell::new(HashMap::new()),
         packed_layouts,
         field_defaults,
@@ -2741,6 +2746,19 @@ fn flatten_array_literal<'e>(
 /// #803): after `-0.0` canonicalisation and NaN rejection a float key hashes and
 /// compares as a plain `i64` word (D-0138). Only an `f32` element (ticket #49) and
 /// bigint/complex (`ZAP4024`) stay unsupported.
+/// The element-kind tag passed to `zap_vartuple_eq` / `zap_vartuple_hash`
+/// (#1474): 0 = plain 64-bit word (int/bool/char/enum), 1 = `f64`, 2 = `str`/
+/// `bytes` (`ZapStr` pointer). `None` for an element kind not supported yet
+/// (nested collection, struct, complex, function, or a nested `tuple[T]`).
+pub(super) fn vartuple_elem_tag(elem: Elem) -> Option<i64> {
+    match elem {
+        Elem::I64 | Elem::Bool | Elem::Char | Elem::Enum(_) => Some(0),
+        Elem::F64 => Some(1),
+        Elem::Ptr | Elem::Bytes => Some(2),
+        _ => None,
+    }
+}
+
 fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError> {
     match t {
         // `bool` (`Ty::I1`) and `char` (`Ty::Char`) each keep their own element
@@ -2769,8 +2787,11 @@ fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError
         | Ty::AtomicArray(_)
         | Ty::ContextVar(_)
         | Ty::Deque(_)
-        | Ty::OSet(_)
-        | Ty::VarTuple(_) => Ok(Elem::Nested(nested.borrow_mut().intern(t))),
+        | Ty::OSet(_) => Ok(Elem::Nested(nested.borrow_mut().intern(t))),
+        // A variadic `tuple[T]` element/key is hashable (#1474): its own kind,
+        // carrying the interned `Ty::VarTuple(...)` for read-back (like `Nested`)
+        // but routing to the `fn` content-hash key path.
+        Ty::VarTuple(_) => Ok(Elem::VarTuple(nested.borrow_mut().intern(t))),
         // A `bytes` element is a `ZapStr` pointer word — the same storage, GC
         // tracing, and byte-wise key hashing as a `str` (`Elem::Ptr`) — but it is
         // a dedicated `Elem::Bytes` (#1074, D-0241) so read-back (`rows[i]`,
@@ -16489,7 +16510,9 @@ impl<'a> FnLower<'a> {
     /// real collection rather than defaulting its bare pointer to `str`.
     fn elem_ty(&self, e: Elem) -> Ty {
         match e {
-            Elem::Nested(id) => self.ctx.nested.borrow().get(id),
+            // Both carry the interned full `Ty` (a `Ty::VarTuple(...)` for the
+            // tuple kind) so read-back recovers the precise type, not a bare `ptr`.
+            Elem::Nested(id) | Elem::VarTuple(id) => self.ctx.nested.borrow().get(id),
             other => other.ty(),
         }
     }
@@ -17941,12 +17964,15 @@ impl<'a> FnLower<'a> {
                 // structs; sort it via a `key=` projection.
                 // A function value (#1348) has no runtime ordering, like a
                 // struct / nested collection / complex; sort via a `key=`.
-                Elem::F64 | Elem::Struct(_) | Elem::Nested(_) | Elem::Complex | Elem::Func(_) => {
-                    Err(err(format!(
-                        "{what} is not orderable; pass key= to sort by an orderable \
-                         projection (an int or str)"
-                    )))
-                }
+                Elem::F64
+                | Elem::Struct(_)
+                | Elem::Nested(_)
+                | Elem::VarTuple(_)
+                | Elem::Complex
+                | Elem::Func(_) => Err(err(format!(
+                    "{what} is not orderable; pass key= to sort by an orderable \
+                     projection (an int or str)"
+                ))),
             }
         };
         let (keys, kind) = match key_expr {

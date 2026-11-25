@@ -26,6 +26,40 @@ impl<'a> FnLower<'a> {
                  element (collections have no stable hash)"
             )));
         }
+        // A variadic `tuple[T]` key (#1474): hashable iff its element kind is
+        // (word / f64 / str). Synthesize a per-element-kind `__hash__`/`__eq__`
+        // wrapper pair over `zap_vartuple_hash`/`zap_vartuple_eq` and route it
+        // through the same fn-pointer key path as a tuple/struct key.
+        if let Elem::VarTuple(id) = elem {
+            let ty = self.ctx.nested.borrow().get(id);
+            let inner_elem = match ty {
+                Ty::VarTuple(e) => e,
+                _ => {
+                    return Err(err(
+                        "internal: a VarTuple element did not resolve to tuple[T]",
+                    ))
+                }
+            };
+            let tag = vartuple_elem_tag(inner_elem).ok_or_else(|| {
+                err(
+                    "this tuple[T] is not hashable, so it cannot be a dict key or set \
+                     element: only tuples of int/bool/char/enum, float, or str/bytes are \
+                     hashable yet (#1474)",
+                )
+            })?;
+            let (hashn, eqn) = self.vartuple_key_fns(tag)?;
+            let hv = self.new_value(Ty::Ptr);
+            self.emit(Inst::FuncAddr {
+                dest: hv,
+                func: hashn,
+            });
+            let ev = self.new_value(Ty::Ptr);
+            self.emit(Inst::FuncAddr {
+                dest: ev,
+                func: eqn,
+            });
+            return Ok(vec![hv, ev]);
+        }
         let Elem::Struct(sid) = elem else {
             return Ok(vec![]);
         };
@@ -308,6 +342,73 @@ impl<'a> FnLower<'a> {
                 "'{other}' is not a capability method on an intrinsic value"
             ))),
         }
+    }
+
+    /// Synthesize the `tuple[T]` key `(__hash__, __eq__)` wrapper pair for an
+    /// element-kind `tag` (#1474), memoized module-wide. Each is a one-call
+    /// trampoline to the runtime (`zap_vartuple_hash`/`zap_vartuple_eq`) with the
+    /// kind baked in, so it matches the fn-pointer key calling convention
+    /// (`hash(ptr) -> i64`, `eq(ptr, ptr) -> i1`) the dict/set key path expects.
+    fn vartuple_key_fns(&mut self, tag: i64) -> Result<(String, String), LowerError> {
+        if let Some(pair) = self.ctx.synth_vartuple_keyfns.borrow().get(&tag) {
+            return Ok(pair.clone());
+        }
+        let hashn = format!("$vt${tag}$hash");
+        let eqn = format!("$vt${tag}$eq");
+        {
+            let mut b = FnLower::new(
+                hashn.clone(),
+                vec![Ty::Ptr],
+                Ty::I64,
+                false,
+                true,
+                self.sigs,
+                self.ctx,
+            );
+            let kind = b.iconst(Ty::I32, tag);
+            let d = b.new_value(Ty::I64);
+            b.emit(Inst::Call {
+                dest: Some(d),
+                func: "zap_vartuple_hash".to_string(),
+                args: vec![0, kind],
+            });
+            b.set_term(Term::Ret(Some(d)));
+            self.ctx.generated.borrow_mut().push(b.func);
+        }
+        {
+            let mut b = FnLower::new(
+                eqn.clone(),
+                vec![Ty::Ptr, Ty::Ptr],
+                Ty::I1,
+                false,
+                true,
+                self.sigs,
+                self.ctx,
+            );
+            let kind = b.iconst(Ty::I32, tag);
+            let raw = b.new_value(Ty::I64);
+            b.emit(Inst::Call {
+                dest: Some(raw),
+                func: "zap_vartuple_eq".to_string(),
+                args: vec![0, 1, kind],
+            });
+            let zero = b.iconst(Ty::I64, 0);
+            let d = b.new_value(Ty::I1);
+            b.emit(Inst::ICmp {
+                dest: d,
+                pred: CmpPred::Ne,
+                lhs: raw,
+                rhs: zero,
+            });
+            b.set_term(Term::Ret(Some(d)));
+            self.ctx.generated.borrow_mut().push(b.func);
+        }
+        let pair = (hashn, eqn);
+        self.ctx
+            .synth_vartuple_keyfns
+            .borrow_mut()
+            .insert(tag, pair.clone());
+        Ok(pair)
     }
 
     fn tuple_key_fns(&mut self, sid: u32) -> Result<(String, String), LowerError> {
