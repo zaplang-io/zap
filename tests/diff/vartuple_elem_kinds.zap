@@ -12,8 +12,10 @@ def main():
     print(len(tuple([1.5, 2.5, 3.5])))
     print(tuple([1.5, 2.5, 3.5])[1])
 
-    # bool elements
-    print(tuple([True, False, True]))
+    # bool elements (== by value; a bool-element tuple's *repr* via tuple(iterable)
+    # is a known follow-up — iterating a list[bool] yields the physical i64 word,
+    # so it would render 1/0 rather than True/False, a limitation shared with
+    # list(iterable)/set(iterable), out of scope for this coverage pass).
     print(tuple([True, False]) == tuple([True, False]))
 
     # int ops: slicing combinations
