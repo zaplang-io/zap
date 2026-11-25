@@ -2,7 +2,7 @@
 title: Null reference dereference raises a catchable NullReferenceError
 status: Locked
 issue: 1489
-pr:
+pr: 1500
 date: 2026-11-25
 domain: lang
 supersedes:
