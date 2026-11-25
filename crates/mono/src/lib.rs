@@ -4058,14 +4058,103 @@ impl Mono<'_> {
 
     /// Convert a call-site type-argument index expression into concrete types
     /// (applying the current substitution). `Name`/nested-`Index` forms only.
-    fn type_args_from_index(&self, index: &Expr) -> Option<Vec<Type>> {
+    /// Number of type parameters the generic named `g` declares — a builtin
+    /// collection (`dict` is the only two-parameter one), a generic
+    /// struct/enum (`self.params`, which includes the prelude `Optional[T]`),
+    /// or a generic free function (`self.gfuncs`). Falls back to `1` when `g`
+    /// is not a known generic, matching the single-argument default for a lone
+    /// type subscript.
+    fn type_param_count(&self, g: &str) -> usize {
+        match g {
+            "dict" => return 2,
+            "list" | "set" | "heap" | "channel" | "deque" | "oset" => return 1,
+            _ => {}
+        }
+        if let Some(ps) = self.params.get(g) {
+            return ps.len();
+        }
+        if let Some(f) = self.gfuncs.get(g) {
+            return f.generics.len();
+        }
+        1
+    }
+
+    /// Convert a type-argument *expression* into an `ast::Type` (names, nested
+    /// generic instantiations, and tuple types).
+    ///
+    /// A generic subscript `g[index]` is split into one type argument per
+    /// declared parameter of `g` — the same arity rule as
+    /// [`type_args_from_index`], applied recursively — because the parser
+    /// renders `g[A, B]` and `g[(A, B)]` identically as a tuple index. So a
+    /// nested one-parameter generic over a tuple (`Optional[(bytes, bytes)]`,
+    /// `list[(bytes, bytes)]`) keeps the tuple whole as its single argument,
+    /// while `dict[K, V]` still splits into two (#1478, #1479).
+    fn expr_to_type(&self, e: &Expr) -> Option<Type> {
+        match e {
+            Expr::Name(n, span) => Some(Type::Named {
+                name: n.clone(),
+                args: Vec::new(),
+                span: *span,
+            }),
+            Expr::Index { base, index, span } => {
+                let Expr::Name(g, _) = base.as_ref() else {
+                    return None;
+                };
+                let elems: Vec<&Expr> = match index.as_ref() {
+                    Expr::Tuple(xs, _) if xs.len() == self.type_param_count(g) => {
+                        xs.iter().collect()
+                    }
+                    other => vec![other],
+                };
+                let mut args = Vec::with_capacity(elems.len());
+                for el in elems {
+                    args.push(self.expr_to_type(el)?);
+                }
+                Some(Type::Named {
+                    name: g.clone(),
+                    args,
+                    span: *span,
+                })
+            }
+            // A tuple type written in type position — `(A, B)` as an explicit
+            // type argument (`run[(Optional[bytes], Optional[bytes])]`, #1478)
+            // or nested inside another type argument (`dict[bytes, (bytes,
+            // bytes)]`, #1479). Without this a tuple type expression yields
+            // `None`, so a generic callee carrying one is not recognized as a
+            // generic instantiation at all and falls through to the structural
+            // rewrite (e.g. a method call mis-lowered as a field access,
+            // `no field 'run'`).
+            Expr::Tuple(xs, span) => {
+                let mut elems = Vec::with_capacity(xs.len());
+                for x in xs {
+                    elems.push(self.expr_to_type(x)?);
+                }
+                Some(Type::Tuple { elems, span: *span })
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve the explicit type arguments in a generic subscript `g[index]`,
+    /// given the number of type parameters `g` declares (`nparams`).
+    ///
+    /// The parser renders `g[A, B]` and `g[(A, B)]` identically as a tuple
+    /// index, so arity is the only thing that distinguishes "two type
+    /// arguments" from "one tuple-typed argument" (#1478). The tuple is split
+    /// into its elements only when its arity matches the declared parameter
+    /// count — `dict[K, V]`, `f[A, B]`, `f[(A, B), C]`; otherwise the whole
+    /// index is a single type argument, so a one-parameter `run[(A, B)]` binds
+    /// `T = (A, B)` rather than being mis-split into two arguments (the first of
+    /// which would silently win and the second be dropped). A non-tuple index is
+    /// always the sole argument, as before.
+    fn type_args_from_index(&self, index: &Expr, nparams: usize) -> Option<Vec<Type>> {
         let elems: Vec<&Expr> = match index {
-            Expr::Tuple(xs, _) => xs.iter().collect(),
+            Expr::Tuple(xs, _) if xs.len() == nparams => xs.iter().collect(),
             other => vec![other],
         };
         let mut out = Vec::with_capacity(elems.len());
         for e in elems {
-            out.push(self.apply_subst(&expr_to_type(e)?));
+            out.push(self.apply_subst(&self.expr_to_type(e)?));
         }
         Some(out)
     }
@@ -4135,7 +4224,7 @@ impl Mono<'_> {
         if !self.is_generic(g) {
             return None;
         }
-        let cargs = self.type_args_from_index(index)?;
+        let cargs = self.type_args_from_index(index, self.type_param_count(g))?;
         let mangled = self.request(&g.clone(), &cargs);
         Some((mangled, g.clone(), cargs))
     }
@@ -4584,7 +4673,9 @@ impl Mono<'_> {
             {
                 if let Expr::Name(g, _) = ibase.as_ref() {
                     if self.genums.contains_key(g) {
-                        if let Some(cargs) = self.type_args_from_index(index) {
+                        if let Some(cargs) =
+                            self.type_args_from_index(index, self.type_param_count(g))
+                        {
                             let mangled = self.request(&g.clone(), &cargs);
                             let node = Expr::Call {
                                 callee: Box::new(Expr::Attr {
@@ -4793,7 +4884,8 @@ impl Mono<'_> {
             if let Expr::Name(g, nspan) = base.as_ref() {
                 // Generic struct construction with explicit type args.
                 if self.gstructs.contains_key(g) {
-                    if let Some(cargs) = self.type_args_from_index(index) {
+                    if let Some(cargs) = self.type_args_from_index(index, self.type_param_count(g))
+                    {
                         let mangled = self.request(&g.clone(), &cargs);
                         let node = Expr::Call {
                             callee: Box::new(Expr::Name(mangled, *nspan)),
@@ -4805,7 +4897,7 @@ impl Mono<'_> {
                 }
                 // Generic free-function call with explicit type args `f[args](...)`.
                 if let Some(f) = self.gfuncs.get(g).copied() {
-                    if let Some(targs) = self.type_args_from_index(index) {
+                    if let Some(targs) = self.type_args_from_index(index, f.generics.len()) {
                         let tparams: Vec<String> =
                             f.generics.iter().map(|p| p.name.clone()).collect();
                         let empty = HashMap::new();
@@ -4833,7 +4925,11 @@ impl Mono<'_> {
                     g.as_str(),
                     "list" | "dict" | "set" | "heap" | "channel" | "deque" | "oset"
                 ) {
-                    if let Some(cargs) = self.type_args_from_index(index) {
+                    // `dict` is the only two-parameter builtin (`dict[K, V]`);
+                    // the rest are single-element containers whose one argument
+                    // may itself be a tuple (`list[(A, B)]`).
+                    let nparams = if g == "dict" { 2 } else { 1 };
+                    if let Some(cargs) = self.type_args_from_index(index, nparams) {
                         if let Some(new_index) = self.ctor_subscript_from_types(&cargs, *nspan) {
                             let node = Expr::Call {
                                 callee: Box::new(Expr::Index {
@@ -4865,7 +4961,9 @@ impl Mono<'_> {
                 {
                     if let Some(method) = self.find_method(owner, m) {
                         if !method.generics.is_empty() {
-                            if let Some(targs) = self.type_args_from_index(index) {
+                            if let Some(targs) =
+                                self.type_args_from_index(index, method.generics.len())
+                            {
                                 let (owner, owner_args) = (owner.clone(), owner_args.clone());
                                 let tparams: Vec<String> =
                                     method.generics.iter().map(|g| g.name.clone()).collect();
@@ -4982,7 +5080,8 @@ impl Mono<'_> {
         {
             if let Expr::Name(g, bspan) = ibase.as_ref() {
                 if self.genums.contains_key(g) {
-                    if let Some(cargs) = self.type_args_from_index(index) {
+                    if let Some(cargs) = self.type_args_from_index(index, self.type_param_count(g))
+                    {
                         let mangled = self.request(&g.clone(), &cargs);
                         return Ok((
                             Expr::Attr {
@@ -5199,37 +5298,6 @@ impl Mono<'_> {
             }
         }
         Ok(Some(args.clone()))
-    }
-}
-
-/// Convert a type-argument *expression* into an `ast::Type` (names and nested
-/// generic instantiations only).
-fn expr_to_type(e: &Expr) -> Option<Type> {
-    match e {
-        Expr::Name(n, span) => Some(Type::Named {
-            name: n.clone(),
-            args: Vec::new(),
-            span: *span,
-        }),
-        Expr::Index { base, index, span } => {
-            let Expr::Name(g, _) = base.as_ref() else {
-                return None;
-            };
-            let elems: Vec<&Expr> = match index.as_ref() {
-                Expr::Tuple(xs, _) => xs.iter().collect(),
-                other => vec![other],
-            };
-            let mut args = Vec::with_capacity(elems.len());
-            for el in elems {
-                args.push(expr_to_type(el)?);
-            }
-            Some(Type::Named {
-                name: g.clone(),
-                args,
-                span: *span,
-            })
-        }
-        _ => None,
     }
 }
 
@@ -5470,6 +5538,96 @@ mod tests {
         );
         // Box$str is the method's return instance, discovered transitively.
         assert!(struct_named(&m, "Box$str").is_some(), "Box$str discovered");
+    }
+
+    // ---- #1478 / #1479: tuple types as explicit generic type arguments -----
+    //
+    // The parser renders `g[A, B]` and `g[(A, B)]` identically as a tuple
+    // index, so the number of declared type parameters is the only thing that
+    // tells "two type arguments" apart from "one tuple-typed argument". These
+    // pin the rewrite that decides it: a one-parameter generic keeps the whole
+    // tuple as a single argument, a two-parameter one still splits, and a
+    // tuple nested inside a type argument resolves rather than vanishing (which
+    // used to leave the call unrecognized, mis-lowered as a field access).
+
+    const OPT_ENUM: &str = "enum Optional[T]:\n    Some(T value)\n    None\n";
+
+    #[test]
+    fn tuple_type_arg_binds_single_param_as_one_tuple() {
+        // #1478: `run[(Optional[bytes], Optional[bytes])]` on a one-parameter
+        // `run[T]` binds `T` to the whole 2-tuple — the symbol carries a single
+        // `tuple$...` argument, never two split `Optional$bytes` arguments.
+        let m = mono_ok(&format!(
+            "{OPT_ENUM}struct Router:\n    int64 unused\n\
+             \x20   def run[T](self, T fallback) -> T:\n        return fallback\n\
+             def main():\n    Router r = Router(0)\n\
+             \x20   auto v = r.run[(Optional[bytes], Optional[bytes])]((None, None))\n\
+             \x20   auto a, b = v\n    print(a.is_none())\n"
+        ));
+        let syms = method_call_syms(&m);
+        assert!(
+            syms.iter()
+                .any(|s| s == "run$tuple$Optional$bytes$Optional$bytes"),
+            "the single tuple type argument must mangle as one `tuple$...`: {syms:?}"
+        );
+        assert!(
+            !syms.iter().any(|s| s == "run" || s == "run$Optional$bytes"),
+            "the call must not stay a bare `run` nor split the tuple into \
+             `run$Optional$bytes`: {syms:?}"
+        );
+    }
+
+    #[test]
+    fn nested_tuple_in_dict_type_arg_is_recognized() {
+        // #1479: `run[dict[bytes, (bytes, bytes)]]` — the nested `(bytes, bytes)`
+        // value type must resolve so the call is recognized as a generic method
+        // (a `run$dict$...` symbol), not fall through to a field access.
+        let m = mono_ok(
+            "struct Router:\n    int64 unused\n\
+             \x20   def run[T](self, T fallback) -> T:\n        return fallback\n\
+             def main():\n    Router r = Router(0)\n\
+             \x20   dict[bytes, (bytes, bytes)] empty = {}\n\
+             \x20   auto d = r.run[dict[bytes, (bytes, bytes)]](empty)\n    print(len(d))\n",
+        );
+        let syms = method_call_syms(&m);
+        assert!(
+            syms.iter().any(|s| s == "run$dict$bytes$tuple$bytes$bytes"),
+            "the dict-of-tuple type argument must be recognized and mangled: {syms:?}"
+        );
+    }
+
+    #[test]
+    fn two_parameter_method_still_splits_tuple_index() {
+        // Arity guard: a two-parameter generic method whose index arity matches
+        // (`two[int64, str]`) still splits into two separate type arguments.
+        let m = mono_ok(
+            "struct Pair:\n    int64 unused\n\
+             \x20   def two[A, B](self, A a, B b) -> B:\n        return b\n\
+             def main():\n    Pair p = Pair(0)\n    print(p.two[int64, str](1, \"x\"))\n",
+        );
+        let syms = method_call_syms(&m);
+        assert!(
+            syms.iter().any(|s| s == "two$int64$str"),
+            "a two-parameter method must split its tuple index into two args: {syms:?}"
+        );
+    }
+
+    #[test]
+    fn single_param_free_fn_tuple_arg_not_split() {
+        // The free-function path shares the same arity-gated rewrite.
+        let m = mono_ok(&format!(
+            "{OPT_ENUM}def run[T](T fallback) -> T:\n    return fallback\n\
+             def main():\n\
+             \x20   auto v = run[(Optional[bytes], Optional[bytes])]((None, None))\n\
+             \x20   auto a, b = v\n    print(a.is_none())\n"
+        ));
+        let names = fn_names(&m);
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "run$tuple$Optional$bytes$Optional$bytes"),
+            "the specialized free function must carry one tuple type argument: {names:?}"
+        );
     }
 
     /// Run monomorphization and return its error message, expecting failure.
