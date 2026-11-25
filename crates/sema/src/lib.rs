@@ -10006,8 +10006,17 @@ impl Checker {
                         if fname == "arena" {
                             self.check_arena_sizing(args, span);
                         }
-                        for a in args {
-                            self.infer(&a.value);
+                        // #1464 (Phase 2 of #1452): type-check the constructor's
+                        // field arguments against their declared types, bringing
+                        // struct construction in line with direct bindings. A
+                        // user type that is not a registered struct (rare) keeps
+                        // the former loose behaviour.
+                        if let Some(info) = self.structs.get(fname).cloned() {
+                            self.check_struct_field_types(fname, &info, args);
+                        } else {
+                            for a in args {
+                                self.infer(&a.value);
+                            }
                         }
                         return Ty::Named(fname.clone());
                     }
@@ -12318,6 +12327,53 @@ impl Checker {
     /// Is `t` a tier-1 (all-constant) enum, convertible to/from an integer?
     fn is_tier1_enum(&self, t: &Ty) -> bool {
         matches!(t, Ty::Named(n) if self.enums.get(n).is_some_and(|e| !e.is_sum))
+    }
+
+    /// Type-check a struct field constructor `StructName(args)` — Phase 2 of
+    /// #1452 (#1464). Each positional/named argument that maps to a declared field
+    /// must be [`coercible`](Self::coercible) to that field's type, exactly as the
+    /// equivalent direct binding (`int64 x = <value>`) already is, so construction
+    /// is brought in line with the rest of the language. A mismatch is `ZAP4064`,
+    /// mirroring enum-variant construction ([`check_variant_construction`]).
+    ///
+    /// This is a deliberate language tightening (decided in #1464): before, sema
+    /// did not type-check struct fields at all, so `S("x")` into an `int64 x` field
+    /// — and `float64`/narrowing/`Optional`-payload mismatches — compiled and
+    /// silently mis-compiled (the `bigint`/`Optional` cases are the memory-safety
+    /// defects #1379/#1407, previously caught only in lowering). Every argument is
+    /// still inferred (for the type map / nested checks) even when it maps to no
+    /// field. **Arity and unknown-field-name stay as they were** (reported by IR
+    /// lowering, `ZAP6001`), so this adds only the field *type* check. A field
+    /// typed by a generic type parameter resolves to [`Ty::Unknown`], which
+    /// `coercible` admits, so generic-struct fields stay permissive.
+    fn check_struct_field_types(&mut self, struct_name: &str, info: &StructInfo, args: &[Arg]) {
+        let mut pos = 0usize;
+        for a in args {
+            let at = self.infer(&a.value);
+            let field = match &a.name {
+                Some(fname) => info.fields.iter().find(|f| &f.name == fname),
+                None => {
+                    let f = info.fields.get(pos);
+                    pos += 1;
+                    f
+                }
+            };
+            if let Some(field) = field {
+                if !self.coercible(&at, &field.ty) {
+                    self.error(
+                        ErrorCode::ZAP4064,
+                        format!(
+                            "field '{}' of '{struct_name}' has type {}, found {}{}",
+                            field.name,
+                            field.ty.display(),
+                            at.display(),
+                            self.conformance_detail(&at, &field.ty),
+                        ),
+                        expr_span(&a.value),
+                    );
+                }
+            }
+        }
     }
 
     /// Type a qualified enum-variant construction `Enum.Variant(args)` (D-0046),
@@ -17731,6 +17787,16 @@ def main():
         );
     }
 
+    /// Assert that `src` is rejected with at least one `ZAP4064` constructor
+    /// field-type-mismatch error (#1464, Phase 2 of #1452).
+    fn rejects_4064(src: &str) {
+        let errs = errors(src);
+        assert!(
+            errs.iter().any(|e| e.code == ErrorCode::ZAP4064),
+            "expected a ZAP4064 constructor field-mismatch error, got: {errs:?}"
+        );
+    }
+
     #[test]
     fn sema_rejects_some_bigint_literal_into_optional_int64() {
         // #1379, verified through the sema-only surface: a bigint literal
@@ -17955,6 +18021,102 @@ def main():
             bigint g = 9223372036854775808\n    \
             Optional[bigint] x = g\n    \
             print(x.is_some())\n");
+    }
+
+    // --- #1464 (Phase 2 of #1452): sema type-checks struct constructor fields ---
+    //
+    // A deliberate language tightening (decided in #1464): a struct-constructor
+    // field argument must be `coercible` to the field's declared type, exactly as
+    // the equivalent direct binding (`int64 x = <value>`). Before, sema did not
+    // type-check struct fields, so these mismatches compiled and silently
+    // mis-compiled (the `bigint`/`Optional` cases are #1379/#1407, caught only in
+    // lowering). Arity / unknown-field-name stay as they were (lowering, ZAP6001).
+
+    #[test]
+    fn sema_rejects_struct_field_type_mismatch() {
+        // str into an int64 field (the headline footgun) — now rejected at sema,
+        // like `int64 x = "hi"`.
+        rejects_4064(
+            "struct S:\n    int64 x\n\
+            def main():\n    S a = S(\"hi\")\n    print(a.x)\n",
+        );
+        // ...by name too.
+        rejects_4064(
+            "struct S:\n    int64 x\n\
+            def main():\n    S a = S(x=\"hi\")\n    print(a.x)\n",
+        );
+        // float into an int64 field.
+        rejects_4064(
+            "struct S:\n    int64 x\n\
+            def main():\n    float64 f = 1.5\n    S a = S(f)\n    print(a.x)\n",
+        );
+        // narrowing (int64 into an int32 field).
+        rejects_4064(
+            "struct S:\n    int32 x\n\
+            def main():\n    int64 n = 5\n    S a = S(n)\n    print(a.x)\n",
+        );
+        // bigint into a fixed-width field (#1379), now surfaced at sema.
+        rejects_4064(
+            "struct S:\n    int64 x\n\
+            def main():\n    S a = S(9223372036854775808)\n    print(a.x)\n",
+        );
+        // Optional[U] into an Optional[T] field with a different payload (#1407).
+        rejects_4064(
+            "struct Box:\n    Optional[int64] f = None\n\
+            def main():\n    bigint g = 9223372036854775808\n    \
+            Box b = Box(Optional.Some(g))\n    print(b.f.is_some())\n",
+        );
+        // A second field after a valid one is still checked.
+        rejects_4064(
+            "struct P:\n    int64 x\n    str y\n\
+            def main():\n    P p = P(1, 2)\n    print(p.x)\n",
+        );
+    }
+
+    #[test]
+    fn sema_accepts_valid_struct_field_construction() {
+        // Exact and untyped-literal matches.
+        ok("struct S:\n    int64 x\n\
+            def main():\n    S a = S(5)\n    print(a.x)\n");
+        ok("struct P:\n    int64 x\n    str y\n\
+            def main():\n    P p = P(1, \"hi\")\n    print(p.y)\n");
+        // Implicit widening is allowed (int32 -> int64 field), as in a binding.
+        ok("struct S:\n    int64 x\n\
+            def main():\n    int32 n = 5\n    S a = S(n)\n    print(a.x)\n");
+        // An untyped int literal fits a float field.
+        ok("struct S:\n    float64 x\n\
+            def main():\n    S a = S(1)\n    print(a.x)\n");
+        // Named fields, order-independent.
+        ok("struct P:\n    int64 x\n    str y\n\
+            def main():\n    P p = P(y=\"hi\", x=1)\n    print(p.y)\n");
+        // A field with a default may be omitted (arity unchanged).
+        ok("struct S:\n    int64 x = 0\n\
+            def main():\n    S a = S()\n    print(a.x)\n");
+        // The #1265 bare-payload wrap works for an Optional field too.
+        ok("struct Box:\n    Optional[int64] f = None\n\
+            def main():\n    Box b = Box(5)\n    print(b.f.is_some())\n");
+        // A matching Optional payload is accepted.
+        ok("struct Box:\n    Optional[int64] f = None\n\
+            def main():\n    Box b = Box(Optional.Some(5))\n    print(b.f.is_some())\n");
+        // A generic-struct field (typed by a type parameter) stays permissive.
+        ok("struct Box[T]:\n    T value\n\
+            def main():\n    Box[int64] b = Box(7)\n    print(b.value)\n");
+    }
+
+    #[test]
+    fn sema_struct_field_interface_coercion_in_constructor() {
+        // A concrete conformer is admitted where a field expects an interface
+        // (the coercible struct->interface rule), and a non-conformer is rejected.
+        ok("interface Shape:\n    def area(self) -> float64\n\
+            struct Circle:\n    float64 r\n    def area(self) -> float64:\n        return self.r\n\
+            struct Holder:\n    Shape s\n\
+            def main():\n    Holder h = Holder(Circle(1.0))\n    print(h.s.area())\n");
+        rejects_4064(
+            "interface Shape:\n    def area(self) -> float64\n\
+            struct NotShape:\n    int64 n\n\
+            struct Holder:\n    Shape s\n\
+            def main():\n    Holder h = Holder(NotShape(1))\n    print(h.s.area())\n",
+        );
     }
 
     #[test]
