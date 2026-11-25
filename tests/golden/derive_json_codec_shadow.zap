@@ -14,21 +14,25 @@
 # unspecified, and round-trip is order-insensitive.
 #
 # #1490 widened `reflect.construct` so it also zero-constructs a nested-struct
-# field (previously a clean "unsupported yet" error). With that the decoder gains
-# its nested-struct branch, so a nested derived struct now round-trips through the
-# LIBRARY decoder (before #1490 it was only cross-checked through the built-in
-# decoder, decode-via-library deferred). `Optional` / `list` / `dict` fields stay
-# out of scope here: the built-in `@derive(Json)` does not round-trip them through
-# this source-accessible DOM (and `@derive(Yaml)` cannot codegen an `Optional`
-# field at all) — a separate documented follow-up — so there is no built-in codec
-# to agree with for those kinds. `reflect.construct`'s own zero set for `Optional`
-# / collection / tuple fields (the heart of #1490) is proven directly by the
+# field, and #1522 adds the `Optional` codec branch (unblocked by #1506, which
+# desugars `reflect.set_field` inside a `match` arm, and #1517, which gave the
+# built-in Yaml codec `Optional` parity). So both a nested derived struct and an
+# `Optional` scalar now round-trip through the LIBRARY decoder (before #1490 /
+# #1522 decode-via-library was a clean "unsupported yet" error and these cases
+# were cross-checked only through the built-in decoder). The `Optional` decode is
+# null-safe and matches the built-in's D-0065 semantics: an absent key OR an
+# explicit `null` -> `None`, a scalar -> `Some(v)`.
+#
+# `list` / `dict` fields stay out of scope: the built-in `@derive(Json)` does not
+# support collection fields yet (a separate documented follow-up), so there is no
+# built-in codec to agree with for those kinds. `reflect.construct`'s own zero set
+# for collection / tuple fields (the heart of #1490) is proven directly by the
 # `construct_zero_set` golden.
 #
 # Built-in Json codegen (`gen_json_to_method` / `gen_json_from_method`), the
 # `DERIVABLE_TRAITS` registry and the prelude are all untouched. Covers int / str
-# / bool / float fields and a nested derived struct, both directions through the
-# library.
+# / bool / float fields, a nested derived struct, and an `Optional` scalar — both
+# directions through the library.
 
 # --- JsonEncode: build a `JsonValue.Object` from the fields, then `json.dumps`.
 # A nested derived struct recurses via its own `to_jsoncodec()`, re-parsed with
@@ -41,6 +45,20 @@ def _derive_jsonencode[T](T value) -> str:
             m[f.name] = json.loads(
                 reflect.field(value, comptime f.index).to_jsoncodec(),
             )
+        elif f.ty.kind.name == "optional":
+            # `Some(x)` -> the scalar; `None` -> `JsonValue.Null` (the built-in
+            # omits a `None` key, but both decoders map an explicit null back to
+            # `None`, so emitting null round-trips either way). The shadow
+            # exercises `Optional[int64]`; the bound local annotates the matched
+            # value's instance (I#154).
+            Optional[int64] ov = reflect.field(value, comptime f.index)
+            JsonValue jv = JsonValue.Null
+            match ov:
+                case Optional.Some(x):
+                    jv = JsonValue.Int(x)
+                case Optional.None:
+                    jv = JsonValue.Null
+            m[f.name] = jv
         elif f.ty.name == "int64":
             m[f.name] = JsonValue.Int(reflect.field(value, comptime f.index))
         elif f.ty.name == "str":
@@ -107,6 +125,19 @@ def _derive_jsondecode[T](str s) -> T:
                 comptime f.index,
                 _derive_jsondecode(json.dumps(m[f.name])),
             )
+        elif f.ty.kind.name == "optional":
+            # Null-safe decode matching the built-in (D-0065): an absent key OR an
+            # explicit `JsonValue.Null` -> `None`, a scalar -> `Some(v)`. The
+            # presence check (`in`) is load-bearing — the built-in omits a `None`
+            # key, so a bare `m[f.name]` would read a missing entry.
+            Optional[int64] dv = None
+            if f.name in m:
+                match m[f.name]:
+                    case JsonValue.Int(i):
+                        dv = Optional.Some(i)
+                    case _:
+                        dv = None
+            reflect.set_field(out, comptime f.index, dv)
         elif f.ty.name == "int64":
             reflect.set_field(out, comptime f.index, _jc_int(m[f.name]))
         elif f.ty.name == "str":
@@ -140,12 +171,14 @@ struct Flat:
     bool b
     float64 f
 
-# A nested derived struct field; both the library encode (recurses) and the
-# library decode (#1490) now handle it, so `Nested` derives JsonDecode too.
+# A nested derived struct field and an `Optional` scalar; the library encode
+# (recurses / maps the option) and the library decode (#1490 nested, #1522
+# optional) handle both, so `Nested` derives JsonDecode too.
 @derive(Eq, Json, JsonEncode, JsonDecode)
 struct Nested:
     int64 n
     Inner inner
+    Optional[int64] opt
 
 def main():
     auto p = Flat(7, "hi", True, 2.5)
@@ -156,14 +189,21 @@ def main():
     # ...and the built-in decode agrees with the library encoder.
     print(Flat.from_json(p.to_jsoncodec()) == p)
 
-    auto o = Nested(3, Inner(9, "z"))
-    # #1490: the nested-struct value now round-trips through the LIBRARY decoder
-    # (previously decode-via-library was a clean "unsupported yet" error, and this
-    # case was cross-checked only through the built-in decoder).
+    auto o = Nested(3, Inner(9, "z"), Optional.Some(5))
+    # #1490: the nested-struct value round-trips through the LIBRARY decoder;
+    # #1522: the `Some` optional does too.
     print(Nested.from_jsoncodec(o.to_jsoncodec()) == o)
-    # The library decode agrees with the built-in encoder for the nested value...
+    # The library decode agrees with the built-in encoder...
     print(Nested.from_jsoncodec(o.to_json()) == o)
     # ...the built-in decode agrees with the library encoder (holds since #1470)...
     print(Nested.from_json(o.to_jsoncodec()) == o)
-    # ...and the built-in's own nested round-trip still holds (control).
+    # ...and the built-in's own round-trip still holds (control).
     print(Nested.from_json(o.to_json()) == o)
+
+    # #1522: a `None` optional round-trips through the library decoder too — the
+    # built-in omits the key on encode, so the decode's presence check maps the
+    # absent key back to `None`.
+    auto e = Nested(1, Inner(0, ""), None)
+    print(Nested.from_jsoncodec(e.to_jsoncodec()) == e)
+    print(Nested.from_jsoncodec(e.to_json()) == e)
+    print(Nested.from_json(e.to_jsoncodec()) == e)
