@@ -658,13 +658,17 @@ on the comma-ok `__next__` internally, so `for` and the `default` form keep the
 hot path exception-free. `next(iter(xs))` is statically the exact element type.
 The iterator is a single-pass, live **view** (container reference + cursor), not a
 snapshot. `iter()` accepts a protocol iterator (a generator, a generator
-expression, or a user type implementing `__iter__` / `__next__`) and, over a
-**built-in container** (`list` / `set` / `heap` / `deque` / `oset` / `tuple` /
-`dict` (keys) / `str` → `char` / `bytes` → `int64` / `range` → `int64` / array), a
-precise **reified iterator** carrying the container's exact element type — so
-`next(iter(xs))` is the exact `T`. The reified iterator is a typed synthesized
-generator (`iter(c)` is `(x for x in c)`); `dict`/`set` iteration order is
-unspecified (sequences iterate against the live length).
+expression, or a user type implementing `__iter__` / `__next__`) and, over any
+**built-in iterable container** — `list` / `set` / `heap` / `deque` / `oset` /
+`tuple[T]` / `dict` (keys) / `str` → `char` / `bytes` → `int64` / `range` →
+`int64` (the same containers `for` iterates; an `array` is indexed/vectorized, not
+iterated through this protocol) — a precise **reified iterator** carrying the
+container's exact element type, so `next(iter(xs))` is the exact `T`. The reified
+iterator is a typed synthesized generator (`iter(c)` is `(x for x in c)`) and
+yields in the same order `for x in c` does: sequences (`list`/`str`/`bytes`/
+`range`) in order against the live length, `deque` left-to-right, `oset` in
+insertion order, `heap` in priority (min-first) order, while `dict`/`set`
+iteration order is unspecified.
 
 **`map()` / `filter()` (#1390):** `map(func, *lists)` applies `func` across one or
 more lists, stopping at the shortest, producing a `list[R]` where `R` is `func`'s
