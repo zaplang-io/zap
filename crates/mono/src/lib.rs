@@ -4637,7 +4637,22 @@ impl Mono<'_> {
             // symbol (`get$Optional$str`), which lowering decodes. `V` comes from
             // the receiver's dict type, or (when the receiver's type is opaque to
             // this inferer) from the expected `Optional[..]` sink of the binding.
-            if variant == "get" {
+            //
+            // This dict special-casing must never shadow a user type's own `get`
+            // method (#1477). A concrete receiver that declares its own `get`
+            // dispatches through the ordinary path below — even when the call's
+            // expected type is `Optional[..]`, which the `optional_payload_ty`
+            // fallback would otherwise latch onto and rewrite to a bogus
+            // `get$Optional$V` symbol that no such method exists under. A genuine
+            // `dict` receiver (or one opaque to this inferer, e.g. a type
+            // parameter) names no user struct/enum, so it still takes the dict
+            // path. The `find_method` probe keys on the receiver's declared type
+            // exactly as the generic-method path below does.
+            let recv_has_own_get = matches!(
+                &bcty,
+                CTy::Ty(Type::Named { name, .. }) if self.find_method(name, "get").is_some()
+            );
+            if variant == "get" && !recv_has_own_get {
                 // Two-arg `get(key, default) -> V` (ticket #570): returns the
                 // stored value when present, else the default — a plain `V`, with
                 // no `Optional` wrapper. Lowering uses only the value element
@@ -6059,6 +6074,7 @@ mod tests {
                         walk_expr(value, out);
                     }
                     Stmt::Expr(e) => walk_expr(e, out),
+                    Stmt::Return { value: Some(e), .. } => walk_expr(e, out),
                     Stmt::If {
                         branches,
                         else_block,
@@ -6198,6 +6214,140 @@ mod tests {
         assert!(
             !syms.iter().any(|s| s == "get$Optional$int64"),
             "the global's type must not leak past the shadowing local: {syms:?}"
+        );
+    }
+
+    // ---- #1477: a user type's own `get` must never be hijacked by the builtin
+    // `dict.get` special-casing. The `dict.get(key) -> Optional[V]` rewrite used
+    // the call's expected `Optional[..]` sink as a fallback value type, which
+    // latched onto ANY `.get` whose binding/return type was `Optional[..]` —
+    // even when the receiver was a user struct/enum with its own `get` method —
+    // and rewrote the symbol to a bogus `get$Optional$V` that no method existed
+    // under (ZAP6001 "no method 'get$Optional$bytes'"). The regression guards
+    // each context (Optional binding, return, struct and enum receivers,
+    // one- and two-arg) that drove the misrewrite.
+
+    const CLIENT_GET: &str = "struct Client:\n    int64 unused\n\
+         \x20   def get(self, bytes key, Optional[bytes] default = None) -> Optional[bytes]:\n\
+         \x20       return default\n";
+
+    #[test]
+    fn user_struct_get_not_hijacked_by_dict_get_optional_binding() {
+        // Two-arg `c.get(k, default)` bound to `Optional[bytes]`: the expected
+        // sink must not forge `get$Optional$bytes`; it dispatches as a plain
+        // user `get`.
+        let m = mono_ok(&format!(
+            "{OPTIONAL}{CLIENT_GET}def main():\n    Client c = Client(0)\n\
+             \x20   Optional[bytes] v = c.get(b\"k\", Optional.Some(b\"x\"))\n    print(1)\n"
+        ));
+        let syms = method_call_syms(&m);
+        assert!(
+            syms.iter().any(|s| s == "get"),
+            "the user struct's own `get` must survive as a bare method: {syms:?}"
+        );
+        assert!(
+            !syms
+                .iter()
+                .any(|s| s.starts_with("get$") || s == "get_default"),
+            "no dict.get rewrite may apply to a user struct's `get`: {syms:?}"
+        );
+    }
+
+    #[test]
+    fn user_struct_get_not_hijacked_by_dict_get_return_context() {
+        // The identical body in a `return` whose declared type is `Optional[..]`
+        // — the exact #1477 reproducer shape — likewise stays a plain `get`.
+        let m = mono_ok(&format!(
+            "{OPTIONAL}{CLIENT_GET}\
+             def fetch(Client c) -> Optional[bytes]:\n\
+             \x20   return c.get(b\"k\", Optional.Some(b\"x\"))\n\
+             def main():\n    print(fetch(Client(0)).unwrap())\n"
+        ));
+        let syms = method_call_syms(&m);
+        assert!(
+            syms.iter().any(|s| s == "get") && !syms.iter().any(|s| s.starts_with("get$")),
+            "return-context `get` on a user struct must not be rewritten: {syms:?}"
+        );
+    }
+
+    #[test]
+    fn user_struct_one_arg_get_not_hijacked() {
+        // One-arg `c.get(k)` bound to `Optional[bytes]`: the one-arg dict path
+        // (which encodes `get$Optional$V`) must also yield to the user method.
+        let m = mono_ok(&format!(
+            "{OPTIONAL}{CLIENT_GET}def main():\n    Client c = Client(0)\n\
+             \x20   Optional[bytes] v = c.get(b\"k\")\n    print(1)\n"
+        ));
+        let syms = method_call_syms(&m);
+        assert!(
+            syms.iter().any(|s| s == "get") && !syms.iter().any(|s| s.starts_with("get$")),
+            "one-arg user `get` must not be rewritten to get$Optional$bytes: {syms:?}"
+        );
+    }
+
+    #[test]
+    fn user_enum_get_not_hijacked_by_dict_get() {
+        // A user *enum* method named `get` is guarded identically (the probe
+        // searches enums as well as structs).
+        let m = mono_ok(&format!(
+            "{OPTIONAL}enum Store:\n    Empty\n    Full(bytes v)\n\
+             \x20   def get(self, bytes key) -> Optional[bytes]:\n\
+             \x20       return None\n\
+             def main():\n    Store s = Store.Empty\n\
+             \x20   Optional[bytes] v = s.get(b\"k\")\n    print(1)\n"
+        ));
+        let syms = method_call_syms(&m);
+        assert!(
+            syms.iter().any(|s| s == "get") && !syms.iter().any(|s| s.starts_with("get$")),
+            "a user enum's `get` must not be rewritten: {syms:?}"
+        );
+    }
+
+    #[test]
+    fn generic_homonym_get_does_not_poison_concrete_get() {
+        // The full #1477 shape: a generic `Typed[T].get` homonym coexisting with
+        // concrete `Client.get` must not disturb a field receiver's dispatch.
+        // Both lower as plain `get`; neither becomes `get$Optional$bytes`.
+        let m = mono_ok(&format!(
+            "{OPTIONAL}struct Typed[T]:\n    T value\n\
+             \x20   def get(self, bytes key, Optional[T] default = None) -> Optional[T]:\n\
+             \x20       return default\n\
+             {CLIENT_GET}\
+             struct Lease:\n    Client client\n\
+             struct Pool:\n    Client client\n\
+             \x20   def get(self, bytes key, Optional[bytes] default = None) -> Optional[bytes]:\n\
+             \x20       Lease lease = Lease(self.client)\n\
+             \x20       return lease.client.get(key, default)\n\
+             def main():\n    Typed[str] typed = Typed(\"present\")\n\
+             \x20   Optional[str] ignored = typed.get(b\"k\")\n\
+             \x20   Pool pool = Pool(Client(0))\n\
+             \x20   print(pool.get(b\"k\", Optional.Some(b\"fallback\")).unwrap())\n"
+        ));
+        let syms = method_call_syms(&m);
+        assert!(
+            !syms.iter().any(|s| s.starts_with("get$")),
+            "no `get` call may carry a forged dict-style Optional suffix: {syms:?}"
+        );
+    }
+
+    #[test]
+    fn dict_get_still_specializes_alongside_a_user_get() {
+        // Guard the guard: a genuine `dict.get` in the SAME module as a user
+        // struct's `get` still specializes normally — the fix narrows only the
+        // user-type case, it does not disable the dict path.
+        let m = mono_ok(&format!(
+            "{OPTIONAL}{CLIENT_GET}def main():\n    dict[str, int64] t = {{}}\n\
+             \x20   Optional[int64] v = t.get(\"a\")\n\
+             \x20   int64 n = t.get(\"b\", 0)\n    print(n)\n"
+        ));
+        let syms = method_call_syms(&m);
+        assert!(
+            syms.iter().any(|s| s == "get$Optional$int64"),
+            "the real dict.get must still specialize: {syms:?}"
+        );
+        assert!(
+            syms.iter().any(|s| s == "get_default"),
+            "the real two-arg dict.get must still specialize to get_default: {syms:?}"
         );
     }
 
