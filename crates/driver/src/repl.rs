@@ -1105,6 +1105,7 @@ mod engine {
             | Expr::Yield { span, .. }
             | Expr::IfElse { span, .. }
             | Expr::Named { span, .. }
+            | Expr::TypeArg { span, .. }
             | Expr::Comptime { span, .. } => *span,
         }
     }

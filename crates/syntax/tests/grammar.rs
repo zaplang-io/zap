@@ -432,6 +432,8 @@ const CORPUS: &[Case] = &[
     case("comp_for", Accept, "auto s = {x for x in xs}\n"),                     // set comprehension (#608)
     case("trailer", Accept, "auto s = set[int64]()\n"),                         // empty-set constructor (#609)
     case("subscript", Accept, "auto s = xs[1:2:3]\n"),                          // slice, D-0030
+    case("index_elem", Accept, "auto f = run[fn(int64) -> int64](g)\n"),        // fn-type type arg, #1488
+    case("index_elem", Accept, "auto f = run[fn(int64, str) -> bytes](g)\n"),   // multi-param fn-type arg, #1488
     case("match_regex", Accept, "auto m = x =~ m/foo/\n"),                      // D-0010
     case("lambda", Reject, "auto f = lambda x x\n"),                            // missing ':'
     case("list_display", Reject, "auto xs = [1, 2\n"),                          // unmatched '['

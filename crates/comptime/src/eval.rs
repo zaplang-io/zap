@@ -146,6 +146,8 @@ impl<'a> Evaluator<'a> {
             Expr::Named { span, .. } => {
                 Err(CtError::not_available("walrus assignment (`:=`)", *span))
             }
+            // A type argument (`g[fn(A) -> B]`, #1488) is a type, never a value.
+            Expr::TypeArg { span, .. } => Err(CtError::not_available("type argument", *span)),
             // `comptime <expr>` (#1297): a force-eval marker. The evaluator is
             // already running at compile time, so it is transparent — evaluate
             // the inner expression.
@@ -1370,6 +1372,7 @@ pub(crate) fn expr_span(e: &Expr) -> Span {
         | Expr::Yield { span, .. }
         | Expr::IfElse { span, .. }
         | Expr::Named { span, .. }
+        | Expr::TypeArg { span, .. }
         | Expr::Comptime { span, .. } => *span,
     }
 }

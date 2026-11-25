@@ -691,7 +691,8 @@ fn expr_start(e: &Expr) -> u32 {
         | Expr::ChanRecv { span, .. }
         | Expr::Yield { span, .. }
         | Expr::IfElse { span, .. }
-        | Expr::Named { span, .. } => span.start,
+        | Expr::Named { span, .. }
+        | Expr::TypeArg { span, .. } => span.start,
     }
 }
 

@@ -1754,10 +1754,13 @@ impl Rewriter<'_> {
             }
             Expr::Name(n, span) => self.map_name(n, span),
             // Leaf literals.
+            // Literals and a type argument (`g[fn(A) -> B]`, #1488) are returned
+            // unchanged — a decorator body rewrites no part of a type.
             e @ (Expr::Int(..)
             | Expr::Float(..)
             | Expr::Imaginary(..)
             | Expr::Bool(..)
+            | Expr::TypeArg { .. }
             | Expr::None(..)) => e,
             Expr::Str {
                 value,

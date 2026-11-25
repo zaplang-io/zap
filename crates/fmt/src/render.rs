@@ -95,6 +95,9 @@ pub fn render(e: &Expr) -> String {
         // `(name := value)` — the walrus always renders with its own parentheses,
         // since it is only legal in a parenthesized position (#600).
         Expr::Named { name, value, .. } => format!("({name} := {})", pexpr(value, P_LAMBDA)),
+        // A function type written as a generic type argument (`g[fn(A) -> B]`,
+        // #1488): render it through the shared type renderer.
+        Expr::TypeArg { ty, .. } => type_str(ty),
         Expr::Dict(items, _) => {
             if items.is_empty() {
                 "{}".to_string()

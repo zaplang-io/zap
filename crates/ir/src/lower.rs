@@ -19765,6 +19765,8 @@ fn collect_free_names(
         | Expr::Imaginary(..)
         | Expr::Str { .. }
         | Expr::Bool(..)
+        // A type argument (`g[fn(A) -> B]`, #1488) has no free value names.
+        | Expr::TypeArg { .. }
         | Expr::None(_) => {}
         Expr::Tuple(es, _) | Expr::List(es, _) | Expr::Set(es, _) => {
             for s in es {

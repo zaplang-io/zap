@@ -706,8 +706,14 @@ member_name   ::= IDENT | "None" | TYPE_KEYWORD ;
 call_expr     ::= postfix "(" [ arg_list ] ")" ;
 
 subscript     ::= index_elem { "," index_elem } ;  (* multi-axis: N-D array index/slice (#502), or type args *)
-index_elem    ::= expr
+index_elem    ::= func_type                       (* a function type as a generic type argument, g[fn(A) -> B], #1488 *)
+                | expr
                 | [ expr ] ":" [ expr ] [ ":" [ expr ] ] ;  (* slice / per-axis slice spec, D-0030 / #502 *)
+                  (* `func_type` is admitted here only because it can never begin
+                     a value index expression (`fn(` is unambiguous); other type
+                     arguments — names, generic instantiations, tuples — already
+                     round-trip through `expr`. sema/mono classify a subscript as
+                     type-args vs a value `__getitem__` from the head, #1488. *)
 
 arg_list      ::= gen_exp                         (* bare generator expression as the SOLE argument, #596 *)
                 | arg { "," arg } ;

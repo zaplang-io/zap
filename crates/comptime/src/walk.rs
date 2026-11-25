@@ -154,6 +154,8 @@ where
         | Expr::GenExp { .. }
         | Expr::Lambda { .. }
         | Expr::RegexMatch { .. }
-        | Expr::RegexSubst { .. } => e.clone(),
+        | Expr::RegexSubst { .. }
+        // A type argument (`g[fn(A) -> B]`, #1488) has no child expressions.
+        | Expr::TypeArg { .. } => e.clone(),
     })
 }

@@ -6132,6 +6132,11 @@ impl Checker {
                 self.declare_walrus(name, t.clone(), *span);
                 t
             }
+            // A type argument (`g[fn(A) -> B]`, #1488) is not a value. A
+            // recognized generic call resolves its explicit type arguments
+            // before inferring the subscript, so this is only reached if a type
+            // argument appears in a genuine value position, which has no type.
+            Expr::TypeArg { .. } => Ty::Unknown,
             Expr::Starred { value, span } => {
                 // A `*expr` is only meaningful as a direct element of a
                 // list/set/tuple display, which consume it themselves (#598).
@@ -13045,6 +13050,7 @@ fn expr_span(e: &Expr) -> Span {
         | Expr::Yield { span, .. }
         | Expr::IfElse { span, .. }
         | Expr::Named { span, .. }
+        | Expr::TypeArg { span, .. }
         | Expr::Comptime { span, .. } => *span,
     }
 }

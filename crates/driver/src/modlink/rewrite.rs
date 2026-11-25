@@ -541,12 +541,14 @@ impl Rewriter<'_> {
                 self.expr(then, locals);
                 self.expr(els, locals);
             }
-            // Literals carry nothing to rewrite.
+            // Literals and a type argument (`g[fn(A) -> B]`, #1488 — a type, no
+            // module-qualified names to resolve) carry nothing to rewrite.
             Expr::Int(..)
             | Expr::Float(..)
             | Expr::Imaginary(..)
             | Expr::Str { .. }
             | Expr::Bool(..)
+            | Expr::TypeArg { .. }
             | Expr::None(..) => {}
         }
     }
