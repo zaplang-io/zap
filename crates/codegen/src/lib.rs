@@ -3576,6 +3576,12 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             Some(p.into()),
         );
         self.declare_rt("zap_str_eq", &[p.into(), p.into()], Some(i.into()));
+        // tuple[T] element-wise equality (#1474): (a, b, kind) -> 0/1.
+        self.declare_rt(
+            "zap_vartuple_eq",
+            &[p.into(), p.into(), self.ctx.i32_type().into()],
+            Some(i.into()),
+        );
         // Power-assert value rendering (ticket #73, D-0054).
         self.declare_rt("zap_f64_to_str", &[f.into()], Some(p.into()));
         self.declare_rt("zap_bool_to_str", &[i.into()], Some(p.into()));

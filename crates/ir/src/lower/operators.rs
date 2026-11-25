@@ -10,6 +10,19 @@
 
 use super::*;
 
+/// The element-kind tag passed to `zap_vartuple_eq` (#1474): 0 = plain 64-bit
+/// word (int/bool/char/enum), 1 = `f64`, 2 = `str`/`bytes` (`ZapStr` pointer).
+/// `None` for an element kind `==` does not support yet (nested collection,
+/// struct, complex, function) — reported as a clean error.
+fn vartuple_elem_tag(elem: Elem) -> Option<i64> {
+    match elem {
+        Elem::I64 | Elem::Bool | Elem::Char | Elem::Enum(_) => Some(0),
+        Elem::F64 => Some(1),
+        Elem::Ptr | Elem::Bytes => Some(2),
+        _ => None,
+    }
+}
+
 impl<'a> FnLower<'a> {
     /// Desugar a binary operator whose left operand is a user struct to the
     /// matching dunder (D-0047). Equality/relational operators derive from
@@ -483,6 +496,37 @@ impl<'a> FnLower<'a> {
                 rhs: r,
             });
             return Ok((d, Ty::I1));
+        }
+
+        // `==` / `!=` on two variadic `tuple[T]` values (#1474): element-wise
+        // equality over the frozen list buffers, by element-kind tag. Ordering /
+        // concat (#1475) and dict/set-key use are follow-ups.
+        if matches!(op, Eq | Ne) {
+            if let (Ty::VarTuple(le), Ty::VarTuple(_)) = (&lt, &rt) {
+                let tag = vartuple_elem_tag(*le).ok_or_else(|| {
+                    err("tuple[...] of this element type does not support == yet (#1474)")
+                })?;
+                let kind = self.iconst(Ty::I32, tag);
+                let raw = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(raw),
+                    func: "zap_vartuple_eq".to_string(),
+                    args: vec![l, r, kind],
+                });
+                let zero = self.iconst(Ty::I64, 0);
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred: if matches!(op, Eq) {
+                        CmpPred::Ne
+                    } else {
+                        CmpPred::Eq
+                    },
+                    lhs: raw,
+                    rhs: zero,
+                });
+                return Ok((d, Ty::I1));
+            }
         }
 
         // Channel send `ch <- v` (ticket #25, D-0031): handled before the
