@@ -5544,7 +5544,81 @@ fn gen_yaml_to_method(
             sid,
             idx: idx as u32,
         });
-        if let Some(DeriveFieldKind::Nested(fsid)) = derive_field_kind(*fty) {
+        if let Some(opt) = optional_layout(ctx, *fty) {
+            // A top-level `Optional[T]` field (I#165 parity with `@derive(Json)`,
+            // D-0065): emit `fname: <inner>` when `Some`, `fname: null` when
+            // `None`. The YAML loader maps `null` / `~` back to the Null variant,
+            // and `from_yaml` shares the JSON `from_json_value` decode core (an
+            // absent key *or* an explicit null → `None`), so this round-trips.
+            //
+            // A nested `Optional` *payload* (`Optional[Optional[...]]`) has no
+            // value-position YAML form yet and is rejected cleanly here — matching
+            // `gen_json_encode_field` — instead of falling into the `Nested`
+            // recursion below and emitting a call to the Optional instance's
+            // non-existent `Optional$T__to_yaml` encoder (an unresolved external
+            // symbol that only the LLVM build caught, #1514).
+            if optional_layout(ctx, opt.payload_ty).is_some() {
+                return Err(err(
+                    "@derive(Yaml) does not support a nested Optional[...] payload yet \
+                     (an Optional[T] yaml field's T must be a scalar, str, or nested \
+                     @derive(Yaml) struct)",
+                ));
+            }
+            // Buffer this field's fragment through a slot so the running `acc`
+            // (threaded linearly and dominating the join) is appended just once,
+            // regardless of which arm ran.
+            let slot = b.alloca(Ty::Ptr);
+            let is_none = gen_opt_is_none(&mut b, &opt, fv);
+            let none_bb = b.new_block();
+            let some_bb = b.new_block();
+            let join_bb = b.new_block();
+            b.set_term(Term::BrIf {
+                cond: is_none,
+                then_bb: none_bb,
+                else_bb: some_bb,
+            });
+            // `None` → `fname: null\n`.
+            b.position(none_bb);
+            let nullfrag = b.strconst(&format!("{fname}: null\n"));
+            b.store(slot, nullfrag);
+            b.set_term(Term::Br(join_bb));
+            // `Some` → encode the payload exactly like a non-optional field of its
+            // type: a nested `@derive(Yaml)` struct as an indented block, any
+            // scalar / str inline.
+            b.position(some_bb);
+            let payload = gen_opt_payload(&mut b, &opt, fv);
+            let frag =
+                if let Some(DeriveFieldKind::Nested(fsid)) = derive_field_kind(opt.payload_ty) {
+                    let label = b.strconst(&format!("{fname}:\n"));
+                    let child_name = ctx.names[fsid as usize].clone();
+                    let child = b.new_value(Ty::Ptr);
+                    b.emit(Inst::Call {
+                        dest: Some(child),
+                        func: format!("{child_name}__to_yaml"),
+                        args: vec![payload],
+                    });
+                    let pad = b.strconst("  ");
+                    let indented = b.new_value(Ty::Ptr);
+                    b.emit(Inst::Call {
+                        dest: Some(indented),
+                        func: "zap_yaml_indent".to_string(),
+                        args: vec![child, pad],
+                    });
+                    gen_concat(&mut b, label, indented)
+                } else {
+                    let label = b.strconst(&format!("{fname}: "));
+                    let vstr = gen_yaml_encode_scalar(&mut b, payload, opt.payload_ty)?;
+                    let withval = gen_concat(&mut b, label, vstr);
+                    let nl = b.strconst("\n");
+                    gen_concat(&mut b, withval, nl)
+                };
+            b.store(slot, frag);
+            b.set_term(Term::Br(join_bb));
+            // Join: append the buffered fragment to the running accumulator.
+            b.position(join_bb);
+            let frag = b.load(slot, Ty::Ptr);
+            acc = gen_concat(&mut b, acc, frag);
+        } else if let Some(DeriveFieldKind::Nested(fsid)) = derive_field_kind(*fty) {
             // `fname:\n` then the child's YAML, indented two spaces.
             let label = b.strconst(&format!("{fname}:\n"));
             acc = gen_concat(&mut b, acc, label);
