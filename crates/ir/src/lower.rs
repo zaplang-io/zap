@@ -4656,24 +4656,27 @@ fn derive_field_kind(fty: Ty) -> Option<DeriveFieldKind> {
     }
 }
 
-/// The element read-back `Ty` for a `list[T]` codec field (#1530). An element is
-/// supported only when its `Elem` representation round-trips its real `Ty`
-/// through `Elem::ty()`: `int`/`float` scalars, `str`, `bytes`, and a nested
-/// `@derive(Json)` struct. A `bool`/`char`/`enum`/`complex`/function element
-/// collapses to a coarse word (`Elem::Bool`/`Char`/… all read back as `i64`),
-/// and a nested-collection element (`Elem::Nested`/`VarTuple`) needs the interner
-/// path — both are a clean "unsupported yet" error, deferred to #1533.
-fn list_elem_json_ty(elem: Elem) -> Result<Ty, LowerError> {
+/// The element read-back `Ty` for a `list[T]` codec field (#1530, nested
+/// collections #1533). `int`/`float`/`str`/`bytes`/nested-struct elements map
+/// from their `Elem` directly. A **nested-collection** element
+/// (`list[list[...]]`, `list[dict[...]]`) is `Elem::Nested(id)`: recover its full
+/// `Ty` from the interner (`ctx.nested`) and let the caller recurse — which
+/// validates the inner element in turn (so e.g. a nested `dict[int64, …]` or a
+/// `set`/tuple leaf is rejected by the recursion). A `bool`/`char`/`enum`/
+/// `complex`/function element collapses to a coarse `i64` word through
+/// `Elem::ty()` and remains unsupported, as does a bare var-tuple element.
+fn list_elem_json_ty(elem: Elem, ctx: &StructCtx) -> Result<Ty, LowerError> {
     match elem {
         Elem::I64 => Ok(Ty::I64),
         Elem::F64 => Ok(Ty::F64),
         Elem::Ptr => Ok(Ty::Ptr),
         Elem::Bytes => Ok(Ty::Bytes),
         Elem::Struct(s) => Ok(Ty::Struct(s)),
+        Elem::Nested(id) => Ok(ctx.nested.borrow().get(id)),
         _ => Err(err(
-            "@derive(Json) list element must be int / float / str / bytes or a \
-             nested @derive(Json) struct yet (bool/char/enum element and a \
-             nested-collection element are a follow-up, #1533)",
+            "@derive(Json) list element must be int / float / str / bytes, a \
+             nested @derive(Json) struct, or a nested list / dict \
+             (bool / char / enum and tuple elements are a follow-up)",
         )),
     }
 }
@@ -4681,15 +4684,16 @@ fn list_elem_json_ty(elem: Elem) -> Result<Ty, LowerError> {
 /// The value read-back `Ty` for a `dict[K, V]` codec field (#1531). A JSON
 /// object has string keys, so the key must be `str` (`Elem::Ptr`); a non-str key
 /// (`dict[int64, V]`, …) is a clean error. The value follows the same element
-/// allowlist as a list element (`list_elem_json_ty`).
-fn dict_value_json_ty(key: Elem, value: Elem) -> Result<Ty, LowerError> {
+/// allowlist as a list element (`list_elem_json_ty`), including a nested
+/// collection value (#1533).
+fn dict_value_json_ty(key: Elem, value: Elem, ctx: &StructCtx) -> Result<Ty, LowerError> {
     if key != Elem::Ptr {
         return Err(err(
             "@derive(Json) dict key must be `str` (a JSON object has string keys); \
              a non-str dict key is a follow-up",
         ));
     }
-    list_elem_json_ty(value)
+    list_elem_json_ty(value, ctx)
 }
 
 /// Guard a `@derive(Yaml)` `list` / `dict` collection field (#1532): its element
@@ -4701,14 +4705,22 @@ fn dict_value_json_ty(key: Elem, value: Elem) -> Result<Ty, LowerError> {
 /// bytes elements need no `to_json`. A nested-struct element in a yaml collection
 /// is a documented follow-up.
 fn yaml_collection_elem_ok(fty: Ty) -> Result<(), LowerError> {
-    let bad =
-        matches!(fty, Ty::List(Elem::Struct(_))) || matches!(fty, Ty::Dict(_, Elem::Struct(_)));
+    // Reject a nested-STRUCT element (needs `to_json`, which `@derive(Yaml)` does
+    // not emit) and a nested-COLLECTION element (`Elem::Nested`): the #1533 JSON
+    // nested-collection support can bottom out in a struct leaf, whose flow encode
+    // would again route through a missing `to_json`, so a yaml collection stays
+    // flat (scalar / str / bytes elements) for now.
+    let bad = matches!(fty, Ty::List(Elem::Struct(_)) | Ty::List(Elem::Nested(_)))
+        || matches!(
+            fty,
+            Ty::Dict(_, Elem::Struct(_)) | Ty::Dict(_, Elem::Nested(_))
+        );
     if bad {
         return Err(err(
-            "@derive(Yaml) does not support a nested-struct element in a list / \
-             dict field yet (the element would encode via its `to_json`, which a \
-             yaml-only struct does not have); a scalar / str / bytes element is \
-             supported — a nested-struct element is a follow-up",
+            "@derive(Yaml) does not support a nested-struct or nested-collection \
+             element in a list / dict field yet (the element would encode via a \
+             `to_json` that a yaml-only struct does not have); a scalar / str / \
+             bytes element is supported — the rest is a follow-up",
         ));
     }
     Ok(())
@@ -5078,7 +5090,7 @@ fn gen_json_encode_field(
         // bracket-wrap (the array analog of the object builder in
         // `gen_json_to_method`).
         Some(DeriveFieldKind::List(elem)) => {
-            let elem_ty = list_elem_json_ty(elem)?;
+            let elem_ty = list_elem_json_ty(elem, ctx)?;
             let parts = b.new_value(Ty::List(Elem::Ptr));
             b.emit(Inst::Call {
                 dest: Some(parts),
@@ -5154,7 +5166,7 @@ fn gen_json_encode_field(
         // by iterating the keys and recursing into the per-value encoder. Keys
         // are JSON-escaped strings; the object analog of the list arm above.
         Some(DeriveFieldKind::Dict(kelem, velem)) => {
-            let value_ty = dict_value_json_ty(kelem, velem)?;
+            let value_ty = dict_value_json_ty(kelem, velem, ctx)?;
             let keys = b.new_value(Ty::List(Elem::Ptr));
             b.emit(Inst::Call {
                 dest: Some(keys),
@@ -5759,7 +5771,7 @@ fn gen_json_decode_field(
         // yields a `list[JsonValue]`), then decode each element through the same
         // per-element decoder and push it into a typed result list.
         Some(DeriveFieldKind::List(elem)) => {
-            let elem_ty = list_elem_json_ty(elem)?;
+            let elem_ty = list_elem_json_ty(elem, ctx)?;
             let arr = call1(b, "__json_as_array", Ty::List(Elem::Ptr), jf);
             let out = b.new_value(Ty::List(elem));
             b.emit(Inst::Call {
@@ -5825,7 +5837,7 @@ fn gen_json_decode_field(
         // yields a `dict[str, JsonValue]`), then decode each value through the
         // same per-value decoder, keyed by the object's own string keys.
         Some(DeriveFieldKind::Dict(kelem, velem)) => {
-            let value_ty = dict_value_json_ty(kelem, velem)?;
+            let value_ty = dict_value_json_ty(kelem, velem, ctx)?;
             let obj = call1(b, "__json_as_object", Ty::Dict(Elem::Ptr, Elem::Ptr), jf);
             let keys = b.new_value(Ty::List(Elem::Ptr));
             b.emit(Inst::Call {

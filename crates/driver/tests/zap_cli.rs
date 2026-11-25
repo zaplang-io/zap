@@ -3227,14 +3227,14 @@ def main():
 
 #[test]
 fn derive_json_rejects_unsupported_list_elements_and_other_collections_cleanly() {
-    // #1530: list support is scoped to int/float/str/bytes/nested-struct elements
-    // and does NOT extend to a nested-collection element (`list[list[...]]`, the
-    // Elem::Nested interner path, #1533) or to a bool/char element (which collapse
-    // to a coarse i64 word). `dict`/`set` fields remain a follow-up. Each must be a
-    // clean compile error, not a miscompile.
+    // #1530: list support is scoped to int/float/str/bytes/nested-struct and (as
+    // of #1533) nested-collection elements. It does NOT extend to a bool/char
+    // element (which collapses to a coarse i64 word) or to a value-position
+    // `Optional` element (a separate follow-up); a `set` field also stays a
+    // follow-up. Each must be a clean compile error, not a miscompile.
     let cases = [
-        ("list[list[int64]] x", "nested-collection"),
         ("list[bool] x", "bool element"),
+        ("list[Optional[int64]] x", "optional element"),
         ("set[int64] x", "set field"),
     ];
     for (field, what) in cases {
@@ -3247,7 +3247,7 @@ fn derive_json_rejects_unsupported_list_elements_and_other_collections_cleanly()
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains("@derive(Json)") && stderr.contains("follow-up"),
+            stderr.contains("@derive(Json)"),
             "{what} errors cleanly via the derive codec: {stderr}"
         );
     }
@@ -3306,12 +3306,13 @@ def main():
 fn derive_json_rejects_non_str_dict_keys_and_unsupported_dict_values() {
     // #1531: a JSON object has string keys, so only `dict[str, V]` is supported —
     // a non-str key is a clean error. The value follows the same element allowlist
-    // as a list, so a bool value or a nested-collection value (`dict[str, list[...]]`)
-    // is also a clean error, not a miscompile.
+    // as a list, so a bool value or a value-position `Optional` is a clean error,
+    // not a miscompile. (A nested-collection value — `dict[str, list[...]]` — is
+    // supported as of #1533, so it is not a reject case.)
     let cases = [
         ("dict[int64, int64] m", "non-str key"),
         ("dict[str, bool] m", "bool value"),
-        ("dict[str, list[int64]] m", "nested-collection value"),
+        ("dict[str, Optional[int64]] m", "optional value"),
     ];
     for (field, what) in cases {
         let src = format!("@derive(Json)\nstruct S:\n    {field}\n\ndef main():\n    print(0)\n");
@@ -3394,7 +3395,79 @@ def main():
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("@derive(Yaml)") && stderr.contains("nested-struct element"),
+        stderr.contains("@derive(Yaml)") && stderr.contains("nested-struct"),
         "the nested-struct yaml element errors cleanly: {stderr}"
+    );
+}
+
+#[test]
+fn derive_json_supports_nested_collection_fields() {
+    // #1533 (epic #1529): a collection whose element/value is itself a collection
+    // — list[list[T]], dict[str, list[T]], list[dict[str, T]], and a struct leaf
+    // (list[list[Nested]]). The codec recovers the nested element's full Ty from
+    // the Elem::Nested interner (ctx.nested) and recurses through the same
+    // per-element codec. Round-trip output is pinned by the golden
+    // `derive_json_nested_collection_field` under the CI LLVM matrix.
+    let src = "\
+@derive(Json)
+struct Item:
+    int64 id
+
+@derive(Json)
+struct N:
+    list[list[int64]] grid
+    dict[str, list[int64]] groups
+    list[list[Item]] items2d
+
+def main():
+    auto n = N([[1, 2]], {\"a\": [3]}, [[Item(9)]])
+    auto d = N.from_json(n.to_json())
+    print(d.grid[0][1])
+    print(d.groups[\"a\"][0])
+    print(d.items2d[0][0].id)
+";
+    let f = write_zap("derive-json-nested-collection", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a @derive(Json) struct with nested-collection fields must lower; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("@N__to_json") && stdout.contains("@N__from_json_value"),
+        "the nested-collection codec methods are emitted: {stdout}"
+    );
+    // A struct leaf inside the nested collection recurses into its own codec.
+    assert!(
+        stdout.contains("@Item__to_json") && stdout.contains("@Item__from_json_value"),
+        "a struct leaf in a nested collection recurses into its own codec (#1533): {stdout}"
+    );
+}
+
+#[test]
+fn derive_yaml_still_rejects_nested_collection_elements() {
+    // #1533 lifts the nested-collection restriction for Json only. A yaml
+    // collection's element flow-encodes and can bottom out in a struct leaf whose
+    // `to_json` @derive(Yaml) does not emit, so a yaml nested-collection element
+    // stays a clean compile error (scalar/str/bytes yaml collections are fine).
+    let src = "\
+@derive(Yaml)
+struct W:
+    list[list[int64]] grid
+
+def main():
+    print(0)
+";
+    let f = write_zap("derive-yaml-nested-collection-reject", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "a yaml nested-collection element must be a clean error"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("@derive(Yaml)") && stderr.contains("nested-collection"),
+        "the yaml nested-collection element errors cleanly: {stderr}"
     );
 }
