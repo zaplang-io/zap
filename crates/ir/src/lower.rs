@@ -6874,6 +6874,30 @@ impl<'a> FnLower<'a> {
     /// location through the module's [`LocInfo`]. Callers apply this only to
     /// genuinely nullable reference values (not value structs, not `Optional[T]`,
     /// which keeps its own `None`/unwrap path).
+    /// The Zap source type name of a built-in **heap reference** whose value may
+    /// be null — so a deref of it (index base, for-iteration base, `len`) must be
+    /// null-guarded (#1489/#1493) — or `None` for a type that is never a null
+    /// reference here: scalars, `char`, enums, value structs / by-value tuples
+    /// (inline, not nullable), and user structs (`Ty::Struct`, whose
+    /// `__getitem__`/`__iter__` receiver guard is the method-receiver follow-up).
+    /// `Optional[T]` is lowered to its own niche/boxed form and never reaches a
+    /// bare deref here, so it is out of scope too.
+    fn builtin_ref_owner(ty: &Ty) -> Option<&'static str> {
+        match ty {
+            Ty::Ptr => Some("str"),
+            Ty::Bytes => Some("bytes"),
+            Ty::List(_) => Some("list"),
+            Ty::VarTuple(_) => Some("tuple"),
+            Ty::Dict(..) => Some("dict"),
+            Ty::Set(_) => Some("set"),
+            Ty::OSet(_) => Some("oset"),
+            Ty::Deque(_) => Some("deque"),
+            Ty::Heap(_) => Some("heap"),
+            Ty::Array(..) => Some("array"),
+            _ => None,
+        }
+    }
+
     fn null_deref_guard(
         &mut self,
         recv: Value,
@@ -7309,7 +7333,12 @@ impl<'a> FnLower<'a> {
             }
             return self.gen_entry_slot(name, ty);
         }
-        let slot = self.alloca(ty);
+        // A plain (non-generator) walrus slot is hoisted to the entry block so it
+        // dominates the enclosing construct's merge block in codegen's block
+        // order even when lowering the operand split the current block (#1493
+        // null-deref guard on a `len`/index/for inside the condition). See
+        // [`entry_alloca`].
+        let slot = self.entry_alloca(ty);
         self.declare(name, slot, ty);
         slot
     }
@@ -7391,6 +7420,29 @@ impl<'a> FnLower<'a> {
     fn alloca(&mut self, pointee: Ty) -> Value {
         let d = self.new_value(Ty::Ptr);
         self.emit(Inst::Alloca { dest: d, pointee });
+        d
+    }
+
+    /// Reserve a stack slot in the **entry block** (block 0) rather than the
+    /// current block. Codegen walks a function's blocks in their stored order and
+    /// requires every value's defining block to precede its uses in that order;
+    /// the entry block precedes (and dominates) all of them, so an entry slot is
+    /// always safe to load anywhere.
+    ///
+    /// A condition-position walrus (`(n := expr)` in an `if`/`while`) outlives the
+    /// construct and is read in the merge block the construct created *before*
+    /// lowering the condition. If lowering the condition splits the current block
+    /// — e.g. a `#1493` null-dereference guard on `len(xs)` / `xs[i]` branches to
+    /// a raising continuation — the binding would otherwise land in that late
+    /// continuation block, after the merge in block order, and codegen would see
+    /// the slot "used before definition". Hoisting the slot to the entry block
+    /// keeps it dominating and correctly ordered. (A terminator lives in a block's
+    /// separate `term` field, so appending to `insts` never lands after it.)
+    fn entry_alloca(&mut self, pointee: Ty) -> Value {
+        let d = self.new_value(Ty::Ptr);
+        self.func.blocks[0]
+            .insts
+            .push(Inst::Alloca { dest: d, pointee });
         d
     }
     fn store(&mut self, ptr: Value, val: Value) {
@@ -9377,6 +9429,21 @@ impl<'a> FnLower<'a> {
                     return Err(err("len() takes exactly one argument"));
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
+                // `len(n)` on a null built-in reference (a non-`Optional`
+                // `str`/`list`/`dict`/… field left unset) raises a located
+                // `NullReferenceError` instead of a SIGSEGV (#1489/#1493): `len`
+                // dereferences the object header to read its length. The strview
+                // / user-`__len__` (`Ty::Struct`) cases below are not built-in
+                // references, so `builtin_ref_owner` returns `None` for them.
+                if let Some(owner) = Self::builtin_ref_owner(&vt) {
+                    self.null_deref_guard(
+                        v,
+                        NullDerefSite::BuiltinLen,
+                        None,
+                        Some(owner),
+                        expr_span(&args[0].value),
+                    );
+                }
                 // `len(v)` on a borrowed `strview` (#1082): the codepoint count of
                 // the borrowed range, with no owned allocation. Intercepted before
                 // the struct `__len__` path (a strview has no user dunders).
@@ -16785,6 +16852,16 @@ impl<'a> FnLower<'a> {
                 return Ok((d, fty));
             }
         }
+        // Indexing a null built-in reference (a non-`Optional` `list`/`str`/
+        // `dict`/… field left unset, then subscripted) raises a located
+        // `NullReferenceError` instead of a SIGSEGV (#1489/#1493). The guard is
+        // on the base value, before the type-specific access. A user struct's
+        // `__getitem__` receiver is excluded here — that is the method-receiver
+        // follow-up — and inline/value bases (a by-value tuple handled above,
+        // scalars) are never null.
+        if let Some(owner) = Self::builtin_ref_owner(&bty) {
+            self.null_deref_guard(bv, NullDerefSite::IndexBase, None, Some(owner), span);
+        }
         match bty {
             // A variadic `tuple[T]` (#1461) reads back exactly like a list — its
             // buffer is a frozen `zap_list_*` object.
@@ -19869,6 +19946,48 @@ fn exception_type_id_name(name: &str) -> Option<i64> {
     })
 }
 
+/// The source span of an expression — the per-variant accessor `ast::Expr` lacks
+/// (only `Type` has a `span()` method). Used to anchor a located
+/// `NullReferenceError` at a deref site whose span is not already threaded as a
+/// separate argument (the `for`-iterable and `len` argument, #1493).
+fn expr_span(e: &Expr) -> Span {
+    match e {
+        Expr::Int(_, s)
+        | Expr::Float(_, s)
+        | Expr::Imaginary(_, s)
+        | Expr::Bool(_, s)
+        | Expr::None(s)
+        | Expr::Name(_, s)
+        | Expr::Tuple(_, s)
+        | Expr::List(_, s)
+        | Expr::Dict(_, s)
+        | Expr::Set(_, s) => *s,
+        Expr::Str { span, .. }
+        | Expr::Starred { span, .. }
+        | Expr::ListComp { span, .. }
+        | Expr::DictComp { span, .. }
+        | Expr::SetComp { span, .. }
+        | Expr::GenExp { span, .. }
+        | Expr::Unary { span, .. }
+        | Expr::Binary { span, .. }
+        | Expr::Compare { span, .. }
+        | Expr::Call { span, .. }
+        | Expr::Index { span, .. }
+        | Expr::Slice { span, .. }
+        | Expr::SliceSpec { span, .. }
+        | Expr::Attr { span, .. }
+        | Expr::Lambda { span, .. }
+        | Expr::RegexMatch { span, .. }
+        | Expr::RegexSubst { span, .. }
+        | Expr::ChanRecv { span, .. }
+        | Expr::Yield { span, .. }
+        | Expr::IfElse { span, .. }
+        | Expr::Named { span, .. }
+        | Expr::TypeArg { span, .. }
+        | Expr::Comptime { span, .. } => *span,
+    }
+}
+
 /// The in-scope null-dereference sites (#1489 ADR scope table,
 /// decisions/lang/1489-null-reference-error.md). A plain (non-`Optional`)
 /// reference used in one of these positions while null raises a
@@ -19892,6 +20011,9 @@ pub enum NullDerefSite {
     IndexBase,
     /// `for x in n:` — the base of a for-iteration.
     IterBase,
+    /// `len(n)` — a built-in that dereferences its reference argument (reads the
+    /// object header's length). `n` is the null reference, not a field.
+    BuiltinLen,
 }
 
 /// Build the located message string for a [`NullReferenceError`] raised at a
@@ -19936,6 +20058,7 @@ pub fn null_reference_error_message(
         },
         NullDerefSite::IndexBase => format!(" indexing{}", owner_of("into")),
         NullDerefSite::IterBase => format!(" iterating{}", owner_of("over")),
+        NullDerefSite::BuiltinLen => format!(" taking the length{}", owner_of("of")),
     };
     format!("null dereference{detail} at {file}:{line}")
 }

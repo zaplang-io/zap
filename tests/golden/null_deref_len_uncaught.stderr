@@ -1,0 +1,1 @@
+null dereference taking the length of 'str' at null_deref_len_uncaught.zap:12

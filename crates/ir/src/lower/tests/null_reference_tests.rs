@@ -65,6 +65,7 @@ fn message_always_carries_the_required_location() {
         NullDerefSite::MethodReceiver,
         NullDerefSite::IndexBase,
         NullDerefSite::IterBase,
+        NullDerefSite::BuiltinLen,
     ] {
         let msg = null_reference_error_message(site, None, None, "a/b/c.zap", 123);
         assert!(
@@ -158,5 +159,17 @@ fn index_and_iter_sites_use_their_own_verbs() {
     assert_eq!(
         null_reference_error_message(NullDerefSite::IterBase, None, None, "f.zap", 5),
         "null dereference iterating at f.zap:5"
+    );
+}
+
+#[test]
+fn builtin_len_site_reads_naturally() {
+    assert_eq!(
+        null_reference_error_message(NullDerefSite::BuiltinLen, None, Some("str"), "f.zap", 6),
+        "null dereference taking the length of 'str' at f.zap:6"
+    );
+    assert_eq!(
+        null_reference_error_message(NullDerefSite::BuiltinLen, None, None, "f.zap", 6),
+        "null dereference taking the length at f.zap:6"
     );
 }
