@@ -2314,6 +2314,13 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             self.declare_rt("zap_chr", &[i.into()], Some(c.into()));
             self.declare_rt("zap_char_to_str", &[c.into()], Some(p.into()));
             self.declare_rt("zap_str_parse_int", &[p.into()], Some(i.into()));
+            // int(s, base) base parse and bytes(n) zero-fill (#1386).
+            self.declare_rt(
+                "zap_str_parse_int_base",
+                &[p.into(), i.into()],
+                Some(i.into()),
+            );
+            self.declare_rt("zap_bytes_zeros", &[i.into()], Some(p.into()));
             self.declare_rt("zap_str_upper", &[p.into()], Some(p.into()));
             self.declare_rt("zap_str_lower", &[p.into()], Some(p.into()));
             self.declare_rt("zap_str_strip", &[p.into(), i.into()], Some(p.into()));

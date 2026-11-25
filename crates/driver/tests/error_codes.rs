@@ -602,3 +602,35 @@ fn open_builtin_codes() {
     );
     assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
 }
+
+#[test]
+fn overload_parity_a_codes() {
+    // int(value[, base]) (#1458): one or two positional args. Wrong arity or a
+    // keyword argument -> ZAP4025; a non-str value or non-int base in the 2-arg
+    // form -> ZAP4024.
+    assert_code("def main():\n    auto n = int()\n", "ZAP4025");
+    assert_code("def main():\n    auto n = int(\"a\", 2, 3)\n", "ZAP4025");
+    assert_code("def main():\n    auto n = int(\"a\", base=16)\n", "ZAP4025");
+    assert_code("def main():\n    auto n = int(10, 2)\n", "ZAP4024");
+    assert_code("def main():\n    auto n = int(\"10\", \"x\")\n", "ZAP4024");
+
+    // bytes(int) accepts an integer count; a float is still the arg-type error.
+    assert_code("def main():\n    auto b = bytes(1.5)\n", "ZAP4024");
+
+    // print() formatting kwargs: an unknown keyword -> ZAP4023; a wrong-typed
+    // sep=/file= -> ZAP4024.
+    assert_code("def main():\n    print(\"x\", color=\"r\")\n", "ZAP4023");
+    assert_code("def main():\n    print(\"x\", sep=5)\n", "ZAP4024");
+    assert_code("def main():\n    print(\"x\", file=\"out\")\n", "ZAP4024");
+
+    // The well-typed forms are clean.
+    let ok = check_source(
+        "def main():\n\
+         \x20   int64 a = int(\"ff\", 16)\n\
+         \x20   int64 b = int(\"42\")\n\
+         \x20   bytes z = bytes(4)\n\
+         \x20   bytes y = bytes(\"hi\")\n\
+         \x20   print(\"a\", \"b\", sep=\", \", end=\"\", flush=True)\n",
+    );
+    assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
+}

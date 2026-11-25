@@ -8715,6 +8715,99 @@ impl<'a> FnLower<'a> {
                 return Ok((copy, Ty::List(elem)));
             }
             if fname == "print" {
+                // print(..., sep=, end=, file=, flush=) (#1386). With no keyword
+                // options this stays on the fast `Inst::Print` path (space-joined,
+                // newline-terminated, buffered stdout). Any keyword option switches
+                // to a manual build: render each positional to a `str`, join with
+                // `sep` (default " "), append `end` (default "\n"), then write to
+                // the `file=` fd via `zap_io_write` (raw) or to stdout via
+                // `zap_print_str` (the same buffered FILE* `Inst::Print` uses).
+                // `flush=` is evaluated for its side effects but is a no-op on the
+                // unbuffered raw-fd path.
+                let has_kwargs = args.iter().any(|a| a.name.is_some());
+                if has_kwargs {
+                    let mut rendered: Vec<Value> = Vec::new();
+                    let mut sep_v: Option<Value> = None;
+                    let mut end_v: Option<Value> = None;
+                    let mut file_v: Option<Value> = None;
+                    for a in args {
+                        if let Some(name) = &a.name {
+                            let (v, vt) = self.expr(&a.value)?;
+                            match name.as_str() {
+                                "sep" => sep_v = Some(v),
+                                "end" => end_v = Some(v),
+                                "file" => file_v = Some(self.coerce(v, vt, Ty::I64)),
+                                "flush" => {} // evaluated above; no-op on the raw path
+                                _ => return Err(err("print() got an unexpected keyword argument")),
+                            }
+                            continue;
+                        }
+                        let (v, vt) = self.expr(&a.value)?;
+                        let s = if vt == Ty::Py {
+                            let s = self.new_value(Ty::Ptr);
+                            self.emit(Inst::Call {
+                                dest: Some(s),
+                                func: "zap_py_str".to_string(),
+                                args: vec![v],
+                            });
+                            s
+                        } else if matches!(vt, Ty::Struct(sid) if self.is_any_view_sid(sid)) {
+                            let Ty::Struct(sid) = vt else { unreachable!() };
+                            let out_ty = if self.is_bytesview_sid(sid) {
+                                Ty::Bytes
+                            } else {
+                                Ty::Ptr
+                            };
+                            let (base, off, len) = self.view_fields(v, sid);
+                            let m = self.new_value(out_ty);
+                            self.emit(Inst::Call {
+                                dest: Some(m),
+                                func: "zap_strview_to_str".to_string(),
+                                args: vec![base, off, len],
+                            });
+                            self.render_str(m, out_ty)?
+                        } else {
+                            self.render_str(v, vt)?
+                        };
+                        rendered.push(s);
+                    }
+                    let strc = |s: &mut Self, bytes: &[u8]| -> Value {
+                        let d = s.new_value(Ty::Ptr);
+                        s.emit(Inst::StrConst {
+                            dest: d,
+                            bytes: bytes.to_vec(),
+                        });
+                        d
+                    };
+                    let sep = sep_v.unwrap_or_else(|| strc(self, b" "));
+                    let end = end_v.unwrap_or_else(|| strc(self, b"\n"));
+                    let concat = |s: &mut Self, a: Value, b: Value| -> Value {
+                        let d = s.new_value(Ty::Ptr);
+                        s.emit(Inst::Call {
+                            dest: Some(d),
+                            func: "zap_str_concat".to_string(),
+                            args: vec![a, b],
+                        });
+                        d
+                    };
+                    let mut acc = rendered.first().copied().unwrap_or_else(|| strc(self, b""));
+                    for i in 1..rendered.len() {
+                        acc = concat(self, acc, sep);
+                        acc = concat(self, acc, rendered[i]);
+                    }
+                    acc = concat(self, acc, end);
+                    if let Some(fd) = file_v {
+                        let d = self.new_value(Ty::I64);
+                        self.throwing_call(Some(d), "zap_io_write", vec![fd, acc]);
+                    } else {
+                        self.emit(Inst::Call {
+                            dest: None,
+                            func: "zap_print_str".to_string(),
+                            args: vec![acc],
+                        });
+                    }
+                    return Ok((self.iconst(Ty::I32, 0), Ty::I32));
+                }
                 let mut vals = Vec::new();
                 for a in args {
                     let (v, vt) = self.expr(&a.value)?;
@@ -9622,7 +9715,17 @@ impl<'a> FnLower<'a> {
                         self.throwing_call(Some(d), "zap_bytes_from_list", vec![v]);
                         Ok((d, Ty::Bytes))
                     }
-                    _ => Err(err("bytes() expects a str or list[int64] argument")),
+                    // bytes(int n) -> n zero bytes (#1386). The count coerces to
+                    // i64; a negative count raises a catchable ValueError.
+                    Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 => {
+                        let n = self.coerce(v, vt, Ty::I64);
+                        let d = self.new_value(Ty::Bytes);
+                        self.throwing_call(Some(d), "zap_bytes_zeros", vec![n]);
+                        Ok((d, Ty::Bytes))
+                    }
+                    _ => Err(err(
+                        "bytes() expects an int, a str, or a list[int64] argument",
+                    )),
                 };
             }
             if fname == "set" {
@@ -9639,8 +9742,21 @@ impl<'a> FnLower<'a> {
             }
             if fname == "int" {
                 // int(x): parse a `str` to an `int`, or convert a number to int.
-                if args.len() != 1 {
-                    return Err(err("int() takes exactly one argument"));
+                // int(s, base): parse a `str` in `base` 2..=36, or base 0 to
+                // auto-detect a `0x`/`0o`/`0b` prefix (#1386).
+                if args.is_empty() || args.len() > 2 {
+                    return Err(err("int() takes one or two arguments (value[, base])"));
+                }
+                if args.len() == 2 {
+                    // Base-parse form: both the invalid-digit/overflow case and a
+                    // bad base raise a catchable `ValueError`, so it is a throwing
+                    // call inside any active `try`.
+                    let (s, _) = self.expr(&args[0].value)?;
+                    let (b, bt) = self.expr(&args[1].value)?;
+                    let b = self.coerce(b, bt, Ty::I64);
+                    let d = self.new_value(Ty::I64);
+                    self.throwing_call(Some(d), "zap_str_parse_int_base", vec![s, b]);
+                    return Ok((d, Ty::I64));
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
                 if vt == Ty::Ptr {
