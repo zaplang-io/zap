@@ -2080,12 +2080,13 @@ struct HttpClient:
     int64 _max_redirects
     bool _follow
     int64 _timeout
+    int64 _max_response_bytes
 
     def _do(self, str method, str url, str body, dict[str, str] headers) -> bytes:
         auto f = 0
         if self._follow:
             f = 1
-        return http._pool_do(self._pool, method, url, body, headers, self._timeout, f, self._max_redirects)
+        return http._pool_do(self._pool, method, url, body, headers, self._timeout, f, self._max_redirects, self._max_response_bytes)
 
     def get(self, str url, dict[str, str] headers = {}) -> bytes:
         return self._do(\"GET\", url, \"\", headers)
@@ -2102,8 +2103,8 @@ struct HttpClient:
         http._pool_close(self._pool)
 
 
-def __http_client(int64 max_redirects=10, bool follow=True, int64 timeout=0) -> HttpClient:
-    return HttpClient(_pool=http._pool_new(8), _max_redirects=max_redirects, _follow=follow, _timeout=timeout)
+def __http_client(int64 max_redirects=10, bool follow=True, int64 timeout=0, int64 max_response_bytes=0) -> HttpClient:
+    return HttpClient(_pool=http._pool_new(8), _max_redirects=max_redirects, _follow=follow, _timeout=timeout, _max_response_bytes=max_response_bytes)
 
 
 # The streaming subprocess handle (#976, D-0237). `process.Popen(...)` desugars

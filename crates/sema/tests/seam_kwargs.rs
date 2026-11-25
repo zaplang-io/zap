@@ -287,6 +287,50 @@ fn http_redirect_accessor_unknown_keyword_rejected() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// http.Client factory keywords (#990 + #1448). `http.Client(...)` is D-0202
+// constructor sugar onto the prelude `def __http_client(max_redirects, follow,
+// timeout, max_response_bytes)`, so its keywords bind through the ordinary
+// user-function binder — the same path these seam tests pin. #1448 adds the
+// `max_response_bytes` cap keyword alongside `follow` / `timeout` /
+// `max_redirects`; before it, the repro `http.Client(max_response_bytes=…)`
+// failed with ZAP4023 ("'__http_client' has no parameter named …").
+// ---------------------------------------------------------------------------
+
+#[test]
+fn http_client_max_response_bytes_keyword() {
+    assert_ok(&prog(
+        "    auto client = http.Client(max_response_bytes=65536)\n    client.shutdown()\n",
+    ));
+}
+
+#[test]
+fn http_client_all_keywords_reordered() {
+    // All four client controls, supplied out of declared order — each must land
+    // in its own slot (max_response_bytes is #1448's addition).
+    assert_ok(&prog(
+        "    auto client = http.Client(max_response_bytes=4096, follow=False, timeout=5000, max_redirects=3)\n    client.shutdown()\n",
+    ));
+}
+
+#[test]
+fn http_client_default_unchanged() {
+    // Omitting every keyword (max_response_bytes defaults to 0 = unlimited).
+    assert_ok(&prog(
+        "    auto client = http.Client()\n    client.shutdown()\n",
+    ));
+}
+
+#[test]
+fn http_client_max_response_bytes_unknown_keyword_rejected() {
+    // A misspelled cap keyword is the ZAP4023 the issue repro reported for the
+    // (then-absent) correct spelling; now it is only the typo that is rejected.
+    assert_code(
+        &prog("    auto client = http.Client(max_responce_bytes=5)\n"),
+        "ZAP4023",
+    );
+}
+
 // Client response header enumeration + Set-Cookie parsing (#989).
 #[test]
 fn http_headers_and_parse_set_cookie_keywords() {

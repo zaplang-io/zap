@@ -817,6 +817,17 @@ enum {
      * file (e.g. a missing `resolv.conf`) without racing a prior existence
      * check or parsing a localized `strerror` string. */
     ZAP_EXC_FILE_NOT_FOUND_ERROR = 20,
+    /* Raised by `http.Client` when a response body would exceed the client's
+     * `max_response_bytes` cap (#1448,
+     * decisions/stdlib/1448-http-response-body-limit.md). A subtype of `OSError`
+     * (`ResponseTooLargeError` ⊂ `OSError` ⊂ `Exception`), so `except
+     * ResponseTooLargeError` selects just the over-limit case while `except
+     * OSError` and `except Exception` still catch it. An over-size response is an
+     * I/O-layer condition, so it shares the `OSError` base rather than inventing
+     * a parallel error path. Enforced during the receive across all three framing
+     * modes; a body of exactly the limit succeeds and the first byte over it
+     * raises this. */
+    ZAP_EXC_RESPONSE_TOO_LARGE_ERROR = 21,
 };
 
 void *zap_exception_new(int64_t type_id, void *message) {
@@ -931,7 +942,8 @@ static int64_t zap_exception_parent(int64_t type_id) {
     case ZAP_EXC_MEMORY_ERROR: case ZAP_EXC_OS_ERROR:
         return ZAP_EXC_EXCEPTION;
     case ZAP_EXC_INDEX_ERROR: case ZAP_EXC_KEY_ERROR: return ZAP_EXC_LOOKUP_ERROR;
-    case ZAP_EXC_FILE_NOT_FOUND_ERROR: return ZAP_EXC_OS_ERROR;
+    case ZAP_EXC_FILE_NOT_FOUND_ERROR: case ZAP_EXC_RESPONSE_TOO_LARGE_ERROR:
+        return ZAP_EXC_OS_ERROR;
     case ZAP_EXC_ZERO_DIVISION_ERROR: return ZAP_EXC_ARITHMETIC_ERROR;
     case ZAP_EXC_CANCELLED: return ZAP_EXC_BASE;
     default:

@@ -19155,6 +19155,7 @@ fn exception_type_id_name(name: &str) -> Option<i64> {
         "MemoryError" => 18,
         "OSError" => 19,
         "FileNotFoundError" => 20,
+        "ResponseTooLargeError" => 21,
         _ => return None,
     })
 }

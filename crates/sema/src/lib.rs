@@ -773,6 +773,7 @@ const BUILTINS: &[&str] = &[
     "MemoryError",
     "OSError",
     "FileNotFoundError",
+    "ResponseTooLargeError",
     // REPL session-binding slot intrinsics (I#159): synthesized by the `zap repl`
     // driver to persist `let` values across entries, never written by users.
     "__repl_load_i64",
@@ -829,6 +830,7 @@ fn is_exception_type(name: &str) -> bool {
             | "MemoryError"
             | "OSError"
             | "FileNotFoundError"
+            | "ResponseTooLargeError"
     )
 }
 

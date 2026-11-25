@@ -94,3 +94,21 @@ fn all_buckets_raiseable_and_catchable_as_exception() {
         ));
     }
 }
+
+#[test]
+fn response_too_large_error_is_oserror_subtype() {
+    // #1448: `ResponseTooLargeError` is a first-class built-in exception,
+    // raiseable and catchable at its own level, as its `OSError` parent, and as
+    // `Exception`. The runtime raise + hierarchy walk is pinned by the
+    // `http_client_response_limit_*` goldens; this pins the compile-time half —
+    // that the three handler spellings a caller writes around it type-check.
+    for catch in ["ResponseTooLargeError", "OSError", "Exception"] {
+        assert_ok(&format!(
+            "def f():\n    \
+             try:\n        \
+             raise ResponseTooLargeError(\"too big\")\n    \
+             except {catch} as e:\n        \
+             print(e)\n"
+        ));
+    }
+}
