@@ -1,0 +1,1 @@
+null dereference calling method 'poke' on 'Thing' at null_deref_user_method_uncaught.zap:14
