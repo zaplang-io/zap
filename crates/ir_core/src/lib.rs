@@ -490,6 +490,14 @@ pub enum Ty {
     /// given element representation (hashed like a `set`, so [`Elem::key_suffix`]).
     /// Maps to `ptr` in codegen.
     OSet(Elem),
+    /// A pointer to a runtime immutable variadic `tuple[T]` (#1461): physically a
+    /// frozen `ZapList`-shaped object with the given element representation, so it
+    /// reuses the `zap_list_*` storage/read/iterate entry points and GC tracing,
+    /// and maps to `ptr` in codegen exactly like [`Ty::List`]. Distinct from
+    /// `List` only so the value layer renders it Python-tuple style `(…)` and the
+    /// type stays immutable/hashable. The fixed heterogeneous tuple is a
+    /// [`Ty::Struct`] layout, unrelated to this.
+    VarTuple(Elem),
     /// A pointer to a numeric `array` object with the given element dtype and
     /// **static rank** (`ndim`, ticket #24 / #500, D-0164). The rank is part of
     /// the type so indexing can be typed statically: a full index (one per axis)
@@ -1462,6 +1470,7 @@ impl fmt::Display for Ty {
             Ty::Heap(e) => return write!(f, "heap[{}]", e.val_suffix()),
             Ty::Deque(e) => return write!(f, "deque[{}]", e.val_suffix()),
             Ty::OSet(e) => return write!(f, "oset[{}]", e.key_suffix()),
+            Ty::VarTuple(e) => return write!(f, "tuple[{}]", e.val_suffix()),
             Ty::Array(d, n) => {
                 return if *n <= 1 {
                     write!(f, "array[{}]", d.suffix())

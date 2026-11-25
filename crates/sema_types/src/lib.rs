@@ -114,6 +114,13 @@ pub enum Ty {
     /// A fixed-arity, heterogeneous, immutable tuple (D-0019/D-0049) carrying its
     /// element types in positional order. The empty tuple `()` is the unit value.
     Tuple(Vec<Ty>),
+    /// A variadic `tuple[T]` (#1461, RFC #1472): a dynamic-length, immutable,
+    /// homogeneous, hashable sequence — Python's `tuple(iterable)` result. The
+    /// one-type-argument sibling of the fixed heterogeneous [`Ty::Tuple`]:
+    /// `(A, B)` stays fixed, `tuple[T]` / `tuple(iterable)` is this variadic form.
+    /// Like `list`/`set` it is a GC-managed reference type, but immutable and
+    /// hashable-iff-`T`-is (so usable as a `dict`/`set` key).
+    VarTuple(Box<Ty>),
     /// A typed channel `channel[T]` (ticket #25, D-0031): a first-class reference
     /// value over which `T` values are sent (`ch <- v`) and received (`<-ch`).
     Chan(Box<Ty>),
@@ -248,6 +255,7 @@ impl Ty {
             Ty::Deque(t) => format!("deque[{}]", t.display()),
             Ty::OSet(t) => format!("oset[{}]", t.display()),
             Ty::Optional(t) => format!("Optional[{}]", t.display()),
+            Ty::VarTuple(t) => format!("tuple[{}]", t.display()),
             Ty::Tuple(ts) => {
                 let inner = ts
                     .iter()
@@ -324,6 +332,7 @@ impl Ty {
             // mangles to `Optional$T`, identical to the pre-#1452 `Named("Optional")`
             // + type-argument form, so monomorph names are byte-for-byte unchanged.
             Ty::Optional(e) => named("Optional", vec![e.to_ast_type()?]),
+            Ty::VarTuple(e) => named("tuple", vec![e.to_ast_type()?]),
             Ty::Chan(e) => named("channel", vec![e.to_ast_type()?]),
             Ty::AtomicArray(e) => named("AtomicArray", vec![e.to_ast_type()?]),
             Ty::ContextVar(e) => named("ContextVar", vec![e.to_ast_type()?]),
@@ -457,6 +466,7 @@ pub fn assignable(from: &Ty, to: &Ty) -> bool {
         (Ty::Heap(a), Ty::Heap(b)) => assignable(a, b),
         (Ty::Deque(a), Ty::Deque(b)) => assignable(a, b),
         (Ty::OSet(a), Ty::OSet(b)) => assignable(a, b),
+        (Ty::VarTuple(a), Ty::VarTuple(b)) => assignable(a, b),
         (Ty::AtomicArray(a), Ty::AtomicArray(b)) => assignable(a, b),
         // `Optional[U]` is assignable to `Optional[T]` iff the payloads are
         // identical — a reject-on-mismatch rule, NOT a widening (#1452; locked by
@@ -643,6 +653,7 @@ pub fn default_type(t: Ty) -> Ty {
         // of `Optional.Some(5)` concretizes to `int64` (never a lingering untyped
         // literal), which is what the payload-aware assignability compares (#1452).
         Ty::Optional(t) => Ty::Optional(Box::new(default_type(*t))),
+        Ty::VarTuple(e) => Ty::VarTuple(Box::new(default_type(*e))),
         other => other,
     }
 }

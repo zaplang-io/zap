@@ -691,3 +691,29 @@ fn list_dict_ctor_codes() {
     );
     assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
 }
+
+#[test]
+fn vartuple_codes() {
+    // tuple(iterable) (#1473): exactly one positional arg (ZAP4025 otherwise); a
+    // non-iterable operand is ZAP4070.
+    assert_code("def main():\n    auto t = tuple()\n", "ZAP4025");
+    assert_code("def main():\n    auto t = tuple([1], [2])\n", "ZAP4025");
+    assert_code("def main():\n    auto t = tuple(5)\n", "ZAP4070");
+
+    // The well-typed forms are clean: tuple(iterable), the typed/empty
+    // tuple[T]() / tuple[T](iterable), a tuple[T] annotation, indexing, and len.
+    let ok = check_source(
+        "def main():\n\
+         \x20   auto a = tuple([1, 2, 3])\n\
+         \x20   auto b = tuple(\"ab\")\n\
+         \x20   auto c = tuple(range(2))\n\
+         \x20   tuple[int64] d = tuple[int64]()\n\
+         \x20   tuple[int64] e = tuple[int64]([1, 2])\n\
+         \x20   tuple[int64] f = tuple([5, 6])\n\
+         \x20   int64 g = f[0]\n\
+         \x20   int64 n = len(a)\n\
+         \x20   for x in a:\n\
+         \x20       print(x)\n",
+    );
+    assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
+}
