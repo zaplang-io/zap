@@ -661,3 +661,33 @@ fn str_decode_codes() {
     );
     assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
 }
+
+#[test]
+fn list_dict_ctor_codes() {
+    // list(iterable) (#1460): exactly one positional arg (ZAP4025 otherwise); a
+    // non-iterable operand is ZAP4070.
+    assert_code("def main():\n    auto l = list()\n", "ZAP4025");
+    assert_code("def main():\n    auto l = list([1], [2])\n", "ZAP4025");
+    assert_code("def main():\n    auto l = list(5)\n", "ZAP4070");
+
+    // dict(...) (#1460): empty / >1 positional / mixing positional + keyword ->
+    // ZAP4025; a positional iterable whose element is not a 2-tuple -> ZAP4024.
+    assert_code("def main():\n    auto d = dict()\n", "ZAP4025");
+    assert_code(
+        "def main():\n    auto d = dict([(1, 2)], [(3, 4)])\n",
+        "ZAP4025",
+    );
+    assert_code("def main():\n    auto d = dict([1, 2, 3])\n", "ZAP4024");
+
+    // The well-typed forms are clean.
+    let ok = check_source(
+        "def main():\n\
+         \x20   list[int64] a = list([1, 2, 3])\n\
+         \x20   list[char] b = list(\"ab\")\n\
+         \x20   list[int64] r = list(range(2))\n\
+         \x20   dict[int64, str] p = dict([(1, \"a\"), (2, \"b\")])\n\
+         \x20   dict[str, int64] k = dict(x=1, y=2)\n\
+         \x20   dict[str, int64] c = dict(k)\n",
+    );
+    assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
+}
