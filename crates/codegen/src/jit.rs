@@ -153,6 +153,9 @@ impl ReplJit {
             true,
             false,
             zapc_ir::FpPolicy::default(),
+            // REPL/JIT: no entry source file threaded; a null-deref message
+            // degrades to `<unknown>:0` (#1493).
+            None,
         )?;
         self.engine
             .add_module(&module)

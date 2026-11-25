@@ -526,6 +526,11 @@ struct StructCtx {
     /// this lowering. When `false` (the default) lowering emits ZERO race hooks,
     /// so the output is byte-identical to a non-`--race` build (golden-safe).
     race: bool,
+    /// Entry-source location context for located runtime diagnostics (#1489/
+    /// #1493): resolves a deref site's span to `<file>:<line>` for the
+    /// `NullReferenceError` message. `None` on the host-lowering / REPL paths
+    /// (location degrades to `<unknown>:0`); `Some` on the real compile path.
+    loc: Option<LocInfo>,
     /// Mangled names (`Type__func`) of user-defined **associated functions**
     /// (receiverless `def`s on a struct/enum, #1260). A call `Type.func(args)`
     /// lowers like a namespaced free function with no receiver, so the call site
@@ -1023,6 +1028,52 @@ fn reflected_op_dunder(op: AstBin) -> Option<&'static str> {
     })
 }
 
+/// Borrowed source handle for the located runtime diagnostics the lowerer bakes
+/// into exception messages (#1489/#1493): the entry file's display name and its
+/// source text. Spans are byte offsets into this source (the same entry-source
+/// convention sema diagnostics use, #571), so a `NullReferenceError` raised at a
+/// null-dereference site can carry `... at <file>:<line>`.
+///
+/// Threaded only on the real compile path (driver → `build_executable` → the
+/// codegen backend → [`lower_module_opts_with_types`]). Host-lowering tests and
+/// the REPL pass `None`, where the location degrades to `<unknown>:0` — real
+/// programs always carry a source.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceLoc<'a> {
+    pub file: &'a str,
+    pub src: &'a str,
+}
+
+/// Owned per-module location context stored in [`StructCtx`]: the entry file
+/// name plus a line index over its source, so a span's 1-based line is an
+/// `O(log lines)` lookup rather than a rescan at every deref site.
+struct LocInfo {
+    file: String,
+    src: String,
+    index: zapc_diag::render::LineIndex,
+}
+
+impl LocInfo {
+    /// The located `(file, line)` of a span's start offset, for the message
+    /// builder. The file is the **basename** (e.g. `foo.zap`), matching the
+    /// locked ADR example `... at foo.zap:7`: a runtime message wants the short,
+    /// stable name, not a machine-specific absolute path (which would also make
+    /// goldens non-deterministic). Absent location degrades to `("<unknown>", 0)`.
+    fn file_line(loc: &Option<LocInfo>, span: Span) -> (String, u32) {
+        match loc {
+            Some(l) => {
+                let (line, _col) = l.index.line_col(&l.src, span.start);
+                let base = std::path::Path::new(&l.file)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&l.file);
+                (base.to_string(), line)
+            }
+            None => ("<unknown>".to_string(), 0),
+        }
+    }
+}
+
 pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     // The default path lowers WITHOUT race instrumentation, so existing callers
     // and goldens are byte-for-byte unchanged (#677, epic #665): `--race` opts in
@@ -1051,6 +1102,22 @@ pub fn lower_module_opts_with_types(
     module: &ast::Module,
     race: bool,
     types: &crate::mono::TypeMap,
+) -> (Module, Vec<LowerError>) {
+    // No source location: located runtime diagnostics (#1493) degrade to
+    // `<unknown>:0`. The real compile path uses the `_located` variant below.
+    lower_module_opts_with_types_located(module, race, types, None)
+}
+
+/// Like [`lower_module_opts_with_types`], but with the entry [`SourceLoc`] so a
+/// null-dereference site's `NullReferenceError` carries `... at <file>:<line>`
+/// (#1489/#1493). Threaded on the real compile path (driver →
+/// `zapc_codegen::build_executable` → the backend → here); every other caller
+/// routes through [`lower_module_opts_with_types`] with no location.
+pub fn lower_module_opts_with_types_located(
+    module: &ast::Module,
+    race: bool,
+    types: &crate::mono::TypeMap,
+    loc: Option<SourceLoc>,
 ) -> (Module, Vec<LowerError>) {
     // Prepend the built-in prelude (`Signal` enum, `MemStats` struct) so the
     // signals surface lowers through the ordinary enum/struct paths. Must match
@@ -1669,6 +1736,11 @@ pub fn lower_module_opts_with_types(
         global_racy: RefCell::new(Vec::new()),
         shareable_types,
         race,
+        loc: loc.map(|l| LocInfo {
+            file: l.file.to_string(),
+            src: l.src.to_string(),
+            index: zapc_diag::render::LineIndex::new(l.src),
+        }),
         associated_fns: HashSet::new(),
     };
 
@@ -6706,13 +6778,36 @@ impl<'a> FnLower<'a> {
         }
     }
 
-    /// Guard a member access against a `None` receiver (EXC-4, D-0007/D-0014):
-    /// if `recv` (a reference value) is the null pointer, raise a catchable
-    /// exception through `zap_panic` — an `invoke` inside a `try`, so `except`
-    /// catches it, exactly like the index/divide faults (#383/EXC-3). On the
-    /// non-null path execution falls through to the access. Callers apply this
-    /// only to genuinely nullable reference receivers (not value structs).
-    fn null_guard(&mut self, recv: Value, msg: &str) {
+    /// Guard a plain (non-`Optional`) reference dereference against a null
+    /// receiver/base (#1489 Epic, #1493; supersedes the EXC-4 D-0007/D-0014
+    /// member-access guard): if `recv` is the null pointer, raise a catchable,
+    /// **located** `NullReferenceError` (`ZAP_EXC_NULL_REFERENCE_ERROR = 22`,
+    /// from #1492) through a `throwing_call` — an `invoke` inside a `try`, so
+    /// `except NullReferenceError` / `except Exception` catches it, exactly like
+    /// the index/divide faults (#383/EXC-3). On the non-null path execution falls
+    /// through to the access.
+    ///
+    /// The explicit check IS the shipping mechanism on every target (the locked
+    /// ADR's explicit-check-primary decision); the hardware trap (#1494) is a
+    /// later x86-64 optimization. Because the check is a real `IsNull` + branch
+    /// to a raising `invoke`, LLVM cannot treat the subsequent load as
+    /// unconditionally dereferenceable and delete/hoist it — the deref stays
+    /// trappable without any `nonnull`/`dereferenceable` attribute (codegen emits
+    /// none on these loads).
+    ///
+    /// `site`/`field`/`owner` shape the message via
+    /// [`null_reference_error_message`]; `span` resolves to the required source
+    /// location through the module's [`LocInfo`]. Callers apply this only to
+    /// genuinely nullable reference values (not value structs, not `Optional[T]`,
+    /// which keeps its own `None`/unwrap path).
+    fn null_deref_guard(
+        &mut self,
+        recv: Value,
+        site: NullDerefSite,
+        field: Option<&str>,
+        owner: Option<&str>,
+        span: Span,
+    ) {
         let is_none = self.new_value(Ty::I1);
         self.emit(Inst::IsNull {
             dest: is_none,
@@ -6726,13 +6821,15 @@ impl<'a> FnLower<'a> {
             else_bb: cont_bb,
         });
         self.position(throw_bb);
+        let (file, line) = LocInfo::file_line(&self.ctx.loc, span);
+        let msg = null_reference_error_message(site, field, owner, &file, line);
         let m = self.new_value(Ty::Ptr);
         self.emit(Inst::StrConst {
             dest: m,
-            bytes: msg.as_bytes().to_vec(),
+            bytes: msg.into_bytes(),
         });
-        let type_error = self.iconst(Ty::I64, 4);
-        self.throwing_call(None, "zap_panic_typed", vec![type_error, m]);
+        let null_ref_error = self.iconst(Ty::I64, 22); // ZAP_EXC_NULL_REFERENCE_ERROR
+        self.throwing_call(None, "zap_panic_typed", vec![null_ref_error, m]);
         if !self.terminated() {
             self.set_term(Term::Unreachable);
         }
@@ -8230,12 +8327,20 @@ impl<'a> FnLower<'a> {
                     .ctx
                     .field(sid, name)
                     .ok_or_else(|| err(format!("no field '{name}' on struct")))?;
-                // Member access on `None` throws (EXC-4, D-0007/D-0014): a
-                // reference struct receiver may be the null pointer, so guard the
-                // read with a catchable null check. Value structs are inline, not
-                // nullable, so they need no guard (and `IsNull` would be wrong).
+                // A field read on a null non-`Optional` reference raises a
+                // located `NullReferenceError` (#1489/#1493): a reference struct
+                // receiver may be the null pointer, so guard the read with a
+                // catchable null check. Value structs are inline, not nullable,
+                // so they need no guard (and `IsNull` would be wrong).
                 if !self.ctx.is_value_struct(sid) {
-                    self.null_guard(bv, "member access on None");
+                    let owner = self.ctx.names[sid as usize].clone();
+                    self.null_deref_guard(
+                        bv,
+                        NullDerefSite::FieldRead,
+                        Some(name),
+                        Some(&owner),
+                        *span,
+                    );
                 }
                 // --race (#684): a read of a shared heap struct field.
                 self.emit_race_field(bv, sid, idx, name, false, *span);

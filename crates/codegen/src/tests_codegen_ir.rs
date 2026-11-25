@@ -66,6 +66,7 @@ fn optimized_llvm_ir(src: &str) -> String {
         false,
         false,
         zir::FpPolicy::default(),
+        None,
     )
     .expect("build module");
     run_opt_pipeline(&llmod, &tm).expect("opt pipeline");
