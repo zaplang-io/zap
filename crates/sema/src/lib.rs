@@ -18036,27 +18036,41 @@ def main():
     fn sema_rejects_struct_field_type_mismatch() {
         // str into an int64 field (the headline footgun) — now rejected at sema,
         // like `int64 x = "hi"`.
-        rejects_4064("struct S:\n    int64 x\n\
-            def main():\n    S a = S(\"hi\")\n    print(a.x)\n");
+        rejects_4064(
+            "struct S:\n    int64 x\n\
+            def main():\n    S a = S(\"hi\")\n    print(a.x)\n",
+        );
         // ...by name too.
-        rejects_4064("struct S:\n    int64 x\n\
-            def main():\n    S a = S(x=\"hi\")\n    print(a.x)\n");
+        rejects_4064(
+            "struct S:\n    int64 x\n\
+            def main():\n    S a = S(x=\"hi\")\n    print(a.x)\n",
+        );
         // float into an int64 field.
-        rejects_4064("struct S:\n    int64 x\n\
-            def main():\n    float64 f = 1.5\n    S a = S(f)\n    print(a.x)\n");
+        rejects_4064(
+            "struct S:\n    int64 x\n\
+            def main():\n    float64 f = 1.5\n    S a = S(f)\n    print(a.x)\n",
+        );
         // narrowing (int64 into an int32 field).
-        rejects_4064("struct S:\n    int32 x\n\
-            def main():\n    int64 n = 5\n    S a = S(n)\n    print(a.x)\n");
+        rejects_4064(
+            "struct S:\n    int32 x\n\
+            def main():\n    int64 n = 5\n    S a = S(n)\n    print(a.x)\n",
+        );
         // bigint into a fixed-width field (#1379), now surfaced at sema.
-        rejects_4064("struct S:\n    int64 x\n\
-            def main():\n    S a = S(9223372036854775808)\n    print(a.x)\n");
+        rejects_4064(
+            "struct S:\n    int64 x\n\
+            def main():\n    S a = S(9223372036854775808)\n    print(a.x)\n",
+        );
         // Optional[U] into an Optional[T] field with a different payload (#1407).
-        rejects_4064("struct Box:\n    Optional[int64] f = None\n\
+        rejects_4064(
+            "struct Box:\n    Optional[int64] f = None\n\
             def main():\n    bigint g = 9223372036854775808\n    \
-            Box b = Box(Optional.Some(g))\n    print(b.f.is_some())\n");
+            Box b = Box(Optional.Some(g))\n    print(b.f.is_some())\n",
+        );
         // A second field after a valid one is still checked.
-        rejects_4064("struct P:\n    int64 x\n    str y\n\
-            def main():\n    P p = P(1, 2)\n    print(p.x)\n");
+        rejects_4064(
+            "struct P:\n    int64 x\n    str y\n\
+            def main():\n    P p = P(1, 2)\n    print(p.x)\n",
+        );
     }
 
     #[test]
@@ -18097,10 +18111,12 @@ def main():
             struct Circle:\n    float64 r\n    def area(self) -> float64:\n        return self.r\n\
             struct Holder:\n    Shape s\n\
             def main():\n    Holder h = Holder(Circle(1.0))\n    print(h.s.area())\n");
-        rejects_4064("interface Shape:\n    def area(self) -> float64\n\
+        rejects_4064(
+            "interface Shape:\n    def area(self) -> float64\n\
             struct NotShape:\n    int64 n\n\
             struct Holder:\n    Shape s\n\
-            def main():\n    Holder h = Holder(NotShape(1))\n    print(h.s.area())\n");
+            def main():\n    Holder h = Holder(NotShape(1))\n    print(h.s.area())\n",
+        );
     }
 
     #[test]
