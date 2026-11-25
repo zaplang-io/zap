@@ -2190,6 +2190,56 @@ def main():
 }
 
 #[test]
+fn reflect_construct_and_set_field_build_a_value() {
+    // #1454 (E4 enabler): the reflect value-construction + field-write surface.
+    // A generator zero-constructs a value of T (`reflect.construct(T)`), writes
+    // each field (`reflect.set_field`, desugared to `out.<name> = …`), then reads
+    // the fields back — the primitive a codec decoder builds on. Returns a scalar
+    // (not `Self`) to avoid the unrelated derived-method `Self`-return gap (#1455).
+    let src = "\
+@derivable(Build)
+def _derive_build[T](T self, list[int64] src) -> int64:
+    auto out = reflect.construct(T)
+    comptime for f in reflect.type_info(T).fields:
+        reflect.set_field(out, comptime f.index, src[comptime f.index])
+    int64 total = 0
+    comptime for f in reflect.type_info(T).fields:
+        total = total + reflect.field(out, comptime f.index)
+    return total
+
+interface Build:
+    def build(self, list[int64] src) -> int64
+
+@derive(Build)
+struct P:
+    int64 x
+    int64 y
+
+def main():
+    auto seed = P(0, 0)
+    print(seed.build([10, 20]))
+";
+    let f = write_zap("e4-reflect-construct", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "reflect.construct + reflect.set_field must lower; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown variable 'reflect'") && !stderr.contains("non-struct"),
+        "no unresolved reflect / non-struct error: {stderr}"
+    );
+    // `reflect.construct(T)` zero-inits the concrete struct and `reflect.set_field`
+    // lowers to ordinary field stores (there is no residual `reflect` symbol).
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("fieldset struct#") && stdout.contains("@_derive_build$P"),
+        "the generator specializes and writes fields: {stdout}"
+    );
+}
+
+#[test]
 fn a_generator_bug_is_a_dual_span_error_not_a_crash() {
     // An engine fault inside a generator (here an out-of-range `reflect.field`)
     // is the library author's bug, not the consumer's: it renders as the

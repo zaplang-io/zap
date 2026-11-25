@@ -7552,7 +7552,18 @@ impl Checker {
         // which is not a value and would otherwise resolve as an unknown name.
         if let Expr::Attr { base, name, .. } = callee {
             if matches!(&**base, Expr::Name(m, _) if m == "reflect")
-                && matches!(name.as_str(), "type_info" | "field" | "has_override")
+                && matches!(
+                    name.as_str(),
+                    // Read surface (#1252/#1298).
+                    "type_info" | "field" | "has_override"
+                    // Value-construction / field-write surface (#1454, E4): the
+                    // write-counterpart of `reflect.field`. `construct(T)`'s
+                    // argument is a TYPE (not a value), and `set_field(target,
+                    // comptime i, v)` is desugared to a field assignment at
+                    // monomorphization; sema accepts both as comptime calls of
+                    // statically-unknown type without inferring their arguments.
+                    | "construct" | "set_field"
+                )
             {
                 return Ty::Unknown;
             }
