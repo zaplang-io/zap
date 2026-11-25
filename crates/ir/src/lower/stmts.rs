@@ -2405,6 +2405,176 @@ impl<'a> FnLower<'a> {
         Ok(())
     }
 
+    /// `iter(x)` (#1382 phase 2, RFC #1417): obtain an explicit D-0048 iterator.
+    /// Phase 2 accepts a value that already satisfies the protocol — a generator,
+    /// a generator expression, or a user type with `__iter__`/`__next__` (all
+    /// `Ty::Struct`). [`setup_iter`] calls `__iter__` (an `Iterable`) or returns
+    /// the value itself (an `Iterator`, so `iter` is idempotent). A reified
+    /// per-container iterator (`iter([1, 2])`, `iter("ab")`) is #1382 phase 3; a
+    /// non-struct value is rejected here (sema already reports it precisely).
+    pub(super) fn lower_iter_builtin(&mut self, arg: &Expr) -> Result<(Value, Ty), LowerError> {
+        let (v, vt) = self.expr(arg)?;
+        let Ty::Struct(sid) = vt else {
+            return Err(err(
+                "iter() over a built-in container (list/str/dict/…) is a reified \
+                 iterator — #1382 phase 3; iter() currently accepts a generator, a \
+                 generator expression, or a type implementing the iterator protocol \
+                 (D-0048)",
+            ));
+        };
+        let (it, iter_sid) = self.setup_iter(v, sid)?;
+        Ok((it, Ty::Struct(iter_sid)))
+    }
+
+    /// `next(it)` / `next(it, default)` (#1382 phase 2): step an iterator one
+    /// element over the D-0048 protocol. Built on the comma-ok `__next__ ->
+    /// (T, bool)` internally, so the iteration hot path stays exception-free
+    /// (D-0048): `next(it)` constructs and raises a catchable `StopIteration`
+    /// only on an explicit step past the end with no default; `next(it, default)`
+    /// returns `default` at exhaustion and never raises. For the Python-form
+    /// `__next__ -> T` iterator (raises `StopIteration` itself), the no-default
+    /// call simply propagates the signal and the default form catches it. The
+    /// `default` is evaluated eagerly (it is a call argument), matching Python.
+    pub(super) fn lower_next_builtin(
+        &mut self,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let (it, vt) = self.expr(&args[0].value)?;
+        let Ty::Struct(iter_sid) = vt else {
+            return Err(err(
+                "next() expects an iterator value — a generator, a generator \
+                 expression, or a type with a '__next__' method (D-0048); stepping \
+                 an interface-typed Iterator[T] value is #1382 phase 3",
+            ));
+        };
+        // Resolve `__next__` the same way `drive_iteration` does: a genexpr
+        // iterator carries its emitted `__next__` name in the side table (its sid
+        // is tuple-interned, not in `ctx.names`); any other iterator mangles it.
+        let next_m = match self.ctx.genexpr_iters.borrow().get(&iter_sid) {
+            Some(gx) => gx.next_fn.clone(),
+            None => format!("{}__{}", self.ctx.names[iter_sid as usize], "__next__"),
+        };
+        let has_default = args.len() >= 2;
+        match self.next_form(iter_sid)? {
+            NextForm::CommaOk { tuple_sid, elem } => {
+                // Evaluate the default eagerly (Python evaluates the argument),
+                // coerced to the element type, before stepping.
+                let default_val = if has_default {
+                    let (dv, dt) = self.expr(&args[1].value)?;
+                    Some(self.coerce(dv, dt, elem))
+                } else {
+                    None
+                };
+                let res = self.new_value(Ty::Struct(tuple_sid));
+                self.throwing_call(Some(res), &next_m, vec![it]);
+                let val = self.new_value(elem);
+                self.emit(Inst::FieldGet {
+                    dest: val,
+                    base: res,
+                    sid: tuple_sid,
+                    idx: 0,
+                });
+                let ok = self.new_value(Ty::I1);
+                self.emit(Inst::FieldGet {
+                    dest: ok,
+                    base: res,
+                    sid: tuple_sid,
+                    idx: 1,
+                });
+                let out = self.alloca(elem);
+                let then_bb = self.new_block();
+                let else_bb = self.new_block();
+                let end_bb = self.new_block();
+                self.set_term(Term::BrIf {
+                    cond: ok,
+                    then_bb,
+                    else_bb,
+                });
+                // A fresh element: yield it.
+                self.position(then_bb);
+                self.store(out, val);
+                self.set_term(Term::Br(end_bb));
+                // Exhausted: return the default, or raise StopIteration.
+                self.position(else_bb);
+                if let Some(dv) = default_val {
+                    self.store(out, dv);
+                    self.set_term(Term::Br(end_bb));
+                } else {
+                    let stop = self.iconst(Ty::I64, 11); // ZAP_EXC_STOP_ITERATION
+                    let msg = self.strconst("");
+                    self.throwing_call(None, "zap_panic_typed", vec![stop, msg]);
+                    if !self.terminated() {
+                        self.set_term(Term::Unreachable);
+                    }
+                }
+                self.position(end_bb);
+                let loaded = self.load(out, elem);
+                Ok((loaded, elem))
+            }
+            NextForm::StopIter { elem } => {
+                if !has_default {
+                    // The iterator's `__next__` raises `StopIteration` at
+                    // exhaustion; with no default we simply let it propagate.
+                    let val = self.new_value(elem);
+                    self.throwing_call(Some(val), &next_m, vec![it]);
+                    return Ok((val, elem));
+                }
+                // With a default, evaluate it eagerly, guard the step with a
+                // landing pad, and on `StopIteration` yield the default (re-raise
+                // anything else) — mirroring `drive_iteration`'s StopIter guard.
+                let (dv, dt) = self.expr(&args[1].value)?;
+                let default_val = self.coerce(dv, dt, elem);
+                let out = self.alloca(elem);
+                let lp = self.new_block();
+                let dflt_bb = self.new_block();
+                let reraise = self.new_block();
+                let end_bb = self.new_block();
+                self.landing_pads.push(lp);
+                let val = self.new_value(elem);
+                self.throwing_call(Some(val), &next_m, vec![it]);
+                self.landing_pads.pop();
+                self.store(out, val);
+                self.set_term(Term::Br(end_bb));
+                // Landing pad: a typed StopIteration ends with the default.
+                self.position(lp);
+                let exc = self.new_value(Ty::Ptr);
+                self.emit(Inst::LandingPad { dest: exc });
+                let stop_id = self.iconst(Ty::I64, 11);
+                let eq = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(eq),
+                    func: "zap_exception_is_a".to_string(),
+                    args: vec![exc, stop_id],
+                });
+                let zero = self.iconst(Ty::I64, 0);
+                let is_stop = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: is_stop,
+                    pred: CmpPred::Ne,
+                    lhs: eq,
+                    rhs: zero,
+                });
+                self.emit_end_catch();
+                self.set_term(Term::BrIf {
+                    cond: is_stop,
+                    then_bb: dflt_bb,
+                    else_bb: reraise,
+                });
+                self.position(dflt_bb);
+                self.store(out, default_val);
+                self.set_term(Term::Br(end_bb));
+                self.position(reraise);
+                self.throwing_call(None, "zap_raise", vec![exc]);
+                if !self.terminated() {
+                    self.set_term(Term::Unreachable);
+                }
+                self.position(end_bb);
+                let loaded = self.load(out, elem);
+                Ok((loaded, elem))
+            }
+        }
+    }
+
     /// `sum(iterable)` over anything that is not a numeric `array` (#596): a
     /// lazy generator / generator expression (a `Ty::Struct` iterator) or a
     /// `list`. Drains the iterable once through the D-0048 protocol, summing

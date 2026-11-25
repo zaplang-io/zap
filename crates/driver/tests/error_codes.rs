@@ -776,3 +776,27 @@ fn generic_interface_value_position_codes() {
         "ZAP4021",
     );
 }
+
+#[test]
+fn iter_next_builtin_codes() {
+    // `iter()`/`next()` (#1382 phase 2) type-check over a protocol iterator ...
+    const CNT: &str = "struct Count:\n    int64 i\n\
+        \x20   def __iter__(self) -> Count:\n        return self\n\
+        \x20   def __next__(self) -> (int64, bool):\n        return (self.i, True)\n\n";
+    let ok = check_source(&format!(
+        "{CNT}def main():\n    auto it = iter(Count(i=0))\n    \
+         int64 a = next(it)\n    int64 b = next(it, -1)\n    print(a)\n    print(b)\n"
+    ));
+    assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
+    // ... reject iter() over a built-in container (reified iterators are phase 3)
+    assert_code("def main():\n    auto it = iter([1, 2, 3])\n", "ZAP4024");
+    // ... reject next() of a non-iterator value ...
+    assert_code("def main():\n    auto x = next(5)\n", "ZAP4024");
+    // ... and a next() default whose type does not match the element type.
+    assert_code(
+        &format!(
+            "{CNT}def main():\n    auto it = iter(Count(i=0))\n    auto x = next(it, \"no\")\n"
+        ),
+        "ZAP4024",
+    );
+}

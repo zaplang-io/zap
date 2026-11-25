@@ -649,6 +649,19 @@ a Python-style `__next__ -> T` raising `StopIteration` is also accepted for
 porting. Generators (`yield`), built-in collections, `str`, and channels all use
 this one protocol; comprehensions and `in`-fallback do too.
 
+**`iter()` / `next()` (explicit iterator access, #1382, D-0048):** `iter(x)`
+returns an explicit iterator over `x` and is idempotent on an iterator (an
+`Iterator[T]` stays itself; an `Iterable[T]` yields its `Iterator[T]`). `next(it)`
+steps the iterator and raises a catchable `StopIteration` at exhaustion, while
+`next(it, default)` returns `default` at exhaustion and never raises — both built
+on the comma-ok `__next__` internally, so `for` and the `default` form keep the
+hot path exception-free. `next(iter(xs))` is statically the exact element type.
+The iterator is a single-pass, live **view** (container reference + cursor), not a
+snapshot. In this release `iter()`/`next()` operate on protocol iterators — a
+generator, a generator expression, or a user type implementing `__iter__` /
+`__next__`; reified per-container iterators (`iter([1, 2])`, `iter("ab")`) are a
+documented follow-up (`for` iterates every built-in container today).
+
 **pass** (#591) is a no-op statement accepted anywhere a statement is expected —
 a function body, any branch of `if`/`elif`/`else`, `for`/`while` (and their
 `else`), `with`, `try`/`except`/`finally`, `scope`, and as the explicit spelling
