@@ -3,7 +3,6 @@ Color.BLUE
 True
 (b'hi', b'yo')
 True
-[(1, 2), (3, 4)]
 (1, 2)
 4
 2
