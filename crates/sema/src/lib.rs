@@ -6479,7 +6479,8 @@ impl Checker {
                     // `array[T]` slice is a view of the same type, but arrays are
                     // typed loosely (ticket #24), so the base is already
                     // `Unknown` and falls through below.
-                    Ty::List(_) => b,
+                    // A `tuple[T]` slice is a `tuple[T]` (#1475), like a list copy.
+                    Ty::List(_) | Ty::VarTuple(_) => b,
                     Ty::Str => Ty::Str,
                     // A `bytes` slice is `bytes` (byte-based, I#337).
                     Ty::Bytes => Ty::Bytes,
@@ -6799,6 +6800,9 @@ impl Checker {
                     // `bytes + bytes` concatenates (I#337).
                     Ty::Bytes
                 } else if matches!(l, Ty::List(_)) && matches!(r, Ty::List(_)) {
+                    l.clone()
+                } else if matches!(l, Ty::VarTuple(_)) && matches!(r, Ty::VarTuple(_)) {
+                    // `tuple[T] + tuple[T]` concatenates into a new tuple[T] (#1475).
                     l.clone()
                 } else {
                     self.error(

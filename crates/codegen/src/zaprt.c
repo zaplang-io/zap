@@ -2838,6 +2838,32 @@ int64_t zap_vartuple_hash(void *buf, int32_t kind) {
     }
     return acc;
 }
+
+/* `tuple[T] + tuple[T]` concatenation (#1475): a fresh frozen list buffer with
+ * `a`'s elements then `b`'s, copied by the element-kind tag (0 = i64 word,
+ * 1 = f64, 2 = str/bytes pointer). Both operands share the element kind (sema). */
+void *zap_vartuple_concat(void *a, void *b, int32_t kind) {
+    void *out = zap_list_new();
+    void *srcs[2] = {a, b};
+    for (int s = 0; s < 2; s++) {
+        void *src = srcs[s];
+        int64_t n = zap_list_len(src);
+        for (int64_t i = 0; i < n; i++) {
+            switch (kind) {
+            case 1:
+                zap_list_push_f64(out, zap_list_get_f64(src, i));
+                break;
+            case 2:
+                zap_list_push_ptr(out, zap_list_get_ptr(src, i));
+                break;
+            default: /* 0: plain 64-bit word */
+                zap_list_push_i64(out, zap_list_get_i64(src, i));
+                break;
+            }
+        }
+    }
+    return out;
+}
 /* Lexicographic byte comparison of two strings, returning -1 / 0 / +1. */
 int64_t zap_str_cmp(void *ap, void *bp) {
     const ZapStr *a = (const ZapStr *)ap;

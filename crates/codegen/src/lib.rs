@@ -3588,6 +3588,12 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), self.ctx.i32_type().into()],
             Some(i.into()),
         );
+        // tuple[T] concatenation (#1475): (a, b, kind) -> new tuple[T].
+        self.declare_rt(
+            "zap_vartuple_concat",
+            &[p.into(), p.into(), self.ctx.i32_type().into()],
+            Some(p.into()),
+        );
         // Power-assert value rendering (ticket #73, D-0054).
         self.declare_rt("zap_f64_to_str", &[f.into()], Some(p.into()));
         self.declare_rt("zap_bool_to_str", &[i.into()], Some(p.into()));
