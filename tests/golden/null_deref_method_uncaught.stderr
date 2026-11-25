@@ -1,0 +1,1 @@
+null dereference calling method 'upper' on 'str' at null_deref_method_uncaught.zap:11
