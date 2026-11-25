@@ -4596,6 +4596,7 @@ impl Mono<'_> {
         if let Expr::Attr { base, name, .. } = callee {
             if name == "construct"
                 && matches!(&**base, Expr::Name(m, _) if m == "reflect")
+                && env.lookup("reflect").is_none()
                 && args.len() == 1
             {
                 return self.rewrite_reflect_construct(&args[0].value, span);
@@ -5036,7 +5037,14 @@ impl Mono<'_> {
         // otherwise reaches lowering as an unresolved `reflect`. Resolved only
         // when `T` is substituted to a concrete type (an active instantiation);
         // a still-generic `reflect.type_info(T)` falls through unchanged.
-        if name == "name" {
+        //
+        // Guarded against a shadowing user binding named `reflect` (#1487), as
+        // the `reflect.construct` and `datetime.zone_abbreviation` special-cases
+        // are. (The fold's `type_info` argument must be a type-parameter name
+        // for `cur_subst` to resolve it, so a user-binding collision is already
+        // unlikely here — the guard keeps the three `reflect`/module paths
+        // consistent.)
+        if name == "name" && env.lookup("reflect").is_none() {
             if let Some(tn) = reflect_type_info_arg(base) {
                 if let Some(Type::Named { name: concrete, .. }) = self.cur_subst.get(&tn) {
                     return Ok((
@@ -5553,6 +5561,48 @@ mod tests {
         );
         // Box$str is the method's return instance, discovered transitively.
         assert!(struct_named(&m, "Box$str").is_some(), "Box$str discovered");
+    }
+
+    // ---- #1487: the `reflect` module special-cases must not hijack a user
+    // binding named `reflect`. The `reflect.construct(T)` rewrite keyed only on
+    // the receiver being literally named `reflect`, without checking (as the
+    // sibling `datetime.zone_abbreviation` special-case does) that the name is
+    // unshadowed. A local/parameter/field named `reflect` whose type declares
+    // its own `construct` was intercepted by the reflection rewrite, failing
+    // monomorphization with `reflect.construct(T) expects a type name` instead
+    // of dispatching to the user method.
+
+    #[test]
+    fn user_local_named_reflect_construct_not_hijacked() {
+        // The issue's reducer: a local `reflect` whose `construct` is an
+        // ordinary two-arg method dispatches normally, not as reflection.
+        let m = mono_ok(
+            "struct Thing:\n    int64 n\n\
+             \x20   def construct(self, int64 x) -> int64:\n        return x + self.n\n\
+             def main():\n    auto reflect = Thing(10)\n    print(reflect.construct(5))\n",
+        );
+        let syms = method_call_syms(&m);
+        assert!(
+            syms.iter().any(|s| s == "construct"),
+            "a shadowing local `reflect`'s own `construct` must dispatch as a \
+             plain method: {syms:?}"
+        );
+    }
+
+    #[test]
+    fn user_param_named_reflect_construct_not_hijacked() {
+        // The same guard holds when `reflect` is a function parameter.
+        let m = mono_ok(
+            "struct Thing:\n    int64 n\n\
+             \x20   def construct(self, int64 x) -> int64:\n        return x + self.n\n\
+             def run(Thing reflect) -> int64:\n    return reflect.construct(5)\n\
+             def main():\n    print(run(Thing(10)))\n",
+        );
+        let syms = method_call_syms(&m);
+        assert!(
+            syms.iter().any(|s| s == "construct"),
+            "a parameter named `reflect` must not be hijacked by reflection: {syms:?}"
+        );
     }
 
     // ---- #1478 / #1479: tuple types as explicit generic type arguments -----
