@@ -90,8 +90,10 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     );
     // Set-Cookie parsing (#989): one getter per prelude `Cookie` field, the
     // struct built in lowering (the `url.split` / `UrlParts` pattern). String
-    // fields return `str` (ptr); `max_age` an int64 (-1 absent); `secure` /
-    // `http_only` an int64 0/1 normalized to the struct's bool field in lowering.
+    // fields return `str` (ptr); `secure` / `http_only` an int64 0/1 normalized
+    // to the struct's bool field in lowering. `max_age` is an int64 parsed value
+    // paired with a `_present` 0/1 flag (#1524) — lowering wraps the two into the
+    // `Optional[int64] max_age` field (present -> Some, absent/malformed -> None).
     cg.declare_rt("zap_http_cookie_name", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_http_cookie_value", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_http_cookie_domain", &[p.into()], Some(p.into()));
@@ -99,6 +101,11 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_http_cookie_expires", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_http_cookie_same_site", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_http_cookie_max_age", &[p.into()], Some(i.into()));
+    cg.declare_rt(
+        "zap_http_cookie_max_age_present",
+        &[p.into()],
+        Some(i.into()),
+    );
     cg.declare_rt("zap_http_cookie_secure", &[p.into()], Some(i.into()));
     cg.declare_rt("zap_http_cookie_http_only", &[p.into()], Some(i.into()));
     cg.declare_rt("zap_http_status", &[p.into()], Some(i.into()));

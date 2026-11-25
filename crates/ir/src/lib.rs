@@ -3684,10 +3684,23 @@ mod tests {
              d[None] = \"y\"\n    print(d[k])\n    print(d[None])\n",
         );
         let text = format!("{m}");
+        // Count the Optional hashers actually *installed as a dict key*
+        // (`funcaddr @$opt$N$hash`), not every Optional hash fn defined in the
+        // module: since #1524 the prelude `Cookie.max_age: Optional[int64]` field
+        // makes `Cookie`'s own synthesized `__hash__` *call* an `Optional[int64]`
+        // hasher inline, so an unrelated `$opt$int64$hash` is always defined. This
+        // test's key is `Optional[(int64, int64)]`, a different instance, and the
+        // point here is that *its* key-fn is synthesized and wired exactly once.
+        let installed_opt_hashers: std::collections::BTreeSet<&str> = text
+            .lines()
+            .filter_map(|l| l.split_once("funcaddr @$opt$"))
+            .filter_map(|(_, rest)| rest.split_whitespace().next())
+            .filter(|n| n.ends_with("$hash"))
+            .collect();
         assert_eq!(
-            opt_hash_fn_count(&m),
+            installed_opt_hashers.len(),
             1,
-            "one Optional hash fn; text:\n{text}"
+            "exactly one Optional key hasher installed; text:\n{text}"
         );
         assert_eq!(
             tuple_hash_fn_count(&m),

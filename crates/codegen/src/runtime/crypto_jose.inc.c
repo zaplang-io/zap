@@ -4864,7 +4864,12 @@ typedef struct {
     size_t expires_len;
     const char *same_site;
     size_t same_site_len;
-    long max_age; /* -1 = absent */
+    long max_age;        /* parsed Max-Age seconds; meaningful only if present */
+    int max_age_present; /* 1 = a valid Max-Age was parsed; 0 = absent OR
+                          * malformed. #1524: a valid `Max-Age=-1` / `=0` is
+                          * present (deletes the cookie, RFC 6265 §5.2.2),
+                          * whereas an absent/garbage attribute is not — the two
+                          * must be distinguishable by the caller. */
     int secure;
     int http_only;
 } ZapCookieFields;
@@ -4913,7 +4918,8 @@ static void zap_http_parse_cookie_fields(const ZapStr *s, ZapCookieFields *f) {
     f->path = "";
     f->expires = "";
     f->same_site = "";
-    f->max_age = -1;
+    f->max_age = 0;         /* value is meaningful only when present */
+    f->max_age_present = 0; /* absent until a well-formed Max-Age is seen */
     if (!s || s->len <= 0) {
         return;
     }
@@ -4974,7 +4980,12 @@ static void zap_http_parse_cookie_fields(const ZapStr *s, ZapCookieFields *f) {
                 m = m * 10 + (val[k] - '0');
                 any = 1;
             }
-            f->max_age = any ? (neg ? -m : m) : -1;
+            /* A well-formed value (digits, optionally a leading '-') is present
+             * regardless of sign or zero; anything else (empty, `-`, garbage)
+             * leaves the field absent so the caller sees `None`, not a bogus
+             * parsed value. #1524. */
+            f->max_age = any ? (neg ? -m : m) : 0;
+            f->max_age_present = any ? 1 : 0;
         } else if (zap_cookie_ci_eq(key, keylen, "secure")) {
             f->secure = 1;
         } else if (zap_cookie_ci_eq(key, keylen, "httponly")) {
@@ -5018,6 +5029,15 @@ int64_t zap_http_cookie_max_age(void *v) {
     ZapCookieFields f;
     zap_http_parse_cookie_fields((const ZapStr *)v, &f);
     return (int64_t)f.max_age;
+}
+/* 1 if a well-formed Max-Age was parsed (any sign, including 0 and negatives),
+ * 0 if the attribute was absent or malformed. Lowering uses this to build the
+ * `Optional[int64] max_age` field: present -> Some(value), absent -> None
+ * (#1524). */
+int64_t zap_http_cookie_max_age_present(void *v) {
+    ZapCookieFields f;
+    zap_http_parse_cookie_fields((const ZapStr *)v, &f);
+    return (int64_t)f.max_age_present;
 }
 int64_t zap_http_cookie_secure(void *v) {
     ZapCookieFields f;
