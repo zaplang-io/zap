@@ -828,6 +828,23 @@ enum {
      * modes; a body of exactly the limit succeeds and the first byte over it
      * raises this. */
     ZAP_EXC_RESPONSE_TOO_LARGE_ERROR = 21,
+    /* Raised when a plain (non-`Optional`) reference is dereferenced while null
+     * (#1489 Epic, foundational sub-issue #1492,
+     * decisions/lang/1489-null-reference-error.md). A null field read/store,
+     * method-call receiver, index base, or for-iteration base used to terminate
+     * the process with an uncatchable `SIGSEGV`; this makes it a catchable,
+     * located exception instead (Go/Java/C# parity: nil panic / NPE / NRE). An
+     * ordinary catchable exception directly under `Exception` (flat, NOT under
+     * `RuntimeError` — CPython's `None.attr` → `AttributeError` is likewise flat
+     * under `Exception`), so `except NullReferenceError` and `except Exception`
+     * both catch it. The message is a located string: the source location is
+     * required, and the field name and owning static type are included when
+     * known, e.g. `null dereference reading field 'name' of 'Node' at foo.zap:7`.
+     * The type/hierarchy/message shape are defined here (#1492); the explicit
+     * null-check + throwing_call that raises it at each deref site lands in
+     * #1493. `Optional[T]` keeps its own `None`/unwrap path untouched and is out
+     * of scope. */
+    ZAP_EXC_NULL_REFERENCE_ERROR = 22,
 };
 
 void *zap_exception_new(int64_t type_id, void *message) {
@@ -940,6 +957,7 @@ static int64_t zap_exception_parent(int64_t type_id) {
     case ZAP_EXC_SCOPE_TIMEOUT: case ZAP_EXC_TIMEOUT_ERROR:
     case ZAP_EXC_ASSERTION_ERROR: case ZAP_EXC_EOF_ERROR:
     case ZAP_EXC_MEMORY_ERROR: case ZAP_EXC_OS_ERROR:
+    case ZAP_EXC_NULL_REFERENCE_ERROR:
         return ZAP_EXC_EXCEPTION;
     case ZAP_EXC_INDEX_ERROR: case ZAP_EXC_KEY_ERROR: return ZAP_EXC_LOOKUP_ERROR;
     case ZAP_EXC_FILE_NOT_FOUND_ERROR: case ZAP_EXC_RESPONSE_TOO_LARGE_ERROR:

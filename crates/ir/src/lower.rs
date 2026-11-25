@@ -19628,8 +19628,80 @@ fn exception_type_id_name(name: &str) -> Option<i64> {
         "OSError" => 19,
         "FileNotFoundError" => 20,
         "ResponseTooLargeError" => 21,
+        "NullReferenceError" => 22,
         _ => return None,
     })
+}
+
+/// The in-scope null-dereference sites (#1489 ADR scope table,
+/// decisions/lang/1489-null-reference-error.md). A plain (non-`Optional`)
+/// reference used in one of these positions while null raises a
+/// [`NullReferenceError`] (`ZAP_EXC_NULL_REFERENCE_ERROR = 22`). `Optional[T]`
+/// keeps its own `None`/unwrap path and is never in scope here.
+///
+/// Defined with #1492 (the type + message shape); the explicit null-check that
+/// selects a site and raises lands in #1493, which calls
+/// [`null_reference_error_message`] with the site and the statically-known
+/// field/owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullDerefSite {
+    /// `n.name` — a field read (`Inst::FieldGet`).
+    FieldRead,
+    /// `n.name = x` — a field store.
+    FieldStore,
+    /// `n.method()` — the receiver loaded before a method call. The "field" slot
+    /// carries the method name when known.
+    MethodReceiver,
+    /// `n[i]` — the base of an index operation.
+    IndexBase,
+    /// `for x in n:` — the base of a for-iteration.
+    IterBase,
+}
+
+/// Build the located message string for a [`NullReferenceError`] raised at a
+/// null-dereference site (#1489/#1492).
+///
+/// The message is a **located** string: the source `file`/`line` are
+/// **required** and always appended as ` at {file}:{line}`. The `field` name and
+/// owning static type (`owner`) are **included when known** and omitted
+/// gracefully when not — matching the ADR's locked example
+/// `null dereference reading field 'name' of 'Node' at foo.zap:7`.
+///
+/// This is the single source of truth for the message shape; #1493's deref
+/// lowering calls it with whatever it knows statically at each site. Pure (no
+/// IR / codegen state), so it is unit-testable on the host without LLVM.
+pub fn null_reference_error_message(
+    site: NullDerefSite,
+    field: Option<&str>,
+    owner: Option<&str>,
+    file: &str,
+    line: u32,
+) -> String {
+    // The site-specific middle clause, weaving in whatever is statically known.
+    // `of '{owner}'` / `on '{owner}'` is appended only when the owner is known;
+    // the field'd sites drop their whole clause if even the field is unknown
+    // (defensive — codegen supplies the field for those sites).
+    let owner_of = |prep: &str| match owner {
+        Some(o) => format!(" {prep} '{o}'"),
+        None => String::new(),
+    };
+    let detail = match site {
+        NullDerefSite::FieldRead => match field {
+            Some(f) => format!(" reading field '{f}'{}", owner_of("of")),
+            None => String::new(),
+        },
+        NullDerefSite::FieldStore => match field {
+            Some(f) => format!(" writing field '{f}'{}", owner_of("of")),
+            None => String::new(),
+        },
+        NullDerefSite::MethodReceiver => match field {
+            Some(f) => format!(" calling method '{f}'{}", owner_of("on")),
+            None => format!(" calling a method{}", owner_of("on")),
+        },
+        NullDerefSite::IndexBase => format!(" indexing{}", owner_of("into")),
+        NullDerefSite::IterBase => format!(" iterating{}", owner_of("over")),
+    };
+    format!("null dereference{detail} at {file}:{line}")
 }
 
 fn exception_type_id(ty: &ast::Type) -> Option<i64> {

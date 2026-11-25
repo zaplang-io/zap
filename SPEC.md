@@ -1114,7 +1114,7 @@ finally:
   `TypeError`, `LookupError`, `IndexError`, `KeyError`, `ArithmeticError`,
   `ZeroDivisionError`, `RuntimeError`, `StopIteration`, `Cancelled`,
   `ScopeTimeout`, `ExceptionGroup`, `TimeoutError`, `AssertionError`, `EOFError`,
-  `MemoryError`, `OSError`, and `FileNotFoundError`.
+  `MemoryError`, `OSError`, `FileNotFoundError`, and `NullReferenceError`.
   `IndexError` and `KeyError`
   derive from `LookupError`; `ZeroDivisionError` derives from `ArithmeticError`;
   `FileNotFoundError` derives from `OSError`; those
@@ -1132,9 +1132,14 @@ finally:
   `FileNotFoundError`, so a caller can select defaults for an absent file without a
   prior existence check (a missing executable passed to `process` likewise raises
   `FileNotFoundError`). An allocation failure raises `MemoryError`, and bad caller
-  input (an invalid `io.open` mode, an empty path) raises `ValueError`. The
-  remaining listed leaf types derive from `Exception`; `Exception` derives from
-  `BaseException`.
+  input (an invalid `io.open` mode, an empty path) raises `ValueError`.
+  `NullReferenceError` is the catchable type for a null (non-`Optional`)
+  reference dereference — a null field read/store, method receiver, index base,
+  or for-iteration base (#1489) — and derives from `Exception`; its message is a
+  located string (the source location, plus the field name and owning type when
+  known, e.g. `null dereference reading field 'name' of 'Node' at foo.zap:7`).
+  The remaining listed leaf types derive from `Exception`; `Exception` derives
+  from `BaseException`.
 - `raise E(message)` constructs a typed built-in exception. Raising a string is
   shorthand for raising `Exception(message)`. A typed `except E` catches `E`
   and its subclasses; clauses are tested in source order. A bare `except` is a

@@ -1,0 +1,5 @@
+null dereference reading field 'name' of 'Node' at foo.zap:7
+null dereference at bar.zap:12
+not-a-valueerror at baz.zap:3
+plain-valueerror
+null dereference indexing at grid.zap:42
