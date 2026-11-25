@@ -3324,6 +3324,11 @@ impl<'a> FnLower<'a> {
                 if let Ty::List(elem) = lty {
                     return self.lower_for_list(target, lst, elem, body);
                 }
+                // A variadic `tuple[T]` (#1461) is a frozen list buffer: the
+                // statement `for x in t` walks it exactly like a list.
+                if let Ty::VarTuple(elem) = lty {
+                    return self.lower_for_list(target, lst, elem, body);
+                }
                 if let Ty::Set(elem) = lty {
                     return self.lower_for_set(target, lst, elem, body);
                 }
