@@ -800,3 +800,31 @@ fn iter_next_builtin_codes() {
         "ZAP4024",
     );
 }
+
+#[test]
+fn map_filter_builtin_codes() {
+    const FNS: &str = "def square(int64 x) -> int64:\n    return x * x\n\n\
+        def is_even(int64 x) -> bool:\n    return x % 2 == 0\n\n";
+    // map()/filter() (#1390) type-check and bind to a `list[...]` directly ...
+    let ok = check_source(&format!(
+        "{FNS}def main():\n    \
+         list[int64] ys = map(square, [1, 2, 3])\n    \
+         list[int64] ev = filter(is_even, [1, 2, 3, 4])\n    print(ys)\n    print(ev)\n"
+    ));
+    assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
+    // ... reject map() with no iterable (ZAP4025) ...
+    assert_code(
+        &format!("{FNS}def main():\n    auto ys = map(square)\n"),
+        "ZAP4025",
+    );
+    // ... reject a non-list iterable (other iterables are a follow-up) ...
+    assert_code(
+        &format!("{FNS}def main():\n    auto ys = map(square, 5)\n"),
+        "ZAP4024",
+    );
+    // ... and reject the deferred filter(None, …) keep-truthy convenience.
+    assert_code(
+        &format!("{FNS}def main():\n    auto xs = filter(None, [0, 1, 2])\n"),
+        "ZAP4024",
+    );
+}

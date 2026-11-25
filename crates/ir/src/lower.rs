@@ -10070,6 +10070,15 @@ impl<'a> FnLower<'a> {
                      is a follow-up"
                 )));
             }
+            // `map(func, *lists)` / `filter(pred, list)` (#1390): materialized
+            // `list` adapters (the `reversed` model), so they compose with
+            // `for` / `list()` / `sum()`.
+            if fname == "map" {
+                return self.lower_map_builtin(args);
+            }
+            if fname == "filter" {
+                return self.lower_filter_builtin(args);
+            }
             // String/char builtins (ticket #284, D-0025).
             if fname == "ord" {
                 // ord(c): the codepoint number of a `char`, as an `int`.
@@ -18595,6 +18604,259 @@ impl<'a> FnLower<'a> {
     /// allocas so they stay GC-reachable across the `key=` call's safepoint
     /// (same reasoning as `build_key_list`). Integer keys compare with a signed
     /// `icmp`, never through float.
+    /// `map(func, *lists)` (#1390): apply `func` across one or more lists,
+    /// stopping at the shortest, into a fresh `list[R]` (R = `func`'s return
+    /// type). Follows `reversed`'s materialized-list model — a usable value that
+    /// composes with `for` / `list()` / `sum()`; strictly-lazy adapters are a
+    /// follow-up shared with enumerate/zip. Lists only for now (other iterables a
+    /// follow-up). Each element is coerced to the matching `func` parameter type;
+    /// the result of each call is boxed into the result list.
+    fn lower_map_builtin(&mut self, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
+        if args.len() < 2 {
+            return Err(err(
+                "map() takes a function and one or more iterables (map(func, *lists))",
+            ));
+        }
+        let (fv, ft) = self.expr(&args[0].value)?;
+        let Ty::Func(sig_idx) = ft else {
+            return Err(err(
+                "map() first argument must be a function value (a named function or a \
+                 fn(T)->R binding)",
+            ));
+        };
+        let sig = self.ctx.fn_sigs.borrow().get(sig_idx).clone();
+        let ret = sig.ret;
+        // Lower each iterable (lists only for now).
+        let mut lists: Vec<(Value, Elem)> = Vec::with_capacity(args.len() - 1);
+        for a in &args[1..] {
+            let (lv, lt) = self.expr(&a.value)?;
+            let Ty::List(e) = lt else {
+                return Err(err(
+                    "map() iterables must be lists (other iterables are a follow-up)",
+                ));
+            };
+            lists.push((lv, e));
+        }
+        // minlen = min over all list lengths (stop at the shortest).
+        let minlen = self.alloca(Ty::I64);
+        let l0 = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(l0),
+            func: "zap_list_len".to_string(),
+            args: vec![lists[0].0],
+        });
+        self.store(minlen, l0);
+        for (lv, _) in &lists[1..] {
+            let ln = self.new_value(Ty::I64);
+            self.emit(Inst::Call {
+                dest: Some(ln),
+                func: "zap_list_len".to_string(),
+                args: vec![*lv],
+            });
+            let cur = self.load(minlen, Ty::I64);
+            let shorter = self.new_value(Ty::I1);
+            self.emit(Inst::ICmp {
+                dest: shorter,
+                pred: CmpPred::Lt,
+                lhs: ln,
+                rhs: cur,
+            });
+            let then_bb = self.new_block();
+            let end_bb = self.new_block();
+            self.set_term(Term::BrIf {
+                cond: shorter,
+                then_bb,
+                else_bb: end_bb,
+            });
+            self.position(then_bb);
+            self.store(minlen, ln);
+            self.set_term(Term::Br(end_bb));
+            self.position(end_bb);
+        }
+        let out_elem = list_elem_kind(ret, &self.ctx.nested)?;
+        let out = self.new_value(Ty::List(Elem::I64));
+        self.emit(Inst::Call {
+            dest: Some(out),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        let idx = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let done_bb = self.new_block();
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let i = self.load(idx, Ty::I64);
+        let n = self.load(minlen, Ty::I64);
+        let more = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: more,
+            pred: CmpPred::Lt,
+            lhs: i,
+            rhs: n,
+        });
+        self.set_term(Term::BrIf {
+            cond: more,
+            then_bb: body_bb,
+            else_bb: done_bb,
+        });
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let mut argvals = Vec::with_capacity(lists.len());
+        for (j, (lv, e)) in lists.iter().enumerate() {
+            let ev = self.new_value(e.ty());
+            self.emit(Inst::Call {
+                dest: Some(ev),
+                func: format!("zap_list_get_{}", e.val_suffix()),
+                args: vec![*lv, i],
+            });
+            let want = sig.params.get(j).copied().unwrap_or_else(|| e.ty());
+            let ev = self.coerce(ev, e.ty(), want);
+            argvals.push(ev);
+        }
+        let (rv, rt) = self.emit_closure_call(fv, sig_idx, argvals)?;
+        let rv = self.coerce(rv, rt, out_elem.ty());
+        let rv = self.box_elem_for_store(rv, out_elem.ty());
+        self.emit(Inst::Call {
+            dest: None,
+            func: format!("zap_list_push_{}", out_elem.val_suffix()),
+            args: vec![out, rv],
+        });
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+        self.position(done_bb);
+        self.func.value_types[out as usize] = Ty::List(out_elem);
+        Ok((out, Ty::List(out_elem)))
+    }
+
+    /// `filter(pred, list)` (#1390): a fresh `list[T]` of the elements for which
+    /// `pred` returns truthy, preserving the element type (same materialized
+    /// model). `filter(None, xs)` (keep-truthy) is a deferred follow-up — a
+    /// flagged design decision — and sema already rejects it, so this guards it
+    /// too rather than mis-lowering `None` as a function value.
+    fn lower_filter_builtin(&mut self, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
+        if args.len() != 2 {
+            return Err(err(
+                "filter() takes exactly two arguments (filter(pred, list))",
+            ));
+        }
+        if matches!(&args[0].value, ast::Expr::None(_)) {
+            return Err(err(
+                "filter(None, xs) (keep the truthy elements) is a follow-up (#1390); \
+                 pass a predicate function for now",
+            ));
+        }
+        let (pv, pt) = self.expr(&args[0].value)?;
+        let Ty::Func(sig_idx) = pt else {
+            return Err(err(
+                "filter() first argument must be a predicate function value (a named \
+                 function or a fn(T)->bool binding)",
+            ));
+        };
+        let want = self
+            .ctx
+            .fn_sigs
+            .borrow()
+            .get(sig_idx)
+            .params
+            .first()
+            .copied();
+        let (lv, lt) = self.expr(&args[1].value)?;
+        let Ty::List(elem) = lt else {
+            return Err(err(
+                "filter() expects a list (other iterables are a follow-up)",
+            ));
+        };
+        let len = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(len),
+            func: "zap_list_len".to_string(),
+            args: vec![lv],
+        });
+        let out = self.new_value(Ty::List(Elem::I64));
+        self.emit(Inst::Call {
+            dest: Some(out),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        let getter = format!("zap_list_get_{}", elem.val_suffix());
+        let pusher = format!("zap_list_push_{}", elem.val_suffix());
+        let idx = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let keep_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let done_bb = self.new_block();
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let i = self.load(idx, Ty::I64);
+        let more = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: more,
+            pred: CmpPred::Lt,
+            lhs: i,
+            rhs: len,
+        });
+        self.set_term(Term::BrIf {
+            cond: more,
+            then_bb: body_bb,
+            else_bb: done_bb,
+        });
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let ev = self.new_value(elem.ty());
+        self.emit(Inst::Call {
+            dest: Some(ev),
+            func: getter.clone(),
+            args: vec![lv, i],
+        });
+        // Call the predicate, coercing the element to its parameter type.
+        let pev = self.coerce(ev, elem.ty(), want.unwrap_or_else(|| elem.ty()));
+        let (bv, bt) = self.emit_closure_call(pv, sig_idx, vec![pev])?;
+        let keep = self.truthy(bv, bt);
+        self.set_term(Term::BrIf {
+            cond: keep,
+            then_bb: keep_bb,
+            else_bb: incr_bb,
+        });
+        self.position(keep_bb);
+        let stored = self.box_elem_for_store(ev, elem.ty());
+        self.emit(Inst::Call {
+            dest: None,
+            func: pusher.clone(),
+            args: vec![out, stored],
+        });
+        self.set_term(Term::Br(incr_bb));
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+        self.position(done_bb);
+        self.func.value_types[out as usize] = Ty::List(elem);
+        Ok((out, Ty::List(elem)))
+    }
+
     fn lower_minmax_iterable(
         &mut self,
         is_max: bool,
