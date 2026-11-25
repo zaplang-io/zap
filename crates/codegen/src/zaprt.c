@@ -2135,7 +2135,10 @@ int64_t zap_list_len(void *l) { return ((ZapList *)l)->len; }
 /* `==` for two variadic `tuple[T]` values (#1474): element-wise equality over
  * the two frozen list buffers, by an element-kind tag (0 = i64 word incl.
  * bool/char/enum, 1 = f64, 2 = str/bytes `ZapStr` pointer). Unequal lengths are
- * unequal; otherwise every element must match. Returns 1 (equal) / 0. */
+ * unequal; otherwise every element must match. Returns 1 (equal) / 0.
+ * `zap_str_eq` is defined later (array.inc.c), so forward-declare it to avoid an
+ * implicit `int` declaration conflicting with its real `int64_t` signature. */
+int64_t zap_str_eq(void *a, void *b);
 int64_t zap_vartuple_eq(void *a, void *b, int32_t kind) {
     int64_t na = zap_list_len(a);
     int64_t nb = zap_list_len(b);
