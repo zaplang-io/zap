@@ -2384,6 +2384,16 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
                 };
                 Ok(Ty::Set(e))
             }
+            // `tuple[T]` (#1461): the variadic immutable tuple, a frozen list
+            // buffer. A value position (any storable element, like `list`), so
+            // `value_elem_of` admits `f64`.
+            "tuple" => {
+                let e = match args.first() {
+                    Some(a) => value_elem_of(a, env)?,
+                    None => Elem::I64,
+                };
+                Ok(Ty::VarTuple(e))
+            }
             "heap" => {
                 let e = match args.first() {
                     Some(a) => heap_elem_of(a, env)?,
