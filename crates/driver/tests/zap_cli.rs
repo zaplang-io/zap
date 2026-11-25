@@ -2932,3 +2932,93 @@ def main():
         "the error names the field and that function types are unsupported: {stderr}"
     );
 }
+
+#[test]
+fn derive_yaml_lowers_a_top_level_optional_field_without_a_dangling_symbol() {
+    // #1514 regression (host-catchable): `@derive(Yaml)` used to miscompile a
+    // top-level `Optional[T]` field into a call to a non-existent
+    // `Optional$T__to_yaml` — an unresolved external symbol that only the LLVM
+    // build caught, because `gen_yaml_to_method` recursed into the `Optional`
+    // aggregate as if it were a nested `@derive(Yaml)` struct. The encoder now
+    // handles `Optional` one level up (JSON/D-0065 parity), so `Rec__to_yaml`
+    // lowers and emits NO `Optional$..__to_yaml` call. Runtime round-trip
+    // (Some/None, scalar + nested payload) is pinned by the golden
+    // `yaml_derive_optional` under the CI LLVM matrix.
+    let src = "\
+@derive(Yaml)
+struct Addr:
+    str city
+    int64 zip
+
+@derive(Yaml)
+struct Rec:
+    str name
+    Optional[int64] age
+    Optional[Addr] addr
+
+def main():
+    auto r = Rec(name=\"a\", age=Optional.Some(1), addr=Optional.Some(Addr(city=\"p\", zip=2)))
+    print(r.to_yaml())
+    auto r2 = Rec(name=\"b\", age=None, addr=None)
+    print(r2.to_yaml())
+";
+    let f = write_zap("i1514-yaml-optional", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a top-level Optional Yaml field must lower cleanly; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("@Rec__to_yaml") && stdout.contains("@Rec__from_yaml"),
+        "the Yaml codec is emitted for the struct: {stdout}"
+    );
+    // The defect: a call to the Optional instance's non-existent encoder. Note
+    // `Optional$int64` / `Optional$Addr` appear legitimately as type names and
+    // for the Optional helper methods (`__is_none` / `__unwrap` / …) — only a
+    // `..__to_yaml` on an Optional instance is the miscompile.
+    assert!(
+        !stdout.contains("Optional$int64__to_yaml") && !stdout.contains("Optional$Addr__to_yaml"),
+        "no call to a non-existent Optional$T__to_yaml is emitted (#1514): {stdout}"
+    );
+    // The Some arm encodes the nested struct payload through the real child
+    // encoder; the None arm emits a literal `null` column.
+    assert!(
+        stdout.contains("@Addr__to_yaml"),
+        "the Some arm of a nested Optional payload encodes through the child: {stdout}"
+    );
+}
+
+#[test]
+fn derive_yaml_rejects_a_nested_optional_payload_cleanly() {
+    // #1514: a nested `Optional` *payload* (`Optional[Optional[T]]`) has no
+    // value-position YAML form yet. It must fail with the clean "unsupported yet"
+    // diagnostic (matching `@derive(Json)`), NOT fall into the `Nested` recursion
+    // and emit a dangling symbol.
+    let src = "\
+@derive(Yaml)
+struct Rec:
+    Optional[Optional[int64]] opt
+
+def main():
+    auto r = Rec(opt=None)
+    print(r.to_yaml())
+";
+    let f = write_zap("i1514-yaml-nested-optional", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "a nested Optional Yaml payload must fail to compile"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("@derive(Yaml) does not support a nested Optional")
+            && stderr.contains("yet"),
+        "the error is the clean 'unsupported nested Optional payload' diagnostic: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "it is a clean diagnostic, not a panic: {stderr}"
+    );
+}

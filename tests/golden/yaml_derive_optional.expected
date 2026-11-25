@@ -1,0 +1,17 @@
+name: "ada"
+age: 42
+addr:
+  city: "paris"
+  zip: 75001
+
+ada
+42
+paris
+75001
+name: "bob"
+age: null
+addr: null
+
+bob
+True
+True
