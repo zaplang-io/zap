@@ -662,6 +662,15 @@ generator, a generator expression, or a user type implementing `__iter__` /
 `__next__`; reified per-container iterators (`iter([1, 2])`, `iter("ab")`) are a
 documented follow-up (`for` iterates every built-in container today).
 
+**`map()` / `filter()` (#1390):** `map(func, *lists)` applies `func` across one or
+more lists, stopping at the shortest, producing a `list[R]` where `R` is `func`'s
+return type; `filter(pred, list)` produces a `list[T]` of the elements for which
+`pred` is truthy, preserving the element type. Both **materialize to a `list`**
+(matching `reversed`), so they compose with `for`, `list(...)`, and `sum(...)` and
+bind to a `list[...]` directly. Strictly-lazy adapters (no intermediate list),
+other iterables beyond `list`, closure / method-value callees, and the
+`filter(None, xs)` keep-truthy convenience are documented follow-ups.
+
 **pass** (#591) is a no-op statement accepted anywhere a statement is expected —
 a function body, any branch of `if`/`elif`/`else`, `for`/`while` (and their
 `else`), `with`, `try`/`except`/`finally`, `scope`, and as the explicit spelling

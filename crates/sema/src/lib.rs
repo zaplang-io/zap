@@ -747,6 +747,12 @@ const BUILTINS: &[&str] = &[
     // `default`. Both build on the comma-ok `__next__ -> (T, bool)` internally.
     "iter",
     "next",
+    // map(func, *lists) / filter(pred, list) (#1390): apply / select across
+    // lists. Materialized to a `list` (the `reversed` model), so they compose
+    // with `for` / `list()` / `sum()`; `map`'s result element type is the
+    // callee's return type, `filter` preserves the input element type.
+    "map",
+    "filter",
     "dot",
     "concatenate",
     "stack",
@@ -9618,6 +9624,105 @@ impl Checker {
                         parts.push(e);
                     }
                     return Ty::List(Box::new(Ty::Tuple(parts)));
+                }
+                // `map(func, *lists)` (#1390): apply `func` across one or more
+                // lists, stopping at the shortest, into a fresh `list[R]` where
+                // `R` is `func`'s return type (the `reversed` materialized model,
+                // so it composes with `for`/`list()`/`sum()`). The result element
+                // type is the callee's return type when it is a named function
+                // (looked up directly); a closure / method value is loose
+                // (`Unknown`) here and precise at lowering. Lists only for now
+                // (other iterables are a follow-up, matching enumerate/zip).
+                "map" => {
+                    if args.len() < 2 || args.iter().any(|a| a.name.is_some()) {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "map(func, *iterables) takes a function and one or more \
+                             positional iterables"
+                                .to_string(),
+                            span,
+                        );
+                        for a in args {
+                            self.infer(&a.value);
+                        }
+                        return Ty::Unknown;
+                    }
+                    // The result element type is the callee's return type when it
+                    // is a named function; otherwise loose.
+                    let ret_ty = match &args[0].value {
+                        Expr::Name(f, _) => self
+                            .sigs
+                            .get(f)
+                            .map(|s| s.ret.clone())
+                            .unwrap_or(Ty::Unknown),
+                        _ => Ty::Unknown,
+                    };
+                    self.infer(&args[0].value);
+                    for a in &args[1..] {
+                        let t = self.infer(&a.value);
+                        if !matches!(t, Ty::List(_) | Ty::Unknown) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "map() iterables must be lists, got {} (other \
+                                     iterables are a follow-up)",
+                                    t.display()
+                                ),
+                                span,
+                            );
+                        }
+                    }
+                    return Ty::List(Box::new(ret_ty));
+                }
+                // `filter(pred, list)` (#1390): a fresh `list[T]` of the elements
+                // for which `pred` returns truthy (same `reversed` materialized
+                // model). The element type is preserved. `filter(None, xs)` (the
+                // keep-truthy convenience) is a deferred follow-up — the predicate
+                // overload is a flagged design decision — so it is a clean error
+                // for now.
+                "filter" => {
+                    if args.len() != 2 || args.iter().any(|a| a.name.is_some()) {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "filter(pred, iterable) takes exactly two positional arguments"
+                                .to_string(),
+                            span,
+                        );
+                        for a in args {
+                            self.infer(&a.value);
+                        }
+                        return Ty::Unknown;
+                    }
+                    let t = self.infer(&args[1].value);
+                    let elem = match &t {
+                        Ty::List(e) => (**e).clone(),
+                        Ty::Unknown => Ty::Unknown,
+                        other => {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "filter() expects a list, got {} (other iterables \
+                                     are a follow-up)",
+                                    other.display()
+                                ),
+                                span,
+                            );
+                            Ty::Unknown
+                        }
+                    };
+                    // `filter(None, xs)` keep-truthy is a flagged decision, deferred.
+                    if matches!(&args[0].value, Expr::None(_)) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            "filter(None, xs) (keep the truthy elements) is a follow-up \
+                             (#1390); pass a predicate function for now"
+                                .to_string(),
+                            span,
+                        );
+                        return Ty::List(Box::new(elem));
+                    }
+                    self.infer(&args[0].value);
+                    return Ty::List(Box::new(elem));
                 }
                 "len" => {
                     for a in args {
@@ -19461,6 +19566,88 @@ def main():
             ))
             .is_empty(),
             "next() with three arguments must be rejected"
+        );
+    }
+
+    // ---- #1390: map() / filter() (materialized list adapters) ----
+    //
+    // `map(func, *lists)` → `list[R]` (R = `func`'s return type), stopping at the
+    // shortest list; `filter(pred, list)` → `list[T]` preserving the element
+    // type. Both materialize to a `list` (the `reversed` model), so they feed
+    // `for` / `list()` / `sum()` and bind to a `list[...]` directly.
+
+    const MAP_FNS: &str = "def square(int64 x) -> int64:\n    return x * x\n\n\
+        def add(int64 a, int64 b) -> int64:\n    return a + b\n\n\
+        def is_even(int64 x) -> bool:\n    return x % 2 == 0\n\n";
+
+    #[test]
+    fn map_result_is_a_list_of_the_callee_return_type() {
+        // `map(square, xs)` is `list[int64]` (square -> int64): it binds to a
+        // `list[int64]`, iterates in a `for`, and feeds `sum()`.
+        ok(&format!(
+            "{MAP_FNS}def main():\n    \
+             list[int64] ys = map(square, [1, 2, 3])\n    \
+             for y in map(square, [1, 2, 3]):\n        print(y)\n    \
+             int64 s = sum(map(square, [1, 2, 3]))\n    print(s)\n    print(ys)\n"
+        ));
+    }
+
+    #[test]
+    fn map_over_multiple_lists_types_by_the_callee() {
+        // `map(add, xs, ys)` applies across two lists; the result element type is
+        // still `add`'s return type (`int64`).
+        ok(&format!(
+            "{MAP_FNS}def main():\n    \
+             list[int64] zs = map(add, [1, 2, 3], [10, 20, 30])\n    print(zs)\n"
+        ));
+    }
+
+    #[test]
+    fn filter_preserves_the_element_type() {
+        // `filter(is_even, xs)` is `list[int64]` — the element type is preserved.
+        ok(&format!(
+            "{MAP_FNS}def main():\n    \
+             list[int64] evens = filter(is_even, [1, 2, 3, 4])\n    \
+             for e in filter(is_even, [1, 2, 3, 4]):\n        print(e)\n    print(evens)\n"
+        ));
+    }
+
+    #[test]
+    fn filter_none_is_a_deferred_follow_up() {
+        // `filter(None, xs)` (keep-truthy) is a flagged decision, deferred: a
+        // clean error pointing at the follow-up, not a silent accept.
+        let msg = err_text("def main():\n    auto xs = filter(None, [0, 1, 2])\n");
+        assert!(
+            msg.contains("filter(None") && msg.contains("#1390"),
+            "filter(None, …) must be a clean deferral; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn map_filter_arity_is_rejected() {
+        // map() needs a function and at least one iterable.
+        assert!(
+            !errors(&format!(
+                "{MAP_FNS}def main():\n    auto ys = map(square)\n"
+            ))
+            .is_empty(),
+            "map() with only a function must be rejected"
+        );
+        // filter() is strictly binary.
+        assert!(
+            !errors(&format!(
+                "{MAP_FNS}def main():\n    auto ys = filter(is_even)\n"
+            ))
+            .is_empty(),
+            "filter() with one argument must be rejected"
+        );
+        // A non-list iterable is rejected (other iterables are a follow-up).
+        assert!(
+            !errors(&format!(
+                "{MAP_FNS}def main():\n    auto ys = map(square, 5)\n"
+            ))
+            .is_empty(),
+            "map() over a non-list must be rejected"
         );
     }
 
