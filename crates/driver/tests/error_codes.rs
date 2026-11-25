@@ -753,3 +753,26 @@ fn vartuple_ops_codes() {
     );
     assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
 }
+
+#[test]
+fn generic_interface_value_position_codes() {
+    // Generic-interface conformance is enforced at value positions (#1428):
+    // `IntBox` conforms to `Container[int64]`, so the call is clean ...
+    const PREFIX: &str = "interface Container[E]:\n    def get(self) -> E\n\n\
+        struct IntBox:\n    int64 v\n\
+        \x20   def get(self) -> int64:\n        return self.v\n\n";
+    let ok = check_source(&format!(
+        "{PREFIX}def take(Container[int64] c):\n    print(1)\n\n\
+         def main():\n    take(IntBox())\n"
+    ));
+    assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
+    // ... and a wrong instantiation `Container[str]` is the argument-type error
+    // ZAP4021 (the value position is now checked against the real `[Arg]`).
+    assert_code(
+        &format!(
+            "{PREFIX}def take(Container[str] c):\n    print(1)\n\n\
+             def main():\n    take(IntBox())\n"
+        ),
+        "ZAP4021",
+    );
+}
