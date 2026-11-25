@@ -2247,7 +2247,9 @@ def _derive_jsondecode[T](str s) -> T:
         case _:
             m = {}
     comptime for f in reflect.type_info(T).fields:
-        if f.ty.name == \"int64\":
+        if f.ty.kind.name == \"struct\":
+            reflect.set_field(out, comptime f.index, _derive_jsondecode(json.dumps(m[f.name])))
+        elif f.ty.name == \"int64\":
             reflect.set_field(out, comptime f.index, _jc_int(m[f.name]))
         elif f.ty.name == \"str\":
             reflect.set_field(out, comptime f.index, _jc_str(m[f.name]))
@@ -2258,7 +2260,7 @@ def _derive_jsondecode[T](str s) -> T:
 interface JsonDecode:
     def from_jsoncodec(str s) -> Self
 
-@derive(Hash, Eq, Json, JsonEncode)
+@derive(Hash, Eq, Json, JsonEncode, JsonDecode)
 struct Inner:
     int64 a
 
@@ -2267,7 +2269,7 @@ struct Flat:
     int64 x
     str s
 
-@derive(Eq, Json, JsonEncode)
+@derive(Eq, Json, JsonEncode, JsonDecode)
 struct Nested:
     int64 n
     Inner inner
@@ -2276,6 +2278,7 @@ def main():
     auto p = Flat(7, \"hi\")
     print(Flat.from_jsoncodec(p.to_jsoncodec()) == p)
     auto o = Nested(3, Inner(9))
+    print(Nested.from_jsoncodec(o.to_jsoncodec()) == o)
     print(Nested.from_json(o.to_jsoncodec()) == o)
 ";
     let f = write_zap("e4-json-codec-shadow", src);
@@ -2307,11 +2310,14 @@ def main():
             && stdout.contains("@_derive_jsonencode$Inner"),
         "the library encode recurses through the nested derived struct: {stdout}"
     );
-    // ...and decode is NOT derived on the nested struct (it derives JsonEncode
-    // only; nested-struct decode via reflect.construct is a documented follow-up).
+    // ...and (since #1490 widened `reflect.construct` to zero-construct
+    // nested-struct and `Optional` fields) decode is now ALSO derived on the
+    // nested struct: `Nested__from_jsoncodec` recurses into `Inner`'s decoder.
     assert!(
-        !stdout.contains("@Nested__from_jsoncodec"),
-        "the nested struct does not synthesize a decoder: {stdout}"
+        stdout.contains("@Nested__from_jsoncodec")
+            && stdout.contains("@_derive_jsondecode$Nested")
+            && stdout.contains("@_derive_jsondecode$Inner"),
+        "the library decode recurses through the nested derived struct (#1490): {stdout}"
     );
 }
 
@@ -2642,7 +2648,9 @@ def _derive_yamldecode[T](str s) -> T:
         case _:
             m = {}
     comptime for f in reflect.type_info(T).fields:
-        if f.ty.name == \"int64\":
+        if f.ty.kind.name == \"struct\":
+            reflect.set_field(out, comptime f.index, _derive_yamldecode(yaml.dump(m[f.name])))
+        elif f.ty.name == \"int64\":
             reflect.set_field(out, comptime f.index, _yc_int(m[f.name]))
         elif f.ty.name == \"str\":
             reflect.set_field(out, comptime f.index, _yc_str(m[f.name]))
@@ -2653,7 +2661,7 @@ def _derive_yamldecode[T](str s) -> T:
 interface YamlDecode:
     def from_yamlcodec(str s) -> Self
 
-@derive(Hash, Eq, Yaml, YamlEncode)
+@derive(Hash, Eq, Yaml, YamlEncode, YamlDecode)
 struct Inner:
     int64 a
 
@@ -2662,7 +2670,7 @@ struct Flat:
     int64 x
     str s
 
-@derive(Eq, Yaml, YamlEncode)
+@derive(Eq, Yaml, YamlEncode, YamlDecode)
 struct Nested:
     int64 n
     Inner inner
@@ -2671,6 +2679,7 @@ def main():
     auto p = Flat(7, \"hi\")
     print(Flat.from_yamlcodec(p.to_yamlcodec()) == p)
     auto o = Nested(3, Inner(9))
+    print(Nested.from_yamlcodec(o.to_yamlcodec()) == o)
     print(Nested.from_yaml(o.to_yamlcodec()) == o)
 ";
     let f = write_zap("e4-yaml-codec-shadow", src);
@@ -2702,10 +2711,224 @@ def main():
             && stdout.contains("@_derive_yamlencode$Inner"),
         "the library encode recurses through the nested derived struct: {stdout}"
     );
-    // ...and decode is NOT derived on the nested struct (it derives YamlEncode
-    // only; nested-struct decode via reflect.construct is a documented follow-up).
+    // ...and (since #1490 widened `reflect.construct` to zero-construct
+    // nested-struct and `Optional` fields) decode is now ALSO derived on the
+    // nested struct: `Nested__from_yamlcodec` recurses into `Inner`'s decoder.
     assert!(
-        !stdout.contains("@Nested__from_yamlcodec"),
-        "the nested struct does not synthesize a decoder: {stdout}"
+        stdout.contains("@Nested__from_yamlcodec")
+            && stdout.contains("@_derive_yamldecode$Nested")
+            && stdout.contains("@_derive_yamldecode$Inner"),
+        "the library decode recurses through the nested derived struct (#1490): {stdout}"
+    );
+}
+
+#[test]
+fn reflect_construct_zero_sets_nested_optional_and_collection_fields() {
+    // #1490 (E4): `reflect.construct(T)` widens the #1454 v1 zero set (scalar /
+    // str / bytes) to also zero-construct a nested struct, an `Optional`, a
+    // `list` / `dict` / `set`, and a tuple field. A `Self`-returning generator
+    // (#1455) zero-constructs the value and `main` reads every field back with a
+    // concrete accessor, so the readback path for each new kind lowers: the
+    // nested struct is zero-valued, the collections are empty (`len == 0`), and
+    // the optional is `None`. Runtime values are pinned by the codec goldens
+    // under the CI LLVM matrix; here we assert the whole program lowers.
+    let src = "\
+@derivable(Make)
+def _derive_make[T]() -> T:
+    return reflect.construct(T)
+
+interface Make:
+    def make() -> Self
+
+@derive(Eq, Hash)
+struct Inner:
+    int64 a
+    str s
+
+@derive(Make)
+struct Wide:
+    int64 n
+    Inner inner
+    Optional[int64] opt
+    list[int64] xs
+    dict[str, int64] m
+    set[int64] st
+    (int64, str) pair
+
+def main():
+    auto z = Wide.make()
+    print(z.n)
+    print(z.inner.a)
+    print(z.inner.s)
+    print(len(z.xs))
+    print(len(z.m))
+    print(len(z.st))
+    match z.opt:
+        case Optional.None:
+            print(\"none\")
+        case Optional.Some(v):
+            print(v)
+";
+    let f = write_zap("e4-construct-zeroset-wide", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "reflect.construct must zero-construct nested / Optional / list / dict / \
+         set / tuple fields and the readback must lower; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("does not support yet")
+            && !stderr.contains("no zero-initializer")
+            && !stderr.contains("unknown variable 'reflect'"),
+        "no residual reflect / unsupported-field error for the widened kinds: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The generator specializes at `Wide` and the forwarding stub is synthesized;
+    // the zero-construction lowers to an ordinary struct field-set (no residual
+    // `reflect` symbol survives to IR).
+    assert!(
+        stdout.contains("@Wide__make") && stdout.contains("fieldset struct"),
+        "the construct generator specializes and zero-initializes the struct: {stdout}"
+    );
+}
+
+#[test]
+fn reflect_construct_recurses_through_a_struct_reachable_only_by_indirection() {
+    // #1490: a struct that contains itself *through an `Optional` / `list`* is NOT
+    // a by-value cycle — the empty optional / empty list breaks the recursion, so
+    // the zero-constructor terminates and the program lowers.
+    let src = "\
+@derivable(Make)
+def _derive_make[T]() -> T:
+    return reflect.construct(T)
+
+interface Make:
+    def make() -> Self
+
+@derive(Make)
+struct Node:
+    int64 v
+    Optional[Node] next
+    list[Node] kids
+
+def main():
+    auto z = Node.make()
+    print(z.v)
+";
+    let f = write_zap("e4-construct-zeroset-recursive-ok", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a self-reference behind Optional/list is not a cycle and must lower; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn reflect_construct_rejects_a_by_value_struct_cycle_cleanly() {
+    // #1490: a struct that contains itself *by value* (directly, or indirectly
+    // A -> B -> A) has no finite zero value. The widened zero-constructor must
+    // reject it with a clean compile error naming the cycle — never an infinite
+    // recursion / hang (this test returning at all proves termination).
+    let direct = "\
+@derivable(Make)
+def _derive_make[T]() -> T:
+    return reflect.construct(T)
+
+interface Make:
+    def make() -> Self
+
+@derive(Make)
+struct Cyc:
+    int64 n
+    Cyc child
+
+def main():
+    auto z = Cyc.make()
+    print(z.n)
+";
+    let f = write_zap("e4-construct-zeroset-cycle-direct", direct);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "a by-value self-cycle must be a clean error, not success"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("contains itself by value"),
+        "the cycle error names the by-value containment: {stderr}"
+    );
+
+    // Indirect: A -> B -> A, both by value (B is not itself derived, but is
+    // reached as A's field type).
+    let indirect = "\
+@derivable(Make)
+def _derive_make[T]() -> T:
+    return reflect.construct(T)
+
+interface Make:
+    def make() -> Self
+
+struct B:
+    int64 x
+    A a
+
+@derive(Make)
+struct A:
+    int64 y
+    B b
+
+def main():
+    auto z = A.make()
+    print(z.y)
+";
+    let f = write_zap("e4-construct-zeroset-cycle-indirect", indirect);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "an indirect A -> B -> A by-value cycle must be a clean error, not success"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("contains itself by value"),
+        "the indirect cycle error names the by-value containment: {stderr}"
+    );
+}
+
+#[test]
+fn reflect_construct_still_rejects_an_unsupported_field_type_cleanly() {
+    // #1490 widens the zero set but does NOT make it total: a field type with no
+    // zero value — a function type — is still a clean "unsupported yet" error
+    // (naming the field and type), not a panic and not silent acceptance.
+    let src = "\
+@derivable(Make)
+def _derive_make[T]() -> T:
+    return reflect.construct(T)
+
+interface Make:
+    def make() -> Self
+
+@derive(Make)
+struct HasFn:
+    int64 n
+    fn(int64) -> int64 f
+
+def main():
+    auto z = HasFn.make()
+    print(z.n)
+";
+    let f = write_zap("e4-construct-zeroset-unsupported", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "a function-typed field has no zero value and must be a clean error"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no zero-initializer")
+            && stderr.contains("field `f` of `HasFn`")
+            && stderr.contains("function types"),
+        "the error names the field and that function types are unsupported: {stderr}"
     );
 }

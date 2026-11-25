@@ -1,7 +1,7 @@
-# E4 (#1429/#1484): shadow-prove that the built-in `@derive(Yaml)` codec can be
-# expressed as plain library `@derivable` generators, WITHOUT replacing the
-# built-in. This is the third and last E4 *codec* slice, after Json (#1470) and
-# Csv (#1480).
+# E4 (#1429/#1484, widened by #1490): shadow-prove that the built-in
+# `@derive(Yaml)` codec can be expressed as plain library `@derivable`
+# generators, WITHOUT replacing the built-in. This is the third and last E4
+# *codec* slice, after Json (#1470) and Csv (#1480).
 #
 # Yaml is the closest sibling of Json: YAML 1.2 is a JSON superset, so the public
 # `yaml` module reuses the shared `JsonValue` DOM — `yaml.load(str) -> JsonValue`
@@ -19,9 +19,21 @@
 # unordered dict, so key (line) order is unspecified and round-trip is
 # order-insensitive.
 #
+# #1490 widened `reflect.construct` so it also zero-constructs a nested-struct
+# field (previously a clean "unsupported yet" error). With that the decoder gains
+# its nested-struct branch, so a nested derived struct now round-trips through the
+# LIBRARY decoder (before #1490 it was only cross-checked through the built-in
+# decoder, decode-via-library deferred). `Optional` / `list` / `dict` fields stay
+# out of scope here: the built-in `@derive(Yaml)` cannot codegen an `Optional`
+# field yet (and does not support collections) — a separate documented follow-up
+# — so there is no built-in codec to agree with for those kinds.
+# `reflect.construct`'s own zero set for `Optional` / collection / tuple fields
+# (the heart of #1490) is proven directly by the `construct_zero_set` golden.
+#
 # Built-in Yaml codegen (`gen_yaml_to_method` / `gen_yaml_from_method`), the
 # `DERIVABLE_TRAITS` registry and the prelude are all untouched. Covers int / str
-# / bool / float fields and a nested derived struct (encode recurses).
+# / bool / float fields and a nested derived struct, both directions through the
+# library.
 
 # --- YamlEncode: build a `JsonValue.Object` from the fields, then `yaml.dump`.
 # A nested derived struct recurses via its own `to_yamlcodec()`, re-parsed with
@@ -79,11 +91,10 @@ def _yc_float(JsonValue v) -> float64:
             return 0.0
 
 # --- YamlDecode: parse to the DOM, zero-construct a T, then write each field.
-# v1 decode covers scalar / str fields: `reflect.construct` zero-initializes only
-# scalar / str / bytes fields (#1454), so a nested-struct field is a clean
-# "unsupported yet" error (widening that zero set is a documented follow-up), not
-# handled here. Nested-struct *encode* is still proven below, cross-checked
-# through the built-in decoder.
+# #1490 widened `reflect.construct` to zero-construct a nested-struct field, so
+# this decoder now handles a nested struct too: decode it via the nested type's
+# own `from_yamlcodec()` — the same generator specialized at the field type, the
+# explicit type argument inferred from the `set_field` destination.
 @derivable(YamlDecode)
 def _derive_yamldecode[T](str s) -> T:
     auto out = reflect.construct(T)
@@ -94,7 +105,13 @@ def _derive_yamldecode[T](str s) -> T:
         case _:
             m = {}
     comptime for f in reflect.type_info(T).fields:
-        if f.ty.name == "int64":
+        if f.ty.kind.name == "struct":
+            reflect.set_field(
+                out,
+                comptime f.index,
+                _derive_yamldecode(yaml.dump(m[f.name])),
+            )
+        elif f.ty.name == "int64":
             reflect.set_field(out, comptime f.index, _yc_int(m[f.name]))
         elif f.ty.name == "str":
             reflect.set_field(out, comptime f.index, _yc_str(m[f.name]))
@@ -109,11 +126,11 @@ def _derive_yamldecode[T](str s) -> T:
 interface YamlDecode:
     def from_yamlcodec(str s) -> Self
 
-# A nested derived struct: built-in `Yaml` (for the built-in round-trip and the
-# cross-check decoder) plus library `YamlEncode` so the outer encode can recurse.
+# A nested derived struct: built-in `Yaml` plus BOTH library codec traits, so the
+# outer encode can recurse AND the outer decode can call `Inner.from_yamlcodec`.
 # `Hash, Eq` make it a hashable, comparable field of `Nested` (the built-in `Eq`
 # of the enclosing struct requires a nested field to be hashable).
-@derive(Hash, Eq, Yaml, YamlEncode)
+@derive(Hash, Eq, Yaml, YamlEncode, YamlDecode)
 struct Inner:
     int64 a
     str s
@@ -127,9 +144,9 @@ struct Flat:
     bool b
     float64 f
 
-# A nested derived struct field; library encode recurses, decode via the library
-# is deferred (nested-struct `reflect.construct`), so it derives YamlEncode only.
-@derive(Eq, Yaml, YamlEncode)
+# A nested derived struct field; both the library encode (recurses) and the
+# library decode (#1490) now handle it, so `Nested` derives YamlDecode too.
+@derive(Eq, Yaml, YamlEncode, YamlDecode)
 struct Nested:
     int64 n
     Inner inner
@@ -144,8 +161,13 @@ def main():
     print(Flat.from_yaml(p.to_yamlcodec()) == p)
 
     auto o = Nested(3, Inner(9, "z"))
-    # A nested derived struct: the library encode (which recurses) round-trips
-    # through the built-in decoder.
+    # #1490: the nested-struct value now round-trips through the LIBRARY decoder
+    # (previously decode-via-library was a clean "unsupported yet" error, and this
+    # case was cross-checked only through the built-in decoder).
+    print(Nested.from_yamlcodec(o.to_yamlcodec()) == o)
+    # The library decode agrees with the built-in encoder for the nested value...
+    print(Nested.from_yamlcodec(o.to_yaml()) == o)
+    # ...the built-in decode agrees with the library encoder (holds since #1484)...
     print(Nested.from_yaml(o.to_yamlcodec()) == o)
-    # Control: the built-in's own nested round-trip still holds.
+    # ...and the built-in's own nested round-trip still holds (control).
     print(Nested.from_yaml(o.to_yaml()) == o)
