@@ -11660,7 +11660,11 @@ impl Checker {
             // One-arg `get(key)` yields `Optional[V]`, un-erased (#1452) so the
             // payload (the dict's value type) is carried for payload-aware checks
             // and precise rendering, instead of the old opaque `Named("Optional")`.
-            return Ty::Optional(Box::new(v.clone()));
+            // The value type is DEFAULTED so an inferred dict of untyped literals
+            // (`auto counts = {"a": 1}` → `dict[str, int]`) yields `Optional[int64]`,
+            // not `Optional[int]` (`UntypedInt`), matching how mono monomorphizes
+            // the payload — so `Optional[int64] x = counts.get(k)` stays accepted.
+            return Ty::Optional(Box::new(default_type(v.clone())));
         }
         let ret = match name {
             "keys" => Ty::List(Box::new(k.clone())),
@@ -17734,6 +17738,34 @@ def main():
              bigint g = 9223372036854775808\n    \
              dict[str, Optional[int64]] d = {\"k\": Optional.Some(g)}\n    \
              print(len(d))\n",
+        );
+    }
+
+    #[test]
+    fn sema_dict_get_into_annotated_optional_accepts_untyped_value_dict() {
+        // Regression (tests/conformance/dict_get_optional.zap): an inferred dict of
+        // untyped-int literals has value type `int` (UntypedInt); `get` must yield
+        // `Optional[int64]` (the defaulted payload, as mono monomorphizes it), so
+        // `Optional[int64] ca = counts.get("a")` type-cleans. Before the payload was
+        // defaulted this rejected with "Optional[int] -> Optional[int64]".
+        ok("def main():\n    \
+            auto counts = {\"a\": 1, \"b\": 2}\n    \
+            Optional[int64] ca = counts.get(\"a\")\n    \
+            Optional[int64] cz = counts.get(\"z\")\n    \
+            print(ca.unwrap_or(-1))\n    \
+            print(cz.unwrap_or(-1))\n");
+        // The str-payload partner from the same fixture.
+        ok("def main():\n    \
+            auto headers = {\"accept\": \"json\", \"host\": \"x\"}\n    \
+            Optional[str] hit = headers.get(\"accept\")\n    \
+            print(hit.unwrap_or(\"fallback\"))\n");
+        // An annotated dict value type is carried precisely; a genuine mismatch of
+        // the get payload against the annotation is still rejected.
+        rejects_4001(
+            "def main():\n    \
+             dict[str, str] d = {\"a\": \"v\"}\n    \
+             Optional[int64] x = d.get(\"a\")\n    \
+             print(x.is_some())\n",
         );
     }
 
