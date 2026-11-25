@@ -1383,6 +1383,13 @@ def __json_field(JsonValue v, str k) -> JsonValue:
         case _:
             return JsonValue.Null
 
+def __json_as_array(JsonValue v) -> list[JsonValue]:
+    match v:
+        case JsonValue.Array(xs):
+            return xs
+        case _:
+            return []
+
 def __yaml_obj_empty(dict[str, JsonValue] m) -> bool:
     for k in json._obj_keys(m):
         return False

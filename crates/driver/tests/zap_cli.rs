@@ -3173,3 +3173,82 @@ def main():
         "no reflect receiver leaks out of any match arm: {stderr}"
     );
 }
+
+#[test]
+fn derive_json_supports_list_fields() {
+    // #1530 (epic #1529): the built-in `@derive(Json)` codec encodes a `list[T]`
+    // field as a JSON array and decodes it back, for element types int / str /
+    // nested @derive(Json) struct. Encode string-builds the array recursing into
+    // the per-element encoder; decode reads the DOM array via the `__json_as_array`
+    // prelude accessor and decodes each element. Round-trip output is pinned by
+    // the golden `derive_json_list_field` under the CI LLVM matrix; here we assert
+    // it lowers and wires the array accessor + element recursion.
+    let src = "\
+@derive(Json)
+struct Item:
+    int64 id
+    str tag
+
+@derive(Json)
+struct Bag:
+    list[int64] nums
+    list[str] names
+    list[Item] items
+
+def main():
+    auto b = Bag([1, 2, 3], [\"a\"], [Item(7, \"x\")])
+    auto d = Bag.from_json(b.to_json())
+    print(len(d.nums))
+    print(d.items[0].id)
+";
+    let f = write_zap("derive-json-list-field", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a @derive(Json) struct with list fields must lower; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("@Bag__to_json") && stdout.contains("@Bag__from_json_value"),
+        "the built-in list-field codec methods are emitted: {stdout}"
+    );
+    // Decode reads the DOM array through the prelude accessor...
+    assert!(
+        stdout.contains("__json_as_array"),
+        "list decode reads the array via __json_as_array (#1530): {stdout}"
+    );
+    // ...and a nested-struct element recurses into its own codec both ways.
+    assert!(
+        stdout.contains("@Item__to_json") && stdout.contains("@Item__from_json_value"),
+        "a nested-struct list element recurses into its own codec: {stdout}"
+    );
+}
+
+#[test]
+fn derive_json_rejects_unsupported_list_elements_and_other_collections_cleanly() {
+    // #1530: list support is scoped to int/float/str/bytes/nested-struct elements
+    // and does NOT extend to a nested-collection element (`list[list[...]]`, the
+    // Elem::Nested interner path, #1533) or to a bool/char element (which collapse
+    // to a coarse i64 word). `dict`/`set` fields remain a follow-up. Each must be a
+    // clean compile error, not a miscompile.
+    let cases = [
+        ("list[list[int64]] x", "nested-collection"),
+        ("list[bool] x", "bool element"),
+        ("dict[str, int64] x", "dict field"),
+    ];
+    for (field, what) in cases {
+        let src = format!("@derive(Json)\nstruct S:\n    {field}\n\ndef main():\n    print(0)\n");
+        let f = write_zap("derive-json-list-reject", &src);
+        let out = zap().arg("ir").arg(&f).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "{what} must be a clean error, not success"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("@derive(Json)") && stderr.contains("follow-up"),
+            "{what} errors cleanly via the derive codec: {stderr}"
+        );
+    }
+}
