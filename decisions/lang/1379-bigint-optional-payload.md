@@ -53,10 +53,17 @@ through) and the bare-payload `Optional`-wrap arm of `expr_collection_context`
 (plain reassignment), via one `check_numeric_payload(from, to)` helper. It is in
 lowering rather than sema because sema has erased the `Optional` payload type by
 the time it checks assignability (`coercible`), so it cannot see that the payload
-is `int64`; lowering has the concrete payload type. A consequence is that this
-specific error surfaces at `zap build` / `zap ir`, not through the sema-only MCP
-`check_source` surface; moving it earlier would require threading the `Optional`
+is `int64`; lowering has the concrete payload type. A consequence was that this
+specific error surfaced at `zap build` / `zap ir`, not through the sema-only MCP
+`check_source` surface; moving it earlier required threading the `Optional`
 payload type through sema (the broader #1265 "verify the payload" follow-up).
+
+**Follow-up resolved (#1452):** sema now un-erases the `Optional` payload
+(`Ty::Optional(T)`) and rejects a bare `bigint` into a fixed-width-numeric payload
+at the type-checking layer too, so this error also surfaces through the sema-only
+`check_source` / LSP path. This lowering `check_numeric_payload` stays as defense
+in depth (constructor fields and monomorphized IR); see
+`decisions/lang/1452-sema-optional-payload.md`.
 
 ## Consequences
 

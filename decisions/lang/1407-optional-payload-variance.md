@@ -76,11 +76,19 @@ outer `Optional`, so a correctly-formed *outer* `Optional` (e.g.
 passed up to be resolved by the outer frame's `it == target`. Checking it at that
 non-final frame would false-positive on nested `Optional`s.
 
-A consequence, shared with #1379: this specific error surfaces at `zap build` /
+A consequence, shared with #1379: this specific error surfaced at `zap build` /
 `zap ir`, not through the sema-only MCP `check_source` surface. Moving it earlier
-would require threading the `Optional` payload type through sema — the broader
+required threading the `Optional` payload type through sema — the broader
 #1265 "verify the payload" follow-up (un-erase the `Optional` payload in
-`coercible`), which this ADR does not take.
+`coercible`), which this ADR did not take.
+
+**Follow-up resolved (#1452):** sema now tracks `Optional[T]` as a payload-carrying
+`Ty::Optional(T)` and makes `assignable`/`coercible` payload-aware (`Optional[U]`
+assignable to `Optional[T]` iff `U == T`), so this payload mismatch is rejected at
+the type-checking layer and surfaces through the sema-only `check_source` / LSP
+path — with no change to end-to-end accept/reject behaviour. This lowering
+`check_optional_payload` stays as defense in depth (constructor fields and
+monomorphized IR); see `decisions/lang/1452-sema-optional-payload.md`.
 
 ## Consequences
 

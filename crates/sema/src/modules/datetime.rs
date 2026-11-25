@@ -718,7 +718,10 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         // `%Z` still renders the numeric offset (`UTC-04:00`) unchanged.
         "zone_abbreviation" => {
             expect1(checker, method, args, span, "a DateTime", is_datetime);
-            Some(Ty::Named("Optional".to_string()))
+            // `Optional[str]`, un-erased (#1452) so it is payload-compatible with
+            // an `Optional[str]` annotation (the old opaque `Named("Optional")` no
+            // longer matches the payload-aware `Ty::Optional`).
+            Some(Ty::Optional(Box::new(Ty::Str)))
         }
         _ => None,
     }

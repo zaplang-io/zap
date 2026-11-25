@@ -55,6 +55,28 @@ pub struct TypeError {
     pub span: Span,
 }
 
+/// Whether `t` is a fixed-width numeric type — a concrete machine integer
+/// (`int32`/`int64`/`uint8..64`/`usize`) or float (`float32`/`float64`) (#1452).
+/// This is exactly the set of payload types into which a `bigint` is NOT
+/// implicitly convertible, mirroring IR lowering's `check_numeric_payload`
+/// (`to.int_width().is_some() || to.is_float()`): `bigint`, `complex`, and the
+/// untyped literals are excluded, so `Optional[bigint]`/`Optional[complex]` stay
+/// accepted.
+fn is_fixed_width_numeric(t: &Ty) -> bool {
+    matches!(
+        t,
+        Ty::Int32
+            | Ty::Int64
+            | Ty::Uint8
+            | Ty::Uint16
+            | Ty::Uint32
+            | Ty::Uint64
+            | Ty::Usize
+            | Ty::Float32
+            | Ty::Float64
+    )
+}
+
 /// A compile-time-constant non-negative integer index, if `e` is one (used for
 /// tuple element access `t[k]`, D-0049). Only integer literals (with an optional
 /// unary `+`) are constant folds here; a negative or non-literal index is not a
@@ -2282,15 +2304,29 @@ impl Checker {
             // wrap at its shared coercion chokepoint (#1262, `gen_opt_some`), so an
             // admitted bare payload lowers to a tagged `Some` end-to-end.
             //
-            // This is payload-agnostic: sema tracks `Optional[T]` opaquely as
-            // `Named("Optional")` with the payload erased (`resolve_type` /
-            // `is_optional_ty`), so — exactly as for an explicit `Optional.Some(e)`
-            // or a constructor field — the payload's own type is verified
-            // downstream (mono / lowering), not here. The source must not itself be
-            // an `Optional`: an `Optional[U]` value flows by the ordinary
-            // `Optional`-to-`Optional` identity (the `from == to` check in
-            // `assignable`), never by re-wrapping into `Some(Some(..))`.
-            (from, to) if Self::is_optional_ty(to) && !Self::is_optional_ty(from) => true,
+            // The source must not itself be an `Optional`: an `Optional[U]` value
+            // flows by the payload-aware `Optional`-to-`Optional` rule in
+            // `assignable` (reject on a differing payload, #1452), never by
+            // re-wrapping into `Some(Some(..))`.
+            //
+            // The wrap stays deliberately PERMISSIVE on the bare payload — it is
+            // NOT a widening check. IR lowering (`opt_payload_source`/`gen_opt_some`)
+            // wraps and coerces a bare `str`/`float`/narrowing-numeric payload into
+            // `Some`, so those are accepted end-to-end and must type-clean here too.
+            // The one exception is the locked #1379 reject, mirrored from lowering's
+            // `check_numeric_payload`: a bare `bigint` is not implicitly convertible
+            // to a fixed-width-numeric payload (`int*`/`float*`/`uint*`/`usize`), so
+            // reject it at sema as well — matching the already-rejected direct
+            // `int64 x = <bigint>`. A bare `bigint` into `Optional[bigint]` (or a
+            // bare `Optional`/`Optional.None`, payload `Unknown`) is still fine.
+            (from, to) if Self::is_optional_ty(to) && !Self::is_optional_ty(from) => {
+                if *from == Ty::Bigint {
+                    if let Ty::Optional(payload) = to {
+                        return !is_fixed_width_numeric(payload);
+                    }
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -3381,6 +3417,19 @@ impl Checker {
                     Ty::ContextVar(Box::new(el))
                 }
                 "ContextToken" => Ty::CtxToken,
+                // The prelude generic enum `Optional[T]` (I#154) — un-erased
+                // (#1452). Capture the payload so sema's assignability is
+                // payload-aware; a bare `Optional` (no type argument) carries
+                // `Unknown`, a wildcard payload. Matched before the generic
+                // `user_types` arm below (which would otherwise collapse it to the
+                // opaque `Named("Optional")`).
+                "Optional" => {
+                    let payload = args
+                        .first()
+                        .map(|a| self.resolve_type(a))
+                        .unwrap_or(Ty::Unknown);
+                    Ty::Optional(Box::new(payload))
+                }
                 other => {
                     // A transparent type alias (#606) resolves to its target
                     // with the generic parameters substituted, recursively, so
@@ -3454,18 +3503,21 @@ impl Checker {
         let span = type_span(t);
         let ty = self.resolve_type(t);
 
-        // `Optional[T]` erases its element at the `Ty` level (sema tracks `T?`
-        // opaquely as `Named("Optional")`, see `is_optional_ty`), so recover the
-        // element from the declared type's first argument when it is written
-        // directly as `Optional[T]`. A bare `Optional` (or an alias to one) has
-        // no recoverable element and reports `Unknown`.
+        // `Optional[T]` now carries its payload in the resolved `Ty` (#1452), so
+        // read the element straight off `Ty::Optional(elem)`. A bare `Optional`
+        // (or an alias to one, or `Optional.None`) carries `Unknown`. The legacy
+        // `Named("Optional"…)` spelling, if it ever reaches here, falls back to
+        // recovering the element from the declared type's first argument.
         if Self::is_optional_ty(&ty) {
-            let elem = match t {
-                Type::Named { args, .. } => args
-                    .first()
-                    .map(|a| self.resolve_type(a))
-                    .unwrap_or(Ty::Unknown),
-                _ => Ty::Unknown,
+            let elem = match &ty {
+                Ty::Optional(e) => (**e).clone(),
+                _ => match t {
+                    Type::Named { args, .. } => args
+                        .first()
+                        .map(|a| self.resolve_type(a))
+                        .unwrap_or(Ty::Unknown),
+                    _ => Ty::Unknown,
+                },
             };
             return Ok(TypeInfo {
                 shape: TypeShape::Optional { elem },
@@ -5938,13 +5990,13 @@ impl Checker {
     /// value (also `Named`) renders by dynamic dispatch to its concrete type's
     /// renderer (#707).
     fn check_renderable(&mut self, ty: &Ty, span: Span) {
-        // `Optional[T]` is the prelude generic enum (I#154); sema tracks it
-        // opaquely as `Named("Optional")` without its payload type, so the
-        // payload's own renderability is enforced later by the lowerer.
-        if let Ty::Named(n) = ty {
-            if n == "Optional" || n.starts_with("Optional$") {
-                return;
-            }
+        // `Optional[T]` is the prelude generic enum (I#154), rendered as its
+        // payload when present / `None` when absent (#498). It is renderable
+        // regardless of payload (the payload's own renderability is enforced by
+        // the lowerer), so accept the un-erased `Ty::Optional(_)` (#1452) and the
+        // legacy `Named("Optional"…)` spelling alike.
+        if Self::is_optional_ty(ty) {
+            return;
         }
         if !matches!(
             ty,
@@ -6404,6 +6456,13 @@ impl Checker {
                     if let Some(info) = self.enums.get(tyname).cloned() {
                         match info.variant(name) {
                             Some(v) if v.fields.is_empty() => {
+                                // `Optional.None` is un-erased (#1452) with a
+                                // wildcard `Unknown` payload, so it stays assignable
+                                // into any `Optional[T]`; every other payload-free
+                                // enum member is the opaque `Named` type.
+                                if tyname == "Optional" {
+                                    return Ty::Optional(Box::new(Ty::Unknown));
+                                }
                                 return Ty::Named(tyname.clone());
                             }
                             Some(_) => {
@@ -6451,6 +6510,11 @@ impl Checker {
                         if self.generic_enums.contains(g) {
                             if let Some(info) = self.enums.get(g) {
                                 return match info.variant(name) {
+                                    // `Optional[T].None` un-erases with a wildcard
+                                    // payload (#1452); the explicit `T` is for mono.
+                                    Some(v) if v.fields.is_empty() && g == "Optional" => {
+                                        Ty::Optional(Box::new(Ty::Unknown))
+                                    }
                                     Some(v) if v.fields.is_empty() => Ty::Named(g.clone()),
                                     Some(_) => {
                                         self.error(
@@ -7377,11 +7441,13 @@ impl Checker {
         self.check_struct_binop(op, l, r, span)
     }
 
-    /// Whether a type names the prelude `Optional[T]` enum (bare `Optional`
-    /// before monomorphization, or a mangled `Optional$…` instance). `Optional`
-    /// is tracked opaquely as a `Named` type, so this is a name test.
+    /// Whether a type is the prelude `Optional[T]` enum (#1452): the payload-aware
+    /// `Ty::Optional(T)` the checker now produces, or — kept for any path that
+    /// still hands over a legacy spelling — the bare `Named("Optional")` or a
+    /// mangled `Named("Optional$…")` monomorph instance.
     fn is_optional_ty(t: &Ty) -> bool {
-        matches!(t, Ty::Named(n) if n == "Optional" || n.starts_with("Optional$"))
+        matches!(t, Ty::Optional(_))
+            || matches!(t, Ty::Named(n) if n == "Optional" || n.starts_with("Optional$"))
     }
 
     /// Whether a value of type `t` can hold `None` — the operand rule for
@@ -11544,10 +11610,10 @@ impl Checker {
         //                          (`Some(value)` present, `None` absent).
         //   `get(key, default)` -> `V`           — the value when present, else
         //                          `default` (a plain `V`, never `Optional[V]`).
-        // The one-arg result is the prelude `Optional[V]`, spelled
-        // `Ty::Named("Optional")` exactly as every other `Optional[T]`
-        // annotation resolves (I#154), so `match`, `is_none()`/`unwrap_or(...)`,
-        // and binding all type-check unchanged.
+        // The one-arg result is the prelude `Optional[V]`, the un-erased
+        // `Ty::Optional(V)` exactly as every other `Optional[T]` annotation
+        // resolves (I#154, #1452), so `match`, `is_none()`/`unwrap_or(...)`, and
+        // binding all type-check unchanged — and a payload mismatch is now caught.
         if name == "get" {
             let n = args.len();
             if n != 1 && n != 2 {
@@ -11602,7 +11668,14 @@ impl Checker {
             if n == 2 {
                 return v.clone();
             }
-            return Ty::Named("Optional".to_string());
+            // One-arg `get(key)` yields `Optional[V]`, un-erased (#1452) so the
+            // payload (the dict's value type) is carried for payload-aware checks
+            // and precise rendering, instead of the old opaque `Named("Optional")`.
+            // The value type is DEFAULTED so an inferred dict of untyped literals
+            // (`auto counts = {"a": 1}` → `dict[str, int]`) yields `Optional[int64]`,
+            // not `Optional[int]` (`UntypedInt`), matching how mono monomorphizes
+            // the payload — so `Optional[int64] x = counts.get(k)` stays accepted.
+            return Ty::Optional(Box::new(default_type(v.clone())));
         }
         let ret = match name {
             "keys" => Ty::List(Box::new(k.clone())),
@@ -12200,8 +12273,17 @@ impl Checker {
             );
         }
         let mut pos = 0usize;
+        // For the prelude `Optional[T]` enum (#1452), capture the first positional
+        // payload's inferred type so the result is the un-erased `Ty::Optional(T)`
+        // (the value side of the un-erasure). Defaulted so an untyped literal
+        // concretizes (`Optional.Some(5)` → `Optional[int64]`), exactly as mono
+        // monomorphizes the payload, keeping sema and lowering in lock-step.
+        let mut optional_payload: Option<Ty> = None;
         for a in args {
             let at = self.infer(&a.value);
+            if enum_name == "Optional" && variant == "Some" && a.name.is_none() && pos == 0 {
+                optional_payload = Some(default_type(at.clone()));
+            }
             let field = match &a.name {
                 Some(fname) => {
                     let f = v.fields.iter().find(|f| &f.name == fname);
@@ -12234,6 +12316,12 @@ impl Checker {
                     );
                 }
             }
+        }
+        // `Optional` is un-erased (#1452): `Some(e)` carries the payload; `None`
+        // (and a malformed `Some` with no positional argument) carries `Unknown`,
+        // a wildcard payload. Every other enum stays the opaque `Named` type.
+        if enum_name == "Optional" {
+            return Ty::Optional(Box::new(optional_payload.unwrap_or(Ty::Unknown)));
         }
         Ty::Named(enum_name.to_string())
     }
@@ -12349,18 +12437,25 @@ impl Checker {
             if let Some(info) = self.enums.get(&path[0]).cloned() {
                 let (enum_name, variant) = (&path[0], &path[1]);
                 // The scrutinee must be this enum (keep going to bind on error).
-                if let Ty::Named(sn) = scrut {
-                    if sn != enum_name {
-                        self.error(
-                            ErrorCode::ZAP5081,
-                            format!(
-                                "pattern '{enum_name}.{variant}' does not match a value of \
-                                 type {}",
-                                scrut.display()
-                            ),
-                            span,
-                        );
-                    }
+                // An un-erased `Ty::Optional(_)` scrutinee (#1452) matches exactly
+                // the `Optional` enum — mirroring the old `Named("Optional")`
+                // check. A non-enum scrutinee (`Unknown`, a scalar) is left
+                // unchecked here, as before.
+                let scrut_mismatch = match scrut {
+                    Ty::Named(sn) => sn != enum_name,
+                    _ if Self::is_optional_ty(scrut) => enum_name != "Optional",
+                    _ => false,
+                };
+                if scrut_mismatch {
+                    self.error(
+                        ErrorCode::ZAP5081,
+                        format!(
+                            "pattern '{enum_name}.{variant}' does not match a value of \
+                             type {}",
+                            scrut.display()
+                        ),
+                        span,
+                    );
                 }
                 let Some(v) = info.variant(variant) else {
                     self.error(
@@ -17518,6 +17613,266 @@ def main():
     print(f"{d.get("k")}")
     print(f"{d["k"]}")
 "#);
+    }
+
+    // --- #1452: sema un-erases the Optional[T] payload -------------------------
+    //
+    // Sema now tracks `Optional[T]` as `Ty::Optional(T)` (no longer the opaque,
+    // payload-erased `Named("Optional")`), so a payload-type mismatch is a
+    // ZAP4001 at the type-checking layer — surfaced through the sema-only
+    // `check` / `check_source` / LSP surface (`errors(..)` here), not only in IR
+    // lowering. This must NOT change end-to-end accept/reject: it only moves the
+    // existing lowering rejections (#1379/#1407) earlier. The lowering checks
+    // (`check_numeric_payload`/`check_optional_payload`) stay as defense in depth.
+
+    /// Assert that type-checking `src` (the sema-only surface) rejects it with at
+    /// least one `ZAP4001` assignability error — the code the binding / collection
+    /// positions emit for the #1379 / #1407 programs.
+    fn rejects_4001(src: &str) {
+        let errs = errors(src);
+        assert!(
+            errs.iter().any(|e| e.code == ErrorCode::ZAP4001),
+            "expected a ZAP4001 payload-mismatch error, got: {errs:?}"
+        );
+    }
+
+    /// Assert that `src` is rejected with an `Optional`-payload-mismatch type
+    /// error. Position-agnostic: the binding / collection positions emit
+    /// `ZAP4001`, a call argument `ZAP4021`/`ZAP4022`, a return `ZAP4003`, so the
+    /// shared, stable signal is the diagnostic naming the un-erased payload type
+    /// (`Optional[…]`) rather than one fixed code.
+    fn rejects_optional_payload(src: &str) {
+        let errs = errors(src);
+        assert!(
+            errs.iter().any(|e| e.message.contains("Optional[")),
+            "expected an Optional payload-mismatch type error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn sema_rejects_some_bigint_literal_into_optional_int64() {
+        // #1379, verified through the sema-only surface: a bigint literal
+        // (2^63 overflows int64) wrapped in `Optional.Some` must not type-clean
+        // into an `Optional[int64]`. Before #1452 this slipped sema and was only
+        // caught at `zap build`.
+        rejects_4001(
+            "def main():\n    \
+             Optional[int64] y = Optional.Some(9223372036854775808)\n    \
+             print(y.is_some())\n",
+        );
+    }
+
+    #[test]
+    fn sema_rejects_some_bigint_var_into_optional_int64() {
+        // #1407, verified through the sema-only surface: a whole `Optional[bigint]`
+        // (`Optional.Some(g)` for a `bigint g`) into an `Optional[int64]`.
+        rejects_4001(
+            "def main():\n    \
+             bigint g = 9223372036854775808\n    \
+             Optional[int64] z = Optional.Some(g)\n    \
+             print(z.is_some())\n",
+        );
+    }
+
+    #[test]
+    fn sema_rejects_optional_payload_mismatch_in_every_position() {
+        // The payload mismatch is caught in every type-checked position, mirroring
+        // the end-to-end lowering rejections in optional_payload_variance.rs. The
+        // binding / collection positions emit ZAP4001; a call argument and a return
+        // emit their own argument/return-mismatch codes — all name the un-erased
+        // `Optional[…]` payload, which `rejects_optional_payload` keys on.
+        // Typed binding (a narrower fixed-width payload).
+        rejects_4001(
+            "def main():\n    \
+             int32 n = 5\n    \
+             Optional[int64] x = Optional.Some(n)\n    \
+             print(x.is_some())\n",
+        );
+        // ...and the reverse narrowing direction.
+        rejects_4001(
+            "def main():\n    \
+             int64 n = 5\n    \
+             Optional[int32] x = Optional.Some(n)\n    \
+             print(x.is_some())\n",
+        );
+        // A pointer payload into a numeric Optional and vice versa.
+        rejects_4001(
+            "def main():\n    \
+             str s = \"hi\"\n    \
+             Optional[int64] x = Optional.Some(s)\n    \
+             print(x.is_some())\n",
+        );
+        rejects_4001(
+            "def main():\n    \
+             int64 n = 5\n    \
+             Optional[str] x = Optional.Some(n)\n    \
+             print(x.is_some())\n",
+        );
+        // A float payload mismatch (int literal defaults to int64, not float64).
+        rejects_4001(
+            "def main():\n    \
+             Optional[float64] x = Optional.Some(5)\n    \
+             print(x.is_some())\n",
+        );
+        // Reassignment.
+        rejects_optional_payload(
+            "def main():\n    \
+             bigint g = 9223372036854775808\n    \
+             Optional[int64] b = None\n    \
+             b = Optional.Some(g)\n    \
+             print(b.is_some())\n",
+        );
+        // Call argument (ZAP4021/ZAP4022).
+        rejects_optional_payload(
+            "def f(Optional[int64] o):\n    print(o.is_some())\n\
+             def main():\n    \
+             bigint g = 9223372036854775808\n    \
+             f(Optional.Some(g))\n",
+        );
+        // Return (ZAP4003).
+        rejects_optional_payload(
+            "def f() -> Optional[int64]:\n    \
+             bigint g = 9223372036854775808\n    \
+             return Optional.Some(g)\n\
+             def main():\n    print(f().is_some())\n",
+        );
+        // List element (reaches the collection-context coercion).
+        rejects_4001(
+            "def main():\n    \
+             bigint g = 9223372036854775808\n    \
+             list[Optional[int64]] xs = [Optional.Some(g)]\n    \
+             print(len(xs))\n",
+        );
+        // Dict value.
+        rejects_4001(
+            "def main():\n    \
+             bigint g = 9223372036854775808\n    \
+             dict[str, Optional[int64]] d = {\"k\": Optional.Some(g)}\n    \
+             print(len(d))\n",
+        );
+    }
+
+    #[test]
+    fn sema_dict_get_into_annotated_optional_accepts_untyped_value_dict() {
+        // Regression (tests/conformance/dict_get_optional.zap): an inferred dict of
+        // untyped-int literals has value type `int` (UntypedInt); `get` must yield
+        // `Optional[int64]` (the defaulted payload, as mono monomorphizes it), so
+        // `Optional[int64] ca = counts.get("a")` type-cleans. Before the payload was
+        // defaulted this rejected with "Optional[int] -> Optional[int64]".
+        ok("def main():\n    \
+            auto counts = {\"a\": 1, \"b\": 2}\n    \
+            Optional[int64] ca = counts.get(\"a\")\n    \
+            Optional[int64] cz = counts.get(\"z\")\n    \
+            print(ca.unwrap_or(-1))\n    \
+            print(cz.unwrap_or(-1))\n");
+        // The str-payload partner from the same fixture.
+        ok("def main():\n    \
+            auto headers = {\"accept\": \"json\", \"host\": \"x\"}\n    \
+            Optional[str] hit = headers.get(\"accept\")\n    \
+            print(hit.unwrap_or(\"fallback\"))\n");
+        // An annotated dict value type is carried precisely; a genuine mismatch of
+        // the get payload against the annotation is still rejected.
+        rejects_4001(
+            "def main():\n    \
+             dict[str, str] d = {\"a\": \"v\"}\n    \
+             Optional[int64] x = d.get(\"a\")\n    \
+             print(x.is_some())\n",
+        );
+    }
+
+    #[test]
+    fn sema_accepts_matching_and_widening_optional_payloads() {
+        // A genuine matching payload still type-cleans (no over-rejection).
+        ok("def main():\n    \
+            bigint g = 9223372036854775808\n    \
+            Optional[bigint] x = Optional.Some(g)\n    \
+            print(x.is_some())\n");
+        ok("def main():\n    \
+            int64 n = 5\n    \
+            Optional[int64] x = Optional.Some(n)\n    \
+            print(x.unwrap())\n");
+        ok("def main():\n    \
+            str s = \"hi\"\n    \
+            Optional[str] x = Optional.Some(s)\n    \
+            print(x.unwrap())\n");
+        // A bare untyped int literal takes its int64 default and matches.
+        ok("def main():\n    \
+            Optional[int64] a = Optional.Some(5)\n    \
+            print(a.is_some())\n");
+        // An `Optional[int64]` value copied into another `Optional[int64]`.
+        ok("def main():\n    \
+            Optional[int64] a = Optional.Some(5)\n    \
+            Optional[int64] b = a\n    \
+            print(b.is_some())\n");
+        // The #1265 bare-payload wrap (the value is NOT itself an Optional):
+        // a bare int32 still widens into an Optional[int64].
+        ok("def main():\n    \
+            int32 n = 5\n    \
+            Optional[int64] x = n\n    \
+            print(x.unwrap())\n");
+        // Bare `None` fits any Optional.
+        ok("def main():\n    \
+            Optional[int64] x = None\n    \
+            print(x.is_none())\n");
+        // `Optional.None` fits any Optional (payload-free variant un-erases to a
+        // wildcard payload).
+        ok("def main():\n    \
+            Optional[int64] x = Optional.None\n    \
+            print(x.is_none())\n");
+        // Nested `Optional[Optional[int64]]`: the top-level payloads match.
+        ok("def main():\n    \
+            Optional[int64] inner = Optional.Some(5)\n    \
+            Optional[Optional[int64]] x = Optional.Some(inner)\n    \
+            print(x.is_some())\n");
+        // A nested payload mismatch is still rejected.
+        rejects_4001(
+            "def main():\n    \
+             int32 n = 5\n    \
+             Optional[int32] inner = Optional.Some(n)\n    \
+             Optional[Optional[int64]] x = Optional.Some(inner)\n    \
+             print(x.is_some())\n",
+        );
+    }
+
+    #[test]
+    fn sema_optional_bare_bigint_payload_rejected() {
+        // The one locked bare-payload reject (#1379): a bare `bigint` into a
+        // fixed-width-numeric `Optional` payload is not implicitly convertible, so
+        // it is rejected at sema too (matching the lowering `check_numeric_payload`
+        // reject), not only at `zap build`. The rest of the #1265 bare-payload
+        // wrap stays permissive (lowering wraps/widens) — see
+        // `sema_optional_bare_payload_stays_permissive`.
+        rejects_4001(
+            "def main():\n    \
+             bigint g = 9223372036854775808\n    \
+             Optional[int64] x = g\n    \
+             print(x.is_some())\n",
+        );
+    }
+
+    #[test]
+    fn sema_optional_bare_payload_stays_permissive() {
+        // Behaviour parity: the #1265 bare-payload wrap is NOT a widening check —
+        // lowering accepts a bare `str`/`float64` payload and a narrowing bare
+        // numeric into an `Optional[T]` (they wrap into `Some` and coerce), so
+        // sema must keep accepting them. Only the locked `bigint`-into-fixed-width
+        // case rejects. A bare `bigint` into an `Optional[bigint]` is fine.
+        ok("def main():\n    \
+            str s = \"hi\"\n    \
+            Optional[int64] x = s\n    \
+            print(x.is_some())\n");
+        ok("def main():\n    \
+            float64 f = 1.5\n    \
+            Optional[int64] x = f\n    \
+            print(x.is_some())\n");
+        ok("def main():\n    \
+            int64 n = 5\n    \
+            Optional[int32] x = n\n    \
+            print(x.is_some())\n");
+        ok("def main():\n    \
+            bigint g = 9223372036854775808\n    \
+            Optional[bigint] x = g\n    \
+            print(x.is_some())\n");
     }
 
     #[test]
