@@ -28,7 +28,7 @@ use zapc_comptime::{
     desugar_reflect_field, error_code, reflect_field, seed_kind_constants, specialize_one,
     type_info_of_enum, unroll, CtError, CtErrorKind, Env, Evaluator, TypeInfo, TypeRegistry, Value,
 };
-use zapc_syntax::ast::{Block, EnumDef, Expr, Function, Module, Stmt, StructDef};
+use zapc_syntax::ast::{Block, EnumDef, Expr, Function, MatchArm, Module, Stmt, StructDef};
 use zapc_syntax::span::Span;
 
 use crate::{DeriveErrorInfo, LowerError};
@@ -293,6 +293,36 @@ fn desugar_stmt_fields(st: &Stmt, info: &TypeInfo) -> Result<Stmt, LowerError> {
             target: target.clone(),
             iter: d(iter)?,
             body: db(body)?,
+            span: *span,
+        },
+        // `match <scrutinee>: case <pat> [if <guard>]: <body>` — a codec decoder
+        // inspects the DOM with a `match` and populates fields from within the
+        // arms (#1506). Desugar the scrutinee and each guard, and recurse into
+        // every arm body so a `reflect.field` / `reflect.set_field` inside an arm
+        // is rewritten too (the body block runs back through this walker, so an
+        // arm-local `reflect.set_field` is desugared by `desugar_set_field` there).
+        // Patterns bind names only — no reflect call to rewrite — so they are kept
+        // as-is.
+        Stmt::Match {
+            scrutinee,
+            arms,
+            span,
+        } => Stmt::Match {
+            scrutinee: d(scrutinee)?,
+            arms: arms
+                .iter()
+                .map(|a| {
+                    Ok(MatchArm {
+                        pattern: a.pattern.clone(),
+                        guard: match &a.guard {
+                            Some(g) => Some(d(g)?),
+                            None => None,
+                        },
+                        body: db(&a.body)?,
+                        span: a.span,
+                    })
+                })
+                .collect::<Result<_, LowerError>>()?,
             span: *span,
         },
         other => other.clone(),
