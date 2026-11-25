@@ -1,0 +1,3 @@
+inner caught, re-raising
+outer caught NullReferenceError:
+null dereference reading field 'head' of 'List' at list.zap:19

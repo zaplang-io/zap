@@ -14,6 +14,7 @@ mod mask_tests;
 mod math_array_tests;
 mod matmul_tests;
 mod nd_array_tests;
+mod null_reference_tests;
 mod reduction_tests;
 mod shape_ops_tests;
 mod strided_view_tests;
