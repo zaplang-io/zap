@@ -220,25 +220,50 @@ fn len_of_null_list_guards_builtin_len() {
 // --- #1493 part B: method-call receiver on a null reference ---
 
 #[test]
-fn method_call_on_null_user_struct_is_not_guarded_at_call_site() {
-    // A user-struct method call is deliberately NOT guarded at the call site
-    // (#1493): a `Ty::Struct` receiver here is not reliably a nullable heap
-    // pointer (tier-3 enums, `Optional$T`, and erased-generic receivers also
-    // arrive as `Ty::Struct`), so an `IsNull` guard would spuriously raise. A
-    // null user receiver is instead caught transitively by the field read/store
-    // guards inside the method body (here `self.n = …` emits the field-store
-    // guard). So no MethodReceiver message is produced for the receiver, but the
-    // field-store guard is present.
+fn method_call_on_null_user_struct_guards_receiver() {
+    // #1541: a method call on a null user reference-struct receiver is guarded
+    // eagerly at the call site.
     let src = "struct Counter:\n    int64 n\n\n    def bump(self):\n        self.n = self.n + 1\n\ndef main():\n    Counter c = None\n    c.bump()\n";
-    let msgs = messages(src);
     assert!(
-        !msgs.iter().any(|m| m.contains("calling method 'bump'")),
-        "a user-struct method call must NOT emit a MethodReceiver guard; got {msgs:?}"
+        messages(src)
+            .iter()
+            .any(|m| m == "null dereference calling method 'bump' on 'Counter' at <unknown>:0"),
+        "a null user-struct method receiver must carry the MethodReceiver message; got {:?}",
+        messages(src)
     );
+}
+
+#[test]
+fn enum_method_receiver_is_not_guarded() {
+    // #1541: a tier-3 sum enum is a heap struct whose unit variants lower to a
+    // null pointer (a legal value), so an enum method receiver must NOT be
+    // guarded — guarding it would make `E.Nothing.m()` spuriously raise.
+    let src = "enum E:\n    Nothing\n    Wrap(int64 v)\n\n    def tag(self) -> int64:\n        return 0\n\ndef main():\n    auto e = E.Nothing\n    print(e.tag())\n";
+    // Specific to the receiver: a guard would read `calling method 'tag' on 'E'`.
+    // (A blanket "no null dereference" check would trip over field-read guards in
+    // unrelated prelude methods that survive monomorphization.)
     assert!(
-        msgs.iter()
-            .any(|m| m.contains("writing field 'n' of 'Counter'")),
-        "the method body's field store is still guarded; got {msgs:?}"
+        !messages(src)
+            .iter()
+            .any(|m| m.contains("calling method 'tag'")),
+        "an enum method receiver must not be guarded; got {:?}",
+        messages(src)
+    );
+}
+
+#[test]
+fn optional_method_receiver_is_not_guarded() {
+    // #1541: `Optional[T]` keeps its own None path; its method receiver must NOT
+    // be guarded (guarding would make `opt.is_none()` spuriously raise).
+    let src = "def main():\n    Optional[int64] o = None\n    print(o.is_none())\n";
+    // Specific to the receiver: a guard would read `calling method 'is_none' on
+    // 'Optional$…'`. (A blanket check would trip over prelude field-read guards.)
+    assert!(
+        !messages(src)
+            .iter()
+            .any(|m| m.contains("calling method 'is_none'")),
+        "an Optional method receiver must not be guarded; got {:?}",
+        messages(src)
     );
 }
 

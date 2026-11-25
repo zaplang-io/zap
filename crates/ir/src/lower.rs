@@ -11084,18 +11084,36 @@ impl<'a> FnLower<'a> {
             if let Some(iid) = self.ctx.iid_of_fat_sid(sid) {
                 return self.lower_iface_call(recv, iid, name, args);
             }
-            // NOTE (#1493): a method call on a null USER-struct receiver
-            // (`n.method()`) is NOT guarded here. Such a receiver is transitively
-            // covered by the field read/store guards (PR#1511): a method that
-            // dereferences `self` raises `NullReferenceError` at that field
-            // access. A struct's `Ty::Struct(sid)` at this site is not reliably a
-            // nullable heap pointer — tier-3 enums, `Optional$T`, and
-            // erased-generic receivers also arrive as `Ty::Struct` but are
-            // inline / have their own None path, and guarding them with `IsNull`
-            // spuriously raises. An eager, call-site-located guard for genuine
-            // reference-struct receivers needs a precise "nullable heap reference"
-            // predicate and is deferred. The built-in reference receivers
-            // (`list`/`str`/… — real heap pointers) are guarded above.
+            // A method call on a null non-`Optional` reference-struct receiver
+            // raises a located `NullReferenceError` at the call site (#1489/
+            // #1493, #1541). The receiver is dereferenced to dispatch, so this
+            // gives an eager, call-site-located error rather than only the
+            // transitive field-access guard inside the method body.
+            //
+            // Guard only a GENUINE nullable heap reference struct. A
+            // `Ty::Struct(sid)` here is not always one:
+            //   - a `value struct` is inline, never null;
+            //   - a monomorphized `Optional$T` lowers as a struct, but a `None`
+            //     Optional is its own value, not a null deref (guarding it makes
+            //     `opt.is_none()` / `opt.unwrap_or(..)` spuriously raise);
+            //   - a tier-3 sum enum is a heap struct whose UNIT variants (e.g.
+            //     `E.Nothing`, `Store.Empty`) lower to a null pointer — a legal
+            //     value dispatched on its tag, not a null deref.
+            // Excluding those three leaves the real reference structs (including
+            // generic instantiations), whose null receiver is the actual footgun.
+            let recv_name = &self.ctx.names[sid as usize];
+            let is_optional = recv_name == "Optional" || recv_name.starts_with("Optional$");
+            let is_enum = self.ctx.enums.values().any(|e| e.sid == Some(sid));
+            if !self.ctx.is_value_struct(sid) && !is_optional && !is_enum {
+                let owner = recv_name.clone();
+                self.null_deref_guard(
+                    recv,
+                    NullDerefSite::MethodReceiver,
+                    Some(name),
+                    Some(&owner),
+                    *span,
+                );
+            }
             let mangled = format!("{}__{}", self.ctx.names[sid as usize], name);
             self.call_resolved_method(recv, name, mangled, args)
         } else {
