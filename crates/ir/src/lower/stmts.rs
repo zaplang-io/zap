@@ -2589,6 +2589,20 @@ impl<'a> FnLower<'a> {
             }
         }
         let (val, ty) = self.expr(iter)?;
+        self.iterate_value(val, ty, body)
+    }
+
+    /// Drive `body` over an already-evaluated iterable `val` of type `ty` — the
+    /// value-level core of [`Self::iterate`]. Separated out so a caller that must
+    /// inspect the operand's type before iterating (the `dict(...)` constructor
+    /// lowering, which distinguishes a dict-copy from a pairs iterable) can reuse
+    /// the exact per-container dispatch instead of re-evaluating the expression.
+    pub(super) fn iterate_value(
+        &mut self,
+        val: Value,
+        ty: Ty,
+        body: impl FnMut(&mut FnLower<'a>, Value, Ty) -> Result<(), LowerError>,
+    ) -> Result<(), LowerError> {
         match ty {
             Ty::List(elem) => self.iterate_list(val, elem, body),
             Ty::Set(elem) => {

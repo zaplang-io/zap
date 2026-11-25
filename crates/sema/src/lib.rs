@@ -9589,6 +9589,105 @@ impl Checker {
                     self.check_numeric_container_value(&ty, span);
                     return ty;
                 }
+                "list" => {
+                    // list(iterable): a new list of the iterable's elements in
+                    // order (#1460), mirroring set(iterable). An empty list has no
+                    // element type to infer, so `list()` points at `list[T]()`.
+                    if args.is_empty() {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "list() needs an iterable; build an empty list with list[T]() (e.g. list[int64]())"
+                                .to_string(),
+                            span,
+                        );
+                        return Ty::List(Box::new(Ty::Unknown));
+                    }
+                    if args.len() != 1 || args[0].name.is_some() {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "list(iterable) takes exactly one positional argument".to_string(),
+                            span,
+                        );
+                    }
+                    let at = self.infer(&args[0].value);
+                    let elem = self.iter_element(&at, expr_span(&args[0].value));
+                    let ty = Ty::List(Box::new(elem));
+                    self.check_numeric_container_value(&ty, span);
+                    return ty;
+                }
+                "dict" => {
+                    // dict(pairs) | dict(other_dict) | dict(k=v, ...) (#1460):
+                    // `pairs` is an iterable of 2-tuples (K, V); keyword arguments
+                    // build a str-keyed dict; another dict is copied. Positional
+                    // and keyword forms cannot be mixed.
+                    let has_kw = args.iter().any(|a| a.name.is_some());
+                    let has_pos = args.iter().any(|a| a.name.is_none());
+                    if has_kw && has_pos {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "dict() does not mix positional and keyword arguments".to_string(),
+                            span,
+                        );
+                    }
+                    if has_kw {
+                        // dict(key=value, ...) -> dict[str, V]; all values share V.
+                        let mut vty = Ty::Unknown;
+                        for a in args {
+                            let t = self.infer(&a.value);
+                            if matches!(vty, Ty::Unknown) {
+                                vty = t;
+                            }
+                        }
+                        return Ty::Dict(Box::new(Ty::Str), Box::new(vty));
+                    }
+                    if args.is_empty() {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "dict() needs an iterable of (key, value) pairs, keyword pairs, or dict[K,V]() for empty"
+                                .to_string(),
+                            span,
+                        );
+                        return Ty::Dict(Box::new(Ty::Unknown), Box::new(Ty::Unknown));
+                    }
+                    if args.len() != 1 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "dict(iterable) takes exactly one positional argument".to_string(),
+                            span,
+                        );
+                    }
+                    let at = self.infer(&args[0].value);
+                    return match &at {
+                        // dict(other_dict): a copy with the same key/value types.
+                        Ty::Dict(k, v) => Ty::Dict(k.clone(), v.clone()),
+                        Ty::Unknown => Ty::Dict(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
+                        _ => {
+                            let elem = self.iter_element(&at, expr_span(&args[0].value));
+                            match &elem {
+                                Ty::Tuple(ts) if ts.len() == 2 => {
+                                    let d =
+                                        Ty::Dict(Box::new(ts[0].clone()), Box::new(ts[1].clone()));
+                                    self.check_numeric_container_value(&d, span);
+                                    d
+                                }
+                                Ty::Unknown => {
+                                    Ty::Dict(Box::new(Ty::Unknown), Box::new(Ty::Unknown))
+                                }
+                                _ => {
+                                    self.error(
+                                        ErrorCode::ZAP4024,
+                                        format!(
+                                            "dict(iterable) needs (key, value) pairs, found element {}",
+                                            elem.display()
+                                        ),
+                                        expr_span(&args[0].value),
+                                    );
+                                    Ty::Dict(Box::new(Ty::Unknown), Box::new(Ty::Unknown))
+                                }
+                            }
+                        }
+                    };
+                }
                 "int" => {
                     // int(x): parse a `str`, or convert a number, to an `int`.
                     // int(s, base): parse a `str` in `base` 2..=36, or base 0 to

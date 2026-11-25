@@ -9813,6 +9813,20 @@ impl<'a> FnLower<'a> {
                 }
                 return self.lower_set_from_iterable(&args[0].value, None);
             }
+            if fname == "list" {
+                // list(iterable): a fresh list of the iterable's elements in
+                // order (#1460). Empty list is list[T]() (rejected in sema).
+                if args.len() != 1 || args[0].name.is_some() {
+                    return Err(err(
+                        "list(iterable) takes exactly one positional argument; use list[T]() for an empty list",
+                    ));
+                }
+                return self.lower_list_from_iterable(&args[0].value);
+            }
+            if fname == "dict" {
+                // dict(pairs) | dict(other_dict) | dict(k=v, ...) (#1460).
+                return self.lower_dict_from_call(args);
+            }
             if fname == "int" {
                 // int(x): parse a `str` to an `int`, or convert a number to int.
                 // int(s, base): parse a `str` in `base` 2..=36, or base 0 to
@@ -13218,6 +13232,167 @@ impl<'a> FnLower<'a> {
         let ek = elem.get().unwrap_or(Elem::I64);
         self.func.value_types[set as usize] = Ty::Set(ek);
         Ok((set, Ty::Set(ek)))
+    }
+
+    /// list(iterable) (#1460): a fresh list of the iterable's elements in order,
+    /// mirroring [`Self::lower_set_from_iterable`] but appending (no key fns) and
+    /// using the list element-kind / store-boxing the list literal uses.
+    fn lower_list_from_iterable(&mut self, iterable: &Expr) -> Result<(Value, Ty), LowerError> {
+        let list = self.new_value(Ty::List(Elem::I64));
+        self.emit(Inst::Call {
+            dest: Some(list),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        let elem: std::cell::Cell<Option<Elem>> = std::cell::Cell::new(None);
+        self.iterate(iterable, |s, v, t| {
+            let ek = match elem.get() {
+                Some(e) => {
+                    if list_elem_kind(t, &s.ctx.nested)? != e {
+                        return Err(err("list elements must all have the same representation"));
+                    }
+                    e
+                }
+                None => {
+                    let e = list_elem_kind(t, &s.ctx.nested)?;
+                    elem.set(Some(e));
+                    e
+                }
+            };
+            let v = s.coerce(v, t, ek.ty());
+            let v = s.box_elem_for_store(v, ek.ty());
+            s.emit(Inst::Call {
+                dest: None,
+                func: format!("zap_list_push_{}", ek.val_suffix()),
+                args: vec![list, v],
+            });
+            Ok(())
+        })?;
+        let ek = elem.get().unwrap_or(Elem::I64);
+        self.func.value_types[list as usize] = Ty::List(ek);
+        Ok((list, Ty::List(ek)))
+    }
+
+    /// dict(...) (#1460): `dict(k=v, ...)` -> a str-keyed dict; `dict(other_dict)`
+    /// -> a copy; `dict(pairs)` -> a dict from an iterable of 2-tuples (K, V).
+    fn lower_dict_from_call(&mut self, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
+        let dict = self.new_value(Ty::Dict(Elem::I64, Elem::I64));
+        self.emit(Inst::Call {
+            dest: Some(dict),
+            func: "zap_dict_new".to_string(),
+            args: vec![],
+        });
+        let has_kw = args.iter().any(|a| a.name.is_some());
+        if has_kw {
+            // dict(key=value, ...) -> dict[str, V]: the arg names are the string
+            // keys (Elem::Ptr, key suffix "str"); all values share V.
+            let kk = Elem::Ptr;
+            let vkind: std::cell::Cell<Option<Elem>> = std::cell::Cell::new(None);
+            for a in args {
+                let name = a
+                    .name
+                    .as_ref()
+                    .ok_or_else(|| err("dict() cannot mix positional and keyword arguments"))?;
+                let (vv, vt) = self.expr(&a.value)?;
+                let vk = match vkind.get() {
+                    Some(k) => {
+                        if value_elem_kind(vt, &self.ctx.nested)? != k {
+                            return Err(err("dict() values must all have the same representation"));
+                        }
+                        k
+                    }
+                    None => {
+                        let k = value_elem_kind(vt, &self.ctx.nested)?;
+                        vkind.set(Some(k));
+                        k
+                    }
+                };
+                let keyv = self.new_value(Ty::Ptr);
+                self.emit(Inst::StrConst {
+                    dest: keyv,
+                    bytes: name.clone().into_bytes(),
+                });
+                let vv = self.coerce(vv, vt, vk.ty());
+                let vv = self.box_elem_for_store(vv, vk.ty());
+                let kfns = self.key_fn_args(kk)?;
+                let mut cargs = vec![dict, keyv, vv];
+                cargs.extend_from_slice(&kfns);
+                self.key_rt_call(
+                    None,
+                    format!("zap_dict_set_str_{}", vk.val_suffix()),
+                    cargs,
+                    kk,
+                );
+            }
+            let vk = vkind.get().unwrap_or(Elem::I64);
+            self.func.value_types[dict as usize] = Ty::Dict(kk, vk);
+            return Ok((dict, Ty::Dict(kk, vk)));
+        }
+        if args.len() != 1 {
+            return Err(err("dict(iterable) takes exactly one positional argument"));
+        }
+        let (src, st) = self.expr(&args[0].value)?;
+        if let Ty::Dict(skk, svk) = st {
+            // dict(other_dict): copy every entry.
+            self.merge_dict_into(dict, src, skk, svk)?;
+            self.func.value_types[dict as usize] = Ty::Dict(skk, svk);
+            return Ok((dict, Ty::Dict(skk, svk)));
+        }
+        // dict(pairs): iterate the iterable, decompose each 2-tuple (K, V), set.
+        let kinds: std::cell::Cell<Option<(Elem, Elem)>> = std::cell::Cell::new(None);
+        self.iterate_value(src, st, |s, v, t| {
+            let Ty::Struct(sid) = t else {
+                return Err(err("dict(iterable) element is not a (key, value) pair"));
+            };
+            let field_tys = s
+                .ctx
+                .tuples
+                .borrow()
+                .fields(sid)
+                .ok_or_else(|| err("dict(iterable) element is not a (key, value) tuple"))?;
+            if field_tys.len() != 2 {
+                return Err(err("dict(iterable) pairs must be 2-tuples (key, value)"));
+            }
+            let kty = field_tys[0];
+            let vty = field_tys[1];
+            let (kk, vk) = match kinds.get() {
+                Some((kk, vk)) => {
+                    if elem_kind(kty, &s.ctx.nested)? != kk
+                        || value_elem_kind(vty, &s.ctx.nested)? != vk
+                    {
+                        return Err(err(
+                            "dict keys/values must all have the same representation",
+                        ));
+                    }
+                    (kk, vk)
+                }
+                None => {
+                    let kk = elem_kind(kty, &s.ctx.nested)?;
+                    let vk = value_elem_kind(vty, &s.ctx.nested)?;
+                    kinds.set(Some((kk, vk)));
+                    (kk, vk)
+                }
+            };
+            let kv = s.field_get(v, sid, 0, kty);
+            let vv = s.field_get(v, sid, 1, vty);
+            let kv = s.coerce(kv, kty, kk.ty());
+            let vv = s.coerce(vv, vty, vk.ty());
+            let kv = s.box_if_value(kv, kk.ty());
+            let vv = s.box_elem_for_store(vv, vk.ty());
+            let kfns = s.key_fn_args(kk)?;
+            let mut cargs = vec![dict, kv, vv];
+            cargs.extend_from_slice(&kfns);
+            s.key_rt_call(
+                None,
+                format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix()),
+                cargs,
+                kk,
+            );
+            Ok(())
+        })?;
+        let (kk, vk) = kinds.get().unwrap_or((Elem::I64, Elem::I64));
+        self.func.value_types[dict as usize] = Ty::Dict(kk, vk);
+        Ok((dict, Ty::Dict(kk, vk)))
     }
 
     fn lower_set_method(
