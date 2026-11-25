@@ -2132,6 +2132,41 @@ void zap_list_set_f64(void *l, int64_t i, double v) {
 }
 int64_t zap_list_len(void *l) { return ((ZapList *)l)->len; }
 
+/* `==` for two variadic `tuple[T]` values (#1474): element-wise equality over
+ * the two frozen list buffers, by an element-kind tag (0 = i64 word incl.
+ * bool/char/enum, 1 = f64, 2 = str/bytes `ZapStr` pointer). Unequal lengths are
+ * unequal; otherwise every element must match. Returns 1 (equal) / 0. */
+int64_t zap_vartuple_eq(void *a, void *b, int32_t kind) {
+    int64_t na = zap_list_len(a);
+    int64_t nb = zap_list_len(b);
+    if (na != nb) {
+        return 0;
+    }
+    for (int64_t i = 0; i < na; i++) {
+        switch (kind) {
+        case 1: {
+            double x = zap_list_get_f64(a, i);
+            double y = zap_list_get_f64(b, i);
+            if (x != y) {
+                return 0;
+            }
+            break;
+        }
+        case 2:
+            if (!zap_str_eq(zap_list_get_ptr(a, i), zap_list_get_ptr(b, i))) {
+                return 0;
+            }
+            break;
+        default: /* 0: plain 64-bit word */
+            if (zap_list_get_i64(a, i) != zap_list_get_i64(b, i)) {
+                return 0;
+            }
+            break;
+        }
+    }
+    return 1;
+}
+
 /* Reinterpret a `double` as the uniform 8-byte collection word and back (#800).
  * A float dict value, channel element, or heap element shares the same storage
  * word as an `i64` element (as `list[float]` does, I#569); these helpers carry
