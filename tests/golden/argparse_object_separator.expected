@@ -1,0 +1,12 @@
+no-sep-caught
+--literal
+--help
+False
+-rf
+sep-missing-caught
+-a
+-b
+sep-extra-caught
+--
+zap
+-pos
