@@ -150,3 +150,69 @@ fn non_null_reference_still_emits_the_guard_once_per_access() {
         "a reference field read is always guarded"
     );
 }
+
+// --- #1493 part A: deref of a null built-in reference VALUE (list/str/dict/…) ---
+// A non-`Optional` reference field left null, then subscripted / iterated / sized.
+// Each program reads the null value through a field (so a FieldRead guard also
+// appears for the owner); the assertions pin the VALUE-site message specifically.
+
+#[test]
+fn index_on_null_builtin_reference_guards_index_base() {
+    let src = "struct L:\n    list[int64] xs\n\ndef main():\n    L l = None\n    auto v = l.xs[0]\n    print(v)\n";
+    assert!(
+        messages(src)
+            .iter()
+            .any(|m| m == "null dereference indexing into 'list' at <unknown>:0"),
+        "indexing a null list must carry the IndexBase message; got {:?}",
+        messages(src)
+    );
+}
+
+#[test]
+fn index_on_null_str_guards_index_base() {
+    let src = "struct S:\n    str name\n\ndef main():\n    S s = None\n    auto c = s.name[0]\n    print(c)\n";
+    assert!(
+        messages(src)
+            .iter()
+            .any(|m| m == "null dereference indexing into 'str' at <unknown>:0"),
+        "indexing a null str must carry the IndexBase message; got {:?}",
+        messages(src)
+    );
+}
+
+#[test]
+fn iterate_null_builtin_reference_guards_iter_base() {
+    let src = "struct L:\n    list[int64] xs\n\ndef main():\n    L l = None\n    for x in l.xs:\n        print(x)\n";
+    assert!(
+        messages(src)
+            .iter()
+            .any(|m| m == "null dereference iterating over 'list' at <unknown>:0"),
+        "iterating a null list must carry the IterBase message; got {:?}",
+        messages(src)
+    );
+}
+
+#[test]
+fn len_of_null_builtin_reference_guards_builtin_len() {
+    // The Epic's headline example: `len(n.name)` on a null `str`.
+    let src = "struct N:\n    str name\n\ndef main():\n    N n = None\n    auto k = len(n.name)\n    print(k)\n";
+    assert!(
+        messages(src)
+            .iter()
+            .any(|m| m == "null dereference taking the length of 'str' at <unknown>:0"),
+        "len() of a null str must carry the BuiltinLen message; got {:?}",
+        messages(src)
+    );
+}
+
+#[test]
+fn len_of_null_list_guards_builtin_len() {
+    let src = "struct L:\n    list[int64] xs\n\ndef main():\n    L l = None\n    auto k = len(l.xs)\n    print(k)\n";
+    assert!(
+        messages(src)
+            .iter()
+            .any(|m| m == "null dereference taking the length of 'list' at <unknown>:0"),
+        "len() of a null list must carry the BuiltinLen message; got {:?}",
+        messages(src)
+    );
+}

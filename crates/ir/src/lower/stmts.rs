@@ -3335,6 +3335,21 @@ impl<'a> FnLower<'a> {
                 }
                 // `for x in <list>` — iterate by index over the list's length.
                 let (lst, lty) = self.expr(iter)?;
+                // Iterating a null built-in reference (a non-`Optional`
+                // `list`/`str`/`dict`/… field left unset, then looped over)
+                // raises a located `NullReferenceError` instead of a SIGSEGV
+                // (#1489/#1493). The guard is on the iterable value, before the
+                // per-type iteration setup. A user iterable's `__iter__` receiver
+                // (`Ty::Struct`) is excluded — the method-receiver follow-up.
+                if let Some(owner) = Self::builtin_ref_owner(&lty) {
+                    self.null_deref_guard(
+                        lst,
+                        NullDerefSite::IterBase,
+                        None,
+                        Some(owner),
+                        expr_span(iter),
+                    );
+                }
                 if let Ty::List(elem) = lty {
                     return self.lower_for_list(target, lst, elem, body);
                 }
