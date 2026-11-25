@@ -14772,7 +14772,8 @@ impl<'a> FnLower<'a> {
     /// `UrlParts` pattern). Field order matches `PRELUDE_SRC`: name(0) value(1)
     /// domain(2) path(3) expires(4) max_age(5) secure(6) http_only(7)
     /// same_site(8). `secure` / `http_only` are C `int64` 0/1 normalized to the
-    /// struct's `bool` fields.
+    /// struct's `bool` fields; `max_age` is `Optional[int64]`, wrapped from the
+    /// C `_max_age` / `_max_age_present` pair (#1524).
     fn lower_http_parse_set_cookie(&mut self, v: Value) -> (Value, Ty) {
         let sid = *self
             .ctx
@@ -14803,18 +14804,6 @@ impl<'a> FnLower<'a> {
                 val: f,
             });
         }
-        let ma = self.new_value(Ty::I64);
-        self.emit(Inst::Call {
-            dest: Some(ma),
-            func: "zap_http_cookie_max_age".to_string(),
-            args: vec![v],
-        });
-        self.emit(Inst::FieldSet {
-            base: dest,
-            sid,
-            idx: 5,
-            val: ma,
-        });
         for (func, idx) in [
             ("zap_http_cookie_secure", 6u32),
             ("zap_http_cookie_http_only", 7u32),
@@ -14840,6 +14829,61 @@ impl<'a> FnLower<'a> {
                 val: b,
             });
         }
+        // max_age (field 5): `Optional[int64]` — `None` when the attribute is
+        // absent or malformed, `Some(n)` for a parsed value (including 0 and
+        // negatives). #1524: a valid `Max-Age=-1`/`=0` deletes the cookie
+        // (RFC 6265 §5.2.2), which must be distinguishable from an absent
+        // `Max-Age`; the C parser exposes a `_present` 0/1 flag beside the
+        // signed value, and this wraps the two into the Optional field. Emitted
+        // last because the branch introduces blocks.
+        let ma_fty = self.ctx.fields[sid as usize][5].1;
+        let opt = optional_layout(self.ctx, ma_fty)
+            .expect("Cookie.max_age must be a monomorphized Optional[int64]");
+        let present = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(present),
+            func: "zap_http_cookie_max_age_present".to_string(),
+            args: vec![v],
+        });
+        let ma = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(ma),
+            func: "zap_http_cookie_max_age".to_string(),
+            args: vec![v],
+        });
+        let zero = self.iconst(Ty::I64, 0);
+        let is_present = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: is_present,
+            pred: CmpPred::Ne,
+            lhs: present,
+            rhs: zero,
+        });
+        let slot = self.alloca(Ty::Struct(opt.sid));
+        let some_bb = self.new_block();
+        let none_bb = self.new_block();
+        let join_bb = self.new_block();
+        self.set_term(Term::BrIf {
+            cond: is_present,
+            then_bb: some_bb,
+            else_bb: none_bb,
+        });
+        self.position(some_bb);
+        let someval = gen_opt_some(self, &opt, ma);
+        self.store(slot, someval);
+        self.set_term(Term::Br(join_bb));
+        self.position(none_bb);
+        let noneval = gen_opt_none(self, &opt);
+        self.store(slot, noneval);
+        self.set_term(Term::Br(join_bb));
+        self.position(join_bb);
+        let maval = self.load(slot, Ty::Struct(opt.sid));
+        self.emit(Inst::FieldSet {
+            base: dest,
+            sid,
+            idx: 5,
+            val: maval,
+        });
         (dest, Ty::Struct(sid))
     }
 

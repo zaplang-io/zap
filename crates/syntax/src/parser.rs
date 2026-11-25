@@ -2067,16 +2067,21 @@ struct arena:
 
 # The parsed form of one `Set-Cookie` header value (#989, D-0231), returned by
 # `http.parse_set_cookie(value)`. Field order is load-bearing: the lowering sets
-# fields by index (name 0 … same_site 8). Absent attributes are empty / -1 /
-# false; `expires` is the raw HTTP-date string (the cookie jar parses it),
-# `max_age` is seconds (-1 = absent).
+# fields by index (name 0 … same_site 8). Absent string attributes are empty and
+# absent flags are false; `expires` is the raw HTTP-date string (the cookie jar
+# parses it). `max_age` is `Optional[int64]` seconds: `None` for an absent or
+# malformed `Max-Age`, `Some(n)` for a parsed value — including `Some(0)` and
+# `Some(-1)`, which RFC 6265 §5.2.2 treats as immediate deletion (and which take
+# precedence over any future `Expires`). This lets a caller tell an absent
+# `Max-Age` (defer to `expires`/session) apart from a valid non-positive one
+# (delete now) — #1524.
 value struct Cookie:
     str name
     str value
     str domain
     str path
     str expires
-    int64 max_age
+    Optional[int64] max_age
     bool secure
     bool http_only
     str same_site

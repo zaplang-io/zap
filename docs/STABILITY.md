@@ -689,8 +689,10 @@ timeout=…)` then `c.get`/`c.post`/`c.request` reuse pooled connections per hos
 response header in order, duplicates preserved — the client twin of
 `http.req_headers`, so multiple `Set-Cookie` lines are visible) and
 **`http.parse_set_cookie(value) -> Cookie`** (parse one `Set-Cookie` into the
-prelude `Cookie` value struct); the stateful cookie *jar* lives in
-`zaplang-io/requests`, built on these. Because `http` is **Experimental**, all of
+prelude `Cookie` value struct — whose `max_age` is `Optional[int64]`, `None` for
+an absent/malformed `Max-Age` and `Some(n)` for a parsed value incl. `0`/`-1`,
+so a caller can apply RFC 6265 §5.2.2 deletion precedence, #1524); the stateful
+cookie *jar* lives in `zaplang-io/requests`, built on these. Because `http` is **Experimental**, all of
 these are additive surface changes requiring no stability promise.
 
 **CLI (`SPEC.md` §17, `crates/driver/src/cli.rs`).**

@@ -1,0 +1,8 @@
+omitted: absent
+malformed: absent
+empty: absent
+neg_one: -1
+zero: 0
+positive: 3600
+precedence: max_age=-1 expires=Wed, 21 Oct 2099 07:28:00 GMT
+done
