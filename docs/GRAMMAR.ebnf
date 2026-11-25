@@ -746,6 +746,16 @@ arg           ::= [ IDENT "=" ] expr              (* keyword arg, D-0038 *)
 
 atom          ::= literal
                 | IDENT
+                  (* A bare PRIMITIVE TYPE NAME in value position is a first-class
+                     TYPE VALUE of type `Type[T]` (#1527,
+                     decisions/lang/1527-type-args-to-decorators.md): `int64`,
+                     `str`, `bool`, … evaluate to a type the program passes as an
+                     argument, e.g. a library decorator
+                     `@cli.option("--count", int64, default=1)`. No new grammar —
+                     a type keyword already reads as a value-position name (same
+                     terminal as the #1237 nominal-type-name note below); the
+                     type-value meaning is semantic. A *called* type name
+                     (`int64(x)`, `str(y)`) is still the conversion, unchanged. *)
                 | "<-" postfix                    (* channel receive, D-0031 *)
                 | "(" named_expression ")"        (* walrus assignment-expr, #600 *)
                 | "(" gen_exp ")"                 (* generator expression, #596 *)

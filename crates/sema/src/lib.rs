@@ -172,6 +172,8 @@ fn subst_ty(ty: &Ty, subst: &HashMap<&str, &Ty>) -> Ty {
         Ty::Chan(e) => Ty::Chan(Box::new(subst_ty(e, subst))),
         Ty::AtomicArray(e) => Ty::AtomicArray(Box::new(subst_ty(e, subst))),
         Ty::ContextVar(e) => Ty::ContextVar(Box::new(subst_ty(e, subst))),
+        // A type value `Type[T]` substitutes inside its represented type (#1527).
+        Ty::TypeVal(e) => Ty::TypeVal(Box::new(subst_ty(e, subst))),
         Ty::Dict(k, v) => Ty::Dict(Box::new(subst_ty(k, subst)), Box::new(subst_ty(v, subst))),
         Ty::Tuple(elems) => Ty::Tuple(elems.iter().map(|e| subst_ty(e, subst)).collect()),
         // A generic interface instantiation substitutes inside its type
@@ -3203,6 +3205,9 @@ impl Checker {
                     "ContextVar" => Ty::ContextVar(Box::new(elem(0))),
                     "ContextToken" => Ty::CtxToken,
                     "dict" => Ty::Dict(Box::new(elem(0)), Box::new(elem(1))),
+                    // A first-class type value `Type[T]` (#1527) — resolve its
+                    // represented type in the same generic scope.
+                    "Type" => Ty::TypeVal(Box::new(elem(0))),
                     _ => self.resolve_type(t),
                 }
             }
@@ -3522,6 +3527,19 @@ impl Checker {
                         .map(|a| self.resolve_type(a))
                         .unwrap_or(Ty::Unknown);
                     Ty::Optional(Box::new(payload))
+                }
+                // A first-class type value `Type[T]` (#1527): the type a library
+                // parameter declares to receive a type argument. `T` is the
+                // represented type (a bare `Type[T]` with `T` a still-unresolved
+                // generic parameter carries `Unknown`, a wildcard that admits any
+                // concrete type value). A non-type argument in such a position is
+                // rejected by `assignable`/`coercible`, a precise error.
+                "Type" => {
+                    let inner = args
+                        .first()
+                        .map(|a| self.resolve_type(a))
+                        .unwrap_or(Ty::Unknown);
+                    Ty::TypeVal(Box::new(inner))
                 }
                 other => {
                     // A transparent type alias (#606) resolves to its target
@@ -6207,6 +6225,19 @@ impl Checker {
                     // Sharing lint: reading a shared mutable global (#664/D-0113).
                     self.note_share_access(n, *span);
                     t
+                } else if let Some(inner) = primitive_type_value_ty(n) {
+                    // A bare primitive type name in value position is a first-class
+                    // **type value** `Type[T]` (#1527), so a concrete type can be
+                    // passed as a library-decorator argument (`@cli.option("--c",
+                    // int64, default=1)`). Checked after `lookup` (a local named
+                    // after a type cannot exist — the names are keywords) and
+                    // before the builtin/function-value fallback so that `str` /
+                    // `bool` (conversion builtins) read as type values here too;
+                    // their `str(x)` / `bool(x)` *call* forms are intercepted
+                    // structurally in `check_call`, so this never shadows a
+                    // conversion. Additive: a bare primitive name was `ZAP3001`
+                    // (or an unlowerable `Unknown`) before.
+                    Ty::TypeVal(Box::new(inner))
                 } else if self.sigs.contains_key(n) || BUILTINS.contains(&n.as_str()) {
                     Ty::Unknown // a function used as a value
                 } else {

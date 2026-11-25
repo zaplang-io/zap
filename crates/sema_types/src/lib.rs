@@ -142,6 +142,23 @@ pub enum Ty {
     /// (#1237, PROVISIONAL). A GC-managed reference, deliberately non-generic and
     /// opaque so it cannot be forged or inspected.
     CtxToken,
+    /// A **first-class type value** `Type[T]` (#1527): the value a bare primitive
+    /// type name denotes in value position, so a concrete type can be passed as a
+    /// library-decorator argument (`@cli.option("--count", int64, default=1)`).
+    /// `T` is the represented type, carried so two type values are **statically
+    /// distinguishable** (`Type[int64]` != `Type[str]`) and a non-type argument in
+    /// a `Type[T]` position is a precise error. Scoped to the primitive scalar
+    /// types in v1 (see [`primitive_type_value_ty`]); user struct/enum type values
+    /// are deferred (the type-vs-constructor ambiguity — ADR
+    /// `decisions/lang/1527-type-args-to-decorators.md`).
+    ///
+    /// It bridges to the AST annotation `Type[T]` (`to_ast_type`), so
+    /// monomorphization's `unify` binds `T` across the `Named("Type", [..])`
+    /// arguments it already recurses. At the IR level it **erases to a plain
+    /// `int64` type-id constant** ([`type_value_id`]): no runtime reflection graph
+    /// (that is E2, #1250), no new IR type, and no GC root — a scalar token the
+    /// library can carry (and, in a later phase, inspect).
+    TypeVal(Box<Ty>),
     /// A user-defined type (struct/enum), treated opaquely for now.
     Named(String),
     /// A **generic interface instantiated at value positions** (#1428):
@@ -272,6 +289,7 @@ impl Ty {
             Ty::Deque(t) => format!("deque[{}]", t.display()),
             Ty::OSet(t) => format!("oset[{}]", t.display()),
             Ty::Optional(t) => format!("Optional[{}]", t.display()),
+            Ty::TypeVal(t) => format!("Type[{}]", t.display()),
             Ty::VarTuple(t) => format!("tuple[{}]", t.display()),
             Ty::Tuple(ts) => {
                 let inner = ts
@@ -360,6 +378,11 @@ impl Ty {
             // mangles to `Optional$T`, identical to the pre-#1452 `Named("Optional")`
             // + type-argument form, so monomorph names are byte-for-byte unchanged.
             Ty::Optional(e) => named("Optional", vec![e.to_ast_type()?]),
+            // A type value bridges to the annotation `Type[T]` so mono's `unify`
+            // binds `T` across its argument (#1527). A bare `Type[Unknown]` (a
+            // `Type[T]` whose parameter is unresolved) keeps `Unknown` as its
+            // argument, matching every other composite's un-bridgeable element.
+            Ty::TypeVal(e) => named("Type", vec![e.to_ast_type()?]),
             Ty::VarTuple(e) => named("tuple", vec![e.to_ast_type()?]),
             Ty::Chan(e) => named("channel", vec![e.to_ast_type()?]),
             Ty::AtomicArray(e) => named("AtomicArray", vec![e.to_ast_type()?]),
@@ -522,6 +545,16 @@ pub fn assignable(from: &Ty, to: &Ty) -> bool {
         (Ty::Optional(a), Ty::Optional(b)) => {
             **a == **b || matches!(**a, Ty::Unknown) || matches!(**b, Ty::Unknown)
         }
+        // A type value `Type[U]` is assignable to `Type[T]` iff the represented
+        // types are identical — type values are **invariant** (no widening, so
+        // `Type[int32]` does NOT fit `Type[int64]`), the distinguishability #1527
+        // relies on. An `Unknown` argument on either side is a wildcard: a
+        // `Type[T]` parameter resolves to `Type[Unknown]`, so any concrete type
+        // value binds to it (and the non-type reject still holds — a non-`TypeVal`
+        // `from` never reaches this arm). (#1527)
+        (Ty::TypeVal(a), Ty::TypeVal(b)) => {
+            **a == **b || matches!(**a, Ty::Unknown) || matches!(**b, Ty::Unknown)
+        }
         (Ty::Dict(ak, av), Ty::Dict(bk, bv)) => assignable(ak, bk) && assignable(av, bv),
         // A tuple is assignable to a tuple of the same arity when each element is
         // (covariantly) assignable — this covers returning untyped literals into
@@ -531,6 +564,65 @@ pub fn assignable(from: &Ty, to: &Ty) -> bool {
         }
         _ => false,
     }
+}
+
+/// The primitive **type value** a bare type name denotes in value position
+/// (#1527), or `None` if `name` is not one of the v1 primitive scalar types.
+///
+/// This is the single source of the canonical type-value name set: every spelling
+/// of a primitive scalar (including the Python-facing `int`/`float` and the
+/// short `i64`/`u8`/`f32` aliases) maps to its canonical [`Ty`], so `int64` and
+/// `int` denote the *same* `Type[int64]`. The composite containers (`list`,
+/// `dict`, `set`, …) and user struct/enum names are deliberately excluded in v1
+/// — they are a documented follow-up (the type-vs-constructor ambiguity for user
+/// types; the container element question). Keeping the set here, rather than in
+/// the checker, lets IR lowering agree on exactly which names are type values.
+pub fn primitive_type_value_ty(name: &str) -> Option<Ty> {
+    Some(match name {
+        "int" | "int64" | "i64" => Ty::Int64,
+        "int32" | "i32" => Ty::Int32,
+        "uint8" | "u8" => Ty::Uint8,
+        "uint16" | "u16" => Ty::Uint16,
+        "uint32" | "u32" => Ty::Uint32,
+        "uint64" | "u64" => Ty::Uint64,
+        "usize" => Ty::Usize,
+        "float" | "float64" | "f64" => Ty::Float64,
+        "float32" | "f32" => Ty::Float32,
+        "bool" => Ty::Bool,
+        "str" => Ty::Str,
+        "bytes" => Ty::Bytes,
+        "char" => Ty::Char,
+        "bigint" => Ty::Bigint,
+        "complex" => Ty::Complex,
+        _ => return None,
+    })
+}
+
+/// The **stable runtime type-id** a type value lowers to (#1527) — the `int64`
+/// token a bare primitive type name becomes at the IR level. Stable and
+/// documented (`decisions/lang/1527-type-args-to-decorators.md`) so a later phase
+/// can expose it to libraries; v1 carries it without a user-facing reader. `None`
+/// for any non-primitive `Ty` (a `Type[T]` whose parameter is still `Unknown`, a
+/// container, a user type): such a type value has no concrete id to emit.
+pub fn type_value_id(ty: &Ty) -> Option<i64> {
+    Some(match ty {
+        Ty::Int64 => 1,
+        Ty::Int32 => 2,
+        Ty::Uint8 => 3,
+        Ty::Uint16 => 4,
+        Ty::Uint32 => 5,
+        Ty::Uint64 => 6,
+        Ty::Usize => 7,
+        Ty::Float64 => 8,
+        Ty::Float32 => 9,
+        Ty::Bool => 10,
+        Ty::Str => 11,
+        Ty::Bytes => 12,
+        Ty::Char => 13,
+        Ty::Bigint => 14,
+        Ty::Complex => 15,
+        _ => return None,
+    })
 }
 
 /// Does a concrete struct method signature `have` match what an interface

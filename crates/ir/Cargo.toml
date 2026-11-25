@@ -17,6 +17,7 @@ zapc_syntax = { path = "../syntax" }
 # edits to the churny `lower.rs` don't recompile them; re-exported from `lib.rs`.
 zapc_ir_core = { path = "../ir_core" }
 zapc_mono = { path = "../mono" }
+zapc_sema_types = { path = "../sema_types" }
 
 # loom is pulled in ONLY under `--cfg loom` (the exhaustive-interleaving model
 # check of the `concurrent.Queue` MPSC CAS protocol, I#184/D-0078 §5 — see
