@@ -2360,3 +2360,97 @@ def main():
         "a generator bug is a clean dual-span diagnostic, not a panic or the consumer header: {stderr}"
     );
 }
+
+#[test]
+fn a_library_generator_shadows_the_built_in_csv_codec_without_replacing_it() {
+    // E4 (#1480): library `@derivable` generators can express the built-in
+    // `@derive(Csv)` *codec* — both encode and decode — in PURE ZAP SOURCE.
+    // Unlike Json (#1470), CSV has no source-accessible DOM or module (it is all
+    // compiler-private codegen over `zap_csv_*` runtime), so the shadow uses only
+    // string primitives (`str()`, `.split`, `",".join`, `int()`/`float()`, a
+    // manual bool parse) plus the two E4 enablers: `reflect.construct` /
+    // `reflect.set_field` (#1454) and derived-method `Self`-return typing (#1455).
+    // A struct derives BOTH the built-in `Csv` (`to_csv`/`from_csv`) and the
+    // library `CsvEncode` (`to_csvcodec`) + `CsvDecode` (`from_csvcodec`); all four
+    // functions are emitted, the built-in `Row__to_csv`/`Row__from_csv` untouched
+    // (shadow, not replace). Round-trip agreement is pinned by the golden
+    // `derive_csv_codec_shadow` under the CI LLVM matrix.
+    let src = "\
+@derivable(CsvEncode)
+def _derive_csvencode[T](T value) -> str:
+    list[str] parts = []
+    comptime for f in reflect.type_info(T).fields:
+        if f.ty.name == \"int64\":
+            parts.append(str(reflect.field(value, comptime f.index)))
+        elif f.ty.name == \"str\":
+            parts.append(reflect.field(value, comptime f.index))
+        elif f.ty.name == \"bool\":
+            parts.append(str(reflect.field(value, comptime f.index)))
+        elif f.ty.name == \"float64\":
+            parts.append(str(reflect.field(value, comptime f.index)))
+        else:
+            comptime.error(f.span, \"CsvEncode: unsupported field kind\")
+    return \",\".join(parts)
+
+interface CsvEncode:
+    def to_csvcodec(self) -> str
+
+def _csv_bool(str col) -> bool:
+    return col == \"True\" or col == \"true\"
+
+@derivable(CsvDecode)
+def _derive_csvdecode[T](str s) -> T:
+    auto out = reflect.construct(T)
+    auto cols = s.split(\",\")
+    comptime for f in reflect.type_info(T).fields:
+        if f.ty.name == \"int64\":
+            reflect.set_field(out, comptime f.index, int(cols[comptime f.index]))
+        elif f.ty.name == \"str\":
+            reflect.set_field(out, comptime f.index, cols[comptime f.index])
+        elif f.ty.name == \"bool\":
+            reflect.set_field(out, comptime f.index, _csv_bool(cols[comptime f.index]))
+        elif f.ty.name == \"float64\":
+            reflect.set_field(out, comptime f.index, float(cols[comptime f.index]))
+        else:
+            comptime.error(f.span, \"CsvDecode: unsupported field kind\")
+    return out
+
+interface CsvDecode:
+    def from_csvcodec(str s) -> Self
+
+@derive(Eq, Csv, CsvEncode, CsvDecode)
+struct Row:
+    str city
+    int64 pop
+    bool capital
+    float64 lat
+
+def main():
+    auto r = Row(city=\"Paris\", pop=42, capital=True, lat=48.5)
+    print(Row.from_csvcodec(r.to_csvcodec()) == r)
+    print(Row.from_csvcodec(r.to_csv()) == r)
+    print(Row.from_csv(r.to_csvcodec()) == r)
+";
+    let f = write_zap("e4-csv-codec-shadow", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the shadow Csv codec generators must lower alongside the built-in; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The built-in Csv codec is left in place (shadow, not replace).
+    assert!(
+        stdout.contains("@Row__to_csv") && stdout.contains("@Row__from_csv"),
+        "the built-in Csv codec is untouched: {stdout}"
+    );
+    // The library encode + decode specialize their generators and forward.
+    assert!(
+        stdout.contains("@_derive_csvencode$Row") && stdout.contains("@_derive_csvdecode$Row"),
+        "both library generators specialize at Row: {stdout}"
+    );
+    assert!(
+        stdout.contains("@Row__to_csvcodec") && stdout.contains("@Row__from_csvcodec"),
+        "both library forwarding stubs are synthesized on Row: {stdout}"
+    );
+}
