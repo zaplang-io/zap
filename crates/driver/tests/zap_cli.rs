@@ -3328,3 +3328,73 @@ fn derive_json_rejects_non_str_dict_keys_and_unsupported_dict_values() {
         );
     }
 }
+
+#[test]
+fn derive_yaml_supports_scalar_list_and_dict_fields() {
+    // #1532 (epic #1529): @derive(Yaml) now encodes a `list[T]` / `dict[str,V]`
+    // field in JSON flow (valid YAML, YAML 1.2 ⊃ JSON) and decodes it through the
+    // shared `from_json_value` core (which gained list/dict in #1530/#1531), for
+    // int / float / str / bytes element and value types. Round-trip output is
+    // pinned by the golden `derive_yaml_list_dict_field` under the CI LLVM matrix.
+    let src = "\
+@derive(Yaml)
+struct W:
+    list[int64] nums
+    dict[str, int64] scores
+
+def main():
+    auto w = W([1, 2], {\"k\": 5})
+    auto d = W.from_yaml(w.to_yaml())
+    print(len(d.nums))
+    print(d.scores[\"k\"])
+";
+    let f = write_zap("derive-yaml-list-dict", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a @derive(Yaml) struct with scalar list/dict fields must lower; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("@W__to_yaml") && stdout.contains("@W__from_yaml"),
+        "the built-in yaml collection codec methods are emitted: {stdout}"
+    );
+    // Encode reuses the JSON flow array/object builder; decode shares the JSON
+    // DOM accessors through the from_json_value core.
+    assert!(
+        stdout.contains("__json_as_array") && stdout.contains("__json_as_object"),
+        "yaml collection decode flows through the shared JSON DOM accessors (#1532): {stdout}"
+    );
+}
+
+#[test]
+fn derive_yaml_rejects_a_nested_struct_collection_element_cleanly() {
+    // #1532: a nested-struct element/value in a yaml collection is a follow-up —
+    // its flow encode would route through `{T}__to_json`, which @derive(Yaml) does
+    // not emit, so it must be a clean compile error, not an unresolved symbol at
+    // codegen (the #1514-class trap). A scalar element is fine (covered above).
+    let src = "\
+@derive(Yaml)
+struct Item:
+    int64 id
+
+@derive(Yaml)
+struct W:
+    list[Item] items
+
+def main():
+    print(0)
+";
+    let f = write_zap("derive-yaml-nested-elem-reject", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "a nested-struct yaml collection element must be a clean error"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("@derive(Yaml)") && stderr.contains("nested-struct element"),
+        "the nested-struct yaml element errors cleanly: {stderr}"
+    );
+}

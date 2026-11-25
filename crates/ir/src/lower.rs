@@ -4692,6 +4692,28 @@ fn dict_value_json_ty(key: Elem, value: Elem) -> Result<Ty, LowerError> {
     list_elem_json_ty(value)
 }
 
+/// Guard a `@derive(Yaml)` `list` / `dict` collection field (#1532): its element
+/// (or dict value) must NOT be a nested struct. The YAML collection encode emits
+/// JSON flow (`gen_json_encode_field`), whose struct-element path calls the
+/// element type's `{T}__to_json` — a method `@derive(Yaml)` does not emit (it
+/// emits `to_yaml` / `from_yaml` / `from_json_value`), so a struct element in a
+/// yaml-only collection would be an unresolved symbol at codegen. Scalar / str /
+/// bytes elements need no `to_json`. A nested-struct element in a yaml collection
+/// is a documented follow-up.
+fn yaml_collection_elem_ok(fty: Ty) -> Result<(), LowerError> {
+    let bad =
+        matches!(fty, Ty::List(Elem::Struct(_))) || matches!(fty, Ty::Dict(_, Elem::Struct(_)));
+    if bad {
+        return Err(err(
+            "@derive(Yaml) does not support a nested-struct element in a list / \
+             dict field yet (the element would encode via its `to_json`, which a \
+             yaml-only struct does not have); a scalar / str / bytes element is \
+             supported — a nested-struct element is a follow-up",
+        ));
+    }
+    Ok(())
+}
+
 /// Layout facts for a monomorphized `Optional[T]` instance used as a
 /// `@derive(Json)` field (I#165, D-0065). Monomorphization has already
 /// specialized `Optional[T]` to a concrete enum (`Optional$int64`, `Optional$str`,
@@ -6005,6 +6027,33 @@ fn gen_yaml_to_method(
                 args: vec![child, pad],
             });
             acc = gen_concat(&mut b, acc, indented);
+        } else if matches!(
+            derive_field_kind(*fty),
+            Some(DeriveFieldKind::List(_)) | Some(DeriveFieldKind::Dict(_, _))
+        ) {
+            // A `list` / `dict` field (#1532) → `fname: <flow>\n`. YAML 1.2 is a
+            // JSON superset, so the compact JSON array/object the `@derive(Json)`
+            // encoder produces (`[e0,e1]` / `{"k":v}`) is valid YAML flow and
+            // round-trips through `__yaml_loads` (which shares the JSON DOM). This
+            // reuses `gen_json_encode_field`'s element recursion and its element
+            // allowlist. A block sequence/mapping layout is a cosmetic follow-up.
+            //
+            // One extra restriction vs `@derive(Json)`: a nested-STRUCT element /
+            // value is rejected here. The flow encode of a struct element routes
+            // through the element type's `{T}__to_json`, which `@derive(Yaml)`
+            // does NOT emit (it emits `to_yaml` / `from_yaml` / `from_json_value`),
+            // so a struct element in a yaml-only collection would be an unresolved
+            // symbol at codegen (the #1514-class trap). Scalar / str / bytes
+            // elements need no `to_json`, so they are fine; a nested-struct element
+            // in a yaml collection is a follow-up.
+            yaml_collection_elem_ok(*fty)?;
+            let label = b.strconst(&format!("{fname}: "));
+            acc = gen_concat(&mut b, acc, label);
+            let fopts = field_json_opts(ctx, sid, idx);
+            let vstr = gen_json_encode_field(&mut b, fv, *fty, &fopts, ctx)?;
+            acc = gen_concat(&mut b, acc, vstr);
+            let nl = b.strconst("\n");
+            acc = gen_concat(&mut b, acc, nl);
         } else {
             // `fname: <scalar>\n`
             let label = b.strconst(&format!("{fname}: "));
