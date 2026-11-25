@@ -1723,7 +1723,10 @@ pub fn lower_module_opts_with_types(
                     } else {
                         m.ret
                             .as_ref()
-                            .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Void))
+                            .map(|t| {
+                                resolve_ty(&subst_self(t, &s.name), &ctx.tyenv())
+                                    .unwrap_or(Ty::Void)
+                            })
                             .unwrap_or(Ty::Void)
                     };
                     // Default/keyword argument metadata for method calls (I#481,
@@ -1766,7 +1769,10 @@ pub fn lower_module_opts_with_types(
                         } else {
                             m.ret
                                 .as_ref()
-                                .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Void))
+                                .map(|t| {
+                                    resolve_ty(&subst_self(t, &e.name), &ctx.tyenv())
+                                        .unwrap_or(Ty::Void)
+                                })
                                 .unwrap_or(Ty::Void)
                         };
                         // Method default/keyword argument metadata (I#481), as
@@ -1795,7 +1801,10 @@ pub fn lower_module_opts_with_types(
                         let ret = m
                             .ret
                             .as_ref()
-                            .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Void))
+                            .map(|t| {
+                                resolve_ty(&subst_self(t, &e.name), &ctx.tyenv())
+                                    .unwrap_or(Ty::Void)
+                            })
                             .unwrap_or(Ty::Void);
                         let params: Vec<Ty> = m
                             .params
@@ -2263,6 +2272,37 @@ pub fn lower_module_opts_with_types(
     }
 
     (out, errors)
+}
+
+/// Replace every bare `Self` type name in `t` with `self_name`, the enclosing
+/// type, so a method's `Self`-typed return or parameter resolves to the concrete
+/// type (#1455): `-> Self` / `Self other` on `struct P` become `-> P` / `P
+/// other`. Recurses through generic arguments, tuples, and function types, so
+/// `list[Self]` / `(Self, int64)` / `fn(Self) -> Self` resolve too. Letting the
+/// ordinary [`resolve_ty`] see the concrete name means `Self` lands on the right
+/// `Ty` for every kind — `Ty::Struct` for a struct or a tier-3 enum, `Ty::Enum`
+/// for a tier-1 enum — with no special case in the resolver.
+fn subst_self(t: &ast::Type, self_name: &str) -> ast::Type {
+    match t {
+        ast::Type::Named { name, args, span } => ast::Type::Named {
+            name: if name == "Self" {
+                self_name.to_string()
+            } else {
+                name.clone()
+            },
+            args: args.iter().map(|a| subst_self(a, self_name)).collect(),
+            span: *span,
+        },
+        ast::Type::Tuple { elems, span } => ast::Type::Tuple {
+            elems: elems.iter().map(|e| subst_self(e, self_name)).collect(),
+            span: *span,
+        },
+        ast::Type::Func { params, ret, span } => ast::Type::Func {
+            params: params.iter().map(|p| subst_self(p, self_name)).collect(),
+            ret: ret.as_ref().map(|r| Box::new(subst_self(r, self_name))),
+            span: *span,
+        },
+    }
 }
 
 fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
@@ -2844,9 +2884,19 @@ fn param_ty(p: &ast::Param, self_sid: Option<u32>, ctx: &StructCtx) -> Ty {
             return Ty::Struct(sid);
         }
     }
+    // A non-`self` parameter typed `Self` (e.g. `def eq(self, Self other)`)
+    // resolves to the enclosing type, like the `Self` return (#1455). Only
+    // inside a method (`self_sid` set); in a free function `Self` is meaningless
+    // and left to the ordinary resolver's error.
     let base =
         p.ty.as_ref()
-            .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Ptr))
+            .map(|t| {
+                let resolved = match self_sid {
+                    Some(sid) => subst_self(t, &ctx.names[sid as usize]),
+                    None => t.clone(),
+                };
+                resolve_ty(&resolved, &ctx.tyenv()).unwrap_or(Ty::Ptr)
+            })
             .unwrap_or(Ty::Ptr);
     // A `TYPE... name` variadic parameter is "received as a `list`" (SPEC §7,
     // D-0038): the callee iterates / indexes / `len`s it like any other list,

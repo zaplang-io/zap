@@ -2240,6 +2240,83 @@ def main():
 }
 
 #[test]
+fn a_method_returning_self_is_usable_at_the_call_site() {
+    // #1455: a method whose declared return is `Self` must be typed as the
+    // enclosing type at the call site, so its result can be field-accessed /
+    // chained. Before the fix the `Self` return resolved to a non-struct in
+    // codegen and `p.clone().x` failed with `ZAP6001: field access on a
+    // non-struct value`. Also covers a `Self`-typed parameter.
+    let src = "\
+struct P:
+    int64 x
+
+    def clone(self) -> Self:
+        return self
+
+    def pick(self, Self other) -> Self:
+        return other
+
+def main():
+    auto p = P(5)
+    print(p.clone().x)
+    print(p.pick(P(9)).x)
+";
+    let f = write_zap("self-return-method", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a `Self`-returning method must lower and be field-accessible; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("non-struct"),
+        "the `Self` return resolves to the struct, not a non-struct: {stderr}"
+    );
+}
+
+#[test]
+fn a_derived_method_returning_self_resolves_to_the_deriving_type() {
+    // #1455: the same fix makes a library-derived method with a `Self` return
+    // (the shape a codec decoder `from_json(…) -> Self` needs) typed as the
+    // deriving struct — so the reflect-construct enabler (#1454) can be consumed
+    // for decode: a generator zero-constructs, sets each field, returns the value,
+    // and the caller reads it back.
+    let src = "\
+@derivable(Build)
+def _derive_build[T](T self, list[int64] src) -> T:
+    auto out = reflect.construct(T)
+    comptime for f in reflect.type_info(T).fields:
+        reflect.set_field(out, comptime f.index, src[comptime f.index])
+    return out
+
+interface Build:
+    def build(self, list[int64] src) -> Self
+
+@derive(Build)
+struct P:
+    int64 x
+    int64 y
+
+def main():
+    auto seed = P(0, 0)
+    auto p = seed.build([10, 20])
+    print(p.x)
+    print(p.y)
+";
+    let f = write_zap("self-return-derived", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a derived `Self`-returning decoder must lower and be field-accessible; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("non-struct") && !stderr.contains("unknown variable 'reflect'"),
+        "the decoder result types as the deriving struct: {stderr}"
+    );
+}
+
+#[test]
 fn a_generator_bug_is_a_dual_span_error_not_a_crash() {
     // An engine fault inside a generator (here an out-of-range `reflect.field`)
     // is the library author's bug, not the consumer's: it renders as the
