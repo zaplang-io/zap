@@ -6606,7 +6606,10 @@ impl Parser {
             self.expect(&TokenKind::RParen, "')'");
             return named;
         }
-        let first = self.parse_display_elem();
+        let first = match self.try_fn_type_tuple_elem() {
+            Some(e) => e,
+            None => self.parse_display_elem(),
+        };
         // `(elem for CLAUSES)` — a bare generator expression (#596). A `for`
         // right after the first element (which must be plain, never a `*expr`
         // splat) makes this a lazy genexpr rather than a grouping paren or a
@@ -6628,7 +6631,10 @@ impl Parser {
                 if self.is(&TokenKind::RParen) {
                     break;
                 }
-                elems.push(self.parse_display_elem());
+                elems.push(match self.try_fn_type_tuple_elem() {
+                    Some(e) => e,
+                    None => self.parse_display_elem(),
+                });
             }
             self.expect(&TokenKind::RParen, "')'");
             Expr::Tuple(elems, self.span_from(start))
@@ -6636,6 +6642,29 @@ impl Parser {
             self.expect(&TokenKind::RParen, "')'");
             first
         }
+    }
+
+    /// If the cursor is at the head of a function type (`fn(`), parse it as a
+    /// type-argument expression (`Expr::TypeArg`) — #1502, extending #1488. A
+    /// function type can appear as a *parenthesized-tuple element* in a generic
+    /// type argument, `run[(fn(A) -> B, C)]`. `fn(` can never begin a value
+    /// expression, so recognizing it here never shadows a value tuple element;
+    /// the enclosing tuple is still an `Expr::Tuple`, which `mono`'s
+    /// `expr_to_type` resolves to a `Type::Tuple` whose element is the
+    /// `Type::Func`. Only applied to tuple elements (not shared list/set display
+    /// elements), matching where a type argument can actually appear.
+    fn try_fn_type_tuple_elem(&mut self) -> Option<Expr> {
+        if matches!(self.peek(), TokenKind::Ident(n) if n == "fn")
+            && *self.peek2() == TokenKind::LParen
+        {
+            let start = self.peek_span().start;
+            let ty = self.parse_type();
+            return Some(Expr::TypeArg {
+                ty: Box::new(ty),
+                span: self.span_from(start),
+            });
+        }
+        None
     }
 
     /// Parse a named (walrus) assignment-expression `name := expr` (#600). The

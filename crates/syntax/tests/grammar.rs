@@ -434,7 +434,13 @@ const CORPUS: &[Case] = &[
     case("subscript", Accept, "auto s = xs[1:2:3]\n"),                          // slice, D-0030
     case("index_elem", Accept, "auto f = run[fn(int64) -> int64](g)\n"),        // fn-type type arg, #1488
     case("index_elem", Accept, "auto f = run[fn(int64, str) -> bytes](g)\n"),   // multi-param fn-type arg, #1488
+    case("star_elem", Accept, "auto p = run[(fn(int64) -> int64, int64)](x)\n"),// fn-type in a tuple type arg, #1502
+    case("star_elem", Accept, "auto p = run[(fn(int64) -> int64, fn(int64) -> int64)](x)\n"), // two fn-types, #1502
     case("match_regex", Accept, "auto m = x =~ m/foo/\n"),                      // D-0010
+    // Accepted ambiguity (#1502): a `fn(` tuple element is always a function
+    // TYPE, so a value named `fn` cannot be CALLED in a tuple — `fn(1)` reads as
+    // `fn(<type>)` and `1` is not a type.
+    case("star_elem", Reject, "auto t = (fn(1), 2)\n"),                         // fn( is a type here, not a call, #1502
     case("lambda", Reject, "auto f = lambda x x\n"),                            // missing ':'
     case("list_display", Reject, "auto xs = [1, 2\n"),                          // unmatched '['
     case("trailer", Reject, "auto y = f(1\n"),                                  // unmatched '('
