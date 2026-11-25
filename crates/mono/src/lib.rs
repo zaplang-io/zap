@@ -581,6 +581,39 @@ fn subst_method_sig(m: &MethodSig, subst: &HashMap<&str, &Type>) -> MethodSig {
     }
 }
 
+/// A zero-value literal expression for a field type, for `reflect.construct`
+/// (#1454): the throwaway initial value a field-set builder overwrites. v1
+/// covers the scalar / `str` / `bytes` field kinds a codec record uses; a
+/// generic/container/nested type yields `None` (a clean "unsupported yet" error
+/// at the call site), mirroring the derive codegen's field-type restrictions.
+fn zero_expr(ty: &Type, span: Span) -> Option<Expr> {
+    let Type::Named { name, args, .. } = ty else {
+        return None;
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    let empty_str = |bytes: bool| Expr::Str {
+        value: String::new(),
+        raw: false,
+        bytes,
+        fstring: false,
+        span,
+        fstring_fields: Vec::new(),
+    };
+    Some(match name.as_str() {
+        "int" | "int64" | "i64" | "int32" | "i32" | "int16" | "i16" | "int8" | "i8" | "uint8"
+        | "u8" | "uint16" | "u16" | "uint32" | "u32" | "uint64" | "u64" | "usize" => {
+            Expr::Int("0".to_string(), span)
+        }
+        "float" | "float64" | "f64" | "float32" | "f32" => Expr::Float("0.0".to_string(), span),
+        "bool" => Expr::Bool(false, span),
+        "str" => empty_str(false),
+        "bytes" => empty_str(true),
+        _ => return None,
+    })
+}
+
 /// Extract the type name from a `reflect.type_info(<TypeName>)` call expression
 /// (#1298) — the base of a `comptime for … in reflect.type_info(T).<member>`
 /// iterable. Returns `None` for any other shape, or a non-bare-name type
@@ -4395,6 +4428,59 @@ impl Mono<'_> {
         out
     }
 
+    /// Rewrite `reflect.construct(T)` (#1454) to a zero-initialized construction
+    /// of the concrete type `T` is substituted to: `ConcreteName(zero(f0), …)`.
+    /// v1 supports a **non-generic struct** whose fields are scalars / str /
+    /// bytes; a generic instance or an unsupported field type is a clean error
+    /// (deferred, like the derive codegen's field-type restrictions).
+    fn rewrite_reflect_construct(
+        &self,
+        ty_arg: &Expr,
+        span: Span,
+    ) -> Result<(Expr, CTy), LowerError> {
+        let Expr::Name(t, _) = ty_arg else {
+            return Err(err("reflect.construct(T) expects a type name"));
+        }; // Resolve a type parameter to its concrete type; a bare concrete name
+           // (not a parameter) is used as-is.
+        let concrete = match self.cur_subst.get(t) {
+            Some(Type::Named { name, args, .. }) if args.is_empty() => name.clone(),
+            Some(Type::Named { name, .. }) => {
+                return Err(err(format!(
+                    "reflect.construct: a generic instance (`{name}[…]`) is not supported yet (#1454)"
+                )));
+            }
+            Some(_) => return Err(err("reflect.construct(T) expects a named struct type")),
+            None => t.clone(),
+        };
+        let Some(def) = self.structs.get(concrete.as_str()).copied() else {
+            return Err(err(format!(
+                "reflect.construct: `{concrete}` is not a non-generic struct in scope (#1454)"
+            )));
+        };
+        let mut zargs = Vec::with_capacity(def.fields.len());
+        for f in &def.fields {
+            let z = zero_expr(&f.ty, span).ok_or_else(|| {
+                err(format!(
+                    "reflect.construct: field `{}` of `{concrete}` has a type the zero-initializer \
+                     does not support yet (scalars / str / bytes only in v1, #1454)",
+                    f.name
+                ))
+            })?;
+            zargs.push(Arg {
+                name: None,
+                value: z,
+                spread: ArgSpread::None,
+                span,
+            });
+        }
+        let call = Expr::Call {
+            callee: Box::new(Expr::Name(concrete.clone(), span)),
+            args: zargs,
+            span,
+        };
+        Ok((call, CTy::Ty(self.named(&concrete, Vec::new()))))
+    }
+
     fn rewrite_call(
         &mut self,
         callee: &Expr,
@@ -4412,6 +4498,20 @@ impl Mono<'_> {
         // the twin rewrite on the type-check path.
         let desugared = zapc_syntax::seam::desugar_seam_ctor_callee(callee);
         let callee = desugared.as_ref().unwrap_or(callee);
+        // `reflect.construct(T)` (#1454, E4): a zero-initialized value of `T`, the
+        // base of the field-set builder a codec decoder uses before populating
+        // each field with `reflect.set_field`. The argument is a TYPE (not a
+        // value), so it is handled before the ordinary argument rewrite; at
+        // specialization `T` is substituted to a concrete type and this rewrites
+        // to `ConcreteName(zero(f0), zero(f1), …)`.
+        if let Expr::Attr { base, name, .. } = callee {
+            if name == "construct"
+                && matches!(&**base, Expr::Name(m, _) if m == "reflect")
+                && args.len() == 1
+            {
+                return self.rewrite_reflect_construct(&args[0].value, span);
+            }
+        }
         // Rewrite the arguments once; keep their inferred types for unification.
         // Each argument is rewritten with the callee's declared parameter/field
         // type as its expected-type sink (#1342), so a payload-less

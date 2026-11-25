@@ -28,7 +28,7 @@
 //! will call.
 
 use zapc_sema_types::TypeInfo;
-use zapc_syntax::ast::{Expr, Type};
+use zapc_syntax::ast::{Expr, Stmt, Type};
 use zapc_syntax::span::Span;
 
 use crate::walk::map_child_exprs;
@@ -85,11 +85,46 @@ pub fn desugar_reflect_field(expr: &Expr, info: &TypeInfo) -> Result<Expr, CtErr
 
 /// Is `callee` the `reflect.field` member access?
 fn is_reflect_field(callee: &Expr) -> bool {
+    is_reflect_member(callee, "field")
+}
+
+/// Is `callee` the `reflect.<member>` access?
+fn is_reflect_member(callee: &Expr, member: &str) -> bool {
     matches!(
         callee,
         Expr::Attr { base, name, .. }
-            if name == "field" && matches!(&**base, Expr::Name(m, _) if m == "reflect")
+            if name == member && matches!(&**base, Expr::Name(m, _) if m == "reflect")
     )
+}
+
+/// Desugar a `reflect.set_field(target, comptime i, value)` **statement** to the
+/// ordinary field assignment `target.<name_i> = value` — the write-counterpart
+/// of [`reflect_field`] (#1454, E4), resolved during the `comptime for` unroll
+/// where the concrete field name is known. Returns `Ok(None)` when `st` is not a
+/// recognizable `reflect.set_field` call statement (a non-constant index is left
+/// for a later pass), so the caller can fall through to its ordinary handling.
+/// Any `reflect.field` reads inside the target or value operands are desugared
+/// too.
+pub fn desugar_set_field(st: &Stmt, info: &TypeInfo) -> Result<Option<Stmt>, CtError> {
+    let Stmt::Expr(Expr::Call { callee, args, span }) = st else {
+        return Ok(None);
+    };
+    if !is_reflect_member(callee, "set_field") || args.len() != 3 {
+        return Ok(None);
+    }
+    let Some(index) = const_int(&args[1].value) else {
+        return Ok(None);
+    };
+    // Desugar nested reads in the target and value first, then resolve the LHS to
+    // the typed field access (reusing `reflect_field`, which builds `target.<name>`).
+    let target = desugar_reflect_field(&args[0].value, info)?;
+    let value = desugar_reflect_field(&args[2].value, info)?;
+    let lhs = reflect_field(&target, index, info, *span)?;
+    Ok(Some(Stmt::Assign {
+        target: lhs,
+        value,
+        span: *span,
+    }))
 }
 
 /// The constant `i64` an integer-literal expression denotes (bare literal, or a

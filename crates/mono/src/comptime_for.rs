@@ -201,6 +201,13 @@ pub fn unroll_struct_fields_with_access(
 fn desugar_stmt_fields(st: &Stmt, info: &TypeInfo) -> Result<Stmt, LowerError> {
     let d = |e: &Expr| desugar_reflect_field(e, info).map_err(ct_lower_error);
     let db = |b: &Block| desugar_block_fields(b, info);
+    // `reflect.set_field(target, comptime i, v)` → `target.<name_i> = v` (#1454):
+    // the field-write counterpart of `reflect.field`, resolved here where the
+    // concrete field name is known (e.g. a codec decoder populating a built value
+    // inside a `comptime for` over the fields).
+    if let Some(assign) = zapc_comptime::desugar_set_field(st, info).map_err(ct_lower_error)? {
+        return Ok(assign);
+    }
     Ok(match st {
         Stmt::Expr(e) => Stmt::Expr(d(e)?),
         Stmt::Return { value, span } => Stmt::Return {
