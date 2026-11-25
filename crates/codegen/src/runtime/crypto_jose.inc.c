@@ -4099,6 +4099,17 @@ static int zap_http_read_one(ZapHttpConn *hc, int64_t max_response_bytes, long *
     } else {
         /* no framing: read to EOF (never reusable) */
         for (;;) {
+            /* Check the buffered body at the TOP of the loop, before filling, so
+             * the cap catches a body that already arrived whole alongside the
+             * headers (the common loopback case, where the next fill is an
+             * immediate EOF) as well as one that streams in over several fills.
+             * Exactly the limit is fine; this fires only past it. */
+            if (max_response_bytes > 0 && (b.len - body_off) > (size_t)max_response_bytes) {
+                zap_dyn_free(&b);
+                zap_httpconn_close(hc);
+                zap_http_too_large_panic();
+                return -1;
+            }
             ssize_t r = zap_httpconn_fill(hc, &b);
             if (r == -2 || r == -3) {
                 zap_dyn_free(&b);
@@ -4107,14 +4118,6 @@ static int zap_http_read_one(ZapHttpConn *hc, int64_t max_response_bytes, long *
             }
             if (r <= 0) {
                 break;
-            }
-            if (max_response_bytes > 0 && (b.len - body_off) > (size_t)max_response_bytes) {
-                /* Buffered body crossed the cap: evict the socket and raise.
-                 * Exactly the limit is fine; this fires only past it. */
-                zap_dyn_free(&b);
-                zap_httpconn_close(hc);
-                zap_http_too_large_panic();
-                return -1;
             }
         }
         blen = b.len > body_off ? b.len - body_off : 0;
