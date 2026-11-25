@@ -316,10 +316,13 @@ impl TypeRegistry {
                 value: (**v).clone(),
             },
             Ty::Tuple(es) => TypeShape::Tuple { elems: es.clone() },
-            // `Optional[T]` erases its element at the `Ty` level (sema tracks it
-            // as `Named("Optional")`), so a container element that is itself an
-            // optional reflects as a bare optional (`Unknown` element) — the
-            // one-level limitation inherited from E1's `Ty` model.
+            // `Optional[T]` now carries its payload in the `Ty` (#1452), so a
+            // container element that is itself an optional reflects with its real
+            // element type. The legacy `Named("Optional")` spelling (payload
+            // erased) still reflects as a bare optional (`Unknown` element).
+            Ty::Optional(e) => TypeShape::Optional {
+                elem: (**e).clone(),
+            },
             Ty::Named(n) if n == "Optional" => TypeShape::Optional { elem: Ty::Unknown },
             Ty::Named(n) if !n.starts_with('$') => {
                 return self.named(n, span);
@@ -429,8 +432,8 @@ fn type_key(t: &Type) -> String {
 }
 
 /// Best-effort map of a declared [`Type`] to a resolved [`Ty`], for the
-/// container/primitive cases the registry resolves. Mirrors the `Ty` erasure of
-/// `Optional` (→ `Named("Optional")`).
+/// container/primitive cases the registry resolves. Carries the `Optional`
+/// payload (→ `Ty::Optional(T)`, un-erased #1452).
 fn ty_of_type(t: &Type) -> Ty {
     match t {
         Type::Tuple { elems, .. } => Ty::Tuple(elems.iter().map(ty_of_type).collect()),
@@ -441,7 +444,9 @@ fn ty_of_type(t: &Type) -> Ty {
                 Box::new(ty_of_type(&args[0])),
                 Box::new(ty_of_type(&args[1])),
             ),
-            ("Optional", _) => Ty::Named("Optional".to_string()),
+            ("Optional", _) => Ty::Optional(Box::new(
+                args.first().map(ty_of_type).unwrap_or(Ty::Unknown),
+            )),
             _ => {
                 // A bare name: a primitive maps to its `Ty`, any other (user
                 // struct/enum, or an unsupported parameterized container) keeps

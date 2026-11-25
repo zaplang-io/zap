@@ -96,6 +96,21 @@ pub enum Ty {
     /// A built-in `oset[T]` insertion-ordered set (#983, D-0208): membership like
     /// `set` (element must be `Hashable`) but iteration follows first-add order.
     OSet(Box<Ty>),
+    /// The prelude generic enum `Optional[T]` (I#154) with its payload type `T`
+    /// preserved (#1452). Previously sema erased the payload — every `Optional[T]`
+    /// resolved to the opaque `Named("Optional")` — so a payload-type mismatch was
+    /// invisible to the type checker and only caught in IR lowering
+    /// (`check_optional_payload`, #1407; `check_numeric_payload`, #1379). Carrying
+    /// the payload (like `List`/`Dict`) lets `assignable`/`coercible` be
+    /// payload-aware — `Optional[U]` is assignable to `Optional[T]` iff `U == T`
+    /// (reject on mismatch, **no new widening**; locked by the #1379/#1407 ADRs) —
+    /// so the mismatch surfaces through the sema-only `check_source`/LSP path. A
+    /// bare, un-parameterized `Optional` (or an `Optional.None` with no recoverable
+    /// payload) carries [`Ty::Unknown`], which is a wildcard on both sides. The
+    /// name mangles identically to the old `Named("Optional")`-plus-argument form
+    /// (`to_ast_type` → `Optional[T]`), so monomorphization is byte-for-byte
+    /// unchanged.
+    Optional(Box<Ty>),
     /// A fixed-arity, heterogeneous, immutable tuple (D-0019/D-0049) carrying its
     /// element types in positional order. The empty tuple `()` is the unit value.
     Tuple(Vec<Ty>),
@@ -232,6 +247,7 @@ impl Ty {
             Ty::Heap(t) => format!("heap[{}]", t.display()),
             Ty::Deque(t) => format!("deque[{}]", t.display()),
             Ty::OSet(t) => format!("oset[{}]", t.display()),
+            Ty::Optional(t) => format!("Optional[{}]", t.display()),
             Ty::Tuple(ts) => {
                 let inner = ts
                     .iter()
@@ -302,6 +318,12 @@ impl Ty {
             Ty::Heap(e) => named("heap", vec![e.to_ast_type()?]),
             Ty::Deque(e) => named("deque", vec![e.to_ast_type()?]),
             Ty::OSet(e) => named("oset", vec![e.to_ast_type()?]),
+            // The payload must bridge, so a bare `Optional[Unknown]` (`None` /
+            // un-parameterized) is left uninferred (fail-closed) exactly like any
+            // other composite with an un-bridgeable element. A concrete payload
+            // mangles to `Optional$T`, identical to the pre-#1452 `Named("Optional")`
+            // + type-argument form, so monomorph names are byte-for-byte unchanged.
+            Ty::Optional(e) => named("Optional", vec![e.to_ast_type()?]),
             Ty::Chan(e) => named("channel", vec![e.to_ast_type()?]),
             Ty::AtomicArray(e) => named("AtomicArray", vec![e.to_ast_type()?]),
             Ty::ContextVar(e) => named("ContextVar", vec![e.to_ast_type()?]),
@@ -436,6 +458,19 @@ pub fn assignable(from: &Ty, to: &Ty) -> bool {
         (Ty::Deque(a), Ty::Deque(b)) => assignable(a, b),
         (Ty::OSet(a), Ty::OSet(b)) => assignable(a, b),
         (Ty::AtomicArray(a), Ty::AtomicArray(b)) => assignable(a, b),
+        // `Optional[U]` is assignable to `Optional[T]` iff the payloads are
+        // identical — a reject-on-mismatch rule, NOT a widening (#1452; locked by
+        // the #1379/#1407 ADRs, which the IR `check_optional_payload` enforces on
+        // monomorphized payloads). An `Unknown` payload on either side is a
+        // wildcard: a bare `Optional` annotation and an `Optional.None` carry
+        // `Unknown`, so `Optional[int64] x = None`-style flows stay accepted. The
+        // `from == to` fast path above already admits identical payloads; this arm
+        // exists to REJECT a differing concrete payload (which would otherwise fall
+        // through to `false` — the intended behaviour — but is spelled out so the
+        // `Unknown` wildcard and the intent are explicit).
+        (Ty::Optional(a), Ty::Optional(b)) => {
+            **a == **b || matches!(**a, Ty::Unknown) || matches!(**b, Ty::Unknown)
+        }
         (Ty::Dict(ak, av), Ty::Dict(bk, bv)) => assignable(ak, bk) && assignable(av, bv),
         // A tuple is assignable to a tuple of the same arity when each element is
         // (covariantly) assignable — this covers returning untyped literals into
@@ -604,6 +639,10 @@ pub fn default_type(t: Ty) -> Ty {
         // Defaulting is element-wise for tuples, so `auto t = (1, 2.0)` becomes
         // `(int64, float64)` rather than carrying untyped-literal elements.
         Ty::Tuple(ts) => Ty::Tuple(ts.into_iter().map(default_type).collect()),
+        // Defaulting is element-wise for an `Optional` payload too, so the payload
+        // of `Optional.Some(5)` concretizes to `int64` (never a lingering untyped
+        // literal), which is what the payload-aware assignability compares (#1452).
+        Ty::Optional(t) => Ty::Optional(Box::new(default_type(*t))),
         other => other,
     }
 }
