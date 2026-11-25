@@ -86,9 +86,27 @@ struct ModuleFacts {
     symbols: HashSet<String>,
 }
 
+/// A linked program: the single merged, import-qualified [`Module`] plus the
+/// **entry** module's import alias → target mangle-prefix map. The map lets the
+/// decorator desugar (which runs after the import statements are consumed)
+/// resolve an imported-package dotted-decorator receiver — `@factory.command`,
+/// where `factory` is an imported module, not a local value (#1519). An ordinary
+/// expression `factory.command(x)` is rewritten to the mangled symbol during the
+/// merge, but a decorator name is a plain string that the merge does not touch,
+/// so the desugar needs the alias→prefix map to resolve it the same way.
+pub struct Linked {
+    pub module: Module,
+    pub import_prefixes: HashMap<String, String>,
+}
+
 /// Load the program rooted at `entry_path`, resolving dependency imports through
 /// the active `zenv` search paths (D-0052). Returns the single merged, qualified
 /// [`Module`], or the linker diagnostics.
+///
+/// The production front-end uses [`load_program_linked`] (it also needs the
+/// import alias→prefix map, #1519); this Module-only convenience is retained for
+/// the module-linker's own unit tests, which assert on the merged AST alone.
+#[cfg(test)]
 pub fn load_program(entry_path: &str, target: &Target) -> Result<Module, Vec<ModDiag>> {
     let pkg_roots = zapc_pkg::zenv::module_search_paths_from_env();
     load_program_with(entry_path, target, pkg_roots)
@@ -97,15 +115,34 @@ pub fn load_program(entry_path: &str, target: &Target) -> Result<Module, Vec<Mod
 /// Like [`load_program`], but with explicit dependency package-search roots (each
 /// a directory containing `<name>/src/…`). Used by tests to avoid touching the
 /// process environment.
+#[cfg(test)]
 pub fn load_program_with(
     entry_path: &str,
     target: &Target,
     pkg_roots: Vec<PathBuf>,
 ) -> Result<Module, Vec<ModDiag>> {
+    load_program_linked(entry_path, target, pkg_roots).map(|l| l.module)
+}
+
+/// Like [`load_program_with`], but also returns the entry module's import
+/// alias → target mangle-prefix map (see [`Linked`]). The driver front-end uses
+/// this so the decorator desugar can resolve an imported-package dotted-decorator
+/// receiver (#1519).
+pub fn load_program_linked(
+    entry_path: &str,
+    target: &Target,
+    pkg_roots: Vec<PathBuf>,
+) -> Result<Linked, Vec<ModDiag>> {
     let mut loader = Loader::new(target, pkg_roots);
     let merged = loader.run(entry_path);
     if loader.diags.is_empty() {
-        merged.ok_or_else(Vec::new)
+        match merged {
+            Some(module) => Ok(Linked {
+                module,
+                import_prefixes: std::mem::take(&mut loader.entry_import_prefixes),
+            }),
+            None => Err(Vec::new()),
+        }
     } else {
         Err(loader.diags)
     }
@@ -123,6 +160,11 @@ struct Loader<'t> {
     raw: Vec<Vec<RawImport>>,
     /// Resolved import edges per module, parallel to `modules`.
     edges: Vec<Vec<Edge>>,
+    /// The entry module's import alias → target mangle-prefix map, captured
+    /// during [`Loader::merge`] (where the alias→module resolution lives, before
+    /// the import statements are consumed). Used by the decorator desugar to
+    /// resolve an imported-package dotted-decorator receiver (#1519).
+    entry_import_prefixes: HashMap<String, String>,
     diags: Vec<ModDiag>,
 }
 
@@ -135,6 +177,7 @@ impl<'t> Loader<'t> {
             modules: Vec::new(),
             raw: Vec::new(),
             edges: Vec::new(),
+            entry_import_prefixes: HashMap::new(),
             diags: Vec::new(),
         }
     }
@@ -521,12 +564,22 @@ impl<'t> Loader<'t> {
         let order = self.init_order();
         let mut items: Vec<Item> = Vec::new();
         let mut rw_diags: Vec<ModDiag> = Vec::new();
+        // The entry module's `alias → target prefix` map, captured here (the one
+        // place the alias→module resolution exists) for the decorator desugar's
+        // imported-receiver resolution (#1519); stored on `self` after the loop.
+        let mut entry_prefixes: HashMap<String, String> = HashMap::new();
         for idx in order {
             let m = &self.modules[idx];
             let aliases: HashMap<String, &ModuleFacts> = self.edges[idx]
                 .iter()
                 .map(|e| (e.bound.clone(), &facts[e.target]))
                 .collect();
+            if m.is_entry {
+                entry_prefixes = aliases
+                    .iter()
+                    .map(|(alias, f)| (alias.clone(), f.prefix.clone()))
+                    .collect();
+            }
             let own = top_level_symbols(&m.ast);
             let mut rw = rewrite::Rewriter {
                 prefix: &m.prefix,
@@ -561,6 +614,7 @@ impl<'t> Loader<'t> {
             }
         }
         self.diags.extend(rw_diags);
+        self.entry_import_prefixes = entry_prefixes;
         let span = self
             .modules
             .first()

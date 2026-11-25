@@ -1194,4 +1194,263 @@ mod import_resolution_tests {
         let rendered = render_front_end_errors(&reports);
         assert!(rendered.starts_with("error["), "got: {rendered:?}");
     }
+
+    // ---- #1519: imported-package dotted-decorator receivers --------------
+    //
+    // The #1509/#1515 object-binding decorator (mechanism A, return-type-driven)
+    // only resolved a LOCAL struct receiver. #1519 extends it across a package
+    // boundary: a dotted decorator whose root is an IMPORTED module resolves the
+    // linked package's exported free function, reads its declared return type,
+    // and — when non-void — rebinds the decorated name to the returned object
+    // (the cli#4 consumer surface). These build a real `zenv/pkg/<name>/src`
+    // path dependency and drive the full front-end (`resolve` = modlink +
+    // decorator desugar + sema), the same flow `ZAP_ZENV=… zap ir repro.zap`
+    // runs.
+
+    /// Find `main`'s body as a debug string, for asserting on the spliced
+    /// rebind/registration statements (the merged AST carries mangled symbols,
+    /// so matching on the debug render mirrors the sibling modlink suite).
+    fn main_body_debug(m: &Module) -> String {
+        m.items
+            .iter()
+            .find_map(|it| match it {
+                Item::Function(f) if f.name == "main" => Some(format!("{:?}", f.body.stmts)),
+                _ => None,
+            })
+            .expect("a main function")
+    }
+
+    /// THE #1519 repro (from the issue): `@factory.command`, where
+    /// `factory.command(fn(str) -> str) -> Command` is an imported free function,
+    /// rebinds `greet` to the returned `Command`, so `greet.run()` type-checks
+    /// and the `assert greet.run() == "Hello Ada"` body resolves. Before the fix
+    /// this reported `ZAP3001: unknown name 'factory'` at the decorator.
+    #[test]
+    fn imported_decorator_binds_decorated_name_to_returned_object() {
+        let p = Project::new("impdeco");
+        p.write(
+            "zenv/pkg/factory/src/factory.zap",
+            "struct Command:\n\
+             \x20   fn(str) -> str handler\n\n\
+             \x20   def run(self) -> str:\n\
+             \x20       auto handler = self.handler\n\
+             \x20       return handler(\"Ada\")\n\n\
+             def command(fn(str) -> str handler) -> Command:\n\
+             \x20   return Command(handler=handler)\n",
+        );
+        let entry = p.write(
+            "src/repro.zap",
+            "import factory\n\n\
+             @factory.command\n\
+             def greet(str name) -> str:\n\
+             \x20   return \"Hello \" + name\n\n\
+             def main():\n\
+             \x20   assert greet.run() == \"Hello Ada\"\n",
+        );
+
+        let module = resolve(&entry, vec![p.pkg_root()])
+            .expect("an imported dotted decorator must resolve and type-check (#1519)");
+        // The original function is kept, renamed `greet$impl` — the typed callable
+        // handed to the factory.
+        assert!(
+            has_fn_containing(&module, "greet$impl"),
+            "the decorated function must be renamed greet$impl"
+        );
+        // The raw `greet` free function no longer exists under its own name (it
+        // is now a local rebound in `main`).
+        assert!(
+            !module
+                .items
+                .iter()
+                .any(|it| matches!(it, Item::Function(f) if f.name == "greet")),
+            "the bare `greet` function must be consumed into the rebind"
+        );
+        // `greet` is rebound in main to the mangled imported free-function call.
+        let main = main_body_debug(&module);
+        assert!(
+            main.contains("__zm") && main.contains("command") && main.contains("greet$impl"),
+            "main must rebind greet to the mangled factory.command(greet$impl), got: {main}"
+        );
+    }
+
+    /// The import ALIAS form: `import factory as f` + `@f.command` binds the same
+    /// way — the alias is the receiver root the decorator resolves through.
+    #[test]
+    fn imported_decorator_alias_form_binds_object() {
+        let p = Project::new("impdeco_alias");
+        p.write(
+            "zenv/pkg/factory/src/factory.zap",
+            "struct Command:\n\
+             \x20   fn(str) -> str handler\n\n\
+             \x20   def run(self) -> str:\n\
+             \x20       auto handler = self.handler\n\
+             \x20       return handler(\"Ada\")\n\n\
+             def command(fn(str) -> str handler) -> Command:\n\
+             \x20   return Command(handler=handler)\n",
+        );
+        let entry = p.write(
+            "src/repro.zap",
+            "import factory as f\n\n\
+             @f.command\n\
+             def greet(str name) -> str:\n\
+             \x20   return \"Hello \" + name\n\n\
+             def main():\n\
+             \x20   assert greet.run() == \"Hello Ada\"\n",
+        );
+
+        let module = resolve(&entry, vec![p.pkg_root()])
+            .expect("the import-alias dotted decorator must resolve (#1519)");
+        assert!(
+            has_fn_containing(&module, "greet$impl"),
+            "alias form must still rename to greet$impl"
+        );
+        let main = main_body_debug(&module);
+        assert!(
+            main.contains("__zm") && main.contains("command") && main.contains("greet$impl"),
+            "alias form must rebind greet to the mangled command call, got: {main}"
+        );
+    }
+
+    /// A STACKED imported-module chain `@cli.command` / `@cli.option(...)` /
+    /// `@cli.argument(...)` composes inner-to-outer into one nested call, with the
+    /// decorators' typed metadata arguments (`"--count"`, `"World"`) retained as
+    /// the library functions' leading arguments. The name binds to the OUTERMOST
+    /// result; `greet.run()` dispatches through the whole chain.
+    #[test]
+    fn imported_decorator_stacked_chain_composes_with_metadata() {
+        let p = Project::new("impdeco_stacked");
+        p.write(
+            "zenv/pkg/cli/src/cli.zap",
+            "struct Command:\n\
+             \x20   str opt\n\
+             \x20   str arg\n\
+             \x20   fn(str) -> str handler\n\n\
+             \x20   def run(self) -> str:\n\
+             \x20       auto handler = self.handler\n\
+             \x20       return handler(self.arg)\n\n\
+             def argument(str name, fn(str) -> str handler) -> Command:\n\
+             \x20   return Command(opt=\"\", arg=name, handler=handler)\n\n\
+             def option(str flag, Command c) -> Command:\n\
+             \x20   return Command(opt=flag, arg=c.arg, handler=c.handler)\n\n\
+             def command(Command c) -> Command:\n\
+             \x20   return Command(opt=c.opt, arg=c.arg, handler=c.handler)\n",
+        );
+        let entry = p.write(
+            "src/repro.zap",
+            "import cli\n\n\
+             @cli.command\n\
+             @cli.option(\"--count\")\n\
+             @cli.argument(\"World\")\n\
+             def greet(str name) -> str:\n\
+             \x20   return \"Hello \" + name\n\n\
+             def main():\n\
+             \x20   assert greet.run() == \"Hello World\"\n",
+        );
+
+        let module = resolve(&entry, vec![p.pkg_root()])
+            .expect("a stacked imported-module decorator chain must resolve (#1519)");
+        assert!(has_fn_containing(&module, "greet$impl"), "stacked: rename");
+        let main = main_body_debug(&module);
+        // One nested call binding greet: command(option("--count", argument("World", greet$impl))).
+        assert!(
+            main.contains("command") && main.contains("option") && main.contains("argument"),
+            "the stacked chain must compose all three imported functions, got: {main}"
+        );
+        assert!(
+            main.contains("--count") && main.contains("World"),
+            "stacked metadata arguments must be retained, got: {main}"
+        );
+        // Composition order: the argument call (innermost) sits inside the option
+        // call, which sits inside the command call — the metadata string for the
+        // inner decorator appears later in the debug render than the outer method.
+        let i_cmd = main.find("command").unwrap();
+        let i_opt = main.find("option").unwrap();
+        let i_arg = main.find("argument").unwrap();
+        assert!(
+            i_cmd < i_opt && i_opt < i_arg,
+            "chain must nest command(option(argument(...))) outer-to-inner, got: {main}"
+        );
+    }
+
+    /// A VOID imported receiver still REGISTERS (the fastzap `@app.get` surface
+    /// across a package boundary): the decorated name stays the raw function and
+    /// the synthesized `factory.register(greet)` call is spliced as a bare
+    /// statement — it is NOT rebound. Preserves the #1509 void case for imports.
+    #[test]
+    fn imported_void_decorator_still_registers() {
+        let p = Project::new("impdeco_void");
+        p.write(
+            "zenv/pkg/factory/src/factory.zap",
+            "def register(fn(str) -> str handler):\n\
+             \x20   auto h = handler\n\
+             \x20   print(h(\"x\"))\n",
+        );
+        let entry = p.write(
+            "src/repro.zap",
+            "import factory\n\n\
+             @factory.register\n\
+             def greet(str name) -> str:\n\
+             \x20   return \"Hello \" + name\n\n\
+             def main():\n\
+             \x20   assert greet(\"World\") == \"Hello World\"\n",
+        );
+
+        let module = resolve(&entry, vec![p.pkg_root()])
+            .expect("a void imported receiver must still register and resolve (#1519)");
+        // Not rebound: no `$impl` rename, and `greet` survives as a free function.
+        assert!(
+            !has_fn_containing(&module, "greet$impl"),
+            "a void imported receiver must NOT rebind (no greet$impl)"
+        );
+        assert!(
+            module
+                .items
+                .iter()
+                .any(|it| matches!(it, Item::Function(f) if f.name == "greet")),
+            "the raw `greet` function must survive the registering path"
+        );
+        // The registration call to the mangled imported function is spliced in.
+        let main = main_body_debug(&module);
+        assert!(
+            main.contains("__zm") && main.contains("register") && main.contains("greet"),
+            "the mangled factory.register(greet) call must be spliced, got: {main}"
+        );
+    }
+
+    /// Regression: a LOCAL struct-receiver object-binding decorator (#1515) still
+    /// binds correctly when driven through the full modlink front-end (not just
+    /// the standalone desugar unit tests) — the imported path must not disturb it.
+    #[test]
+    fn local_struct_receiver_decorator_still_binds_through_front_end() {
+        let p = Project::new("localdeco");
+        let entry = p.write(
+            "src/repro.zap",
+            "struct Cli:\n\
+             \x20   def command(self, fn(str) -> str handler) -> Command:\n\
+             \x20       return Command(handler=handler)\n\n\
+             struct Command:\n\
+             \x20   fn(str) -> str handler\n\n\
+             \x20   def run(self) -> str:\n\
+             \x20       auto handler = self.handler\n\
+             \x20       return handler(\"Ada\")\n\n\
+             @cli.command\n\
+             def greet(str name) -> str:\n\
+             \x20   return \"Hello \" + name\n\n\
+             def main():\n\
+             \x20   auto cli = Cli()\n\
+             \x20   assert greet.run() == \"Hello Ada\"\n",
+        );
+
+        let module =
+            resolve(&entry, Vec::new()).expect("a local struct-receiver decorator must still bind");
+        assert!(
+            has_fn_containing(&module, "greet$impl"),
+            "the local receiver path must still rename to greet$impl"
+        );
+        let main = main_body_debug(&module);
+        assert!(
+            main.contains("command") && main.contains("greet$impl"),
+            "local receiver must still rebind greet to cli.command(greet$impl), got: {main}"
+        );
+    }
 }
