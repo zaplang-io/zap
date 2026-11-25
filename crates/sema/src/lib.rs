@@ -739,6 +739,14 @@ const BUILTINS: &[&str] = &[
     // supported directly in a for-loop header.
     "enumerate",
     "zip",
+    // Explicit D-0048 iterator access (#1382 phase 2, RFC #1417): `iter(x)`
+    // obtains an iterator over a generator / generator-expression / user type
+    // implementing the protocol (reified per-container iterators are phase 3),
+    // and `next(it)` / `next(it, default)` step it — `next(it)` raises a
+    // catchable `StopIteration` at exhaustion, `next(it, default)` returns
+    // `default`. Both build on the comma-ok `__next__ -> (T, bool)` internally.
+    "iter",
+    "next",
     "dot",
     "concatenate",
     "stack",
@@ -7082,6 +7090,12 @@ impl Checker {
             // and distinct from `str`'s codepoint (`char`) iteration.
             Ty::Bytes => Some(Ty::Int64),
             Ty::Unknown | Ty::Py => Some(Ty::Unknown),
+            // A value typed as the built-in generic `Iterator[T]` / `Iterable[T]`
+            // interface (#1382 phase 1, RFC #1417) iterates at element type `T`:
+            // the instantiation's single argument (#1428 carries it on the type).
+            Ty::Iface(n, args) if n == "Iterator" || n == "Iterable" => {
+                Some(args.first().cloned().unwrap_or(Ty::Unknown))
+            }
             Ty::Named(_) => {
                 let info = self.struct_info(it)?;
                 let iter_ty = if let Some(sig) = info.methods.get("__iter__") {
@@ -7092,6 +7106,61 @@ impl Checker {
                     return None;
                 };
                 let next = self.struct_info(&iter_ty)?.methods.get("__next__")?;
+                Some(next_elem(&next.ret))
+            }
+            _ => None,
+        }
+    }
+
+    /// The iterator type produced by `iter(x)` (#1382 phase 2, RFC #1417), or
+    /// `None` when `x` is not a protocol iterator/iterable this phase handles.
+    ///
+    /// Phase 2 covers values that already satisfy the D-0048 protocol — a
+    /// generator / generator-expression / user type with `__iter__` or
+    /// `__next__`, and a value typed as the `Iterator[T]` / `Iterable[T]`
+    /// interface. `iter` is idempotent on an iterator (a type with `__next__`
+    /// returns itself; `Iterator[T]` stays `Iterator[T]`); an `Iterable` yields
+    /// its `__iter__` result (`Iterable[T]` → `Iterator[T]`). Reified per-
+    /// container iterators (`iter([1, 2])`, `iter("ab")`, …) are #1382 phase 3,
+    /// so a built-in container returns `None` here (a clean error at the call).
+    /// `Unknown` / `Py` stay permissive.
+    fn iter_result_ty(&self, x: &Ty) -> Option<Ty> {
+        match x {
+            Ty::Unknown | Ty::Py => Some(Ty::Unknown),
+            // Idempotent on an iterator; an `Iterable[T]` produces `Iterator[T]`.
+            Ty::Iface(n, _) if n == "Iterator" => Some(x.clone()),
+            Ty::Iface(n, args) if n == "Iterable" => {
+                Some(Ty::Iface("Iterator".to_string(), args.clone()))
+            }
+            Ty::Named(_) => {
+                let info = self.struct_info(x)?;
+                if let Some(sig) = info.methods.get("__iter__") {
+                    Some(sig.ret.clone())
+                } else if info.methods.contains_key("__next__") {
+                    Some(x.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The element type `next(it)` yields (#1382 phase 2), or `None` when `it` is
+    /// not an iterator this phase steps. An iterator is a value typed as
+    /// `Iterator[T]` (→ `T`), or a struct/generator with a `__next__` method
+    /// (→ its comma-ok / Python element type). A pure `Iterable` (only
+    /// `__iter__`) is **not** an iterator — the caller must `iter()` it first.
+    /// `Unknown` / `Py` stay permissive.
+    fn next_result_ty(&self, it: &Ty) -> Option<Ty> {
+        match it {
+            Ty::Unknown | Ty::Py => Some(Ty::Unknown),
+            Ty::Iface(n, args) if n == "Iterator" => {
+                Some(args.first().cloned().unwrap_or(Ty::Unknown))
+            }
+            Ty::Named(_) => {
+                let info = self.struct_info(it)?;
+                let next = info.methods.get("__next__")?;
                 Some(next_elem(&next.ret))
             }
             _ => None,
@@ -9179,6 +9248,123 @@ impl Checker {
                             return Ty::Unknown;
                         }
                     }
+                }
+                // `iter(x)` (#1382 phase 2, RFC #1417): obtain an explicit D-0048
+                // iterator over a generator / generator-expression / user type;
+                // idempotent on an iterator. Result is the iterator's own type
+                // (precise: `next(iter(xs))` is the exact element type), which
+                // also conforms to `Iterator[T]` (#1428). Reified per-container
+                // iterators (`iter([1,2])`, `iter("ab")`) are #1382 phase 3.
+                "iter" => {
+                    if let Some(a) = args.iter().find(|a| a.name.is_some()) {
+                        self.error(
+                            ErrorCode::ZAP4023,
+                            format!(
+                                "iter() takes no keyword arguments; unexpected '{}'",
+                                a.name.as_deref().unwrap_or_default()
+                            ),
+                            span,
+                        );
+                    }
+                    if args.len() != 1 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!("iter() takes exactly one argument, got {}", args.len()),
+                            span,
+                        );
+                        for a in args {
+                            self.infer(&a.value);
+                        }
+                        return Ty::Unknown;
+                    }
+                    let t = self.infer(&args[0].value);
+                    match self.iter_result_ty(&t) {
+                        Some(it) => return it,
+                        None => {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "iter() expects a generator, generator expression, or a \
+                                     type implementing the iterator protocol (D-0048), got {} \
+                                     (iter() over a built-in container — list/str/dict/… — is \
+                                     a reified iterator, #1382 phase 3; use `for` meanwhile)",
+                                    t.display()
+                                ),
+                                span,
+                            );
+                            return Ty::Unknown;
+                        }
+                    }
+                }
+                // `next(it)` / `next(it, default)` (#1382 phase 2): step an
+                // iterator. `next(it)` raises a catchable `StopIteration` at
+                // exhaustion; `next(it, default)` returns `default` instead. The
+                // result is the iterator's exact element type.
+                "next" => {
+                    if let Some(a) = args.iter().find(|a| a.name.is_some()) {
+                        self.error(
+                            ErrorCode::ZAP4023,
+                            format!(
+                                "next() takes no keyword arguments; unexpected '{}'",
+                                a.name.as_deref().unwrap_or_default()
+                            ),
+                            span,
+                        );
+                    }
+                    if args.is_empty() || args.len() > 2 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!(
+                                "next() takes one or two positional arguments \
+                                 (the iterator and an optional default), got {}",
+                                args.len()
+                            ),
+                            span,
+                        );
+                        for a in args {
+                            self.infer(&a.value);
+                        }
+                        return Ty::Unknown;
+                    }
+                    let it = self.infer(&args[0].value);
+                    let elem = match self.next_result_ty(&it) {
+                        Some(e) => e,
+                        None => {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "next() expects an iterator (a type with a '__next__' \
+                                     method, the 'Iterator' interface, D-0048), got {} — call \
+                                     iter() on an iterable first",
+                                    it.display()
+                                ),
+                                span,
+                            );
+                            Ty::Unknown
+                        }
+                    };
+                    // The `default` must fit the element type: `next(it, d)`
+                    // returns either `T` or `d`, so `d` must be assignable to `T`
+                    // (an `Unknown` element/default stays permissive).
+                    if args.len() == 2 {
+                        let dt = self.infer(&args[1].value);
+                        if !matches!(elem, Ty::Unknown)
+                            && !matches!(dt, Ty::Unknown)
+                            && !self.coercible(&dt, &elem)
+                        {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "next() default has type {}, which does not match the \
+                                     iterator's element type {}",
+                                    dt.display(),
+                                    elem.display()
+                                ),
+                                span,
+                            );
+                        }
+                    }
+                    return elem;
                 }
                 // `sorted(xs, key=..., reverse=...)` -> a new list of the same
                 // element type, leaving `xs` unchanged (ticket #336). The element
@@ -19144,6 +19330,137 @@ def main():
         assert!(
             !msg.is_empty(),
             "a non-conforming list element must be rejected; got no error"
+        );
+    }
+
+    // ---- #1382 phase 2: iter() / next() over the D-0048 protocol ----
+    //
+    // `iter(x)` obtains an explicit iterator over a generator / genexpr / user
+    // iterator (idempotent on an iterator); `next(it)` / `next(it, default)` step
+    // it. A user `__next__ -> (T, bool)` gives the exact element type; a generator
+    // is element-loose at sema (`Unknown`), precise only at lowering.
+
+    /// A user type that is its own iterator — `__iter__ -> Count` and comma-ok
+    /// `__next__ -> (int64, bool)` — so `iter`/`next` type precisely.
+    const COUNT_ITER: &str = "struct Count:\n    int64 i\n\
+        \x20   def __iter__(self) -> Count:\n        return self\n\
+        \x20   def __next__(self) -> (int64, bool):\n        return (self.i, True)\n\n";
+
+    #[test]
+    fn iter_next_over_user_iterator_types_precisely() {
+        // `iter(Count())` is the iterator (idempotent via `__iter__ -> Count`);
+        // `next(it)` is the exact element type `int64`, and `next(it, default)`
+        // accepts an `int64` default.
+        ok(&format!(
+            "{COUNT_ITER}def main():\n    auto it = iter(Count(i=0))\n    \
+             int64 a = next(it)\n    int64 b = next(it, -1)\n    print(a)\n    print(b)\n"
+        ));
+    }
+
+    #[test]
+    fn next_element_type_is_enforced() {
+        // The element type flows: binding `next(it)` to the wrong type is a
+        // mismatch (int64 element, str binding).
+        let e = errors(&format!(
+            "{COUNT_ITER}def main():\n    auto it = iter(Count(i=0))\n    str s = next(it)\n"
+        ));
+        assert!(
+            !e.is_empty(),
+            "wrong-typed binding of next() must be rejected"
+        );
+        // A `default` whose type does not match the element type is ZAP4024.
+        let msg = err_text(&format!(
+            "{COUNT_ITER}def main():\n    auto it = iter(Count(i=0))\n    \
+             auto x = next(it, \"nope\")\n"
+        ));
+        assert!(
+            msg.contains("default") && msg.contains("int64"),
+            "next() default mismatch must name the element type; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn iter_next_over_a_generator() {
+        // A generator call is a D-0048 iterator; `iter` is idempotent on it and
+        // `next` steps it. The element type is permissive (`Unknown`) at sema —
+        // lowering computes the precise type — so any binding is accepted.
+        ok("def gen():\n    yield 1\n    yield 2\n\n\
+            def main():\n    auto it = iter(gen())\n    auto a = next(it)\n    \
+            auto b = next(it, -1)\n    print(a)\n    print(b)\n");
+    }
+
+    #[test]
+    fn next_on_an_iterator_typed_parameter() {
+        // A library may accept the `Iterator[int64]` interface (value-position,
+        // #1428): `next(it)` is then statically `int64`. (Consuming an abstract
+        // interface-typed iterator is realized at lowering in phase 3; this pins
+        // the sema typing.)
+        ok(
+            "def first(Iterator[int64] it) -> int64:\n    return next(it)\n\n\
+            def main():\n    print(1)\n",
+        );
+    }
+
+    #[test]
+    fn iter_over_a_container_is_phase_3() {
+        // Reified per-container iterators are #1382 phase 3: `iter([1, 2])` is a
+        // clean error pointing there (not a silent accept), and `for` still works.
+        let msg = err_text("def main():\n    auto it = iter([1, 2, 3])\n");
+        assert!(
+            msg.contains("phase 3") && msg.contains("iter()"),
+            "iter() over a container must point at phase 3; got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn next_on_a_non_iterator_is_rejected() {
+        // `next` of a non-iterator value is ZAP4024, naming the missing protocol.
+        let msg = err_text("def main():\n    auto x = next(5)\n");
+        assert!(
+            msg.contains("iterator") && msg.contains("__next__"),
+            "next() of a non-iterator must name the protocol; got:\n{msg}"
+        );
+        // A pure `Iterable` (only `__iter__`) is not an iterator — `iter()` first.
+        let msg2 = err_text(
+            "struct Bag:\n    int64 n\n\
+             \x20   def __iter__(self) -> Count:\n        return Count(i=0)\n\n\
+             struct Count:\n    int64 i\n\
+             \x20   def __next__(self) -> (int64, bool):\n        return (self.i, True)\n\n\
+             def main():\n    auto x = next(Bag(n=1))\n",
+        );
+        assert!(
+            !msg2.is_empty(),
+            "next() of a pure Iterable must be rejected"
+        );
+    }
+
+    #[test]
+    fn iter_next_arity_and_kwargs_are_rejected() {
+        assert!(
+            !errors(&format!("{COUNT_ITER}def main():\n    auto it = iter()\n")).is_empty(),
+            "iter() with no argument must be rejected"
+        );
+        assert!(
+            !errors(&format!(
+                "{COUNT_ITER}def main():\n    auto it = iter(Count(i=0), Count(i=1))\n"
+            ))
+            .is_empty(),
+            "iter() with two arguments must be rejected"
+        );
+        assert!(
+            !errors(&format!(
+                "{COUNT_ITER}def main():\n    auto it = iter(x=Count(i=0))\n"
+            ))
+            .is_empty(),
+            "iter() with a keyword argument must be rejected"
+        );
+        assert!(
+            !errors(&format!(
+                "{COUNT_ITER}def main():\n    auto it = iter(Count(i=0))\n    \
+                 auto v = next(it, -1, -2)\n"
+            ))
+            .is_empty(),
+            "next() with three arguments must be rejected"
         );
     }
 

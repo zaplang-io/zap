@@ -8825,6 +8825,22 @@ impl<'a> FnLower<'a> {
                 // codegen per operand type, so this handles int and float elements.
                 return self.lower_sum_iterable(v, vt, start);
             }
+            // `iter(x)` / `next(it[, default])` (#1382 phase 2, RFC #1417):
+            // explicit D-0048 iterator access over a generator / genexpr / user
+            // iterator (reified container iterators are phase 3).
+            if fname == "iter" {
+                if args.len() != 1 || args.iter().any(|a| a.name.is_some()) {
+                    return Err(err("iter() takes exactly one positional argument"));
+                }
+                return self.lower_iter_builtin(&args[0].value);
+            }
+            if fname == "next" {
+                if args.is_empty() || args.len() > 2 || args.iter().any(|a| a.name.is_some()) {
+                    return Err(err("next() takes one or two positional arguments \
+                         (the iterator and an optional default)"));
+                }
+                return self.lower_next_builtin(args);
+            }
             // `dot(a, b)` — matrix multiply / dot product, the function spelling
             // of `a @ b` (#509). Same kernels, same NEP-50 result dtype.
             if fname == "dot" {
