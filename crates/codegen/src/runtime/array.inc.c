@@ -3784,6 +3784,99 @@ int64_t zap_str_parse_int(void *sp) {
     return neg ? -(int64_t)acc : (int64_t)acc;
 }
 
+/* Digit value of an ASCII character for bases up to 36, or -1 if not a digit. */
+static int zap_base_digit(unsigned char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'Z') return c - 'A' + 10;
+    return -1;
+}
+
+/* int(s, base) (#1386): parse `s` in `base` 2..=36, or base 0 to auto-detect a
+ * `0x`/`0o`/`0b` prefix (CPython-style). Surrounding ASCII whitespace and an
+ * optional sign are allowed, and an explicit matching prefix is accepted for
+ * base 2/8/16. A non-prefixed base-0 string is decimal; leading-zero strictness
+ * (`"010"` in base 0) is intentionally not enforced (documented in the ADR). An
+ * out-of-range base, an invalid digit, an empty value, or trailing garbage
+ * raises a catchable ValueError, matching `zap_str_parse_int`. The result wraps
+ * into int64 on overflow (Zap returns a fixed-width int, not a bigint). */
+int64_t zap_str_parse_int_base(void *sp, int64_t base) {
+    const ZapStr *s = (const ZapStr *)sp;
+    if (base != 0 && (base < 2 || base > 36)) {
+        const char *m = "int() base must be >= 2 and <= 36, or 0";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
+    const char *d = s->data;
+    int64_t n = s->len;
+    int64_t i = 0;
+    while (i < n && zap_is_ascii_ws((unsigned char)d[i])) {
+        i++;
+    }
+    int neg = 0;
+    if (i < n && (d[i] == '+' || d[i] == '-')) {
+        neg = d[i] == '-';
+        i++;
+    }
+    if (base == 0) {
+        if (i + 1 < n && d[i] == '0' && (d[i + 1] == 'x' || d[i + 1] == 'X')) {
+            base = 16;
+            i += 2;
+        } else if (i + 1 < n && d[i] == '0' && (d[i + 1] == 'o' || d[i + 1] == 'O')) {
+            base = 8;
+            i += 2;
+        } else if (i + 1 < n && d[i] == '0' && (d[i + 1] == 'b' || d[i + 1] == 'B')) {
+            base = 2;
+            i += 2;
+        } else {
+            base = 10;
+        }
+    } else if ((base == 16 && i + 1 < n && d[i] == '0' && (d[i + 1] == 'x' || d[i + 1] == 'X')) ||
+               (base == 8 && i + 1 < n && d[i] == '0' && (d[i + 1] == 'o' || d[i + 1] == 'O')) ||
+               (base == 2 && i + 1 < n && d[i] == '0' && (d[i + 1] == 'b' || d[i + 1] == 'B'))) {
+        i += 2;
+    }
+    int64_t start = i;
+    unsigned long long acc = 0;
+    while (i < n) {
+        int dv = zap_base_digit((unsigned char)d[i]);
+        if (dv < 0 || dv >= (int)base) {
+            break;
+        }
+        acc = acc * (unsigned long long)base + (unsigned long long)dv;
+        i++;
+    }
+    int64_t digits = i - start;
+    while (i < n && zap_is_ascii_ws((unsigned char)d[i])) {
+        i++;
+    }
+    if (digits == 0 || i != n) {
+        char buf[160];
+        int m = snprintf(buf, sizeof buf,
+                         "invalid literal for int() with base %lld: '%.*s'",
+                         (long long)base, (int)s->len, s->data);
+        if (m < 0) {
+            m = 0;
+        }
+        if (m >= (int)sizeof buf) {
+            m = (int)sizeof buf - 1;
+        }
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(buf, (int64_t)m));
+    }
+    return neg ? -(int64_t)acc : (int64_t)acc;
+}
+
+/* bytes(n) (#1386): a fresh `bytes` of `n` zero bytes; a negative count raises a
+ * catchable ValueError (matching Python's `ValueError: negative count`). */
+void *zap_bytes_zeros(int64_t n) {
+    if (n < 0) {
+        const char *m = "negative count";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
+    ZapStr *s = zap_str_alloc(n);
+    memset(s->data, 0, (size_t)n);
+    return s;
+}
+
 /* float(s): parse a float, Python-style (surrounding ASCII whitespace allowed,
  * a C float literal otherwise). Raises a catchable ValueError on a malformed
  * string, matching int()'s strictness and CPython (epic #374, issue #741).

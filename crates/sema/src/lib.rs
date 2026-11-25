@@ -9075,8 +9075,62 @@ impl Checker {
                     return result;
                 }
                 "print" => {
+                    // print(*values, sep=" ", end="\n", file=stdout_fd, flush=False)
+                    // (#1386). Positional values print space-joined by default;
+                    // the keyword options tune the separator/terminator, redirect
+                    // to an int64 fd, and (no-op on the raw-fd path) flush.
                     for a in args {
-                        self.infer(&a.value);
+                        let t = self.infer(&a.value);
+                        if let Some(name) = &a.name {
+                            match name.as_str() {
+                                "sep" | "end" => {
+                                    if !matches!(t, Ty::Str | Ty::Unknown) {
+                                        self.error(
+                                            ErrorCode::ZAP4024,
+                                            format!(
+                                                "print() {name}= must be a str, found {}",
+                                                t.display()
+                                            ),
+                                            expr_span(&a.value),
+                                        );
+                                    }
+                                }
+                                "file" => {
+                                    if !t.is_int() && !matches!(t, Ty::Unknown) {
+                                        self.error(
+                                            ErrorCode::ZAP4024,
+                                            format!(
+                                                "print() file= must be an int fd, found {}",
+                                                t.display()
+                                            ),
+                                            expr_span(&a.value),
+                                        );
+                                    }
+                                }
+                                "flush" => {
+                                    if !matches!(t, Ty::Bool | Ty::Unknown) {
+                                        self.error(
+                                            ErrorCode::ZAP4024,
+                                            format!(
+                                                "print() flush= must be a bool, found {}",
+                                                t.display()
+                                            ),
+                                            expr_span(&a.value),
+                                        );
+                                    }
+                                }
+                                other => {
+                                    self.error(
+                                        ErrorCode::ZAP4023,
+                                        format!(
+                                            "print() has no keyword argument '{other}' \
+                                             (only sep=, end=, file=, flush=)"
+                                        ),
+                                        expr_span(&a.value),
+                                    );
+                                }
+                            }
+                        }
                     }
                     return Ty::Unit;
                 }
@@ -9443,8 +9497,10 @@ impl Checker {
                     return Ty::Str;
                 }
                 "bytes" => {
-                    // bytes(): empty; bytes(str): UTF-8 encode; bytes(list[int64]
-                    // | list[int32]): one byte per element (0..=255 at runtime).
+                    // bytes(): empty; bytes(int n): n zero bytes (#1386, negative
+                    // -> ValueError at runtime); bytes(str): UTF-8 encode;
+                    // bytes(list[int64] | list[int32]): one byte per element
+                    // (0..=255 at runtime).
                     if args.len() > 1 {
                         self.error(
                             ErrorCode::ZAP4025,
@@ -9455,12 +9511,13 @@ impl Checker {
                     for a in args {
                         let at = self.infer(&a.value);
                         let ok = matches!(at, Ty::Str | Ty::Bytes | Ty::Unknown | Ty::Py)
+                            || (at.is_int() && !matches!(at, Ty::Bigint))
                             || matches!(&at, Ty::List(e) if e.is_int() || matches!(**e, Ty::Unknown));
                         if !ok {
                             self.error(
                                 ErrorCode::ZAP4024,
                                 format!(
-                                    "bytes() expects a str or list of integers, found {}",
+                                    "bytes() expects an int count, a str, or a list of integers, found {}",
                                     at.display()
                                 ),
                                 expr_span(&a.value),
@@ -9499,25 +9556,50 @@ impl Checker {
                 }
                 "int" => {
                     // int(x): parse a `str`, or convert a number, to an `int`.
-                    if args.len() != 1 {
+                    // int(s, base): parse a `str` in `base` 2..=36, or base 0 to
+                    // auto-detect a `0x`/`0o`/`0b` prefix (#1386), CPython-style.
+                    if args.is_empty() || args.len() > 2 || args.iter().any(|a| a.name.is_some()) {
                         self.error(
                             ErrorCode::ZAP4025,
-                            "int() takes exactly one argument".to_string(),
+                            "int() takes one or two positional arguments (value[, base])"
+                                .to_string(),
                             span,
                         );
                     }
-                    for a in args {
-                        let at = self.infer(&a.value);
-                        if !matches!(at, Ty::Str | Ty::Char | Ty::Unknown | Ty::Py)
-                            && (!at.is_numeric() || matches!(at, Ty::Complex))
-                            && !self.is_tier1_enum(&at)
-                        {
+                    let at = args
+                        .first()
+                        .map(|a| self.infer(&a.value))
+                        .unwrap_or(Ty::Unknown);
+                    if args.len() == 2 {
+                        // The base form only parses strings — `int(number, base)`
+                        // is meaningless, like CPython's `TypeError`.
+                        if !matches!(at, Ty::Str | Ty::Unknown) {
                             self.error(
                                 ErrorCode::ZAP4024,
-                                format!("int() expects a str or number, found {}", at.display()),
-                                expr_span(&a.value),
+                                format!(
+                                    "int(value, base) requires a str value, found {}",
+                                    at.display()
+                                ),
+                                expr_span(&args[0].value),
                             );
                         }
+                        let bt = self.infer(&args[1].value);
+                        if !bt.is_int() && !matches!(bt, Ty::Unknown) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!("int() base must be an integer, found {}", bt.display()),
+                                expr_span(&args[1].value),
+                            );
+                        }
+                    } else if !matches!(at, Ty::Str | Ty::Char | Ty::Unknown | Ty::Py)
+                        && (!at.is_numeric() || matches!(at, Ty::Complex))
+                        && !self.is_tier1_enum(&at)
+                    {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!("int() expects a str or number, found {}", at.display()),
+                            expr_span(&args[0].value),
+                        );
                     }
                     return Ty::Int64;
                 }
@@ -19655,11 +19737,13 @@ def main():
             str s = str(b)\n    \
             print(s)\n    \
             print(n)\n");
-        // bytes(int) is not a valid construction.
-        let e = errors("def main():\n    auto b = bytes(5)\n    print(b)\n");
+        // bytes(int) is now a valid construction: n zero bytes (#1458). A float
+        // count is still the arg-type error.
+        ok("def main():\n    auto b = bytes(5)\n    print(len(b))\n");
+        let e = errors("def main():\n    auto b = bytes(1.5)\n    print(b)\n");
         assert!(
             e.iter().any(|x| x.code == ErrorCode::ZAP4024),
-            "expected ZAP4024 for bytes(int), got {e:?}"
+            "expected ZAP4024 for bytes(float), got {e:?}"
         );
     }
 

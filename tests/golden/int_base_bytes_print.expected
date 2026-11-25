@@ -1,0 +1,21 @@
+255
+10
+511
+35
+5
+255
+-2
+42
+int-empty:valueerror
+int-baddigit:valueerror
+int-badbase:valueerror
+0
+4
+bytes-neg:valueerror
+a, b
+xy
+a-b-c!
+end-only
+123
+flushed
+file:to-file
