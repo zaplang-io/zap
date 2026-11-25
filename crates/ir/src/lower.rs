@@ -9669,8 +9669,31 @@ impl<'a> FnLower<'a> {
                 // representation, so `str(int32_v)` also renders a character —
                 // format an int32 as decimal via `str(int64(x))`; a full fix
                 // needs `char` threaded through the IR — follow-up.)
-                if args.len() != 1 {
-                    return Err(err("str() takes exactly one argument"));
+                if args.is_empty() || args.len() > 3 {
+                    return Err(err(
+                        "str() takes one to three arguments (value[, encoding[, errors]])",
+                    ));
+                }
+                if args.len() >= 2 {
+                    // str(bytes, encoding[, errors]) (#1459): decode via the
+                    // throwing zap_str_decode. `errors` defaults to "strict"; an
+                    // unknown encoding/errors or a strict decode failure raises a
+                    // catchable ValueError.
+                    let (b, _) = self.expr(&args[0].value)?;
+                    let (enc, _) = self.expr(&args[1].value)?;
+                    let errs = if let Some(a) = args.get(2) {
+                        self.expr(&a.value)?.0
+                    } else {
+                        let e = self.new_value(Ty::Ptr);
+                        self.emit(Inst::StrConst {
+                            dest: e,
+                            bytes: b"strict".to_vec(),
+                        });
+                        e
+                    };
+                    let d = self.new_value(Ty::Ptr);
+                    self.throwing_call(Some(d), "zap_str_decode", vec![b, enc, errs]);
+                    return Ok((d, Ty::Ptr));
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
                 return Ok((self.render_str(v, vt)?, Ty::Ptr));

@@ -2296,6 +2296,12 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             );
             self.declare_rt("zap_bytes_from_list", &[p.into()], Some(p.into()));
             self.declare_rt("zap_bytes_to_str", &[p.into()], Some(p.into()));
+            // str(bytes, encoding[, errors]) decode (#1459).
+            self.declare_rt(
+                "zap_str_decode",
+                &[p.into(), p.into(), p.into()],
+                Some(p.into()),
+            );
             // Bulk byte-table translation (ticket #1099). `maketrans(frm, to)`
             // builds a 256-byte table (raises on unequal lengths); `translate`
             // rewrites the whole buffer in one pass (raises when table != 256

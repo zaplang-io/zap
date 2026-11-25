@@ -228,6 +228,196 @@ void *zap_bytes_to_str(void *bp) {
     return zap_str_new(b->data, b->len);
 }
 
+/* --- str(bytes, encoding[, errors]) decode (#1459) ----------------------------
+ *
+ * Encodings: utf-8 (utf8), ascii (us-ascii), latin-1 (latin1 / iso-8859-1 / l1).
+ * errors: strict (raise ValueError), replace (U+FFFD), ignore (drop). An unknown
+ * encoding or errors handler raises a catchable ValueError. */
+
+/* Case-insensitive equality of a ZapStr against an ASCII-lowercase literal. */
+static int zap_str_ieq(const ZapStr *s, const char *lit) {
+    size_t n = strlen(lit);
+    if ((size_t)s->len != n) {
+        return 0;
+    }
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        if (c >= 'A' && c <= 'Z') {
+            c = (unsigned char)(c + 32);
+        }
+        if (c != (unsigned char)lit[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* UTF-8 decode dropping each maximal invalid subpart (the `ignore` twin of
+ * `zap_utf8_decode_replace`): same maximal-subpart walk, but a bad lead byte or
+ * truncated/invalid sequence is skipped with no U+FFFD emitted. Output is at
+ * most `n` bytes. Never raises. */
+static void *zap_utf8_decode_ignore(const unsigned char *d, int64_t n) {
+    char *out = (char *)zap_buf(n > 0 ? n : 1);
+    int64_t o = 0;
+    int64_t i = 0;
+    while (i < n) {
+        unsigned char c = d[i];
+        if (c < 0x80) {
+            out[o++] = (char)c;
+            i++;
+            continue;
+        }
+        int w;
+        unsigned char lo2, hi2;
+        if (c >= 0xC2 && c <= 0xDF) {
+            w = 2, lo2 = 0x80, hi2 = 0xBF;
+        } else if (c == 0xE0) {
+            w = 3, lo2 = 0xA0, hi2 = 0xBF;
+        } else if (c >= 0xE1 && c <= 0xEC) {
+            w = 3, lo2 = 0x80, hi2 = 0xBF;
+        } else if (c == 0xED) {
+            w = 3, lo2 = 0x80, hi2 = 0x9F;
+        } else if (c >= 0xEE && c <= 0xEF) {
+            w = 3, lo2 = 0x80, hi2 = 0xBF;
+        } else if (c == 0xF0) {
+            w = 4, lo2 = 0x90, hi2 = 0xBF;
+        } else if (c >= 0xF1 && c <= 0xF3) {
+            w = 4, lo2 = 0x80, hi2 = 0xBF;
+        } else if (c == 0xF4) {
+            w = 4, lo2 = 0x80, hi2 = 0x8F;
+        } else {
+            i++; /* invalid lead byte: drop exactly one */
+            continue;
+        }
+        int accepted = 1;
+        int bad = 0;
+        for (int k = 1; k < w; k++) {
+            if (i + k >= n) {
+                bad = 1;
+                break;
+            }
+            unsigned char cc = d[i + k];
+            unsigned char lo = (k == 1) ? lo2 : 0x80;
+            unsigned char hi = (k == 1) ? hi2 : 0xBF;
+            if (cc < lo || cc > hi) {
+                bad = 1;
+                break;
+            }
+            accepted++;
+        }
+        if (bad) {
+            i += accepted; /* drop the subpart; the bad byte is re-read */
+            continue;
+        }
+        for (int k = 0; k < w; k++) {
+            out[o++] = (char)d[i + k];
+        }
+        i += w;
+    }
+    return zap_str_adopt(out, o);
+}
+
+/* ASCII decode: a byte >= 0x80 is strict -> ValueError, replace -> U+FFFD,
+ * ignore -> dropped. `mode`: 0 strict, 1 replace, 2 ignore. */
+static void *zap_ascii_decode(const unsigned char *d, int64_t n, int mode) {
+    char *out = (char *)zap_buf(n > 0 ? n * 3 : 1);
+    int64_t o = 0;
+    for (int64_t i = 0; i < n; i++) {
+        unsigned char c = d[i];
+        if (c < 0x80) {
+            out[o++] = (char)c;
+        } else if (mode == 0) {
+            const char *m = "'ascii' codec can't decode byte: ordinal not in range(128)";
+            zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+        } else if (mode == 1) {
+            out[o++] = (char)0xEF;
+            out[o++] = (char)0xBF;
+            out[o++] = (char)0xBD;
+        }
+        /* mode == 2 (ignore): drop the byte */
+    }
+    return zap_str_adopt(out, o);
+}
+
+/* latin-1 (ISO-8859-1) decode: byte b -> code point U+00bb; never fails, so the
+ * `errors` handler is irrelevant. A byte >= 0x80 becomes a 2-byte UTF-8
+ * sequence. */
+static void *zap_latin1_decode(const unsigned char *d, int64_t n) {
+    char *out = (char *)zap_buf(n > 0 ? n * 2 : 1);
+    int64_t o = 0;
+    for (int64_t i = 0; i < n; i++) {
+        unsigned char c = d[i];
+        if (c < 0x80) {
+            out[o++] = (char)c;
+        } else {
+            out[o++] = (char)(0xC0 | (c >> 6));
+            out[o++] = (char)(0x80 | (c & 0x3F));
+        }
+    }
+    return zap_str_adopt(out, o);
+}
+
+/* str(bytes, encoding, errors): decode `bp` under `enc_p`/`errs_p`, raising a
+ * catchable ValueError for an unknown encoding/errors or a strict decode
+ * failure (#1459). The lowering passes "strict" when no errors arg is given. */
+void *zap_str_decode(void *bp, void *enc_p, void *errs_p) {
+    const ZapStr *b = (const ZapStr *)bp;
+    const ZapStr *enc = (const ZapStr *)enc_p;
+    const ZapStr *er = (const ZapStr *)errs_p;
+    int mode;
+    if (er->len == 0 || zap_str_ieq(er, "strict")) {
+        mode = 0;
+    } else if (zap_str_ieq(er, "replace")) {
+        mode = 1;
+    } else if (zap_str_ieq(er, "ignore")) {
+        mode = 2;
+    } else {
+        char buf[96];
+        int m = snprintf(buf, sizeof buf, "unknown error handler name '%.*s'",
+                         (int)er->len, er->data);
+        if (m < 0) {
+            m = 0;
+        }
+        if (m >= (int)sizeof buf) {
+            m = (int)sizeof buf - 1;
+        }
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(buf, (int64_t)m));
+    }
+    const unsigned char *d = (const unsigned char *)b->data;
+    int64_t n = b->len;
+    if (zap_str_ieq(enc, "utf-8") || zap_str_ieq(enc, "utf8")) {
+        if (mode == 0) {
+            int64_t bad = 0;
+            if (!zap_utf8_valid(d, n, &bad)) {
+                const char *m = "'utf-8' codec can't decode byte: invalid UTF-8";
+                zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+            }
+            return zap_str_new(b->data, n);
+        }
+        if (mode == 1) {
+            return zap_utf8_decode_replace(d, n);
+        }
+        return zap_utf8_decode_ignore(d, n);
+    }
+    if (zap_str_ieq(enc, "ascii") || zap_str_ieq(enc, "us-ascii")) {
+        return zap_ascii_decode(d, n, mode);
+    }
+    if (zap_str_ieq(enc, "latin-1") || zap_str_ieq(enc, "latin1") ||
+        zap_str_ieq(enc, "iso-8859-1") || zap_str_ieq(enc, "l1")) {
+        return zap_latin1_decode(d, n);
+    }
+    char buf[96];
+    int m = snprintf(buf, sizeof buf, "unknown encoding: '%.*s'", (int)enc->len, enc->data);
+    if (m < 0) {
+        m = 0;
+    }
+    if (m >= (int)sizeof buf) {
+        m = (int)sizeof buf - 1;
+    }
+    zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(buf, (int64_t)m));
+    return NULL; /* unreachable */
+}
+
 /* bytes.maketrans(frm, to) -> a freshly-allocated 256-byte translation table:
  * the identity map (table[i] == i) except that each byte frm[i] maps to to[i]
  * (ticket #1099, Python `bytes.maketrans` parity). `frm` and `to` must have
