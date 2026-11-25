@@ -83,7 +83,19 @@ decorators    ::= { "@" decorator_name [ "(" [ arg_list ] ")" ] NEWLINE } ;
                      ticket #77): on a function, register it as a handler for
                      signal X — no new syntax, it is a decorator with one arg.
                      Field decorators `@default(expr)`, `@validate(...)` and
-                     `@range(...)` generate construction-time code (D-0101). *)
+                     `@range(...)` generate construction-time code (D-0101).
+                     A *dotted* function decorator `@recv.method(...)` desugars,
+                     before sema, to a call on the receiver's method (I#457,
+                     D-0087). Whether it *registers* (the call runs for effect,
+                     the name stays the function) or *binds* (the name is rebound
+                     to the object the method returns, Click command objects) is
+                     decided by the method's declared return type: void →
+                     register, non-void → bind, keeping the original function as
+                     `<name>$impl` (I#1509,
+                     decisions/lang/1509-decorator-binds-object.md). Stacked
+                     dotted decorators on a binding head compose bottom-up into
+                     one nested call, retaining their arguments as metadata. No
+                     new grammar — a dotted decorator already parses. *)
 
 decorator_name ::= dotted_name | "range" ;
                   (* `dotted_name`, except the leading segment may be the
