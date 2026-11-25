@@ -5744,6 +5744,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fn_type_nested_in_tuple_type_arg_specializes() {
+        // #1502: a function type as a *tuple* element in the type argument —
+        // `run[(fn(int64) -> int64, int64)]` — mangles the whole tuple
+        // (`tuple$fn$int64$to$int64$int64`), proving `expr_to_type` resolved the
+        // nested `Type::Func` inside the `Type::Tuple`.
+        let m = mono_ok(
+            "def inc(int64 x) -> int64:\n    return x + 1\n\
+             def run[T](T fallback) -> T:\n    return fallback\n\
+             def main():\n\
+             \x20   auto p = run[(fn(int64) -> int64, int64)]((inc, 5))\n\
+             \x20   auto f, n = p\n    print(f(n))\n",
+        );
+        let names = fn_names(&m);
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "run$tuple$fn$int64$to$int64$int64"),
+            "the tuple type argument with a nested fn type must specialize: {names:?}"
+        );
+    }
+
     /// Run monomorphization and return its error message, expecting failure.
     fn mono_err(src: &str) -> String {
         let (module, perrs, lerrs) = parse_str(src);

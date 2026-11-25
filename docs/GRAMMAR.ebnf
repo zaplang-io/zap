@@ -767,12 +767,23 @@ named_expression ::= IDENT ":=" expr ;
                      statement `a := 10` is rejected (ZAP2020) in favour of
                      `auto a = 10` (D-0003). *)
 
-star_elem     ::= expr | "*" expr ;   (* a display element, optionally spliced (#598) *)
+star_elem     ::= func_type           (* a function type as a tuple-display element in a generic type argument, #1502 *)
+                | expr
+                | "*" expr ;          (* a display element, optionally spliced (#598) *)
                   (* "*expr" splices an iterable's elements in place inside a
                      list/set/tuple display: `[1, *xs, 2]`, `{*a, *b}`,
                      `(x, *rest)`. In a tuple display the operand must be a
                      statically-sized tuple (the result's arity stays known); in
-                     a list/set the operand is any iterable. *)
+                     a list/set the operand is any iterable.
+
+                     `func_type` is admitted only as a *tuple* element and only
+                     because `fn(` can never begin a value element (same basis as
+                     `index_elem`, #1488): it lets a function type appear inside a
+                     tuple generic type argument, `run[(fn(A) -> B, C)]` (#1502).
+                     Since `fn` is a legal identifier, a `fn(` element in this
+                     position is always read as a function TYPE — a variable named
+                     `fn` cannot be CALLED here. sema/mono classify the whole
+                     subscript as type-args vs a value `__getitem__`. *)
 
 list_display  ::= "[" [ star_elem { "," star_elem } [ "," ] | expr comp_clauses ] "]" ;
 brace_display ::= "{" [ dict_items | dict_comp | set_items | expr comp_clauses ] "}" ;

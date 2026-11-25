@@ -1330,6 +1330,26 @@ mod tests {
     }
 
     #[test]
+    fn fn_type_in_tuple_type_argument_canonicalizes() {
+        // A function type nested inside a tuple type argument (#1502). fmt
+        // canonicalizes a tuple type argument to its paren-free spelling (as it
+        // does for every tuple type argument), so the parenthesized input
+        // normalizes and the canonical form is idempotent — in both cases the
+        // `fn(...)` element renders through the shared type renderer.
+        let canon = "def main():\n    auto p = run[fn(int64) -> int64, int64](x)\n";
+        let parened = "def main():\n    auto p = run[(fn(int64) -> int64, int64)](x)\n";
+        assert_eq!(format_source(parened).unwrap(), canon);
+        assert_eq!(format_source(canon).unwrap(), canon);
+        // Two function-type elements, same canonicalization.
+        let two_canon =
+            "def main():\n    auto p = run[fn(int64) -> int64, fn(int64) -> int64](x)\n";
+        let two_parened =
+            "def main():\n    auto p = run[(fn(int64) -> int64, fn(int64) -> int64)](x)\n";
+        assert_eq!(format_source(two_parened).unwrap(), two_canon);
+        assert_eq!(format_source(two_canon).unwrap(), two_canon);
+    }
+
+    #[test]
     fn type_aliases_are_formatted_stably() {
         // Plain, generic, chained, and function-target aliases round-trip
         // byte-for-byte (#606), including the single-blank-line item gap.
