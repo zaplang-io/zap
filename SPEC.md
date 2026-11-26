@@ -1193,9 +1193,13 @@ finally:
   errno-driven failure raises `OSError`, and a missing path raises
   `FileNotFoundError`, so a caller can select defaults for an absent file without a
   prior existence check (a missing executable passed to `process` likewise raises
-  `FileNotFoundError`). A **bounded or temporary** allocation failure raises a
-  catchable `MemoryError` (#882, #1581): the arena `cap`/heap-OOM path, and the
-  bounded temp-buffer wrappers (`str.expandtabs` / `str.translate` /
+  `FileNotFoundError`). A failure to obtain entropy from the operating-system
+  CSPRNG — backing `crypto.random_bytes`/`token_hex`/`token_urlsafe`/`randbelow`/
+  `choice` and `uuid.uuid1`/`uuid4`/`uuid7`/`nanoid` — also raises `OSError`, and
+  the raising call discards any partially-filled buffer (the result is never
+  observable on the failure path). A **bounded or temporary** allocation failure
+  raises a catchable `MemoryError` (#882, #1581): the arena `cap`/heap-OOM path,
+  and the bounded temp-buffer wrappers (`str.expandtabs` / `str.translate` /
   `str.format_map`, `http.url`) that build a sized result and can fail their
   backing `malloc`/`realloc`. `MemoryError` descends directly from `Exception`, so
   `except MemoryError` and `except Exception` both catch it, and `finally` / `with`

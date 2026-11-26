@@ -765,8 +765,8 @@ static void zap_crypto_fill_random(uint8_t *buf, size_t n) {
      * BCRYPT_USE_SYSTEM_PREFERRED_RNG flag no algorithm handle is needed. The call
      * fills the whole buffer in one go (no 256-byte per-call limit). */
     if (BCryptGenRandom(NULL, buf, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
-        fprintf(stderr, "zap: crypto: no CSPRNG available (BCryptGenRandom)\n");
-        abort();
+        const char *m = "crypto: no CSPRNG available (BCryptGenRandom failed)";
+        zap_panic_typed(ZAP_EXC_OS_ERROR, zap_str_new(m, (int64_t)strlen(m)));
     }
     return;
 #else
@@ -782,14 +782,16 @@ static void zap_crypto_fill_random(uint8_t *buf, size_t n) {
         /* Fallback: read the kernel CSPRNG directly. */
         int fd = open("/dev/urandom", O_RDONLY);
         if (fd < 0) {
-            fprintf(stderr, "zap: crypto: no CSPRNG available\n");
-            abort();
+            const char *m =
+                "crypto: no CSPRNG available (getentropy and /dev/urandom both failed)";
+            zap_panic_typed(ZAP_EXC_OS_ERROR, zap_str_new(m, (int64_t)strlen(m)));
         }
         while (off < n) {
             ssize_t r = read(fd, buf + off, n - off);
             if (r <= 0) {
-                fprintf(stderr, "zap: crypto: CSPRNG read failed\n");
-                abort();
+                close(fd);
+                const char *m = "crypto: CSPRNG read from /dev/urandom failed";
+                zap_panic_typed(ZAP_EXC_OS_ERROR, zap_str_new(m, (int64_t)strlen(m)));
             }
             off += (size_t)r;
         }

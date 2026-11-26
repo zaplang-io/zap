@@ -652,7 +652,11 @@ mod tests {
             assert_eq!(main.value_ty(result), expected, "result type of {symbol}");
         }
         for inst in main.blocks.iter().flat_map(|b| &b.insts) {
-            if let Inst::Call { func, args, .. } = inst {
+            // random_bytes / token_hex are CSPRNG-backed and therefore throwing
+            // (#1580), so in `main` (which carries the implicit top-level handler)
+            // they lower to an `Invoke`; match both shapes so the count ABI check
+            // keeps covering them.
+            if let Inst::Call { func, args, .. } | Inst::Invoke { func, args, .. } = inst {
                 if matches!(
                     func.as_str(),
                     "zap_crypto_random_bytes" | "zap_crypto_token_hex"
@@ -684,6 +688,134 @@ mod tests {
 "#
             ));
         }
+    }
+
+    // --- CSPRNG entropy failure is a catchable OSError (#1580) -----------------
+    //
+    // A CSPRNG entropy failure (`zap_crypto_fill_random`: getentropy /
+    // /dev/urandom / BCryptGenRandom) now `zap_panic_typed(ZAP_EXC_OS_ERROR, …)`
+    // instead of `abort()`-ing the process, and every CSPRNG-backed entry point
+    // lowers through `throwing_call` so a matching `try`/`except OSError` catches
+    // it. The runtime failure path is not reproducible on a healthy host, so
+    // there is no end-to-end golden for it; these host checks pin the invoke edge
+    // (only the LLVM CI build exercises the unwinding itself) and the OSError
+    // type mapping (id 19, matching `ZAP_EXC_OS_ERROR` in zaprt.c). Runs under
+    // both Immix and Boehm in CI.
+
+    #[test]
+    fn csprng_backed_apis_lower_to_invoke() {
+        // Each CSPRNG-backed surface (crypto random/token/secrets, UUID random
+        // versions, NanoID) must lower to an `Invoke` of its runtime symbol — in
+        // `main` the implicit top-level handler supplies the unwind edge, so the
+        // entropy-failure raise reaches a handler rather than unwinding past the
+        // frame (the #1566 failure mode). A plain `Call` here would silently drop
+        // the exception.
+        let m = lower_ok(
+            r#"def main():
+    int64 n = 16
+    auto rb = crypto.random_bytes(n)
+    auto th = crypto.token_hex(n)
+    auto tu = crypto.token_urlsafe(n)
+    auto rbel = crypto.randbelow(n)
+    auto u4 = uuid.uuid4()
+    auto u7 = uuid.uuid7()
+    auto u1 = uuid.uuid1()
+    auto nid = uuid.nanoid()
+"#,
+        );
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        for symbol in [
+            "zap_crypto_random_bytes",
+            "zap_crypto_token_hex",
+            "zap_crypto_token_urlsafe",
+            "zap_crypto_randbelow",
+            "zap_uuid_v4",
+            "zap_uuid_v7",
+            "zap_uuid_v1",
+            "zap_uuid_nanoid",
+        ] {
+            let is_invoke = main
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i, Inst::Invoke { func, .. } if func == symbol));
+            let is_plain_call = main
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i, Inst::Call { func, .. } if func == symbol));
+            assert!(
+                is_invoke,
+                "{symbol} must lower to an Invoke (carries the unwind edge), not a plain Call"
+            );
+            assert!(
+                !is_plain_call,
+                "{symbol} must not also appear as a plain (non-throwing) Call"
+            );
+        }
+    }
+
+    #[test]
+    fn csprng_failure_caught_by_except_oserror() {
+        // Inside `try: … except OSError`, a CSPRNG-backed call is an `invoke`
+        // whose unwind edge reaches the handler, and the handler dispatch tests
+        // the OSError type id (19) — the same id the runtime raises
+        // (ZAP_EXC_OS_ERROR), so `except OSError` actually catches the entropy
+        // failure. Covers the crypto and uuid facets together.
+        let m = lower_ok(
+            r#"def main():
+    try:
+        auto rb = crypto.random_bytes(16)
+        auto u4 = uuid.uuid4()
+        auto nid = uuid.nanoid()
+    except OSError as e:
+        print("no entropy")
+"#,
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("invoke @zap_crypto_random_bytes") && text.contains("unwind"),
+            "crypto.random_bytes in a `try` must be an invoke with an unwind edge, text:\n{text}"
+        );
+        assert!(
+            text.contains("invoke @zap_uuid_v4"),
+            "uuid.uuid4 in a `try` must be an invoke, text:\n{text}"
+        );
+        assert!(
+            text.contains("invoke @zap_uuid_nanoid"),
+            "uuid.nanoid in a `try` must be an invoke, text:\n{text}"
+        );
+        assert!(
+            text.contains("landingpad"),
+            "expected a landing pad, text:\n{text}"
+        );
+        // The `except OSError` filter lowers to a `zap_exception_is_a(exc, <id>)`
+        // membership test; `<id>` must be the OSError type id 19 — the same value
+        // the runtime raises (ZAP_EXC_OS_ERROR in zaprt.c) — or the catch would
+        // never fire for the entropy failure.
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        let id_arg = main
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find_map(|i| match i {
+                Inst::Call { func, args, .. } if func == "zap_exception_is_a" => Some(args[1]),
+                _ => None,
+            })
+            .expect("except OSError must emit a zap_exception_is_a membership test");
+        let id_val = main
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find_map(|i| match i {
+                Inst::IConst { dest, val } if *dest == id_arg => Some(*val),
+                _ => None,
+            })
+            .expect("the OSError type id must be a constant");
+        assert_eq!(
+            id_val, 19,
+            "OSError must map to type id 19 (ZAP_EXC_OS_ERROR)"
+        );
     }
 
     #[test]
