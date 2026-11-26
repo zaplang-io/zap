@@ -117,6 +117,15 @@ The root is chosen by the **first segment**, in this fixed precedence:
 1. **Compiler-known stdlib module** (`math`, `os`, `json`, … — the names
    registered in `crates/sema/src/modules/`, D-0056). Existing behavior,
    unchanged; the `import` line stays optional.
+1b. **Bundled pure-Zap stdlib module** (`serde`, … — the names in
+   `crates/driver/src/bundled_stdlib.rs`). Unlike a tier-1 seam (hand-written
+   Rust), a bundled module is ordinary Zap source that ships **embedded in the
+   compiler** (via `include_str!`) and is parsed + merged like any other module —
+   so it carries interfaces, generics and `comptime` reflection. Resolved by a
+   bare `import <name>` with no file / `zenv` lookup (a synthetic path label the
+   linker sources from the registry); checked before dependencies so a bundled
+   name is never shadowed by a same-named package. A dotted `import <name>.sub`
+   falls through to tiers 2/3 (a bundled module is a single file today).
 2. **Dependency package.** If the first segment equals a dependency **logical
    name** (from `zap.lock`/`zap.toml`, D-0052), the root is that package
    (`$ZAP_ZENV/pkg/<name>`), and the **remaining** segments map within it. A

@@ -283,6 +283,19 @@ impl<'t> Loader<'t> {
         if zapc_sema::is_builtin_module(first) {
             return None;
         }
+        // (1b) bundled pure-Zap stdlib module (Option B, a D-0081 extension): a
+        // blessed in-language module whose Zap source ships embedded in the
+        // compiler, resolved by name with no file / `zenv` lookup. Checked before
+        // dependencies so a bundled name is never shadowed by a same-named
+        // package. Bare `import <name>` only — a bundled module is a single file,
+        // so a dotted `import <name>.sub` falls through to the dependency / local
+        // tiers (and their "cannot find module" diagnostic).
+        if path == first && crate::bundled_stdlib::is_bundled(first) {
+            return Some((
+                PathBuf::from(crate::bundled_stdlib::synthetic_path(first)),
+                None,
+            ));
+        }
         // (2) dependency package (D-0052): `<pkg_root>/<first>` is a directory.
         for pkg_root in &self.pkg_roots {
             let pkg_dir = pkg_root.join(first);
@@ -340,16 +353,23 @@ impl<'t> Loader<'t> {
             return Some(idx);
         }
         let file_label = file.display().to_string();
-        let src = match std::fs::read_to_string(file) {
-            Ok(s) => s,
-            Err(e) => {
-                self.diag(
-                    ErrorCode::ZAP3010,
-                    format!("cannot read module `{path}`: {e}"),
-                    Span::new(0, 0),
-                    &file_label,
-                );
-                return None;
+        // A bundled pure-Zap stdlib module (Option B) sources its text from the
+        // compiler-embedded registry, not the filesystem; its `file` is a
+        // synthetic label, never a real path.
+        let src = if let Some(embedded) = crate::bundled_stdlib::source_for_label(&file_label) {
+            embedded.to_string()
+        } else {
+            match std::fs::read_to_string(file) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.diag(
+                        ErrorCode::ZAP3010,
+                        format!("cannot read module `{path}`: {e}"),
+                        Span::new(0, 0),
+                        &file_label,
+                    );
+                    return None;
+                }
             }
         };
         let (mut ast, perrs, lerrs) = zapc_syntax::parser::parse_str(&src);

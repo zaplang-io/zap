@@ -20,6 +20,7 @@ use zapc_syntax::ast::Module;
 use zapc_syntax::cfg::Target;
 
 mod behavioral_decorator;
+mod bundled_stdlib;
 pub mod cli;
 mod decorator_desugar;
 mod derive_synth;

@@ -3780,3 +3780,87 @@ def main():
         "binary backend methods are called directly through the bound: {stdout}"
     );
 }
+
+#[test]
+fn the_serde_core_is_a_bundled_pure_zap_stdlib_module() {
+    // E6 (Option B, a D-0081 extension): the serde foundation ships BUNDLED with
+    // the compiler as a pure-Zap stdlib module — `import serde` resolves it from
+    // the compiler-embedded registry (crates/driver/src/bundled_stdlib.rs), with
+    // no `zap add` / `zenv` lookup, so there is one blessed in-language version
+    // for the whole ecosystem. Unlike a Rust seam, it is real Zap (interfaces +
+    // generics + comptime reflection) merged like any module. This asserts that a
+    // user program `import serde`s it and the generic drivers specialize across
+    // the module boundary at the user's local backend + types; the runtime round
+    // trip is pinned by the golden `serde_bundled_import` under the CI LLVM matrix.
+    let src = "\
+import serde
+
+struct Sink:
+    list[str] toks = []
+    def begin_struct(self):
+        self.toks.append(\"<\")
+    def field_name(self, str name):
+        pass
+    def emit_int(self, int64 v):
+        self.toks.append(str(v))
+    def emit_str(self, str v):
+        self.toks.append(v)
+    def emit_bool(self, bool v):
+        self.toks.append(str(v))
+    def end_struct(self):
+        self.toks.append(\">\")
+
+struct Src:
+    list[str] toks = []
+    int64 pos = 0
+    def begin_struct(self):
+        pass
+    def read_int(self, str field) -> int64:
+        auto t = self.toks[self.pos]
+        self.pos = self.pos + 1
+        return int(t)
+    def read_str(self, str field) -> str:
+        auto t = self.toks[self.pos]
+        self.pos = self.pos + 1
+        return t
+    def read_bool(self, str field) -> bool:
+        auto t = self.toks[self.pos]
+        self.pos = self.pos + 1
+        return t == \"True\"
+    def end_struct(self):
+        pass
+
+struct Point:
+    int64 x
+    str label
+    bool active
+
+def main():
+    auto p = Point(3, \"hi\", True)
+    auto w = Sink()
+    serde.serialize(p, w)
+    print(\",\".join(w.toks))
+    auto p2 = serde.deserialize[Point, Src](Src([\"3\", \"hi\", \"True\"], 0))
+    print(p2.x == 3 and p2.label == \"hi\" and p2.active == True)
+";
+    let f = write_zap("e6-serde-bundled", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // `import serde` must resolve from the embedded registry (no file / zenv) and
+    // the program must lower cleanly.
+    assert!(
+        out.status.success(),
+        "`import serde` must resolve the bundled module and lower; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The bundled module merged under its own prefix and the generic drivers
+    // specialized across the module boundary at the user's local backend + type.
+    assert!(
+        stdout.contains("serde__serialize$Point$Sink"),
+        "serde.serialize specializes at (Point, user backend) across the module boundary: {stdout}"
+    );
+    assert!(
+        stdout.contains("serde__deserialize$Point$Src"),
+        "serde.deserialize specializes at (Point, user backend) across the module boundary: {stdout}"
+    );
+}
