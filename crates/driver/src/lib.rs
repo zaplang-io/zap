@@ -858,4 +858,34 @@ mod derive_render_tests {
         assert!(out.contains("instantiated here"), "second span: {out}");
         assert!(out.contains("out of range"), "{out}");
     }
+
+    #[test]
+    fn an_enum_derive_failure_names_the_variant_in_the_backtrace() {
+        // An enum derive failure the generator points at a variant payload field
+        // renders a backtrace frame naming the variant (#1616), not a frame that
+        // mislabels the payload as a struct field of the enum.
+        const ENUM_SRC: &str = "enum Shape:\n    Circle(Widget r)\n";
+        let start = ENUM_SRC.find("Widget r").unwrap() as u32;
+        let sp = Span::new(start, start + "Widget r".len() as u32);
+        let di = DeriveErrorInfo {
+            trait_and_type: Some(("Ser".into(), "Shape".into())),
+            cause_message: "`Ser` is not implemented for this type".into(),
+            cause_span: sp,
+            cause_is_user: true,
+            instantiation_span: Some(Span::new(0, 4)),
+            frames: vec![(
+                "payload field `r` of variant `Circle` of `Shape`".into(),
+                sp,
+            )],
+        };
+        let out = render_derive_failure("shape.zap", Some(ENUM_SRC), &di);
+        assert!(
+            out.contains("error[ZAP7003]: cannot derive `Ser` for `Shape`"),
+            "{out}"
+        );
+        assert!(
+            out.contains("required because of payload field `r` of variant `Circle` of `Shape`"),
+            "{out}"
+        );
+    }
 }

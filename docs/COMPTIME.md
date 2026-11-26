@@ -301,11 +301,15 @@ and a `ZAP7xxx` code:
   each field and container level (`the element type of list[Widget]`, `the
   key/value type of dict[…]`, element *N* of a tuple, the element of an
   Optional) to the leaf that actually failed — plus the root-cause note. A
-  generator fault additionally dual-spans the generator line and the
-  instantiation site.
+  failing enum variant payload names its variant
+  (`payload field `r` of variant `Circle` of `Shape``); a generator fault
+  additionally dual-spans the generator line and the instantiation site.
 
 The backtrace is what turns "something deep in a nested generic codec failed"
-into a readable path back to the type the user wrote.
+into a readable path back to the type the user wrote. (Linking a failing nested
+*derived* type back to the outer type's field that required it — a cross-type
+frame — is a tracked follow-up; the chain today is complete within one derived
+type.)
 
 ---
 

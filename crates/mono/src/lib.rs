@@ -418,17 +418,52 @@ fn span_contains(outer: Span, inner: Span) -> bool {
 /// `required because of …` chain, exactly as a struct field is. Carries each
 /// payload field's type, name, and span (decorators/bitfield/default are not
 /// part of a variant payload).
-fn variant_payload_fields(def: &EnumDef) -> Vec<ast::Field> {
+/// One candidate the derive backtrace may anchor its top frame on: a field and
+/// the name of the enum variant that carries it, when any. `None` is a plain
+/// struct field (the top frame reads `` field `name` of `T` ``); `Some(v)` is a
+/// variant payload field (the top frame reads `` payload field `name` of variant
+/// `v` of `T` ``), so an enum derive failure names the variant that pulled the
+/// failing type in rather than mislabeling it a struct field of the enum
+/// (#1616, E7; refines #1375).
+type DeriveAnchor = (ast::Field, Option<String>);
+
+/// The top `required because of …` frame label for a derive anchor: a plain
+/// struct field is `` field `name` of `T` ``; an enum payload field names the
+/// variant, `` payload field `name` of variant `v` of `T` `` (#1616, E7).
+fn derive_top_label(field_name: &str, variant: Option<&str>, ty: &str) -> String {
+    match variant {
+        Some(v) => format!("payload field `{field_name}` of variant `{v}` of `{ty}`"),
+        None => format!("field `{field_name}` of `{ty}`"),
+    }
+}
+
+/// Backtrace anchors for a struct's fields: each field with no variant.
+fn struct_anchors(def: &StructDef) -> Vec<DeriveAnchor> {
+    def.fields.iter().map(|f| (f.clone(), None)).collect()
+}
+
+/// Backtrace anchors for an enum's variant payload fields: each payload field
+/// paired with the name of the variant that carries it. The payload fields are
+/// flattened across variants so a derive failure the generator points at
+/// (`comptime.error(f.span, …)` for a variant payload) is attributed to the
+/// exact variant + field in the `required because of …` chain (#1375/#1616).
+fn enum_anchors(def: &EnumDef) -> Vec<DeriveAnchor> {
     def.variants
         .iter()
         .flat_map(|v| {
-            v.fields.iter().map(|vf| ast::Field {
-                decorators: Vec::new(),
-                ty: vf.ty.clone(),
-                name: vf.name.clone(),
-                bits: None,
-                default: None,
-                span: vf.span,
+            let vname = v.name.clone();
+            v.fields.iter().map(move |vf| {
+                (
+                    ast::Field {
+                        decorators: Vec::new(),
+                        ty: vf.ty.clone(),
+                        name: vf.name.clone(),
+                        bits: None,
+                        default: None,
+                        span: vf.span,
+                    },
+                    Some(vname.clone()),
+                )
             })
         })
         .collect()
@@ -2698,18 +2733,18 @@ impl Mono<'_> {
                         &[],
                         Some(&self.comptime_registry),
                     )
-                    .map_err(|e| self.enrich_derive_error(e, &def.fields, def.span))?;
+                    .map_err(|e| self.enrich_derive_error(e, &struct_anchors(def), def.span))?;
                     Ok(Some(out))
                 }
                 None => Ok(None),
             },
             "variants" => match self.enums.get(type_name.as_str()) {
                 Some(def) => {
-                    // Flatten the variant payload fields so a derive failure the
-                    // generator points at (`comptime.error(f.span, …)` for a
-                    // variant payload) is attributed to that field in the
-                    // `required because of …` chain (#1375, E3d).
-                    let payload_fields = variant_payload_fields(def);
+                    // Anchor a derive failure the generator points at
+                    // (`comptime.error(f.span, …)` for a variant payload) to the
+                    // exact variant + field in the `required because of …` chain
+                    // (#1375, E3d; variant naming #1616).
+                    let anchors = enum_anchors(def);
                     let out = comptime_for::unroll_enum_variants(
                         def,
                         loop_var,
@@ -2717,7 +2752,7 @@ impl Mono<'_> {
                         &[],
                         Some(&self.comptime_registry),
                     )
-                    .map_err(|e| self.enrich_derive_error(e, &payload_fields, def.span))?;
+                    .map_err(|e| self.enrich_derive_error(e, &anchors, def.span))?;
                     Ok(Some(out))
                 }
                 None => Ok(None),
@@ -2842,7 +2877,7 @@ impl Mono<'_> {
     fn enrich_derive_error(
         &self,
         mut le: LowerError,
-        fields: &[ast::Field],
+        anchors: &[DeriveAnchor],
         instantiation_span: Span,
     ) -> LowerError {
         if let (Some(di), Some((tr, ty))) = (le.derive.as_mut(), self.cur_derive.as_ref()) {
@@ -2859,17 +2894,18 @@ impl Mono<'_> {
                 // types carry use-site spans (#1346) — a type *inside* the
                 // field's declared type (the `Widget` element of
                 // `list[Widget] items`, via `comptime.error(f.ty.elem.span, …)`).
-                // Match the field whose declaration contains the cause span,
-                // then walk its declared type from the field inward, emitting one
-                // frame per container level crossed — the multi-level chain
-                // (#1293). Frames are outermost-first; the renderer prints them
-                // inner-first.
-                if let Some(f) = fields
-                    .iter()
-                    .find(|f| f.span == di.cause_span || span_contains(f.ty.span(), di.cause_span))
-                {
-                    di.frames
-                        .push((format!("field `{}` of `{}`", f.name, ty), f.span));
+                // Match the anchor whose field declaration contains the cause
+                // span, then walk its declared type from the field inward,
+                // emitting one frame per container level crossed — the
+                // multi-level chain (#1293). The top frame names a variant for an
+                // enum payload field, so an enum failure says which variant
+                // carried the failing type (#1616). Frames are outermost-first;
+                // the renderer prints them inner-first.
+                if let Some((f, variant)) = anchors.iter().find(|(f, _)| {
+                    f.span == di.cause_span || span_contains(f.ty.span(), di.cause_span)
+                }) {
+                    let top = derive_top_label(&f.name, variant.as_deref(), ty);
+                    di.frames.push((top, f.span));
                     push_container_frames(&mut di.frames, &f.ty, di.cause_span);
                 }
             }
@@ -5917,6 +5953,122 @@ mod tests {
             frames.is_empty(),
             "no container levels for a bare struct field"
         );
+    }
+
+    // ---- enum variant naming in the derive chain (#1616, E7) --------------
+
+    fn enum_named<'a>(m: &'a Module, name: &str) -> Option<&'a EnumDef> {
+        m.items.iter().find_map(|i| match i {
+            Item::Enum(e) if e.name == name => Some(e),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn derive_top_label_distinguishes_struct_field_and_variant_payload() {
+        assert_eq!(
+            derive_top_label("tags", None, "User"),
+            "field `tags` of `User`",
+        );
+        assert_eq!(
+            derive_top_label("r", Some("Circle"), "Shape"),
+            "payload field `r` of variant `Circle` of `Shape`",
+        );
+    }
+
+    #[test]
+    fn struct_anchors_pair_every_field_with_no_variant() {
+        let m = one_field_struct("struct User:\n    str name\n    int64 age\n");
+        let def = struct_named(&m, "User").unwrap();
+        let anchors = struct_anchors(def);
+        let got: Vec<(&str, Option<&str>)> = anchors
+            .iter()
+            .map(|(f, v)| (f.name.as_str(), v.as_deref()))
+            .collect();
+        assert_eq!(got, vec![("name", None), ("age", None)]);
+    }
+
+    #[test]
+    fn enum_anchors_name_the_variant_for_each_payload_field() {
+        // Payload-free, single-payload, and multi-payload variants flattened in
+        // declaration order, each paired with its own variant name.
+        let m = one_field_struct(
+            "enum Shape:\n    Unit\n    Circle(float64 r)\n    Rect(float64 w, float64 h)\n",
+        );
+        let def = enum_named(&m, "Shape").unwrap();
+        let anchors = enum_anchors(def);
+        let got: Vec<(&str, Option<&str>)> = anchors
+            .iter()
+            .map(|(f, v)| (f.name.as_str(), v.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("r", Some("Circle")),
+                ("w", Some("Rect")),
+                ("h", Some("Rect")),
+            ],
+            "a payload-free variant contributes no anchor; each payload field \
+             keeps its own variant name",
+        );
+    }
+
+    #[test]
+    fn enum_anchor_span_matches_the_pointed_at_payload_field() {
+        // The anchor whose field span contains the cause is the one selected,
+        // even when two variants share a payload field name.
+        let m = one_field_struct("enum Shape:\n    Circle(float64 r)\n    Square(float64 r)\n");
+        let def = enum_named(&m, "Shape").unwrap();
+        let anchors = enum_anchors(def);
+        // The `r` of `Square` — the second variant's payload field span.
+        let square_r_span = def.variants[1].fields[0].span;
+        let (f, variant) = anchors
+            .iter()
+            .find(|(f, _)| f.span == square_r_span || span_contains(f.ty.span(), square_r_span))
+            .expect("an anchor contains the Square.r span");
+        assert_eq!(f.name, "r");
+        assert_eq!(variant.as_deref(), Some("Square"));
+        assert_eq!(
+            derive_top_label(&f.name, variant.as_deref(), "Shape"),
+            "payload field `r` of variant `Square` of `Shape`",
+        );
+    }
+
+    #[test]
+    fn enum_variant_payload_chain_descends_through_containers() {
+        // A variant payload of `list[Widget]`: the top frame names the variant,
+        // then one container frame per level to the nested `Widget`, exactly as
+        // the struct path (so an enum failure in a nested type reads as a full
+        // chain). Mirrors `chain_is_built_outermost_first_with_nested_spans`.
+        let m = one_field_struct(
+            "struct Widget:\n    int64 w\nenum Shape:\n    Group(list[Widget] kids)\n",
+        );
+        let def = enum_named(&m, "Shape").unwrap();
+        let anchors = enum_anchors(def);
+        let (field, variant) = &anchors[0];
+        // cause = the inner `Widget` element of `list[Widget]`.
+        let Type::Named { args, .. } = &field.ty else {
+            panic!("list");
+        };
+        let cause = args[0].span();
+
+        let mut frames = vec![(
+            derive_top_label(&field.name, variant.as_deref(), "Shape"),
+            field.span,
+        )];
+        push_container_frames(&mut frames, &field.ty, cause);
+
+        let labels: Vec<&str> = frames.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "payload field `kids` of variant `Group` of `Shape`",
+                "the element type of `list[Widget]`",
+            ],
+        );
+        // Spans zoom inward toward the cause, same invariant as the struct chain.
+        assert!(span_contains(frames[0].1, frames[1].1));
+        assert!(span_contains(frames.last().unwrap().1, cause));
     }
 
     // ---- transparent type aliases (#606, D-0105) --------------------------
