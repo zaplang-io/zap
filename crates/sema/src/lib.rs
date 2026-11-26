@@ -205,6 +205,65 @@ fn subst_fn_sig(sig: &FnSig, subst: &HashMap<&str, &Ty>) -> FnSig {
     }
 }
 
+/// Structurally match an un-erased parameter type `pty` (type parameters kept as
+/// `Ty::Named`) against a concrete argument type `aty`, collecting every
+/// `(type parameter, argument sub-type, from-type-value)` the pairing binds
+/// (#1545). The `from-type-value` flag is true when the binding comes from a
+/// `Type[T]` parameter position (a type *value* argument), whose represented type
+/// is an exact, authoritative binding for `T`.
+///
+/// An `Unknown`/`py` argument sub-type is a wildcard: it is skipped so it neither
+/// binds nor conflicts, keeping the consistency pass purely additive.
+fn collect_tyvar_pairs(pty: &Ty, aty: &Ty, generics: &[String], out: &mut Vec<(String, Ty, bool)>) {
+    collect_tyvar_pairs_inner(pty, aty, generics, false, out);
+}
+
+fn collect_tyvar_pairs_inner(
+    pty: &Ty,
+    aty: &Ty,
+    generics: &[String],
+    from_type_value: bool,
+    out: &mut Vec<(String, Ty, bool)>,
+) {
+    if matches!(aty, Ty::Unknown | Ty::Py) {
+        return;
+    }
+    match (pty, aty) {
+        // A bare type parameter binds to the whole argument type (which may itself
+        // be a `Type[..]` value, as in `opt[T](T kind)` receiving `int64`).
+        (Ty::Named(g), _) if generics.iter().any(|x| x == g) => {
+            out.push((g.clone(), aty.clone(), from_type_value));
+        }
+        // A `Type[T]` parameter binds `T` to the represented type of a type-value
+        // argument — the authoritative binding (#1527 type values are invariant).
+        (Ty::TypeVal(p), Ty::TypeVal(a)) => {
+            collect_tyvar_pairs_inner(p, a, generics, true, out);
+        }
+        (Ty::List(p), Ty::List(a))
+        | (Ty::Set(p), Ty::Set(a))
+        | (Ty::Heap(p), Ty::Heap(a))
+        | (Ty::Deque(p), Ty::Deque(a))
+        | (Ty::OSet(p), Ty::OSet(a))
+        | (Ty::Chan(p), Ty::Chan(a))
+        | (Ty::AtomicArray(p), Ty::AtomicArray(a))
+        | (Ty::ContextVar(p), Ty::ContextVar(a))
+        | (Ty::VarTuple(p), Ty::VarTuple(a))
+        | (Ty::Optional(p), Ty::Optional(a)) => {
+            collect_tyvar_pairs_inner(p, a, generics, from_type_value, out);
+        }
+        (Ty::Dict(pk, pv), Ty::Dict(ak, av)) => {
+            collect_tyvar_pairs_inner(pk, ak, generics, from_type_value, out);
+            collect_tyvar_pairs_inner(pv, av, generics, from_type_value, out);
+        }
+        (Ty::Tuple(ps), Ty::Tuple(a_s)) if ps.len() == a_s.len() => {
+            for (p, a) in ps.iter().zip(a_s.iter()) {
+                collect_tyvar_pairs_inner(p, a, generics, from_type_value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Collect the names of the aliases referenced anywhere in `t` (#606 cycle
 /// detection). Only names present in `aliases` are recorded.
 fn collect_alias_refs(
@@ -500,8 +559,30 @@ struct TyBound {
     args: Vec<Ty>,
 }
 
+/// A generic free function's call-site surface (#1545): its type-parameter
+/// names and its *un-erased* parameter types (type parameters preserved as
+/// `Ty::Named(param)`), used to bind each type parameter from a call's arguments
+/// and enforce consistency across every argument that mentions it.
+struct GenericFnInfo {
+    /// The declared type-parameter names, e.g. `["T"]` for `def f[T](...)`.
+    generics: Vec<String>,
+    /// `(parameter name, un-erased parameter type)` in declaration order, so a
+    /// positional argument maps by index and a keyword argument maps by name.
+    params: Vec<(String, Ty)>,
+}
+
 struct Checker {
     sigs: HashMap<String, FnSig>,
+    /// Per free function, its generic surface for call-site type-parameter
+    /// consistency (#1545). The stored `FnSig` (above) erases every type
+    /// parameter to `Ty::Unknown`, which severs the connection between a
+    /// `Type[T] kind` argument that binds `T` and a later `T default` argument
+    /// that must respect it. This records the function's generic parameter names
+    /// and its *un-erased* parameter types (type parameters kept as
+    /// `Ty::Named(param)` via `resolve_type_scoped`), so a call can bind each
+    /// type parameter from the arguments and reject an inconsistent one. Only
+    /// generic functions are recorded; a non-generic call never consults it.
+    generic_fns: HashMap<String, GenericFnInfo>,
     user_types: HashSet<String>,
     /// Registered enums (tier-1 and tier-3), keyed by type name.
     enums: HashMap<String, EnumInfo>,
@@ -1350,6 +1431,7 @@ impl Checker {
     fn new() -> Checker {
         Checker {
             sigs: HashMap::new(),
+            generic_fns: HashMap::new(),
             user_types: HashSet::new(),
             enums: HashMap::new(),
             generic_enums: HashSet::new(),
@@ -3229,6 +3311,28 @@ impl Checker {
                 Item::Function(f) => {
                     let sig = self.sig_of(f);
                     self.sigs.insert(f.name.clone(), sig);
+                    // Record the generic surface (#1545) so a call can enforce
+                    // type-parameter consistency. The stored `sig` erases type
+                    // parameters to `Unknown`; here the parameter types keep the
+                    // `Ty::Named(param)` type variables (via `resolve_type_scoped`)
+                    // so a `Type[T]`/`T` pairing can be bound and checked.
+                    if !f.generics.is_empty() {
+                        let generics: Vec<String> =
+                            f.generics.iter().map(|g| g.name.clone()).collect();
+                        let params = f
+                            .params
+                            .iter()
+                            .map(|p| {
+                                let ty =
+                                    p.ty.as_ref()
+                                        .map(|t| self.resolve_type_scoped(t, "", &generics))
+                                        .unwrap_or(Ty::Unknown);
+                                (p.name.clone(), ty)
+                            })
+                            .collect();
+                        self.generic_fns
+                            .insert(f.name.clone(), GenericFnInfo { generics, params });
+                    }
                     // `@deprecated` on a free function (I#472, D-0109): record
                     // the optional message so every call site warns (ZAP5124).
                     if let Some(msg) = deprecated_message(&f.decorators) {
@@ -12685,8 +12789,14 @@ impl Checker {
             );
         }
 
+        // Inferred argument types mapped to their declared parameter, for the
+        // generic type-parameter consistency pass (#1545). Positional args map by
+        // index, keyword args by parameter name.
+        let mut positional_tys: Vec<(Ty, Span)> = Vec::new();
+        let mut keyword_tys: Vec<(String, Ty, Span)> = Vec::new();
         for (i, a) in positional.iter().enumerate() {
             let at = self.infer(&a.value);
+            positional_tys.push((at.clone(), expr_span(&a.value)));
             // A parameter after the bare `*` separator is keyword-only (I#496) and
             // cannot be filled positionally. Positional args bind to params by
             // index, and keyword-only params always follow the positional-or-
@@ -12733,10 +12843,123 @@ impl Checker {
         for a in &keyword {
             let name = a.name.clone().unwrap();
             let at = self.infer(&a.value);
+            keyword_tys.push((name.clone(), at.clone(), expr_span(&a.value)));
             self.check_keyword_arg(sig, fname, &name, &at, expr_span(&a.value));
         }
 
+        self.check_generic_arg_consistency(fname, &positional_tys, &keyword_tys);
+
         sig.ret.clone()
+    }
+
+    /// Enforce generic type-parameter consistency across a call's arguments
+    /// (#1545). When a free function is generic, binding a type parameter `T`
+    /// from one argument must constrain every other argument that mentions `T`.
+    ///
+    /// The stored `FnSig` erases every type parameter to `Ty::Unknown`, so the
+    /// per-argument checks in [`check_user_call_plain`] treat each `T` position as
+    /// an independent wildcard — they cannot see that a `Type[T] kind` argument
+    /// binding `T = int64` makes a later `T default = "oops"` illegal. This pass
+    /// consults the *un-erased* parameter types (`self.generic_fns`) and runs two
+    /// rounds over the `(parameter type, argument type)` pairs:
+    ///
+    /// 1. **establish** — bind each type parameter from the arguments. A
+    ///    `Type[T]` argument (a type *value*) binds `T` to its represented type
+    ///    and is authoritative, so those bindings are processed first and the
+    ///    verdict is independent of positional/keyword ordering; an ordinary `T`
+    ///    argument binds or widens to the least upper bound.
+    /// 2. **check** — re-visit every `T`-typed argument against the final binding
+    ///    and report `ZAP4021` on an incompatible one.
+    ///
+    /// The pass is purely additive: an `Unknown`/`py` argument is a wildcard that
+    /// never binds or conflicts, and a non-generic call never reaches it, so no
+    /// previously-accepted *consistent* program changes behaviour.
+    fn check_generic_arg_consistency(
+        &mut self,
+        fname: &str,
+        positional_tys: &[(Ty, Span)],
+        keyword_tys: &[(String, Ty, Span)],
+    ) {
+        let Some(info) = self.generic_fns.get(fname) else {
+            return;
+        };
+        // Clone the small generic surface so `self` is free for `self.error`.
+        let generics = info.generics.clone();
+        let params = info.params.clone();
+
+        // Build `(param type, arg type, span, display index)` pairs in parameter-
+        // declaration order, so the verdict does not depend on how the call lists
+        // its arguments. A positional argument maps to the param at its index; a
+        // keyword argument maps to the param of that name.
+        let mut bindings: Vec<(Ty, Ty, Span, usize)> = Vec::new();
+        for (i, (pname, pty)) in params.iter().enumerate() {
+            if let Some((aty, span)) = positional_tys.get(i) {
+                bindings.push((pty.clone(), aty.clone(), *span, i + 1));
+            } else if let Some((_, aty, span)) = keyword_tys.iter().find(|(n, _, _)| n == pname) {
+                bindings.push((pty.clone(), aty.clone(), *span, i + 1));
+            }
+        }
+
+        // Collect the `(type parameter, argument sub-type, from-type-value)` pairs
+        // each binding contributes by structurally matching the un-erased
+        // parameter type against the argument type.
+        let mut contribs: Vec<(String, Ty, bool, Span, usize)> = Vec::new();
+        for (pty, aty, span, idx) in &bindings {
+            let mut collected: Vec<(String, Ty, bool)> = Vec::new();
+            collect_tyvar_pairs(pty, aty, &generics, &mut collected);
+            for (g, sub, from_tv) in collected {
+                contribs.push((g, sub, from_tv, *span, *idx));
+            }
+        }
+
+        // Round 1 — establish. Type-value bindings are exact and authoritative, so
+        // process them before the ordinary value bindings.
+        let mut subst: HashMap<String, Ty> = HashMap::new();
+        for pass_tv in [true, false] {
+            for (g, sub, from_tv, _, _) in &contribs {
+                if *from_tv != pass_tv {
+                    continue;
+                }
+                match subst.get(g) {
+                    None => {
+                        subst.insert(g.clone(), sub.clone());
+                    }
+                    Some(bound) => {
+                        // Keep the binding if the new argument is assignable to it;
+                        // widen to the new type if it is the wider of the two (the
+                        // least upper bound); otherwise leave the conflict for the
+                        // check round to report.
+                        if self.coercible(sub, bound) {
+                            // already covered
+                        } else if self.coercible(bound, sub) {
+                            subst.insert(g.clone(), sub.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Round 2 — check. Report the first incompatible argument for each type
+        // parameter (one diagnostic per offending argument).
+        for (g, sub, _from_tv, span, idx) in &contribs {
+            if let Some(bound) = subst.get(g) {
+                if !self.coercible(sub, bound) && !self.coercible(bound, sub) {
+                    self.error(
+                        ErrorCode::ZAP4021,
+                        format!(
+                            "argument {} to '{}' has type {}, but the type parameter \
+                             '{}' is bound to {} by another argument",
+                            idx,
+                            fname,
+                            sub.display(),
+                            g,
+                            bound.display(),
+                        ),
+                        *span,
+                    );
+                }
+            }
+        }
     }
 
     /// Type-check a call that carries `*`/`**` spread arguments (#597). The
