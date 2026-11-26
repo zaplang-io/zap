@@ -14,11 +14,10 @@
 # version-coherent implementation for the whole ecosystem, no `zap add`.
 #
 # Supported field kinds: `int64`, `uint64`, `float64`, `str`, `bool`, `bytes`, a
-# nested derived struct (encode recurses into the field's own specialization), and
-# `list[T]` / `dict[str, V]` of scalar elements (both directions). Enum and
-# generic-struct DESERIALIZE are blocked on the `reflect.construct` generalization
-# (#1561); `Optional` awaits a multi-inner-type comptime formulation; both are
-# later additions.
+# nested derived struct (encode recurses into the field's own specialization),
+# `list[T]` / `dict[str, V]` of scalar elements, and `Optional[T]` of a scalar
+# (all both directions). Enum and generic-struct DESERIALIZE are blocked on the
+# `reflect.construct` generalization (#1561) and are a later addition.
 
 # A format backend emits a value as a sequence of visitor events. A concrete
 # codec implements this once; `field_name` may be a no-op for positional formats.
@@ -31,6 +30,8 @@ interface Serializer:
     def emit_str(self, str v)
     def emit_bool(self, bool v)
     def emit_bytes(self, bytes v)
+    # `Optional` None; a `Some` emits the inner value directly.
+    def emit_nil(self)
     # Sequence (list) and map (dict) framing. The driver calls `begin_*`, emits
     # the elements / key+value pairs, then `end_*`. A length-prefixed backend
     # buffers and backfills the header at `end_*` (no count up front on encode).
@@ -51,6 +52,9 @@ interface Deserializer:
     def read_str(self, str field) -> str
     def read_bool(self, str field) -> bool
     def read_bytes(self, str field) -> bytes
+    # `Optional`: return True and leave the value to be read (a `Some`), or consume
+    # a nil and return False (a `None`).
+    def begin_optional(self, str field) -> bool
     def begin_seq(self, str field) -> int64
     def end_seq(self)
     def begin_map(self, str field) -> int64
@@ -77,6 +81,44 @@ def serialize[T, S: Serializer](T value, S s):
             s.emit_bytes(reflect.field(value, comptime f.index))
         elif f.ty.name == "uint64":
             s.emit_uint(reflect.field(value, comptime f.index))
+        elif f.ty.kind.name == "optional":
+            if comptime f.ty.inner.name == "int64":
+                Optional[int64] ov = reflect.field(value, comptime f.index)
+                match ov:
+                    case Optional.Some(x):
+                        s.emit_int(x)
+                    case Optional.None:
+                        s.emit_nil()
+            elif comptime f.ty.inner.name == "uint64":
+                Optional[uint64] ov = reflect.field(value, comptime f.index)
+                match ov:
+                    case Optional.Some(x):
+                        s.emit_uint(x)
+                    case Optional.None:
+                        s.emit_nil()
+            elif comptime f.ty.inner.name == "float64":
+                Optional[float64] ov = reflect.field(value, comptime f.index)
+                match ov:
+                    case Optional.Some(x):
+                        s.emit_float(x)
+                    case Optional.None:
+                        s.emit_nil()
+            elif comptime f.ty.inner.name == "str":
+                Optional[str] ov = reflect.field(value, comptime f.index)
+                match ov:
+                    case Optional.Some(x):
+                        s.emit_str(x)
+                    case Optional.None:
+                        s.emit_nil()
+            elif comptime f.ty.inner.name == "bool":
+                Optional[bool] ov = reflect.field(value, comptime f.index)
+                match ov:
+                    case Optional.Some(x):
+                        s.emit_bool(x)
+                    case Optional.None:
+                        s.emit_nil()
+            else:
+                comptime.error(comptime f.span, "serde.serialize: unsupported optional inner kind")
         elif f.ty.kind.name == "list":
             s.begin_seq()
             for el in reflect.field(value, comptime f.index):
@@ -137,6 +179,44 @@ def deserialize[T, D: Deserializer](D d) -> T:
             reflect.set_field(out, comptime f.index, d.read_bytes(comptime f.name))
         elif f.ty.name == "uint64":
             reflect.set_field(out, comptime f.index, d.read_uint(comptime f.name))
+        elif f.ty.kind.name == "optional":
+            if comptime f.ty.inner.name == "int64":
+                if d.begin_optional(comptime f.name):
+                    Optional[int64] sv = Optional.Some(d.read_int(comptime f.name))
+                    reflect.set_field(out, comptime f.index, sv)
+                else:
+                    Optional[int64] nv = Optional.None
+                    reflect.set_field(out, comptime f.index, nv)
+            elif comptime f.ty.inner.name == "uint64":
+                if d.begin_optional(comptime f.name):
+                    Optional[uint64] sv = Optional.Some(d.read_uint(comptime f.name))
+                    reflect.set_field(out, comptime f.index, sv)
+                else:
+                    Optional[uint64] nv = Optional.None
+                    reflect.set_field(out, comptime f.index, nv)
+            elif comptime f.ty.inner.name == "float64":
+                if d.begin_optional(comptime f.name):
+                    Optional[float64] sv = Optional.Some(d.read_float(comptime f.name))
+                    reflect.set_field(out, comptime f.index, sv)
+                else:
+                    Optional[float64] nv = Optional.None
+                    reflect.set_field(out, comptime f.index, nv)
+            elif comptime f.ty.inner.name == "str":
+                if d.begin_optional(comptime f.name):
+                    Optional[str] sv = Optional.Some(d.read_str(comptime f.name))
+                    reflect.set_field(out, comptime f.index, sv)
+                else:
+                    Optional[str] nv = Optional.None
+                    reflect.set_field(out, comptime f.index, nv)
+            elif comptime f.ty.inner.name == "bool":
+                if d.begin_optional(comptime f.name):
+                    Optional[bool] sv = Optional.Some(d.read_bool(comptime f.name))
+                    reflect.set_field(out, comptime f.index, sv)
+                else:
+                    Optional[bool] nv = Optional.None
+                    reflect.set_field(out, comptime f.index, nv)
+            else:
+                comptime.error(comptime f.span, "serde.deserialize: unsupported optional inner kind")
         elif f.ty.kind.name == "list":
             if comptime f.ty.elem.name == "int64":
                 list[int64] xs = []

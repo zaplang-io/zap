@@ -3956,6 +3956,8 @@ struct Sink:
         self.toks.append(str(v))
     def emit_uint(self, uint64 v):
         self.toks.append(str(v))
+    def emit_nil(self):
+        self.toks.append(\"nil\")
     def begin_seq(self):
         self.toks.append(\"[\")
     def end_seq(self):
@@ -3996,6 +3998,8 @@ struct Src:
         auto t = self.toks[self.pos]
         self.pos = self.pos + 1
         return uint64(int(t))
+    def begin_optional(self, str field) -> bool:
+        return True
     def begin_seq(self, str field) -> int64:
         return 0
     def end_seq(self):
