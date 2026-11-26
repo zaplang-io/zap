@@ -618,3 +618,63 @@ fn switch_to_g_records_the_resuming_m_before_swapping_in() {
         "I#869: `g->run_m = m` must happen BEFORE the coroutine is swapped in"
     );
 }
+
+/// Text of the runtime fragment at manifest path `runtime/<name>`.
+fn fragment_text(path: &str) -> &'static str {
+    runtime_manifest::RUNTIME_FRAGMENTS
+        .iter()
+        .find(|f| f.path == path)
+        .unwrap_or_else(|| panic!("no RUNTIME_FRAGMENTS row for {path}"))
+        .text
+}
+
+/// Body (comments stripped) of the C function defined in runtime fragment
+/// `runtime/<frag>` whose definition starts with `sig`.
+fn frag_fn_body(frag: &str, sig: &str) -> String {
+    let src = fragment_text(frag);
+    let start = src
+        .find(sig)
+        .unwrap_or_else(|| panic!("{frag} must define `{sig}`"));
+    let end = start + src[start..].find("\n}\n").expect("function must end");
+    strip_c_comments(&src[start..end])
+}
+
+/// #1599 tripwire. `zap_strbuf_ensure` (shared by `str.expandtabs` /
+/// `str.translate` / `str.format_map`) grows a scratch buffer with `realloc`.
+/// The leaky form assigned `realloc`'s result straight back into `buf` before
+/// the `NULL` check — on a growth failure libc keeps the OLD allocation live,
+/// but the helper has overwritten its only pointer with `NULL` and then raises
+/// `MemoryError`, so a caught-and-retried caller leaks one buffer per failure.
+/// The fix captures `realloc` into a temporary and `free(buf)`s the old pointer
+/// before raising. This pins the source-level contract on every host (the leak
+/// itself is not reproducible without injected allocation faults).
+#[test]
+fn strbuf_ensure_frees_old_buffer_before_raising_1599() {
+    let body = frag_fn_body("runtime/str.inc.c", "static char *zap_strbuf_ensure(");
+    let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // The leaky pattern — assigning realloc's result directly into `buf` before
+    // the NULL check — must be gone (either cast or uncast form).
+    assert!(
+        !compact.contains("buf=realloc(buf") && !compact.contains("buf=(char*)realloc(buf"),
+        "#1599: zap_strbuf_ensure must not assign realloc() straight back into \
+         `buf` (that leaks the old buffer on a growth failure); capture it in a \
+         temporary and only assign on success:\n{body}"
+    );
+
+    // The old buffer must be released on the failure path, before the raise.
+    let free_pos = compact.find("free(buf)").unwrap_or_else(|| {
+        panic!(
+            "#1599: zap_strbuf_ensure must free the old buffer on a realloc \
+             failure before raising MemoryError:\n{body}"
+        )
+    });
+    let raise_pos = compact
+        .find("zap_panic_typed(ZAP_EXC_MEMORY_ERROR")
+        .expect("#1599: zap_strbuf_ensure raises MemoryError on allocation failure");
+    assert!(
+        free_pos < raise_pos,
+        "#1599: the old buffer must be freed BEFORE MemoryError is raised \
+         (the raise unwinds past the helper, so a later free never runs):\n{body}"
+    );
+}

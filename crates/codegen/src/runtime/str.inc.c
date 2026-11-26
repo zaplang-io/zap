@@ -1365,22 +1365,31 @@ void *zap_py_str(void *obj_) {
  * use `zap_panic_typed` with the shared ZAP_EXC_* codes. */
 
 /* Grow `buf` so it holds at least `need` bytes; returns the (possibly moved)
- * buffer. Aborts to a catchable RuntimeError on allocation failure. */
+ * buffer. Raises a catchable MemoryError on allocation failure. */
 static char *zap_strbuf_ensure(char *buf, size_t need, size_t *cap) {
     if (need > *cap) {
         while (need > *cap) {
             *cap = *cap ? *cap * 2 : 16;
         }
-        buf = (char *)realloc(buf, *cap);
-        if (!buf) {
+        /* Grow through a temporary: `realloc` returning NULL leaves the OLD
+         * allocation live, so assigning its result straight back into `buf`
+         * before the check would lose the pointer and leak it (#1599). Capture
+         * the result, and only overwrite `buf` once growth succeeds. */
+        char *grown = (char *)realloc(buf, *cap);
+        if (!grown) {
             /* A bounded/temp-buffer allocation failure is a recoverable
              * `MemoryError` (#1581, SPEC §10), not a fail-stop: the callers
              * (str.expandtabs/translate/format_map) lower through an invoke so a
-             * `try`/`except MemoryError` catches it. Distinct from the GC's own
-             * heap-exhaustion fail-stop abort (D-0119). */
+             * `try`/`except MemoryError` catches it. Free the still-live old
+             * buffer before raising — the raise unwinds past this helper, so a
+             * caller that catches and retries would otherwise leak one buffer
+             * per failure (#1599). Distinct from the GC's own heap-exhaustion
+             * fail-stop abort (D-0119). */
+            free(buf);
             const char *m = "out of memory";
             zap_panic_typed(ZAP_EXC_MEMORY_ERROR, zap_str_new(m, (int64_t)strlen(m)));
         }
+        buf = grown;
     }
     return buf;
 }
