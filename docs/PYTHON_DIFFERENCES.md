@@ -274,6 +274,18 @@ Beyond the language itself, a few standard-library functions deviate from their
 closest CPython equivalent. This section is new and deliberately partial — a
 fuller stdlib-parity triage is planned, which may move or prune smaller entries.
 
+### `str.translate` key form (#1034, D-0214; #1637)
+
+Zap's `str.translate(table)` takes a `dict[str, str]` keyed by **1-character
+strings** — `"café".translate({"é": "e"})` → `"cafe"`, an empty value deletes,
+an absent key passes through. CPython's `str.translate` takes a dict keyed by
+**codepoint ordinals** (typically built with `str.maketrans`), so the Zap form
+needs no `maketrans` step. The matching is per **codepoint** in both (#1637), and
+multibyte character keys work; only the key *type* differs (string vs ordinal).
+The rest of the codepoint-oriented `str` methods — `find`/`index`,
+`rfind`/`rindex`, `count`, `expandtabs`, char-set `strip`/`lstrip`/`rstrip` — are
+behaviorally faithful to CPython over the shared subset (epic #1638).
+
 ### `crypto.b64url_encode` / `crypto.b64url_decode` (#771, D-0133)
 
 Zap's URL-safe base64 helpers follow the **JOSE/JWT convention** (unpadded),
