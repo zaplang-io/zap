@@ -95,7 +95,12 @@ decorators    ::= { "@" decorator_name [ "(" [ arg_list ] ")" ] NEWLINE } ;
                      decisions/lang/1509-decorator-binds-object.md). Stacked
                      dotted decorators on a binding head compose bottom-up into
                      one nested call, retaining their arguments as metadata. No
-                     new grammar — a dotted decorator already parses. *)
+                     new grammar — a dotted decorator already parses.
+                     The user-extensible `@derivable(Trait)` (on a generic
+                     generator function) and `@derive(Trait, ...)` (on a struct /
+                     enum) are likewise ordinary decorator applications — no new
+                     grammar; the compile-time reflection mechanism they drive is
+                     specified in docs/COMPTIME.md (epic #1248). *)
 
 decorator_name ::= dotted_name | "range" ;
                   (* `dotted_name`, except the leading segment may be the
@@ -643,7 +648,19 @@ closed_pattern ::= "_"
                                                     above, not a value pattern. *)
                 | dotted_name "(" [ pat_arg { "," pat_arg } ] ")"
                 | "[" [ seq_pat { "," seq_pat } ] "]"
-                | "(" [ pattern { "," pattern } ] ")" ;
+                | "(" [ pattern { "," pattern } ] ")"
+                | "comptime" IDENT "in" expr [ "as" IDENT ] ;
+                  (* The comptime-generated variant arm (E3, #1374, epic #1371):
+                     `case comptime <v> in reflect.type_info(T).variants [as
+                     <payload>]:` is used inside a `@derivable` generator's
+                     `match value:` over an enum. `expr` is a comptime sequence
+                     of variants; at monomorphization this one arm expands into
+                     one ordinary variant pattern arm per variant, the body
+                     shared with `<v>` bound (comptime) to each variant and the
+                     optional `as <payload>` handle binding the payload so
+                     `reflect.field(<payload>, comptime i)` names its i-th field.
+                     Sema treats it as covering every variant (exhaustiveness);
+                     mono expands it before lowering. See docs/COMPTIME.md §3. *)
 seq_pat       ::= "*" [ IDENT ] | pattern ;
 pat_arg       ::= IDENT "=" pattern                (* by field name *)
                 | pattern ;                        (* positional, decl order; D-0046 *)
