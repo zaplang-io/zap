@@ -3387,8 +3387,42 @@ fn references_operator_iface(module: &Module) -> bool {
 /// `Optional[T]` enum is injected — just enough for an inline
 /// `d.get(k).unwrap_or(...)` to resolve and monomorphize (#497) — keeping every
 /// other program byte-for-byte unchanged.
+/// The names of the prelude's `@derivable`-registered generator functions
+/// (#1596). Empty until the prelude registers a library derive (the Json retire
+/// #1558 is the first), so `references_prelude_derivable` below is inert — and
+/// every current program stays byte-for-byte unchanged — until then.
+fn prelude_derivable_generators() -> Vec<String> {
+    prelude_items()
+        .into_iter()
+        .filter_map(|it| match it {
+            crate::ast::Item::Function(f) if f.decorators.iter().any(|d| d.name == "derivable") => {
+                Some(f.name)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Does `module` reference a prelude `@derivable` generator (#1596)? A routed
+/// `@derive(<prelude trait>)` leaves a synthesized forwarding stub that calls the
+/// generator by name (`derive_synth::expand_library_derives`, run pre-sema), so
+/// the generator's body and its `interface` must be injected from the prelude for
+/// sema and lowering — the same whole-prelude injection the needle surface uses.
+fn references_prelude_derivable(module: &Module) -> bool {
+    let gens = prelude_derivable_generators();
+    if gens.is_empty() {
+        return false;
+    }
+    let dbg = format!("{module:?}");
+    gens.iter().any(|g| dbg.contains(&format!("\"{g}\"")))
+}
+
 pub fn with_prelude(module: &Module) -> Module {
-    let full = references_prelude(module);
+    // A routed `@derive` to a prelude-registered `@derivable` (#1596) pulls in the
+    // whole prelude, exactly like the needle surface, so the generator body and
+    // its interface are present for sema/lowering. Inert while the prelude
+    // registers no derivable (the default today).
+    let full = references_prelude(module) || references_prelude_derivable(module);
     // `dict.get(key) -> Optional[V]` produces an `Optional` without the program
     // ever naming it. `references_optional_get` catches a parsed `.get(...)`
     // call (#497/#555); a `.get` that occurs only inside an f-string field is
@@ -7123,6 +7157,23 @@ mod tests {
         assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
         assert!(perrs.is_empty(), "parse errors: {perrs:?}");
         module
+    }
+
+    #[test]
+    fn prelude_registers_no_derivable_today_so_the_hook_is_inert() {
+        // #1596 is inert until the prelude registers a library derive (the Json
+        // retire #1558 is the first): the prelude has no `@derivable` generator,
+        // so `references_prelude_derivable` never fires and every current program
+        // stays byte-for-byte unchanged (no extra prelude injection).
+        assert!(
+            prelude_derivable_generators().is_empty(),
+            "no prelude @derivable exists yet; adding one activates the #1596 hook"
+        );
+        let m = parse_ok("@derive(Eq)\nstruct S:\n    int64 a\n\ndef main():\n    pass\n");
+        assert!(
+            !references_prelude_derivable(&m),
+            "with no prelude derivable, the hook must not trigger prelude injection"
+        );
     }
 
     #[test]
