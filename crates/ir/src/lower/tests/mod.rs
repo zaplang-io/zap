@@ -13,6 +13,7 @@ mod float_collection_tests;
 mod mask_tests;
 mod math_array_tests;
 mod matmul_tests;
+mod module_tree_tests;
 mod nd_array_tests;
 mod null_deref_guard_tests;
 mod null_reference_tests;
