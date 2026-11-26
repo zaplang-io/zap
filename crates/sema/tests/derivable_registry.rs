@@ -47,7 +47,11 @@ fn generator(trait_name: &str, fn_name: &str) -> String {
 
 #[test]
 fn every_builtin_derivable_still_resolves() {
-    for t in ["Eq", "Ord", "Json", "Repr", "Hash"] {
+    // `Json` is no longer a sema built-in derivable (#1558): it is the prelude
+    // library codec, routed by the driver's pre-sema `@derive(Json)` sugar, and
+    // covered end-to-end by the `json_*` goldens / zap_cli — not resolvable
+    // through raw sema here. `Csv` / `Yaml` remain built-in.
+    for t in ["Eq", "Ord", "Csv", "Yaml", "Repr", "Hash"] {
         assert_clean(&format!("@derive({t})\nstruct S:\n    int64 x\n"));
     }
 }

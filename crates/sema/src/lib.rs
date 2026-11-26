@@ -1161,7 +1161,7 @@ fn deprecated_message(decorators: &[zapc_syntax::ast::Decorator]) -> Option<Opti
 /// They are **pre-registered** in the derivable registry (#1290, E3a) so every
 /// existing `@derive(...)` program keeps compiling once resolution moves to the
 /// registry; a library `@derivable(...)` adds to the set without touching these.
-const DERIVABLE_TRAITS: &[&str] = &["Eq", "Ord", "Json", "Csv", "Yaml", "Repr", "Hash"];
+const DERIVABLE_TRAITS: &[&str] = &["Eq", "Ord", "Csv", "Yaml", "Repr", "Hash"];
 
 /// One entry in the derivable-trait registry (#1290, E3a — epic #1289 / #1248).
 /// `@derive(X)` resolves against this registry instead of a closed list, so a
@@ -2872,14 +2872,10 @@ impl Checker {
                 .entry("__repr__".into())
                 .or_insert_with(|| unary(Ty::Str));
         }
-        if derived.contains("Json") {
-            // Compile-time JSON codec (D-0059, I#100): `self.to_json() -> str`.
-            // The decode direction, `Struct.from_json(s)`, is an associated
-            // function resolved in `check_call` (keyed on `to_json` existing).
-            methods
-                .entry("to_json".into())
-                .or_insert_with(|| unary(Ty::Str));
-        }
+        // `@derive(Json)` is retired from built-in synthesis (#1558): it is sugar
+        // for the prelude library codec traits, whose forwarding stubs provide
+        // `to_json` / `from_json` like any hand-written method, so no built-in
+        // `to_json` is synthesized here.
         if derived.contains("Csv") {
             // Compile-time CSV record codec (D-0059 §4b, I#132):
             // `self.to_csv() -> str`; `Struct.from_csv(s)` is the associated
@@ -22573,12 +22569,14 @@ def main():
     }
 
     #[test]
-    fn struct_from_json_decoder_still_resolves() {
-        // Regression: the derived `Struct.from_json(s)` associated decoder (D-0059)
-        // must still resolve and is not shadowed by the general dispatch.
-        ok("@derive(Json)\nstruct Rec:\n    int64 n\n\
+    fn struct_from_csv_decoder_still_resolves() {
+        // Regression: a derived `Struct.from_<fmt>(s)` associated decoder (D-0059)
+        // must still resolve and is not shadowed by the general dispatch. Uses the
+        // still-built-in `Csv` codec; `@derive(Json)` is now the prelude library
+        // codec (#1558), covered end-to-end by the `json_*` goldens / zap_cli.
+        ok("@derive(Csv)\nstruct Rec:\n    int64 n\n    int64 m\n\
             def main():\n    \
-            auto r = Rec.from_json(\"{\\\"n\\\": 1}\")\n    \
+            auto r = Rec.from_csv(\"1,2\")\n    \
             print(r.n)\n");
     }
 
@@ -22701,16 +22699,13 @@ def main():
 
     #[test]
     fn derived_dunder_instance_methods_are_not_associated() {
-        // Regression (#1260): a `@derive`d codec/dunder (`to_json`, `to_csv`,
-        // `to_yaml`, `__hash__`, …) has a SYNTHESIZED unnamed receiver, not a
-        // real first parameter. It must stay an instance method — callable as
-        // `value.to_json()` — and NOT be misread as a receiverless associated
+        // Regression (#1260): a `@derive`d codec/dunder (`to_csv`, `to_yaml`,
+        // `__hash__`, …) has a SYNTHESIZED unnamed receiver, not a real first
+        // parameter. It must stay an instance method — callable as
+        // `value.to_csv()` — and NOT be misread as a receiverless associated
         // function (which would wrongly reject the call with ZAP4085).
-        ok("@derive(Json)\nstruct Rec:\n    int64 n\n\
-            def main():\n    \
-            auto r = Rec(1)\n    \
-            str j = r.to_json()\n    \
-            print(j)\n");
+        // (`@derive(Json)` is now the prelude library codec, #1558; its
+        // instance-method shape is covered end-to-end by the `json_*` goldens.)
         ok("@derive(Csv)\nstruct Row:\n    int64 a\n    int64 b\n\
             def main():\n    \
             auto r = Row(1, 2)\n    \
@@ -22727,13 +22722,13 @@ def main():
             auto key = Key(5)\n    \
             int64 h = key.__hash__()\n    \
             print(h)\n");
-        // And the derived decoder `from_json` associated function still resolves
-        // alongside the instance `to_json` on the same type.
-        ok("@derive(Json)\nstruct Both:\n    int64 n\n\
+        // And a derived decoder associated function still resolves alongside the
+        // instance encoder on the same type (here the still-built-in `Csv`).
+        ok("@derive(Csv)\nstruct Both:\n    int64 n\n    int64 m\n\
             def main():\n    \
-            auto a = Both(1)\n    \
-            str j = a.to_json()\n    \
-            auto b = Both.from_json(j)\n    \
+            auto a = Both(1, 2)\n    \
+            str j = a.to_csv()\n    \
+            auto b = Both.from_csv(j)\n    \
             print(b.n)\n");
     }
 

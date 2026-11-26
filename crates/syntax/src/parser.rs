@@ -3040,6 +3040,25 @@ pub fn prelude_items() -> Vec<crate::ast::Item> {
     module.items
 }
 
+/// The library `@derive(Json)` codec (#1558): `JsonEncode` / `JsonDecode`
+/// interfaces + their `@derivable` generators + element/DOM helpers. Kept in a
+/// separate, un-escaped `.zap` source (the generators are string-literal heavy)
+/// and injected only when a module routes a `@derive(Json)`
+/// (`references_prelude_derivable`), so a program that does not derive Json is
+/// byte-for-byte unchanged.
+pub const JSON_DERIVE_SRC: &str = include_str!("json_derive.zap");
+
+/// Parse the library `@derive(Json)` codec source ([`JSON_DERIVE_SRC`]) into AST
+/// items. Must parse cleanly, like the other prelude sources.
+pub fn json_derive_items() -> Vec<crate::ast::Item> {
+    let (module, perrs, lerrs) = parse_str(JSON_DERIVE_SRC);
+    debug_assert!(
+        perrs.is_empty() && lerrs.is_empty(),
+        "built-in json-derive prelude must parse cleanly: {perrs:?} {lerrs:?}"
+    );
+    module.items
+}
+
 /// Parse the always-available operator-capability interfaces
 /// ([`OPERATOR_PRELUDE_SRC`], #1199). Like [`prelude_items`] this must parse
 /// cleanly; [`with_prelude`] prepends them to every module (they add no struct
@@ -3394,6 +3413,7 @@ fn references_operator_iface(module: &Module) -> bool {
 fn prelude_derivable_generators() -> Vec<String> {
     prelude_items()
         .into_iter()
+        .chain(json_derive_items())
         .filter_map(|it| match it {
             crate::ast::Item::Function(f) if f.decorators.iter().any(|d| d.name == "derivable") => {
                 Some(f.name)
@@ -3422,7 +3442,8 @@ pub fn with_prelude(module: &Module) -> Module {
     // whole prelude, exactly like the needle surface, so the generator body and
     // its interface are present for sema/lowering. Inert while the prelude
     // registers no derivable (the default today).
-    let full = references_prelude(module) || references_prelude_derivable(module);
+    let wants_json_derive = references_prelude_derivable(module);
+    let full = references_prelude(module) || wants_json_derive;
     // `dict.get(key) -> Optional[V]` produces an `Optional` without the program
     // ever naming it. `references_optional_get` catches a parsed `.get(...)`
     // call (#497/#555); a `.get` that occurs only inside an f-string field is
@@ -3495,6 +3516,20 @@ pub fn with_prelude(module: &Module) -> Module {
             None => !item_mentions_any(it, &shadowed),
         }
     }));
+    // The library `@derive(Json)` codec (#1558) is injected only when a module
+    // routes a `@derive(Json)` (its synthesized stubs reference the generators),
+    // so a non-Json program never pays for it. A user type of the same name as
+    // one of its interfaces still shadows it, like the rest of the prelude.
+    if wants_json_derive {
+        items.extend(
+            json_derive_items()
+                .into_iter()
+                .filter(|it| match item_type_name(it) {
+                    Some(n) => !user_names.contains(n),
+                    None => true,
+                }),
+        );
+    }
     items.extend(module.items.iter().cloned());
     Module {
         items,
@@ -7160,19 +7195,23 @@ mod tests {
     }
 
     #[test]
-    fn prelude_registers_no_derivable_today_so_the_hook_is_inert() {
-        // #1596 is inert until the prelude registers a library derive (the Json
-        // retire #1558 is the first): the prelude has no `@derivable` generator,
-        // so `references_prelude_derivable` never fires and every current program
-        // stays byte-for-byte unchanged (no extra prelude injection).
+    fn prelude_derivable_hook_is_gated_to_json_deriving_programs() {
+        // The prelude registers the Json codec's `@derivable` generators (#1558,
+        // via `json_derive.zap`), so `prelude_derivable_generators()` is now
+        // non-empty — but the #1596 hook still only fires for a program that
+        // routes one of them. A program that does not derive Json (no reference to
+        // a generator) leaves `references_prelude_derivable` false, so it gets no
+        // extra prelude injection and stays byte-for-byte unchanged.
+        let gens = prelude_derivable_generators();
         assert!(
-            prelude_derivable_generators().is_empty(),
-            "no prelude @derivable exists yet; adding one activates the #1596 hook"
+            gens.iter().any(|g| g == "__derive_json_to")
+                && gens.iter().any(|g| g == "__derive_json_from"),
+            "the prelude Json codec generators must be registered: {gens:?}"
         );
         let m = parse_ok("@derive(Eq)\nstruct S:\n    int64 a\n\ndef main():\n    pass\n");
         assert!(
             !references_prelude_derivable(&m),
-            "with no prelude derivable, the hook must not trigger prelude injection"
+            "a non-Json-deriving program must not trigger the prelude derivable injection"
         );
     }
 
