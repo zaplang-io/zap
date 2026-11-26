@@ -559,16 +559,23 @@ struct TyBound {
     args: Vec<Ty>,
 }
 
-/// A generic free function's call-site surface (#1545): its type-parameter
-/// names and its *un-erased* parameter types (type parameters preserved as
-/// `Ty::Named(param)`), used to bind each type parameter from a call's arguments
-/// and enforce consistency across every argument that mentions it.
+/// A generic function's or method's call-site surface (#1545/#1622/#1623): its
+/// type-parameter names and its *un-erased* parameter and return types (type
+/// parameters preserved as `Ty::Named(param)`), used to bind each type parameter
+/// from a call's arguments, enforce consistency across every argument that
+/// mentions it, and substitute the binding back into the return type.
 struct GenericFnInfo {
     /// The declared type-parameter names, e.g. `["T"]` for `def f[T](...)`.
     generics: Vec<String>,
     /// `(parameter name, un-erased parameter type)` in declaration order, so a
-    /// positional argument maps by index and a keyword argument maps by name.
+    /// positional argument maps by index and a keyword argument maps by name. For
+    /// a method the implicit `self` receiver is dropped, so the indices still line
+    /// up with the call's arguments.
     params: Vec<(String, Ty)>,
+    /// The *un-erased* declared return type (#1623), so a bound type parameter can
+    /// be substituted back into the call's result type instead of the erased
+    /// `Unknown` the stored `FnSig` carries.
+    ret: Ty,
 }
 
 struct Checker {
@@ -3326,8 +3333,19 @@ impl Checker {
                                 (p.name.clone(), ty)
                             })
                             .collect();
-                        self.generic_fns
-                            .insert(f.name.clone(), GenericFnInfo { generics, params });
+                        let ret = f
+                            .ret
+                            .as_ref()
+                            .map(|t| self.resolve_type_scoped(t, "", &generics))
+                            .unwrap_or(Ty::Unit);
+                        self.generic_fns.insert(
+                            f.name.clone(),
+                            GenericFnInfo {
+                                generics,
+                                params,
+                                ret,
+                            },
+                        );
                     }
                     // `@deprecated` on a free function (I#472, D-0109): record
                     // the optional message so every call site warns (ZAP5124).
@@ -3348,12 +3366,57 @@ impl Checker {
                             self.deprecated
                                 .insert(format!("{}.{}", s.name, m.name), msg);
                         }
+                        self.record_generic_method(&s.name, m);
+                    }
+                }
+                Item::Enum(e) => {
+                    for m in &e.methods {
+                        self.record_generic_method(&e.name, m);
                     }
                 }
                 _ => {}
             }
         }
         self.register_generators(module);
+    }
+
+    /// Record a generic method's call-site surface (#1622) keyed `"Type.method"`,
+    /// mirroring the free-function path. The implicit `self` receiver is dropped
+    /// so a call's positional arguments map to the stored parameters by index (a
+    /// method call supplies no argument for `self`); the remaining parameter types
+    /// keep their type variables un-erased (`resolve_type_scoped`, with the type
+    /// name in scope for `Self`) so a `Type[T]`/`T` pairing binds and checks. A
+    /// non-generic method is not recorded.
+    fn record_generic_method(&mut self, type_name: &str, m: &Function) {
+        if m.generics.is_empty() {
+            return;
+        }
+        let generics: Vec<String> = m.generics.iter().map(|g| g.name.clone()).collect();
+        let params = m
+            .params
+            .iter()
+            .filter(|p| p.name != "self")
+            .map(|p| {
+                let ty =
+                    p.ty.as_ref()
+                        .map(|t| self.resolve_type_scoped(t, type_name, &generics))
+                        .unwrap_or(Ty::Unknown);
+                (p.name.clone(), ty)
+            })
+            .collect();
+        let ret = m
+            .ret
+            .as_ref()
+            .map(|t| self.resolve_type_scoped(t, type_name, &generics))
+            .unwrap_or(Ty::Unit);
+        self.generic_fns.insert(
+            format!("{type_name}.{}", m.name),
+            GenericFnInfo {
+                generics,
+                params,
+                ret,
+            },
+        );
     }
 
     /// Register the compiler-synthesized iterator type for every generator
@@ -11111,8 +11174,29 @@ impl Checker {
                 if let Ty::Named(owner) = &bt {
                     self.warn_deprecated_call(&format!("{owner}.{name}"), *span);
                 }
+                // Generic type-parameter consistency for a generic method (#1622).
+                // Instance-method arguments are otherwise inferred loosely (no
+                // per-argument type check), so this collects the argument types and
+                // enforces only that a type parameter bound by one argument is
+                // respected by the others — keyed `"Type.method"`, with `self`
+                // dropped from the stored parameters so the indices line up. The
+                // method's return type stays loose (`sig.ret`) to preserve the
+                // method-chain operator typing this path relies on.
+                let mut positional_tys: Vec<(Ty, Span)> = Vec::new();
+                let mut keyword_tys: Vec<(String, Ty, Span)> = Vec::new();
                 for a in args {
-                    self.infer(&a.value);
+                    let at = self.infer(&a.value);
+                    match &a.name {
+                        Some(n) => keyword_tys.push((n.clone(), at, expr_span(&a.value))),
+                        None => positional_tys.push((at, expr_span(&a.value))),
+                    }
+                }
+                if let Ty::Named(owner) = &bt {
+                    self.check_generic_arg_consistency(
+                        &format!("{owner}.{name}"),
+                        &positional_tys,
+                        &keyword_tys,
+                    );
                 }
                 return sig.ret.clone();
             }
@@ -12843,9 +12927,12 @@ impl Checker {
             self.check_keyword_arg(sig, fname, &name, &at, expr_span(&a.value));
         }
 
-        self.check_generic_arg_consistency(fname, &positional_tys, &keyword_tys);
-
-        sig.ret.clone()
+        // Generic consistency (#1545) + return-type binding (#1623): when the
+        // callee is generic, the bound type parameters substitute into the result
+        // type (`option(int64, default=1)` yields `int64`, not `Unknown`); a
+        // non-generic call keeps the erased `sig.ret`.
+        self.check_generic_arg_consistency(fname, &positional_tys, &keyword_tys)
+            .unwrap_or_else(|| sig.ret.clone())
     }
 
     /// Enforce generic type-parameter consistency across a call's arguments
@@ -12870,18 +12957,23 @@ impl Checker {
     /// The pass is purely additive: an `Unknown`/`py` argument is a wildcard that
     /// never binds or conflicts, and a non-generic call never reaches it, so no
     /// previously-accepted *consistent* program changes behaviour.
+    ///
+    /// Returns the call's **result type** with the bound type parameters
+    /// substituted into the generic return type (#1623) — `Some(ret)` when the
+    /// callee is generic, `None` otherwise (the caller keeps the erased
+    /// `sig.ret`). A type parameter the arguments did not bind is substituted to
+    /// `Unknown`, so an un-inferable generic return stays permissive.
     fn check_generic_arg_consistency(
         &mut self,
         fname: &str,
         positional_tys: &[(Ty, Span)],
         keyword_tys: &[(String, Ty, Span)],
-    ) {
-        let Some(info) = self.generic_fns.get(fname) else {
-            return;
-        };
+    ) -> Option<Ty> {
+        let info = self.generic_fns.get(fname)?;
         // Clone the small generic surface so `self` is free for `self.error`.
         let generics = info.generics.clone();
         let params = info.params.clone();
+        let ret = info.ret.clone();
 
         // Build `(param type, arg type, span, display index)` pairs in parameter-
         // declaration order, so the verdict does not depend on how the call lists
@@ -12956,6 +13048,17 @@ impl Checker {
                 }
             }
         }
+
+        // #1623: substitute the binding back into the return type. Every type
+        // parameter is replaced — a bound one by its inferred type, an unbound one
+        // by `Unknown` — so `option(int64, default=1) -> T` yields `int64` while an
+        // un-inferable generic return stays permissive.
+        let unknown = Ty::Unknown;
+        let full: HashMap<&str, &Ty> = generics
+            .iter()
+            .map(|g| (g.as_str(), subst.get(g).unwrap_or(&unknown)))
+            .collect();
+        Some(subst_ty(&ret, &full))
     }
 
     /// Type-check a call that carries `*`/`**` spread arguments (#597). The
