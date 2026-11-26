@@ -3619,3 +3619,164 @@ def main():
         "backend methods are called directly through the [S: Serializer] bound: {stdout}"
     );
 }
+
+#[test]
+fn a_binary_codec_is_a_pure_serde_backend_with_no_compiler_change() {
+    // E6.2 (#1563): a REAL format backend validates the serde visitor model
+    // (#1562) end-to-end. A compact self-describing TLV binary codec is
+    // implemented purely as a `Serializer` / `Deserializer` backend and driven by
+    // the SAME generic `serialize` / `deserialize` free functions — no compiler
+    // change, no per-codec special-casing (the #1248 thesis). Byte-exact + round-
+    // trip agreement is pinned by the golden `serde_binary_backend` under the CI
+    // LLVM matrix; here we assert the lowering specializes the generic drivers per
+    // (type, backend) and calls the backend methods directly (monomorphized).
+    let src = "\
+interface Serializer:
+    def begin_struct(self)
+    def field_name(self, str name)
+    def emit_int(self, int64 v)
+    def emit_str(self, str v)
+    def emit_bool(self, bool v)
+    def end_struct(self)
+
+interface Deserializer:
+    def begin_struct(self)
+    def read_int(self, str field) -> int64
+    def read_str(self, str field) -> str
+    def read_bool(self, str field) -> bool
+    def end_struct(self)
+
+def serialize[T, S: Serializer](T value, S s):
+    s.begin_struct()
+    comptime for f in reflect.type_info(T).fields:
+        s.field_name(comptime f.name)
+        if f.ty.name == \"int64\":
+            s.emit_int(reflect.field(value, comptime f.index))
+        elif f.ty.name == \"str\":
+            s.emit_str(reflect.field(value, comptime f.index))
+        elif f.ty.name == \"bool\":
+            s.emit_bool(reflect.field(value, comptime f.index))
+        elif f.ty.kind.name == \"struct\":
+            serialize(reflect.field(value, comptime f.index), s)
+        else:
+            comptime.error(f.span, \"serialize: unsupported field kind\")
+    s.end_struct()
+
+def deserialize[T, D: Deserializer](D d) -> T:
+    auto out = reflect.construct(T)
+    d.begin_struct()
+    comptime for f in reflect.type_info(T).fields:
+        if f.ty.name == \"int64\":
+            reflect.set_field(out, comptime f.index, d.read_int(comptime f.name))
+        elif f.ty.name == \"str\":
+            reflect.set_field(out, comptime f.index, d.read_str(comptime f.name))
+        elif f.ty.name == \"bool\":
+            reflect.set_field(out, comptime f.index, d.read_bool(comptime f.name))
+        else:
+            comptime.error(f.span, \"deserialize: unsupported field kind\")
+    d.end_struct()
+    return out
+
+struct BinWriter:
+    list[int64] buf = []
+    def begin_struct(self):
+        self.buf.append(16)
+    def field_name(self, str name):
+        pass
+    def emit_int(self, int64 v):
+        self.buf.append(1)
+        for k in range(8):
+            auto shift = (7 - k) * 8
+            self.buf.append((v >> shift) & 255)
+    def emit_str(self, str v):
+        self.buf.append(2)
+        auto sb = bytes(v)
+        self.buf.append(len(sb))
+        for i in range(len(sb)):
+            self.buf.append(sb[i])
+    def emit_bool(self, bool v):
+        self.buf.append(3)
+        if v:
+            self.buf.append(1)
+        else:
+            self.buf.append(0)
+    def end_struct(self):
+        self.buf.append(17)
+    def done(self) -> bytes:
+        return bytes(self.buf)
+
+struct BinReader:
+    bytes data = bytes([])
+    int64 pos = 0
+    def _byte(self) -> int64:
+        auto b = self.data[self.pos]
+        self.pos = self.pos + 1
+        return b
+    def begin_struct(self):
+        auto _t = self._byte()
+    def read_int(self, str field) -> int64:
+        auto _t = self._byte()
+        int64 v = 0
+        for k in range(8):
+            v = (v << 8) | self._byte()
+        return v
+    def read_str(self, str field) -> str:
+        auto _t = self._byte()
+        auto n = self._byte()
+        list[int64] raw = []
+        for i in range(n):
+            raw.append(self._byte())
+        return str(bytes(raw))
+    def read_bool(self, str field) -> bool:
+        auto _t = self._byte()
+        auto b = self._byte()
+        return b == 1
+    def end_struct(self):
+        auto _t = self._byte()
+
+struct Point:
+    int64 x
+    str label
+    bool active
+
+struct Outer:
+    int64 id
+    Point p
+
+def main():
+    auto p = Point(3, \"hi\", True)
+    auto w = BinWriter()
+    serialize(p, w)
+    auto wire = w.done()
+    auto p2 = deserialize[Point, BinReader](BinReader(wire, 0))
+    print(p2.x == 3 and p2.label == \"hi\" and p2.active == True)
+    auto o = Outer(7, Point(1, \"q\", False))
+    auto wo = BinWriter()
+    serialize(o, wo)
+    print(len(wo.done()))
+";
+    let f = write_zap("e6-serde-binary", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the binary serde backend must lower; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The generic drivers specialize per (type, backend) — a real codec is a pure
+    // library over the serde core, no compiler edit.
+    assert!(
+        stdout.contains("@serialize$Point$BinWriter")
+            && stdout.contains("@serialize$Outer$BinWriter"),
+        "serialize specializes at the binary backend (incl. the nested field type): {stdout}"
+    );
+    assert!(
+        stdout.contains("@deserialize$Point$BinReader"),
+        "deserialize specializes at the binary backend: {stdout}"
+    );
+    // Backend methods are direct static calls — monomorphized, unboxed.
+    assert!(
+        stdout.contains("@BinWriter__emit_int") && stdout.contains("@BinReader__read_int"),
+        "binary backend methods are called directly through the bound: {stdout}"
+    );
+}
