@@ -52,10 +52,15 @@ Surfaces fixed in this first cut (PR1) and their exception types:
 | `print(py_obj)` whose Python `__str__` raises / returns non-str | existing (translated) exception (added the unwind edge) |
 | dict/set op with a **function-key** (`Elem::Struct`/`VarTuple`) key whose hash/eq may raise (e.g. a float leaf, NaN) | existing `ValueError`/user exception (added the unwind edge) |
 
-Numeric `array[T]` N-D indexing and slicing bounds are the **sequenced
-follow-up** (PR2): the `zap_array_bounds` / `zap_array_ckidx` /
-`zap_array_index_axis` / `zap_array_slice_axis` runtime guards and their
-duplicated `lower.rs`/`arrays.rs` lowering sites.
+Numeric `array[T]` N-D indexing and slicing bounds were the **sequenced
+follow-up** and are now also catchable (PR2): the `zap_array_bounds` /
+`zap_array_ckidx` / `zap_array_index_axis` / `zap_array_dim` runtime guards
+raise `IndexError` and `zap_array_slice_axis`'s zero-step raises `ValueError`,
+with the `lower.rs` subscript/slice/partial-view/augmented-assign sites carrying
+the unwind edge (the contiguous 1-D `zap_array_slice` clamps and does not raise;
+`array_ckidx` and `array_fold_rows` are the per-axis / partial-view chokepoints).
+The orphaned `crates/ir/src/lower/arrays.rs` (not declared as a module anywhere,
+so never compiled) is left untouched.
 
 ## Rationale
 

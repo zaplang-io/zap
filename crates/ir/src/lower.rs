@@ -12547,11 +12547,10 @@ impl<'a> FnLower<'a> {
         for &i in idxs {
             rank -= 1;
             let v = self.new_value(Ty::Array(d, rank));
-            self.emit(Inst::Call {
-                dest: Some(v),
-                func: "zap_array_row".to_string(),
-                args: vec![cur, i],
-            });
+            // A partial index `m[i]` is a rank-reduced view via
+            // `zap_array_index_axis`, which raises a catchable `IndexError` when
+            // `i` is out of range (#1566) — carry the unwind edge.
+            self.throwing_call(Some(v), "zap_array_row", vec![cur, i]);
             cur = v;
         }
         cur
@@ -12566,11 +12565,9 @@ impl<'a> FnLower<'a> {
     fn array_ckidx(&mut self, arr: Value, axis: usize, i: Value) -> Value {
         let ax = self.iconst(Ty::I64, axis as i64);
         let v = self.new_value(Ty::I64);
-        self.emit(Inst::Call {
-            dest: Some(v),
-            func: "zap_array_ckidx".to_string(),
-            args: vec![arr, ax, i],
-        });
+        // An out-of-range axis index raises a catchable `IndexError` (#1566), so
+        // it carries an unwind edge to a `try` in the calling frame.
+        self.throwing_call(Some(v), "zap_array_ckidx", vec![arr, ax, i]);
         v
     }
 
@@ -12695,11 +12692,12 @@ impl<'a> FnLower<'a> {
         }
         let flat = self.array_full_flat_index(rv, ndim, &idxs);
         let dest = self.new_value(d.ty());
-        self.emit(Inst::Call {
-            dest: Some(dest),
-            func: format!("zap_array_get_{}", d.suffix()),
-            args: vec![rv, flat],
-        });
+        // Out-of-range flat index raises a catchable `IndexError` (#1566).
+        self.throwing_call(
+            Some(dest),
+            &format!("zap_array_get_{}", d.suffix()),
+            vec![rv, flat],
+        );
         Ok(Some((dest, d.ty())))
     }
 
@@ -12736,11 +12734,12 @@ impl<'a> FnLower<'a> {
             let i = self.coerce_index(iv, it);
             if ndim == 1 {
                 let dest = self.new_value(d.ty());
-                self.emit(Inst::Call {
-                    dest: Some(dest),
-                    func: format!("zap_array_get_{}", d.suffix()),
-                    args: vec![arr, i],
-                });
+                // 1-D `a[i]`: out-of-range raises a catchable `IndexError` (#1566).
+                self.throwing_call(
+                    Some(dest),
+                    &format!("zap_array_get_{}", d.suffix()),
+                    vec![arr, i],
+                );
                 return Ok((dest, d.ty()));
             }
             let view = self.array_fold_rows(arr, d, ndim, &[i]);
@@ -12819,11 +12818,12 @@ impl<'a> FnLower<'a> {
                     IdxPart::Slice { lo, hi, step } => {
                         let axis = self.iconst(Ty::I64, cur_axis);
                         let v = self.new_value(Ty::Array(d, rank));
-                        self.emit(Inst::Call {
-                            dest: Some(v),
-                            func: "zap_array_slice_axis".to_string(),
-                            args: vec![cur, axis, lo.0, hi.0, step.0, lo.1, hi.1, step.1],
-                        });
+                        // A zero step raises a catchable `ValueError` (#1566).
+                        self.throwing_call(
+                            Some(v),
+                            "zap_array_slice_axis",
+                            vec![cur, axis, lo.0, hi.0, step.0, lo.1, hi.1, step.1],
+                        );
                         cur = v;
                         cur_axis += 1;
                     }
@@ -12833,11 +12833,8 @@ impl<'a> FnLower<'a> {
                         rank -= 1;
                         let out = Ty::Array(d, rank);
                         let nv = self.new_value(out);
-                        self.emit(Inst::Call {
-                            dest: Some(nv),
-                            func: "zap_array_index_axis".to_string(),
-                            args: vec![cur, axis, i],
-                        });
+                        // Out-of-range axis index raises a catchable `IndexError` (#1566).
+                        self.throwing_call(Some(nv), "zap_array_index_axis", vec![cur, axis, i]);
                         cur = nv;
                     }
                     IdxPart::Adv(..) => unreachable!("has_adv is false here"),
@@ -12865,11 +12862,12 @@ impl<'a> FnLower<'a> {
                 self.array_full_flat_index(arr, ndim, &idxs)
             };
             let dest = self.new_value(d.ty());
-            self.emit(Inst::Call {
-                dest: Some(dest),
-                func: format!("zap_array_get_{}", d.suffix()),
-                args: vec![arr, flat],
-            });
+            // Out-of-range flat index raises a catchable `IndexError` (#1566).
+            self.throwing_call(
+                Some(dest),
+                &format!("zap_array_get_{}", d.suffix()),
+                vec![arr, flat],
+            );
             Ok((dest, d.ty()))
         } else {
             let view = self.array_fold_rows(arr, d, ndim, &idxs);
@@ -17625,17 +17623,18 @@ impl<'a> FnLower<'a> {
                     });
                     return Ok((d, out));
                 }
-                // Strided / N-D axis-0 slice: keeps the rank (#502).
+                // Strided / N-D axis-0 slice: keeps the rank (#502). A zero step
+                // raises a catchable `ValueError` (#1566).
                 let axis = self.iconst(Ty::I64, 0);
                 let (lo_v, has_lo) = self.array_slice_bound(lo)?;
                 let (hi_v, has_hi) = self.array_slice_bound(hi)?;
                 let (st_v, has_st) = self.array_slice_bound(step)?;
                 let d = self.new_value(out);
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: "zap_array_slice_axis".to_string(),
-                    args: vec![bv, axis, lo_v, hi_v, st_v, has_lo, has_hi, has_st],
-                });
+                self.throwing_call(
+                    Some(d),
+                    "zap_array_slice_axis",
+                    vec![bv, axis, lo_v, hi_v, st_v, has_lo, has_hi, has_st],
+                );
                 Ok((d, out))
             }
             Ty::Ptr => self.emit_seq_slice(bv, "zap_str_slice", Ty::Ptr, lo, hi, step),
@@ -17828,11 +17827,12 @@ impl<'a> FnLower<'a> {
                         return Err(err("array element assignment requires a numeric scalar"));
                     }
                     let v = self.coerce(v, vt, d.ty());
-                    self.emit(Inst::Call {
-                        dest: None,
-                        func: format!("zap_array_set_{}", d.suffix()),
-                        args: vec![bv, i, v],
-                    });
+                    // 1-D `a[i] = v`: out-of-range raises a catchable `IndexError` (#1566).
+                    self.throwing_call(
+                        None,
+                        &format!("zap_array_set_{}", d.suffix()),
+                        vec![bv, i, v],
+                    );
                     return Ok(());
                 }
                 let (view, last) = self.array_scalar_slot(bv, ndim, index)?;
@@ -17841,11 +17841,12 @@ impl<'a> FnLower<'a> {
                     return Err(err("array element assignment requires a numeric scalar"));
                 }
                 let v = self.coerce(v, vt, d.ty());
-                self.emit(Inst::Call {
-                    dest: None,
-                    func: format!("zap_array_set_{}", d.suffix()),
-                    args: vec![view, last, v],
-                });
+                // Out-of-range raises a catchable `IndexError` (#1566).
+                self.throwing_call(
+                    None,
+                    &format!("zap_array_set_{}", d.suffix()),
+                    vec![view, last, v],
+                );
                 Ok(())
             }
             Ty::Struct(sid) => {
@@ -17965,22 +17966,16 @@ impl<'a> FnLower<'a> {
                 // slot, then read-modified-written through that rank-1 view.
                 let (view, last) = self.array_scalar_slot(bv, ndim, index)?;
                 let cur = self.new_value(d.ty());
-                self.emit(Inst::Call {
-                    dest: Some(cur),
-                    func: format!("zap_array_get_{}", d.suffix()),
-                    args: vec![view, last],
-                });
+                // `a[i] OP= v`: an out-of-range slot raises a catchable
+                // `IndexError` on either the read or the write (#1566).
+                self.throwing_call(Some(cur), &format!("zap_array_get_{}", d.suffix()), vec![view, last]);
                 let (rhs, rt) = self.expr(value)?;
                 let (res, rty) = self.aug_combine(op, cur, d.ty(), rhs, rt)?;
                 if rty.int_width().is_none() && !rty.is_float() {
                     return Err(err("array element assignment requires a numeric scalar"));
                 }
                 let res = self.coerce(res, rty, d.ty());
-                self.emit(Inst::Call {
-                    dest: None,
-                    func: format!("zap_array_set_{}", d.suffix()),
-                    args: vec![view, last, res],
-                });
+                self.throwing_call(None, &format!("zap_array_set_{}", d.suffix()), vec![view, last, res]);
                 Ok(())
             }
             _ => Err(err(
@@ -18185,11 +18180,12 @@ impl<'a> FnLower<'a> {
                     return Err(err("array element assignment requires a numeric scalar"));
                 }
                 let v = self.coerce(v, vt, d.ty());
-                self.emit(Inst::Call {
-                    dest: None,
-                    func: format!("zap_array_set_{}", d.suffix()),
-                    args: vec![view, last, v],
-                });
+                // Out-of-range raises a catchable `IndexError` (#1566).
+                self.throwing_call(
+                    None,
+                    &format!("zap_array_set_{}", d.suffix()),
+                    vec![view, last, v],
+                );
                 Ok(())
             }
             Ty::Struct(sid) => {

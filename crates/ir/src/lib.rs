@@ -2281,6 +2281,77 @@ mod tests {
     }
 
     #[test]
+    fn lower_array_faults_catchable_1566() {
+        // #1566 PR2: numeric array[T] N-D indexing/slicing bounds are catchable.
+        // 1-D element read `a[i]` -> zap_array_get_* out-of-range IndexError.
+        assert_try_invoke(
+            "def main():\n    \
+                 auto a = array[int64]([1, 2, 3])\n    \
+                 int64 i = 9\n    \
+                 try:\n        \
+                     auto v = a[i]\n    \
+                 except IndexError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_array_get_i64",
+        );
+        // 1-D element write `a[i] = v`.
+        assert_try_invoke(
+            "def main():\n    \
+                 auto a = array[int64]([1, 2, 3])\n    \
+                 int64 i = 9\n    \
+                 try:\n        \
+                     a[i] = 7\n    \
+                 except IndexError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_array_set_i64",
+        );
+        // Full N-D integer index `m[i, j]` -> per-axis check (zap_array_ckidx).
+        assert_try_invoke(
+            "def main():\n    \
+                 auto m = array[int64]([[1, 2], [3, 4]])\n    \
+                 int64 j = 2\n    \
+                 try:\n        \
+                     auto v = m[0, j]\n    \
+                 except IndexError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_array_ckidx",
+        );
+        // Partial index `m[i]` -> rank-reduced view via zap_array_row/index_axis.
+        assert_try_invoke(
+            "def main():\n    \
+                 auto m = array[int64]([[1, 2], [3, 4]])\n    \
+                 int64 i = 5\n    \
+                 try:\n        \
+                     auto row = m[i]\n    \
+                 except IndexError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_array_row",
+        );
+        // Mixed slice+int `m[:, j]` -> zap_array_index_axis on the integer axis.
+        assert_try_invoke(
+            "def main():\n    \
+                 auto m = array[int64]([[1, 2], [3, 4]])\n    \
+                 int64 j = 5\n    \
+                 try:\n        \
+                     auto col = m[:, j]\n    \
+                 except IndexError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_array_index_axis",
+        );
+        // Zero-step slice `a[::st]` -> zap_array_slice_axis ValueError.
+        assert_try_invoke(
+            "def main():\n    \
+                 auto a = array[int64]([1, 2, 3])\n    \
+                 int64 st = 0\n    \
+                 try:\n        \
+                     auto s = a[::st]\n    \
+                 except ValueError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_array_slice_axis",
+        );
+    }
+
+    #[test]
     fn lower_divide_by_zero_catchable() {
         // EXC-3: integer `//` and `%` inside a `try` lower to an `invoke` of the
         // runtime helper (which raises via `zap_panic` on a zero divisor), so the
@@ -2416,10 +2487,12 @@ mod tests {
         let m = lower_ok(include_str!("../../../tests/golden/array_int.zap"));
         let text = format!("{m}");
         assert!(text.contains("call @zap_array_new"), "text:\n{text}");
-        assert!(text.contains("call @zap_array_set_i64"), "text:\n{text}");
+        // element get/set are catchable (#1566): `invoke` in `main`'s implicit
+        // top-level handler, so match either prefix.
+        assert!(text.contains("@zap_array_set_i64"), "text:\n{text}");
         assert!(text.contains("call @zap_array_sum_i64"), "text:\n{text}");
         assert!(text.contains("call @zap_array_len"), "text:\n{text}");
-        assert!(text.contains("call @zap_array_get_i64"), "text:\n{text}");
+        assert!(text.contains("@zap_array_get_i64"), "text:\n{text}");
         assert!(text.contains("array.Add.i64"), "text:\n{text}");
         assert!(text.contains("array.Mul.i64"), "text:\n{text}");
         assert!(text.contains("array.Sub.i64"), "text:\n{text}");
@@ -2447,9 +2520,10 @@ mod tests {
         // scalar keeps the dtype (`a * 2` stays u8).
         let m = lower_ok(include_str!("../../../tests/golden/array_uint8.zap"));
         let text = format!("{m}");
-        assert!(text.contains("call @zap_array_set_u8"), "text:\n{text}");
+        // element get/set are catchable (#1566): `invoke` in `main`, so match either.
+        assert!(text.contains("@zap_array_set_u8"), "text:\n{text}");
         assert!(text.contains("call @zap_array_sum_u8"), "text:\n{text}");
-        assert!(text.contains("call @zap_array_get_u8"), "text:\n{text}");
+        assert!(text.contains("@zap_array_get_u8"), "text:\n{text}");
         assert!(text.contains("array.Add.u8"), "text:\n{text}");
         assert!(text.contains("array.Mul.u8"), "text:\n{text}");
 
@@ -2457,7 +2531,8 @@ mod tests {
         // -> uint8 (so `m + n` / `m * n` are u8 results).
         let m = lower_ok(include_str!("../../../tests/golden/array_bool.zap"));
         let text = format!("{m}");
-        assert!(text.contains("call @zap_array_set_bool"), "text:\n{text}");
+        // element set is catchable (#1566): `invoke` in `main`, so match either.
+        assert!(text.contains("@zap_array_set_bool"), "text:\n{text}");
         assert!(text.contains("call @zap_array_sum_bool"), "text:\n{text}");
         assert!(text.contains("array.Add.u8 %"), "text:\n{text}");
         assert!(text.contains(":bool, %"), "text:\n{text}");
