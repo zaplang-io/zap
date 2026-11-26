@@ -9044,11 +9044,10 @@ impl<'a> FnLower<'a> {
                     _ => return Err(err("sorted() expects a list or bytes value")),
                 };
                 let (keys, kind, reverse) = self.prepare_sort(copy, elem, "sorted", &rest)?;
-                self.emit(Inst::Call {
-                    dest: None,
-                    func: "zap_list_sort_by".to_string(),
-                    args: vec![copy, keys, kind, reverse],
-                });
+                // A scratch-allocation failure inside `zap_list_sort_by` raises a
+                // catchable `MemoryError` (#1598), so the call carries an unwind
+                // edge inside a `try`.
+                self.throwing_call(None, "zap_list_sort_by", vec![copy, keys, kind, reverse]);
                 return Ok((copy, Ty::List(elem)));
             }
             if fname == "print" {
@@ -16732,11 +16731,10 @@ impl<'a> FnLower<'a> {
             // `xs.sort(key=..., reverse=...)` — stable, in place (ticket #336).
             "sort" => {
                 let (keys, kind, reverse) = self.prepare_sort(recv, elem, "sort", args)?;
-                self.emit(Inst::Call {
-                    dest: None,
-                    func: "zap_list_sort_by".to_string(),
-                    args: vec![recv, keys, kind, reverse],
-                });
+                // A scratch-allocation failure inside `zap_list_sort_by` raises a
+                // catchable `MemoryError` (#1598), so the call carries an unwind
+                // edge inside a `try`.
+                self.throwing_call(None, "zap_list_sort_by", vec![recv, keys, kind, reverse]);
                 Ok((self.iconst(Ty::I32, 0), Ty::I32))
             }
             // clear(): drop every element in place (#977).

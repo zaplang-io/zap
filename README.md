@@ -24,6 +24,7 @@ metaprogramming system for keeping business logic free of boilerplate.
 - [`ROADMAP.md`](ROADMAP.md) — the original phased build plan; use the issue tracker and stability policy for current project status.
 - [`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md) — the tracked backlog.
 - [`docs/GRAMMAR.ebnf`](docs/GRAMMAR.ebnf) — the grammar.
+- [`docs/COMPTIME.md`](docs/COMPTIME.md) — compile-time reflection and `comptime`: `reflect.type_info`, `comptime for`, `@derivable`/`@derive`, and the pure/sandboxed subset (the machinery behind `@derive(Json)` and `serde`).
 - [`design/`](design/) — per-feature design docs.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) · [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) · [`SECURITY.md`](SECURITY.md) — contributing, conduct, and vulnerability reporting.
 

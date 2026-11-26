@@ -639,6 +639,13 @@ fn frag_fn_body(frag: &str, sig: &str) -> String {
     strip_c_comments(&src[start..end])
 }
 
+/// Body (comments stripped) of the C function in `runtime/crypto.inc.c` whose
+/// definition starts with `sig`. (#1600 source-contract helper; named distinctly
+/// so it never collides with other fragment helpers.)
+fn crypto_fn_body(sig: &str) -> String {
+    frag_fn_body("runtime/crypto.inc.c", sig)
+}
+
 /// #1599 tripwire. `zap_strbuf_ensure` (shared by `str.expandtabs` /
 /// `str.translate` / `str.format_map`) grows a scratch buffer with `realloc`.
 /// The leaky form assigned `realloc`'s result straight back into `buf` before
@@ -676,5 +683,94 @@ fn strbuf_ensure_frees_old_buffer_before_raising_1599() {
         free_pos < raise_pos,
         "#1599: the old buffer must be freed BEFORE MemoryError is raised \
          (the raise unwinds past the helper, so a later free never runs):\n{body}"
+    );
+}
+
+/// #1600 tripwire (allocation failure). `crypto.token_urlsafe(nbytes)` mallocs a
+/// scratch buffer sized by the caller. A failed scratch allocation used to raise
+/// `ValueError`; per the #1581 temp-allocation policy it must raise a catchable
+/// `MemoryError`. A negative `nbytes` is still a `ValueError` (bad caller input).
+#[test]
+fn token_urlsafe_alloc_failure_is_memoryerror_1600() {
+    let body = crypto_fn_body("void *zap_crypto_token_urlsafe(");
+    let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // A negative length is bad caller input -> ValueError (unchanged).
+    assert!(
+        compact.contains("if(nbytes<0){zap_panic_typed(ZAP_EXC_VALUE_ERROR"),
+        "#1600: a negative nbytes must still raise ValueError:\n{body}"
+    );
+    // A scratch-allocation failure -> MemoryError, not ValueError.
+    assert!(
+        compact.contains("if(!rnd){zap_panic_typed(ZAP_EXC_MEMORY_ERROR"),
+        "#1600: a failed scratch malloc must raise MemoryError:\n{body}"
+    );
+    assert!(
+        !compact.contains("if(!rnd){zap_panic_typed(ZAP_EXC_VALUE_ERROR"),
+        "#1600: the scratch-allocation failure must no longer raise ValueError:\n{body}"
+    );
+}
+
+/// #1600 tripwire (entropy failure / scratch leak). `token_urlsafe` must fill its
+/// scratch through the NON-raising CSPRNG helper and `free()` the scratch before
+/// an entropy failure raises `OSError` — otherwise the unwind bypasses the free
+/// and a caught-and-retried caller leaks one buffer per failure. It must not call
+/// the raising `zap_crypto_fill_random` directly (that unwind would skip the free).
+#[test]
+fn token_urlsafe_frees_scratch_before_entropy_oserror_1600() {
+    let body = crypto_fn_body("void *zap_crypto_token_urlsafe(");
+    let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // Fills via the non-raising helper, never the raising one.
+    assert!(
+        compact.contains("zap_crypto_fill_random_try(rnd"),
+        "#1600: token_urlsafe must fill via the non-raising zap_crypto_fill_random_try \
+         so it can free its scratch on failure:\n{body}"
+    );
+    assert!(
+        !compact.contains("zap_crypto_fill_random(rnd"),
+        "#1600: token_urlsafe must not call the raising zap_crypto_fill_random directly \
+         (its unwind would skip the free(rnd)):\n{body}"
+    );
+    // The scratch is released before the OSError raise.
+    let os_pos = compact
+        .find("zap_panic_typed(ZAP_EXC_OS_ERROR")
+        .expect("#1600: token_urlsafe must raise OSError on an entropy failure");
+    assert!(
+        compact[..os_pos].contains("free(rnd)"),
+        "#1600: the scratch buffer must be freed BEFORE OSError is raised:\n{body}"
+    );
+}
+
+/// #1600 companion: the CSPRNG fill is split into a non-raising core
+/// (`zap_crypto_fill_random_try`, returning an error message or NULL) and a thin
+/// raising wrapper (`zap_crypto_fill_random`) that keeps the `OSError` contract
+/// for its GC-/stack-backed callers (random_bytes / token_hex / randbelow /
+/// uuid). The core still closes the `/dev/urandom` descriptor on a read failure
+/// before returning the message.
+#[test]
+fn csprng_fill_split_into_nonraising_core_and_raising_wrapper_1600() {
+    // The non-raising core returns a message (const char *) and never panics.
+    let core = crypto_fn_body("static const char *zap_crypto_fill_random_try(");
+    assert!(
+        !core.contains("zap_panic_typed("),
+        "#1600: the non-raising CSPRNG core must not raise; it returns an error message:\n{core}"
+    );
+    let core_compact: String = core.chars().filter(|c| !c.is_whitespace()).collect();
+    // The fallback descriptor is still closed on a read failure before returning.
+    assert!(
+        core_compact.contains("close(fd);return"),
+        "#1600: the CSPRNG core must close the /dev/urandom fd on a read failure \
+         before returning the error message:\n{core}"
+    );
+
+    // The thin wrapper raises OSError from the core's message, preserving the
+    // catchable-OSError contract (#1580) for the GC-/stack-backed callers.
+    let wrapper = crypto_fn_body("static void zap_crypto_fill_random(");
+    let wrap_compact: String = wrapper.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        wrap_compact.contains("zap_crypto_fill_random_try(")
+            && wrap_compact.contains("zap_panic_typed(ZAP_EXC_OS_ERROR"),
+        "#1600: zap_crypto_fill_random must delegate to the core and raise OSError on failure:\n{wrapper}"
     );
 }

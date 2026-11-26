@@ -759,16 +759,25 @@ void *zap_crypto_hmac_sha256_raw(void *key, void *msg) {
 }
 
 /* ---- Secure random / secrets ---- */
-static void zap_crypto_fill_random(uint8_t *buf, size_t n) {
+
+/* Non-raising CSPRNG fill: fills `buf[0..n)` from the OS entropy source and
+ * returns NULL on success, or a static error message on failure. It performs no
+ * `zap_panic_typed` itself, so a caller holding a libc `malloc` scratch buffer
+ * (only `zap_crypto_token_urlsafe`, #1600) can `free()` that buffer before it
+ * raises — the raising wrapper below unwinds past its frame, which would skip a
+ * post-fill free. The GC-/stack-backed callers (random_bytes / token_hex /
+ * randbelow / uuid) go through the raising wrapper, whose unwind safely drops
+ * their collector- or stack-owned buffers. The `/dev/urandom` fallback descriptor
+ * is closed on a read failure before the message is returned. */
+static const char *zap_crypto_fill_random_try(uint8_t *buf, size_t n) {
 #if defined(ZAP_PLATFORM_WINDOWS)
     /* CNG system CSPRNG: the Windows replacement for getentropy/_urandom. With the
      * BCRYPT_USE_SYSTEM_PREFERRED_RNG flag no algorithm handle is needed. The call
      * fills the whole buffer in one go (no 256-byte per-call limit). */
     if (BCryptGenRandom(NULL, buf, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
-        const char *m = "crypto: no CSPRNG available (BCryptGenRandom failed)";
-        zap_panic_typed(ZAP_EXC_OS_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+        return "crypto: no CSPRNG available (BCryptGenRandom failed)";
     }
-    return;
+    return NULL;
 #else
     size_t off = 0;
     while (off < n) {
@@ -782,23 +791,32 @@ static void zap_crypto_fill_random(uint8_t *buf, size_t n) {
         /* Fallback: read the kernel CSPRNG directly. */
         int fd = open("/dev/urandom", O_RDONLY);
         if (fd < 0) {
-            const char *m =
-                "crypto: no CSPRNG available (getentropy and /dev/urandom both failed)";
-            zap_panic_typed(ZAP_EXC_OS_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+            return "crypto: no CSPRNG available (getentropy and /dev/urandom both failed)";
         }
         while (off < n) {
             ssize_t r = read(fd, buf + off, n - off);
             if (r <= 0) {
                 close(fd);
-                const char *m = "crypto: CSPRNG read from /dev/urandom failed";
-                zap_panic_typed(ZAP_EXC_OS_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+                return "crypto: CSPRNG read from /dev/urandom failed";
             }
             off += (size_t)r;
         }
         close(fd);
-        return;
+        return NULL;
     }
+    return NULL;
 #endif /* ZAP_PLATFORM_WINDOWS */
+}
+
+/* Raising CSPRNG fill: the thin wrapper used by every GC-/stack-backed caller. A
+ * failure of the OS entropy source is a catchable `OSError` (#1580), so these
+ * entry points lower through an invoke; the unwind safely discards their
+ * collector- or stack-owned buffers. */
+static void zap_crypto_fill_random(uint8_t *buf, size_t n) {
+    const char *err = zap_crypto_fill_random_try(buf, n);
+    if (err) {
+        zap_panic_typed(ZAP_EXC_OS_ERROR, zap_str_new(err, (int64_t)strlen(err)));
+    }
 }
 
 void *zap_crypto_random_bytes(int64_t n) {
@@ -821,11 +839,14 @@ void *zap_crypto_token_hex(int64_t n) {
 
 /* crypto.token_urlsafe(nbytes) -> str (ticket #764): `nbytes` bytes from the OS
  * CSPRNG, base64url-encoded with NO padding (mirrors Python secrets.token_urlsafe).
- * A negative `nbytes` raises a catchable ValueError; `nbytes == 0` yields "".
- * The URL-safe base64 is encoded inline (the general base64url helper #771 is a
- * separate nice-to-have) over the `-_` alphabet; output length is the unpadded
- * ceil(nbytes*4/3). The random bytes live in a transient stack buffer that never
- * escapes; only the encoded string is a GC object, built last. */
+ * A negative `nbytes` raises a catchable ValueError; a failed scratch allocation
+ * a catchable MemoryError (#1600); `nbytes == 0` yields "". The URL-safe base64
+ * is encoded inline (the general base64url helper #771 is a separate
+ * nice-to-have) over the `-_` alphabet; output length is the unpadded
+ * ceil(nbytes*4/3). The random bytes live in a libc `malloc` scratch buffer that
+ * never escapes and is freed on every path — the normal return, and before the
+ * MemoryError / OSError raises (#1600); only the encoded string is a GC object,
+ * built last. */
 void *zap_crypto_token_urlsafe(int64_t nbytes) {
     static const char B64URL[64] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -837,11 +858,26 @@ void *zap_crypto_token_urlsafe(int64_t nbytes) {
     size_t n = (size_t)nbytes;
     uint8_t *rnd = (uint8_t *)malloc(n ? n : 1);
     if (!rnd) {
-        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
-                        zap_str_new("crypto.token_urlsafe: out of memory", 36));
+        /* A bounded/temp-buffer allocation failure is a recoverable `MemoryError`
+         * (#1600, #1581, SPEC §10), not a `ValueError`: the scratch is a sized
+         * libc allocation, and token_urlsafe lowers through an invoke so a
+         * `try`/`except MemoryError` catches it. */
+        zap_panic_typed(ZAP_EXC_MEMORY_ERROR,
+                        zap_str_new("crypto.token_urlsafe: out of memory",
+                                    sizeof("crypto.token_urlsafe: out of memory") - 1));
     }
-    if (n)
-        zap_crypto_fill_random(rnd, n);
+    if (n) {
+        /* Fill through the non-raising CSPRNG core so the scratch buffer can be
+         * released before an entropy failure raises: the raise unwinds past this
+         * frame, which would otherwise skip the `free(rnd)` and leak one buffer
+         * per caught-and-retried failure (#1600). The core closes its fallback
+         * descriptor on a read failure before returning. */
+        const char *err = zap_crypto_fill_random_try(rnd, n);
+        if (err) {
+            free(rnd);
+            zap_panic_typed(ZAP_EXC_OS_ERROR, zap_str_new(err, (int64_t)strlen(err)));
+        }
+    }
     /* Unpadded base64url length: the ceil of n*4/3 (full groups of 3 -> 4 chars,
      * a 1-byte tail -> 2 chars, a 2-byte tail -> 3 chars). */
     int64_t outlen = (int64_t)((n / 3) * 4 + ((n % 3) ? (n % 3) + 1 : 0));
