@@ -1407,6 +1407,56 @@ def main():
     );
 }
 
+#[test]
+fn comptime_reflect_folds_in_a_called_generic_helper() {
+    // #1604: a derive generator recurses into a container's element type through
+    // a generic HELPER — `reflect.type_info(E)` resolves a type parameter bound
+    // to a container (`list[int64]`), so a kind `if` folds in the helper, and
+    // `reflect.type_info(E).elem` resolves as a type argument so the helper
+    // recurses (`_elem[reflect.type_info(E).elem](y)`). This is what lets a
+    // library codec handle nested collections of arbitrary depth.
+    let src = "\
+def _elem[E](E x) -> int64:
+    if reflect.type_info(E).name == \"int64\":
+        return x
+    elif reflect.type_info(E).kind.name == \"list\":
+        int64 n = 0
+        for y in x:
+            n = n + _elem[reflect.type_info(E).elem](y)
+        return n
+    return 0
+
+@derivable(Sum)
+def _derive_sum[T](T value) -> int64:
+    int64 total = 0
+    comptime for f in reflect.type_info(T).fields:
+        total = total + _elem[f.ty](reflect.field(value, comptime f.index))
+    return total
+
+interface Sum:
+    def sum(self) -> int64
+
+@derive(Sum)
+struct N:
+    list[list[int64]] grid
+
+def main():
+    print(N([[1, 2], [3, 4]]).sum())
+"
+    .to_string();
+    let f = write_zap("reflect-helper-recurse", &src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a recursive element helper must compile; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown variable") && !stderr.contains("not wired yet"),
+        "reflect.type_info(E) in a helper must fold (kind if + element type arg): {stderr}"
+    );
+}
+
 // --- E3d (#1293): a @derive that cannot apply is an average-programmer-grade
 // compile error pointing at the user's field, not an internal symbol. ---
 

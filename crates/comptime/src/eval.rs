@@ -695,22 +695,19 @@ impl<'a> Evaluator<'a> {
                     CtError::value("`reflect.type_info(T)` expects a type name", span)
                 })?;
                 // Resolve a generic type parameter to the concrete instantiation
-                // (#1394): inside a specialized generic generator, `T` maps to the
-                // concrete type via the evaluator's type substitution, so
-                // `reflect.type_info(T).kind` is evaluable (e.g. for a top-level
-                // kind-dispatch `if`).
+                // (#1394, widened #1604): inside a specialized generic, `T` maps
+                // to the concrete type via the evaluator's type substitution, so
+                // `reflect.type_info(T).kind` / `.elem` is evaluable (a top-level
+                // kind-dispatch `if`, or a recursive element codec). The concrete
+                // type may itself be a container (`list[int64]`) or a generic
+                // instance (`Pair[int64, str]`), not only a bare name.
                 if let zapc_syntax::ast::Type::Named {
                     name, args: targs, ..
                 } = &ty
                 {
                     if targs.is_empty() {
-                        let resolved = self.resolve_type_param(name);
-                        if resolved != name {
-                            ty = zapc_syntax::ast::Type::Named {
-                                name: resolved.to_string(),
-                                args: Vec::new(),
-                                span: crate::eval::expr_span(&args[0].value),
-                            };
+                        if let Some(concrete) = self.resolve_type_param_ty(name) {
+                            ty = concrete.clone();
                         }
                     }
                 }
