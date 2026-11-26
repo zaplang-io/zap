@@ -3471,3 +3471,151 @@ def main():
         "the yaml nested-collection element errors cleanly: {stderr}"
     );
 }
+
+#[test]
+fn the_serde_core_monomorphizes_serialize_deserialize_over_a_backend() {
+    // E6.1 (#1562): the serde CORE — a format-agnostic `Serializer` /
+    // `Deserializer` backend pair plus the shared generic `serialize` /
+    // `deserialize` free functions — expresses (de)serialization as a PURE
+    // LIBRARY over comptime reflection, with NO per-codec compiler change (the
+    // payoff of epic #1248). The backend is a `[S: Serializer]` type parameter, so
+    // dispatch is MONOMORPHIZED and UNBOXED (static, no fat pointer / vtable) and
+    // the field walk is a compile-time `comptime for` over
+    // `reflect.type_info(T).fields` — explicitly NOT runtime reflection. A
+    // monomorphized backend cannot be threaded through a `@derive`'d method
+    // (interface methods cannot be generic; the forwarding stub is non-generic),
+    // so the core is free generic functions — the idiomatic Zap form. Runtime
+    // round-trip agreement is pinned by the golden `serde_core_roundtrip` under the
+    // CI LLVM matrix; here we assert the lowering specializes per (type, backend).
+    let src = "\
+interface Serializer:
+    def begin_struct(self)
+    def field_name(self, str name)
+    def emit_int(self, int64 v)
+    def emit_str(self, str v)
+    def emit_bool(self, bool v)
+    def end_struct(self)
+
+interface Deserializer:
+    def begin_struct(self)
+    def read_int(self, str field) -> int64
+    def read_str(self, str field) -> str
+    def read_bool(self, str field) -> bool
+    def end_struct(self)
+
+def serialize[T, S: Serializer](T value, S s):
+    s.begin_struct()
+    comptime for f in reflect.type_info(T).fields:
+        s.field_name(comptime f.name)
+        if f.ty.name == \"int64\":
+            s.emit_int(reflect.field(value, comptime f.index))
+        elif f.ty.name == \"str\":
+            s.emit_str(reflect.field(value, comptime f.index))
+        elif f.ty.name == \"bool\":
+            s.emit_bool(reflect.field(value, comptime f.index))
+        elif f.ty.kind.name == \"struct\":
+            serialize(reflect.field(value, comptime f.index), s)
+        else:
+            comptime.error(f.span, \"serialize: unsupported field kind\")
+    s.end_struct()
+
+def deserialize[T, D: Deserializer](D d) -> T:
+    auto out = reflect.construct(T)
+    d.begin_struct()
+    comptime for f in reflect.type_info(T).fields:
+        if f.ty.name == \"int64\":
+            reflect.set_field(out, comptime f.index, d.read_int(comptime f.name))
+        elif f.ty.name == \"str\":
+            reflect.set_field(out, comptime f.index, d.read_str(comptime f.name))
+        elif f.ty.name == \"bool\":
+            reflect.set_field(out, comptime f.index, d.read_bool(comptime f.name))
+        else:
+            comptime.error(f.span, \"deserialize: unsupported field kind\")
+    d.end_struct()
+    return out
+
+struct Sink:
+    list[str] toks = []
+    def begin_struct(self):
+        self.toks.append(\"<\")
+    def field_name(self, str name):
+        pass
+    def emit_int(self, int64 v):
+        self.toks.append(str(v))
+    def emit_str(self, str v):
+        self.toks.append(v)
+    def emit_bool(self, bool v):
+        self.toks.append(str(v))
+    def end_struct(self):
+        self.toks.append(\">\")
+
+struct Src:
+    list[str] toks = []
+    int64 pos = 0
+    def begin_struct(self):
+        pass
+    def read_int(self, str field) -> int64:
+        auto t = self.toks[self.pos]
+        self.pos = self.pos + 1
+        return int(t)
+    def read_str(self, str field) -> str:
+        auto t = self.toks[self.pos]
+        self.pos = self.pos + 1
+        return t
+    def read_bool(self, str field) -> bool:
+        auto t = self.toks[self.pos]
+        self.pos = self.pos + 1
+        return t == \"True\"
+    def end_struct(self):
+        pass
+
+struct Point:
+    int64 x
+    str label
+    bool active
+
+struct Outer:
+    int64 id
+    Point p
+
+def main():
+    auto p = Point(3, \"origin\", True)
+    auto sink = Sink()
+    serialize(p, sink)
+    auto src = Src([\"3\", \"origin\", \"True\"], 0)
+    auto p2 = deserialize[Point, Src](src)
+    print(p2.x == 3 and p2.label == \"origin\" and p2.active == True)
+    auto o = Outer(7, Point(1, \"q\", False))
+    auto nsink = Sink()
+    serialize(o, nsink)
+    print(\",\".join(nsink.toks))
+";
+    let f = write_zap("e6-serde-core", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the serde core must lower; stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The free generic drivers monomorphize per (type, backend) — a distinct
+    // specialization for each, not one boxed path.
+    assert!(
+        stdout.contains("@serialize$Point$Sink"),
+        "serialize specializes at (Point, Sink): {stdout}"
+    );
+    assert!(
+        stdout.contains("@serialize$Outer$Sink"),
+        "a nested struct field recurses into its own serialize specialization: {stdout}"
+    );
+    assert!(
+        stdout.contains("@deserialize$Point$Src"),
+        "deserialize specializes at (Point, Src): {stdout}"
+    );
+    // Backend methods resolve to DIRECT static calls (monomorphized, unboxed) —
+    // no interface fat pointer / vtable.
+    assert!(
+        stdout.contains("@Sink__emit_int") && stdout.contains("@Src__read_int"),
+        "backend methods are called directly through the [S: Serializer] bound: {stdout}"
+    );
+}
