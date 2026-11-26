@@ -293,7 +293,26 @@ impl<'a> FnLower<'a> {
         if let Some(name) = self.ctx.synth_container_reprfns.borrow().get(&key) {
             return Ok(name.clone());
         }
+        // Reserve the memo entry — name AND key — BEFORE building the body
+        // (#1516). A container whose element is itself a container (e.g.
+        // `list[tuple[T]]`, `list[list[T]]`, a dict with container values)
+        // synthesizes that element's renderer *while* this body is being built,
+        // through `render_elem_repr`. Deriving the `$crepr$N` name from the map
+        // length only after the body was built let that nested synthesis observe
+        // the same (pre-insert) length and reuse this very index, emitting two
+        // `$crepr$N` functions with an identical name; at link time the inner
+        // renderer then shadowed the outer, so the container rendered with the
+        // wrong element renderer (elements printed as their raw buffer words).
+        // Inserting now gives the nested renderer the next distinct index (and
+        // makes a self-referential type resolve to this in-progress function
+        // rather than recursing forever). The collision was previously masked
+        // whenever the inner type's renderer happened to be synthesized by an
+        // earlier top-level `print`, which pre-cached it.
         let name = format!("$crepr${}", self.ctx.synth_container_reprfns.borrow().len());
+        self.ctx
+            .synth_container_reprfns
+            .borrow_mut()
+            .insert(key, name.clone());
         let mut b = FnLower::new(
             name.clone(),
             vec![vt],
@@ -496,10 +515,6 @@ impl<'a> FnLower<'a> {
             _ => return Err(err("container_repr_fn called on a non-container type")),
         }
         self.ctx.generated.borrow_mut().push(b.func);
-        self.ctx
-            .synth_container_reprfns
-            .borrow_mut()
-            .insert(key, name.clone());
         Ok(name)
     }
 }

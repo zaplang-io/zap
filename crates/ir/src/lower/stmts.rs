@@ -2828,11 +2828,18 @@ impl<'a> FnLower<'a> {
         ty: Ty,
         body: impl FnMut(&mut FnLower<'a>, Value, Ty) -> Result<(), LowerError>,
     ) -> Result<(), LowerError> {
+        // The general D-0048 protocol yields each element at its LOGICAL
+        // read-back type: the list-backed sources route through
+        // `iterate_list_logical`, which narrows a `bool`/`char` element's `i64`
+        // storage word back to `i1`/`char` (#1513) so constructors,
+        // comprehensions, and splats keep the element's identity (a no-op for
+        // every other kind). `str` already yields `char`; `bytes` yields the
+        // byte as an `int64` (its logical form).
         match ty {
-            Ty::List(elem) => self.iterate_list(val, elem, body),
+            Ty::List(elem) => self.iterate_list_logical(val, elem, body),
             // A variadic `tuple[T]` (#1461) is a frozen list buffer: iterate it
             // element-wise exactly like a list.
-            Ty::VarTuple(elem) => self.iterate_list(val, elem, body),
+            Ty::VarTuple(elem) => self.iterate_list_logical(val, elem, body),
             Ty::Set(elem) => {
                 let items = self.new_value(Ty::List(elem));
                 self.emit(Inst::Call {
@@ -2840,7 +2847,7 @@ impl<'a> FnLower<'a> {
                     func: "zap_set_items".to_string(),
                     args: vec![val],
                 });
-                self.iterate_list(items, elem, body)
+                self.iterate_list_logical(items, elem, body)
             }
             Ty::Heap(elem) => {
                 // Iteration yields elements in priority (min-first) order without
@@ -2852,7 +2859,7 @@ impl<'a> FnLower<'a> {
                     func: "zap_heap_items".to_string(),
                     args: vec![val],
                 });
-                self.iterate_list(items, elem, body)
+                self.iterate_list_logical(items, elem, body)
             }
             // `deque`/`oset` (#983): iterate a left-to-right / insertion-order
             // snapshot list, exactly like `set`/`heap`.
@@ -2863,7 +2870,7 @@ impl<'a> FnLower<'a> {
                     func: "zap_deque_items".to_string(),
                     args: vec![val],
                 });
-                self.iterate_list(items, elem, body)
+                self.iterate_list_logical(items, elem, body)
             }
             Ty::OSet(elem) => {
                 let items = self.new_value(Ty::List(elem));
@@ -2872,7 +2879,7 @@ impl<'a> FnLower<'a> {
                     func: "zap_oset_items".to_string(),
                     args: vec![val],
                 });
-                self.iterate_list(items, elem, body)
+                self.iterate_list_logical(items, elem, body)
             }
             // A `dict` iterates its keys (Python semantics, #299, #1154):
             // materialize the key list via `zap_dict_keys_*` — exactly as the
@@ -2883,7 +2890,7 @@ impl<'a> FnLower<'a> {
             // and the `set(...)`/`oset(...)` constructors accept a dict operand.
             Ty::Dict(key, _val) => {
                 let keys = self.dict_keys(val, key);
-                self.iterate_list(keys, key, body)
+                self.iterate_list_logical(keys, key, body)
             }
             // A `str` (a pointer handle in ZIR) iterates its codepoints as
             // `char`s (D-0025), walking the UTF-8 buffer once — so comprehensions
@@ -3115,6 +3122,33 @@ impl<'a> FnLower<'a> {
         self.position(end_bb);
         self.pop_scope();
         Ok(())
+    }
+
+    /// Iterate a list-backed value like [`Self::iterate_list`], but yield each
+    /// element at its LOGICAL read-back type rather than its physical storage
+    /// word (#1513). A `bool`/`char` element is stored as an `i64` word, so
+    /// [`Self::iterate_list`] hands the user body that bare `i64` (and
+    /// [`Self::elem_ty`] types it `i64`), which drops the element's `bool`/`char`
+    /// identity: the `list(…)`/`set(…)`/`tuple(…)` constructors, comprehensions,
+    /// and splats then re-derived an `int` element and rendered `1`/`0` instead
+    /// of `True`/`False` (or a quoted char). This narrows the word back to
+    /// `i1`/`char` via [`Self::narrow_read_elem`] before invoking the body — a
+    /// no-op for every other element kind — so the general D-0048 iteration
+    /// protocol observes the same logical element the statement-`for` read-back
+    /// (`lower_for_list`) and indexing (`lower_index_get`) already do. The direct
+    /// [`Self::iterate_list`] callers that intentionally consume the raw storage
+    /// word (the container repr renderer, `extend`, dict copy/merge, `sum`) keep
+    /// using it and are unaffected.
+    pub(super) fn iterate_list_logical(
+        &mut self,
+        lst: Value,
+        elem: Elem,
+        mut body: impl FnMut(&mut FnLower<'a>, Value, Ty) -> Result<(), LowerError>,
+    ) -> Result<(), LowerError> {
+        self.iterate_list(lst, elem, move |s, v, _phys| {
+            let (nv, nt) = s.narrow_read_elem(v, elem);
+            body(s, nv, nt)
+        })
     }
 
     /// Desugar a comprehension clause list into nested loops (#599). Each clause

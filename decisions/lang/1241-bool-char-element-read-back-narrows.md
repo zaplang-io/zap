@@ -107,7 +107,10 @@ Alternatives rejected:
   as the `i64` word; `[v for v in bools]` into a `list[bool]` therefore remains
   rejected (unchanged from before this fix). Making that work consistently
   requires teaching the `iterate_list` internal consumers to re-widen, and is
-  tracked as a follow-up.
+  tracked as a follow-up. **Resolved by
+  [1513](1513-ctor-comprehension-bool-char-narrows.md)**, which routes only the
+  general iteration protocol through a separate logical wrapper
+  (`iterate_list_logical`) rather than re-widening the internal consumers.
 - `print(xs[i])` / `print(value)` for a `bool`/`char` element now renders
   `True`/`False` / `'c'` through the scalar Display path, instead of the element
   word's `-1`/codepoint integer (the same `str()`-matching rendering a container

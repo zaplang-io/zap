@@ -19,11 +19,11 @@ def main():
     print(b)  # (b'hi', b'yo')
     print(b == tuple([bytes("hi"), bytes("yo")]))  # True
 
-    # a tuple[T] nested in a list: indexing reads back the precise tuple[int64].
-    # (Whole-container repr of tuple-valued elements — print(nested) rendering
-    # [(1, 2), (3, 4)] — is a known follow-up: the container renderer does not yet
-    # recurse into an Elem::VarTuple element, so it is not asserted here.)
+    # a tuple[T] nested in a list: the whole-container repr recurses into each
+    # Elem::VarTuple element (#1516), and indexing reads back the precise
+    # tuple[int64].
     auto nested = [tuple([1, 2]), tuple([3, 4])]
+    print(nested)  # [(1, 2), (3, 4)]
     print(nested[0])  # (1, 2)
     print(nested[1][1])  # 4
 
