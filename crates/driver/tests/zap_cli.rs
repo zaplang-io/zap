@@ -3803,9 +3803,13 @@ struct Sink:
         pass
     def emit_int(self, int64 v):
         self.toks.append(str(v))
+    def emit_float(self, float64 v):
+        self.toks.append(str(v))
     def emit_str(self, str v):
         self.toks.append(v)
     def emit_bool(self, bool v):
+        self.toks.append(str(v))
+    def emit_bytes(self, bytes v):
         self.toks.append(str(v))
     def end_struct(self):
         self.toks.append(\">\")
@@ -3819,6 +3823,10 @@ struct Src:
         auto t = self.toks[self.pos]
         self.pos = self.pos + 1
         return int(t)
+    def read_float(self, str field) -> float64:
+        auto t = self.toks[self.pos]
+        self.pos = self.pos + 1
+        return float(t)
     def read_str(self, str field) -> str:
         auto t = self.toks[self.pos]
         self.pos = self.pos + 1
@@ -3827,6 +3835,10 @@ struct Src:
         auto t = self.toks[self.pos]
         self.pos = self.pos + 1
         return t == \"True\"
+    def read_bytes(self, str field) -> bytes:
+        auto t = self.toks[self.pos]
+        self.pos = self.pos + 1
+        return bytes(t)
     def end_struct(self):
         pass
 

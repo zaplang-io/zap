@@ -13,7 +13,7 @@
 # resolved by `import serde` as a built-in pure-Zap stdlib module — one blessed,
 # version-coherent implementation for the whole ecosystem, no `zap add`.
 #
-# Supported field kinds this release: `int64`, `str`, `bool`, and a nested
+# Supported field kinds: `int64`, `float64`, `str`, `bool`, `bytes`, and a nested
 # derived struct (encode recurses into the field's own specialization). Enum and
 # generic-struct DESERIALIZE are blocked on the `reflect.construct` generalization
 # (#1561) and are a later addition; collection / Optional breadth is a follow-up.
@@ -24,16 +24,20 @@ interface Serializer:
     def begin_struct(self)
     def field_name(self, str name)
     def emit_int(self, int64 v)
+    def emit_float(self, float64 v)
     def emit_str(self, str v)
     def emit_bool(self, bool v)
+    def emit_bytes(self, bytes v)
     def end_struct(self)
 
 # The decode mirror: a backend reads scalar values in field order.
 interface Deserializer:
     def begin_struct(self)
     def read_int(self, str field) -> int64
+    def read_float(self, str field) -> float64
     def read_str(self, str field) -> str
     def read_bool(self, str field) -> bool
+    def read_bytes(self, str field) -> bytes
     def end_struct(self)
 
 # Serialize `value` of any struct type `T` into the backend `s`. The backend is a
@@ -46,10 +50,14 @@ def serialize[T, S: Serializer](T value, S s):
         s.field_name(comptime f.name)
         if f.ty.name == "int64":
             s.emit_int(reflect.field(value, comptime f.index))
+        elif f.ty.name == "float64":
+            s.emit_float(reflect.field(value, comptime f.index))
         elif f.ty.name == "str":
             s.emit_str(reflect.field(value, comptime f.index))
         elif f.ty.name == "bool":
             s.emit_bool(reflect.field(value, comptime f.index))
+        elif f.ty.name == "bytes":
+            s.emit_bytes(reflect.field(value, comptime f.index))
         elif f.ty.kind.name == "struct":
             serialize(reflect.field(value, comptime f.index), s)
         else:
@@ -66,10 +74,14 @@ def deserialize[T, D: Deserializer](D d) -> T:
     comptime for f in reflect.type_info(T).fields:
         if f.ty.name == "int64":
             reflect.set_field(out, comptime f.index, d.read_int(comptime f.name))
+        elif f.ty.name == "float64":
+            reflect.set_field(out, comptime f.index, d.read_float(comptime f.name))
         elif f.ty.name == "str":
             reflect.set_field(out, comptime f.index, d.read_str(comptime f.name))
         elif f.ty.name == "bool":
             reflect.set_field(out, comptime f.index, d.read_bool(comptime f.name))
+        elif f.ty.name == "bytes":
+            reflect.set_field(out, comptime f.index, d.read_bytes(comptime f.name))
         else:
             comptime.error(f.span, "serde.deserialize: unsupported field kind")
     d.end_struct()
