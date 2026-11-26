@@ -3480,6 +3480,29 @@ impl Checker {
                         }
                     }
                 }
+                // Enum method generators (I#449): a `self`-bearing method on a
+                // tier-3 (data-carrying) enum whose body `yield`s is a generator,
+                // exactly like the struct-method case above. Rewrite its entry in
+                // the enum's method table so a call `obj.gen(...)` types as the
+                // synthetic iterator rather than the method's declared (unit)
+                // return — the enum instance-method call path (#1642) reads the
+                // return type straight off this table. A tier-1 enum generator
+                // method is rejected in `check_function` (ZAP5060), so rewriting
+                // the entry is harmless there.
+                Item::Enum(EnumDef { name, methods, .. }) => {
+                    for m in methods {
+                        if !genanalysis::is_generator(m) {
+                            continue;
+                        }
+                        let gen_name = genanalysis::gen_state_name(&format!("{name}__{}", m.name));
+                        self.register_generator_iter_type(&gen_name);
+                        if let Some(info) = self.enums.get_mut(name) {
+                            if let Some(sig) = info.methods.get_mut(&m.name) {
+                                sig.ret = Ty::Named(gen_name);
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -11199,6 +11222,93 @@ impl Checker {
                     );
                 }
                 return sig.ret.clone();
+            }
+            // An enum instance-method call `recv.method(args)` (#1642). Enum
+            // receivers are excluded from `struct_info`, so the struct path above
+            // never runs for them: before this, their arguments were inferred with
+            // no type check at all — both a plain argument mismatch and a generic
+            // type-parameter inconsistency went unchecked (#1622 deferred enums).
+            // Resolve the method signature from `EnumInfo.methods` and check the
+            // call like the struct path, with the implicit `self` parameter
+            // (`sig.params[0]`) dropped so a call's positional arguments map to the
+            // remaining parameters by index: per-argument `coercible` against the
+            // declared parameter type (ZAP4021) and `check_generic_arg_consistency`
+            // keyed `"Enum.method"` (ZAP4021). `record_generic_method` already
+            // records enum methods' generic surface. Arity stays loose (an extra or
+            // missing argument is not flagged here), matching the struct path and
+            // the other receiver paths. An unknown method keeps the loose `Unknown`
+            // fallback below.
+            if let Ty::Named(owner) = &bt {
+                if let Some(sig) = self
+                    .enums
+                    .get(owner)
+                    .and_then(|i| i.methods.get(name))
+                    .cloned()
+                {
+                    let owner = owner.clone();
+                    let key = format!("{owner}.{name}");
+                    // A receiverless `def` is an associated function (#1260):
+                    // callable only as `Enum.func(...)`, never on an instance.
+                    if sig_is_associated(&sig) {
+                        self.error(
+                            ErrorCode::ZAP4085,
+                            format!(
+                                "`{name}` is an associated function — call it as \
+                                 `{owner}.{name}(...)`"
+                            ),
+                            *span,
+                        );
+                        for a in args {
+                            self.infer(&a.value);
+                        }
+                        return sig.ret.clone();
+                    }
+                    // `@deprecated` method (I#472, D-0109), keyed `"Enum.method"`.
+                    self.warn_deprecated_call(&key, *span);
+                    // Per-argument type check + generic consistency. `self` is
+                    // `sig.params[0]`, so positional argument `i` maps to
+                    // `sig.params[i + 1]`; a keyword is checked against its named
+                    // parameter. A `coercible` failure is ZAP4021.
+                    let mut positional_tys: Vec<(Ty, Span)> = Vec::new();
+                    let mut keyword_tys: Vec<(String, Ty, Span)> = Vec::new();
+                    let mut pidx = 0usize;
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        let aspan = expr_span(&a.value);
+                        match &a.name {
+                            Some(n) => {
+                                self.check_keyword_arg(&sig, &key, n, &at, aspan);
+                                keyword_tys.push((n.clone(), at, aspan));
+                            }
+                            None => {
+                                // Skip `self` (param 0); only check when the mapped
+                                // parameter is a fixed positional one (never the
+                                // variadic/`**kwargs` collector), so arity stays
+                                // loose and an extra argument is not flagged.
+                                if let Some(p) = sig.params.get(pidx + 1) {
+                                    if !p.variadic && !p.kwargs && !self.coercible(&at, &p.ty) {
+                                        self.error(
+                                            ErrorCode::ZAP4021,
+                                            format!(
+                                                "argument {} to '{}' has type {}, expected {}{}",
+                                                pidx + 1,
+                                                key,
+                                                at.display(),
+                                                p.ty.display(),
+                                                self.conformance_detail(&at, &p.ty),
+                                            ),
+                                            aspan,
+                                        );
+                                    }
+                                }
+                                positional_tys.push((at, aspan));
+                                pidx += 1;
+                            }
+                        }
+                    }
+                    self.check_generic_arg_consistency(&key, &positional_tys, &keyword_tys);
+                    return sig.ret.clone();
+                }
             }
             for a in args {
                 self.infer(&a.value);
