@@ -2173,6 +2173,99 @@ mod tests {
     }
 
     #[test]
+    fn lower_temp_alloc_memoryerror_catchable_1581() {
+        // #1581: the temp-allocation wrappers raise a *catchable* `MemoryError`
+        // on bounded/temp-buffer allocation failure, so their call sites must
+        // lower to an `invoke` (not a plain `call`) inside a `try` — a missed
+        // unwind edge would terminate the process instead of reaching the local
+        // handler, and only an LLVM build catches that at run time. The #1566
+        // sweep left these three on plain-call lowerings.
+        //
+        // str.expandtabs([tabsize]) grows a temp buffer via zap_strbuf_ensure,
+        // which now raises MemoryError on realloc failure.
+        assert_try_invoke(
+            "def main():\n    \
+                 str s = \"a\\tb\"\n    \
+                 try:\n        \
+                     auto v = s.expandtabs()\n    \
+                 except MemoryError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_str_expandtabs",
+        );
+        // str.translate(table) also grows a temp buffer via zap_strbuf_ensure.
+        assert_try_invoke(
+            "def main():\n    \
+                 str s = \"abc\"\n    \
+                 auto t = dict[str, str]()\n    \
+                 try:\n        \
+                     auto v = s.translate(t)\n    \
+                 except MemoryError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_str_translate",
+        );
+        // http.url(host, port, path) mallocs a bounded URL buffer and now raises
+        // MemoryError on allocation failure.
+        assert_try_invoke(
+            "def main():\n    \
+                 int64 port = 8080\n    \
+                 try:\n        \
+                     auto u = http.url(\"127.0.0.1\", port, \"/x\")\n    \
+                 except MemoryError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_http_url",
+        );
+    }
+
+    #[test]
+    fn lower_temp_alloc_catchable_as_exception_base_1581() {
+        // `MemoryError` descends from `Exception`, so a plain `except Exception`
+        // handler must also take the unwind edge (same invoke lowering): the
+        // catchability is a property of the call site, not the clause type.
+        assert_try_invoke(
+            "def main():\n    \
+                 str s = \"a\\tb\"\n    \
+                 try:\n        \
+                     auto v = s.expandtabs()\n    \
+                 except Exception as e:\n        \
+                     print(\"caught\")\n",
+            "zap_str_expandtabs",
+        );
+    }
+
+    #[test]
+    fn temp_alloc_wrappers_plain_call_without_handler_1581() {
+        // In a helper function with no active landing pad (no enclosing `try`,
+        // and — unlike `main` — no implicit top-level handler), the wrapper lowers
+        // to a plain `call`: a raised `MemoryError` unwinds through this frame to
+        // the caller's handler. This pins that the invoke edge is driven by an
+        // active handler, not emitted unconditionally, while the uncaught form
+        // still reaches `main`'s top-level reporter (exit 1). Contrast with the
+        // `_catchable_1581` tests, where the `try` forces the invoke form.
+        let m = lower_ok(
+            "def expand(str s) -> str:\n    \
+                 return s.expandtabs()\n\
+def main():\n    \
+                 print(expand(\"a\\tb\"))\n",
+        );
+        let f = m.funcs.iter().find(|f| f.name == "expand").unwrap();
+        let text = format!("{m}");
+        let has_plain_call = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::Call { func, .. } if func == "zap_str_expandtabs"));
+        let has_invoke = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::Invoke { func, .. } if func == "zap_str_expandtabs"));
+        assert!(
+            has_plain_call && !has_invoke,
+            "without an active handler, expandtabs is a plain call, text:\n{text}"
+        );
+    }
+
+    #[test]
     fn lower_sequence_faults_catchable_1566() {
         // list slice with a zero step raises ValueError.
         assert_try_invoke(

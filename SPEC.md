@@ -1191,7 +1191,19 @@ finally:
   errno-driven failure raises `OSError`, and a missing path raises
   `FileNotFoundError`, so a caller can select defaults for an absent file without a
   prior existence check (a missing executable passed to `process` likewise raises
-  `FileNotFoundError`). An allocation failure raises `MemoryError`, and bad caller
+  `FileNotFoundError`). A **bounded or temporary** allocation failure raises a
+  catchable `MemoryError` (#882, #1581): the arena `cap`/heap-OOM path, and the
+  bounded temp-buffer wrappers (`str.expandtabs` / `str.translate` /
+  `str.format_map`, `http.url`) that build a sized result and can fail their
+  backing `malloc`/`realloc`. `MemoryError` descends directly from `Exception`, so
+  `except MemoryError` and `except Exception` both catch it, and `finally` / `with`
+  cleanup runs on the unwind path. A failure of the **GC's own infrastructure**
+  allocation — the collector's block/large-object maps, the `ZAP_GC_HEAP_LIMIT`
+  caps, or a general heap exhaustion observed at an unrooted allocation site — is
+  **not** recoverable and stays a clean fail-stop: the runtime prints
+  `zap: out of memory` and `abort()`s rather than unwinding (unwinding there would
+  itself need to allocate and would traverse unrooted temporaries; D-0119,
+  decisions/lang/1581-memoryerror-reconciliation.md). Bad caller
   input (an invalid `io.open` mode, an empty path) raises `ValueError`.
   `NullReferenceError` is the catchable type for a null (non-`Optional`)
   reference dereference — a null field read/store, method receiver, index base,

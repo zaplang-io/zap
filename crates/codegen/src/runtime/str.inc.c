@@ -1367,8 +1367,13 @@ static char *zap_strbuf_ensure(char *buf, size_t need, size_t *cap) {
         }
         buf = (char *)realloc(buf, *cap);
         if (!buf) {
+            /* A bounded/temp-buffer allocation failure is a recoverable
+             * `MemoryError` (#1581, SPEC §10), not a fail-stop: the callers
+             * (str.expandtabs/translate/format_map) lower through an invoke so a
+             * `try`/`except MemoryError` catches it. Distinct from the GC's own
+             * heap-exhaustion fail-stop abort (D-0119). */
             const char *m = "out of memory";
-            zap_panic_typed(ZAP_EXC_RUNTIME_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+            zap_panic_typed(ZAP_EXC_MEMORY_ERROR, zap_str_new(m, (int64_t)strlen(m)));
         }
     }
     return buf;

@@ -327,6 +327,9 @@ impl<'a> FnLower<'a> {
                 Ok((d, Ty::Ptr))
             }
             // expandtabs([tabsize]): optional int tab stop, default 8 (#1034).
+            // Grows a temp buffer (zap_strbuf_ensure), which raises a catchable
+            // `MemoryError` on allocation failure (#1581), so the call carries an
+            // unwind edge inside a `try`.
             "expandtabs" => {
                 if args.len() > 1 {
                     return Err(err("str.expandtabs() takes 0 or 1 arguments"));
@@ -338,25 +341,20 @@ impl<'a> FnLower<'a> {
                     self.iconst(Ty::I64, 8)
                 };
                 let d = self.new_value(Ty::Ptr);
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: "zap_str_expandtabs".to_string(),
-                    args: vec![recv, tabsize],
-                });
+                self.throwing_call(Some(d), "zap_str_expandtabs", vec![recv, tabsize]);
                 Ok((d, Ty::Ptr))
             }
-            // translate(table): dict[str,str] char map; never raises (#1034).
+            // translate(table): dict[str,str] char map. The character substitution
+            // never raises, but the temp buffer it grows (zap_strbuf_ensure) can
+            // raise a catchable `MemoryError` on allocation failure (#1581), so the
+            // call carries an unwind edge inside a `try`.
             "translate" => {
                 if args.len() != 1 {
                     return Err(err("str.translate() takes exactly one argument"));
                 }
                 let (table, _) = self.expr(&args[0].value)?;
                 let d = self.new_value(Ty::Ptr);
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: "zap_str_translate".to_string(),
-                    args: vec![recv, table],
-                });
+                self.throwing_call(Some(d), "zap_str_translate", vec![recv, table]);
                 Ok((d, Ty::Ptr))
             }
             // format_map(mapping): dict[str,str] field fill. Raises KeyError on a
