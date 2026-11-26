@@ -459,12 +459,21 @@ impl<'a> Evaluator<'a> {
         match base {
             Value::Type(ti, decl) => match name {
                 "kind" => Ok(Value::Kind(ti.kind())),
-                "name" => ti.name().map(Value::str).ok_or_else(|| {
-                    CtError::value(
-                        "`.name` is not available for this type kind at comptime",
-                        span,
-                    )
-                }),
+                // `.name` is the type's own name for a *named* kind (struct /
+                // enum / primitive) and the **empty string** for an *unnamed*
+                // kind (list / dict / optional / tuple). Returning "" rather than
+                // raising makes a comptime dispatch `f.ty.name == <literal>`
+                // TOTAL: it folds to a comptime boolean for every field kind, so
+                // the surrounding comptime `if`/`elif` chain is pruned (and the
+                // `comptime for` loop variable is substituted) even when a field
+                // is nameless. Raising here instead left the whole chain as a
+                // runtime `if`, dropping the loop variable and leaking it to
+                // lowering as `unknown variable 'f'` (#1586; and #1584, where the
+                // dropped branch also held a `match`). Use `.is_named` to tell an
+                // unnamed kind from a (non-existent) empty name, and `.kind.name`
+                // to dispatch on the structural kind.
+                "name" => Ok(Value::str(ti.name().unwrap_or(""))),
+                "is_named" => Ok(Value::Bool(ti.name().is_some())),
                 "fields" => Ok(Value::list(
                     ti.fields()
                         .iter()

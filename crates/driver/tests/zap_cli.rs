@@ -3876,3 +3876,85 @@ def main():
         "serde.deserialize specializes at (Point, user backend) across the module boundary: {stdout}"
     );
 }
+
+#[test]
+fn comptime_for_dispatch_is_total_over_nameless_field_types() {
+    // #1586: inside a `comptime for f in reflect.type_info(T).fields`, a dispatch
+    // chain that compares `f.ty.name` must FOLD for every field kind, including
+    // the nameless ones (list / dict / optional / tuple) whose `f.ty.name` is the
+    // empty string. Previously `f.ty.name == <literal>` raised for a nameless type,
+    // so the whole comptime `if` was left as a runtime `if` and the loop variable
+    // leaked to lowering as `unknown variable 'f'`.
+    let src = "\
+def ser[T]():
+    comptime for f in reflect.type_info(T).fields:
+        if f.ty.name == \"int64\":
+            print(\"int\")
+        elif f.ty.kind.name == \"list\":
+            print(\"list\")
+        elif f.ty.kind.name == \"dict\":
+            print(\"dict\")
+
+struct R:
+    dict[str, str] meta
+    list[int64] nums
+    int64 n
+
+def main():
+    ser[R]()
+";
+    let f = write_zap("comptime-nameless-dispatch", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a comptime dispatch that checks f.ty.name must lower even when a field is \
+         nameless (list/dict); stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown variable 'f'"),
+        "the comptime for loop variable must not leak to lowering: {stderr}"
+    );
+}
+
+#[test]
+fn comptime_for_substitutes_loop_var_into_a_match_in_an_if_branch() {
+    // #1584: a `match` nested inside an `if`/`elif` branch of a `comptime for` body
+    // must still get the loop variable substituted. The failure mode was the same
+    // root cause as #1586 — a preceding `f.ty.name == <literal>` check on a
+    // nameless (optional) field did not fold, so the chain fell to the runtime-if
+    // path and the branch holding the `match` lost `f`.
+    let src = "\
+def ser[T](T value):
+    comptime for f in reflect.type_info(T).fields:
+        if f.ty.name == \"int64\":
+            print(str(reflect.field(value, comptime f.index)))
+        elif f.ty.kind.name == \"optional\":
+            Optional[int64] ov = reflect.field(value, comptime f.index)
+            int64 got = -1
+            match ov:
+                case Optional.Some(x):
+                    got = x
+                case Optional.None:
+                    got = -1
+            print(comptime f.name + \"=\" + str(got))
+
+struct T1:
+    int64 a
+    Optional[int64] b
+
+def main():
+    ser(T1(3, Optional.Some(9)))
+";
+    let f = write_zap("comptime-match-in-if", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a match nested in an if branch of a comptime for must lower; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown variable 'f'"),
+        "the comptime for loop variable must reach the match branch: {stderr}"
+    );
+}
