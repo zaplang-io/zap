@@ -94,15 +94,35 @@ pub struct GenericDeriveBounds {
 /// trait with no interface, and — for each generic derive — the inferred serde
 /// bounds (E3c, #1292) for E3d to consume (the current pipeline ignores them).
 pub fn expand_library_derives(module: &mut Module) -> (Vec<TypeError>, Vec<GenericDeriveBounds>) {
+    // The built-in prelude may itself register `@derivable` traits (#1596, the
+    // seam the Json retire #1558 uses): a prelude-provided generator + interface
+    // routes `@derive(Trait)` in any module without the user declaring them. The
+    // prelude is injected into sema/lowering separately (`with_prelude`), after
+    // this pre-sema pass, so its declarations are scanned here explicitly.
+    let prelude = zapc_syntax::parser::prelude_items();
+    expand_library_derives_with(module, &prelude)
+}
+
+/// [`expand_library_derives`] with the prelude's declarations supplied
+/// explicitly (`extra`), so the prelude-awareness (#1596) is unit-testable with a
+/// synthetic prelude. A `@derivable`/`interface` in `extra` is registered just
+/// like one in `module`; a declaration in `module` shadows a prelude one of the
+/// same trait name (the user's own generator wins).
+pub fn expand_library_derives_with(
+    module: &mut Module,
+    extra: &[Item],
+) -> (Vec<TypeError>, Vec<GenericDeriveBounds>) {
     let mut diags = Vec::new();
     let mut bounds: Vec<GenericDeriveBounds> = Vec::new();
 
     // Pass 1: collect the library-registered derivable traits (`@derivable(T)`
     // on a free function) and the interfaces that supply their method sets. Both
-    // are scanned from the AST directly — sema has not run yet.
+    // are scanned from the AST directly — sema has not run yet. Prelude
+    // declarations (`extra`) are scanned first so a same-named declaration in the
+    // user module overrides them.
     let mut generators: HashMap<String, String> = HashMap::new(); // trait -> generator fn
     let mut interfaces: HashMap<String, Vec<MethodSig>> = HashMap::new();
-    for item in &module.items {
+    for item in extra.iter().chain(module.items.iter()) {
         match item {
             Item::Function(f) => {
                 if let Some(trait_name) = derivable_trait(f) {
@@ -579,6 +599,51 @@ interface Dump:
             !point.decorators.iter().any(|d| d.name == "derive"),
             "empty @derive removed"
         );
+    }
+
+    #[test]
+    fn a_prelude_provided_derivable_routes_a_derive_with_no_in_file_declaration() {
+        // #1596: the `@derivable(Dump)` + `interface Dump` live in the prelude
+        // (here the synthetic `extra`), NOT the user module — the shape the Json
+        // retire (#1558) needs. `@derive(Dump)` must still synthesize the
+        // forwarding stub and strip the trait, exactly as when they are in-file.
+        let extra = module(LIB).items;
+        let mut m = module("@derive(Dump)\nstruct Point:\n    int64 x\n");
+        let (diags, _bounds) = expand_library_derives_with(&mut m, &extra);
+        assert!(diags.is_empty(), "no diagnostics: {diags:?}");
+
+        let point = get_struct(&m, "Point");
+        let dump = method(point, "dump").expect("stub synthesized from a prelude derivable");
+        // Forwards to the prelude-registered generator by name.
+        let Stmt::Expr(Expr::Call { callee, .. }) = &dump.body.stmts[0] else {
+            panic!("expected a forwarding call, got {:?}", dump.body.stmts[0]);
+        };
+        let Expr::Index { base, .. } = &**callee else {
+            panic!("expected `gen[Type](...)`, got {callee:?}");
+        };
+        assert!(matches!(&**base, Expr::Name(n, _) if n == "_derive_dump"));
+        assert!(
+            derive_args(point).is_empty(),
+            "the prelude-registered library trait is stripped"
+        );
+    }
+
+    #[test]
+    fn a_user_declaration_overrides_a_same_named_prelude_derivable() {
+        // A user `@derivable(Dump)` of the same name as a prelude one wins (the
+        // registry scans the prelude first, then the user module). Both name the
+        // same generator here, so routing still succeeds; the point is that a
+        // same-name user declaration does not break registration.
+        let extra = module(LIB).items;
+        let mut m = module(&format!("{LIB}@derive(Dump)\nstruct P:\n    int64 x\n"));
+        let (diags, _bounds) = expand_library_derives_with(&mut m, &extra);
+        assert!(diags.is_empty(), "no diagnostics: {diags:?}");
+        let p = get_struct(&m, "P");
+        assert!(
+            method(p, "dump").is_some(),
+            "routed with both declarations present"
+        );
+        assert!(derive_args(p).is_empty(), "trait stripped");
     }
 
     #[test]
