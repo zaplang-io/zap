@@ -1174,10 +1174,12 @@ finally:
   `TypeError`, `LookupError`, `IndexError`, `KeyError`, `ArithmeticError`,
   `ZeroDivisionError`, `RuntimeError`, `StopIteration`, `Cancelled`,
   `ScopeTimeout`, `ExceptionGroup`, `TimeoutError`, `AssertionError`, `EOFError`,
-  `MemoryError`, `OSError`, `FileNotFoundError`, and `NullReferenceError`.
+  `MemoryError`, `OSError`, `FileNotFoundError`, `NullReferenceError`, and
+  `RegexError`.
   `IndexError` and `KeyError`
   derive from `LookupError`; `ZeroDivisionError` derives from `ArithmeticError`;
-  `FileNotFoundError` derives from `OSError`; those
+  `FileNotFoundError` derives from `OSError`; `RegexError` derives from
+  `ValueError`; those
   intermediate types derive from `Exception`. `Cancelled` derives directly from
   `BaseException`, so `except Exception` does not suppress cancellation.
   `ScopeTimeout` (raised to the caller when a `scope(timeout=…)` deadline expires)
@@ -1210,6 +1212,10 @@ finally:
   or for-iteration base (#1489) — and derives from `Exception`; its message is a
   located string (the source location, plus the field name and owning type when
   known, e.g. `null dereference reading field 'name' of 'Node' at foo.zap:7`).
+  `RegexError` is the dedicated type for a regex failure (an uncompilable pattern
+  or a bad replacement-group reference, §14) and derives from `ValueError`, so a
+  bad pattern is caught by `except RegexError`, by `except ValueError`, and by
+  `except Exception`; its message carries the PCRE2 diagnostic.
   The remaining listed leaf types derive from `Exception`; `Exception` derives
   from `BaseException`.
 - `raise E(message)` constructs a typed built-in exception. Raising a string is
@@ -1493,8 +1499,9 @@ surface is frozen, D-0076, so they are additive). Full design in
 
 Perl-style literals with PCRE2; `m`/`s` prefixes required. Full details in
 `design/0001-perl-regex.md`. An invalid pattern or a bad replacement-group
-reference raises a catchable `ValueError` carrying the PCRE2 diagnostic (#1566);
-a dedicated regex error type may later subclass `ValueError`.
+reference raises a catchable `RegexError` (a subclass of `ValueError`) carrying
+the PCRE2 diagnostic (#1566, #1582); because it derives from `ValueError`, an
+existing `except ValueError` handler keeps catching it unchanged.
 
 ```python
 if line =~ m/\bfoo\d+\b/:

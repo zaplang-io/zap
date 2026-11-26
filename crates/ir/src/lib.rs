@@ -3314,6 +3314,52 @@ def main():\n    \
         assert!(text.contains("= call @zap_regex_group("), "text:\n{text}");
     }
 
+    #[test]
+    fn regex_match_catchable_as_regex_error() {
+        // #1582: a bad pattern inside `try`/`except RegexError` lowers the match
+        // to an `invoke @zap_regex_match` (catchable path, #1566) whose
+        // exception-handler landing pad dispatches on `RegexError`'s runtime id
+        // (`ZAP_EXC_REGEX_ERROR = 23`) via `zap_exception_is_a`. The runtime
+        // `zap_regex_fail` now raises that id, and because RegexError subclasses
+        // ValueError the SAME invoke is also caught by `except ValueError`.
+        let m = lower_ok(
+            "def main():\n    \
+             str s = \"x\"\n    \
+             try:\n        \
+             auto mt = s =~ m/(/\n    \
+             except RegexError:\n        \
+             print(\"re\")\n",
+        );
+        let text = format!("{m}");
+        // The match is an `invoke` (catchable), not a plain `call`.
+        assert!(text.contains("invoke @zap_regex_match("), "text:\n{text}");
+        // The `except RegexError` clause tests the caught exception against the
+        // RegexError type id (23) through the hierarchy-aware `zap_exception_is_a`.
+        assert!(text.contains("@zap_exception_is_a"), "text:\n{text}");
+        assert!(text.contains("iconst 23"), "text:\n{text}");
+        assert!(text.contains("landingpad"), "text:\n{text}");
+    }
+
+    #[test]
+    fn regex_error_caught_as_value_error_parent() {
+        // #1582: `except ValueError` still catches a regex failure (RegexError ⊂
+        // ValueError), so an existing #1566-era handler needs no migration. The
+        // clause dispatches on the ValueError id (3); the hierarchy walk in
+        // `zap_exception_is_a` matches the RegexError the runtime raises.
+        let m = lower_ok(
+            "def main():\n    \
+             str s = \"x\"\n    \
+             try:\n        \
+             auto mt = s =~ m/(/\n    \
+             except ValueError:\n        \
+             print(\"val\")\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("invoke @zap_regex_match("), "text:\n{text}");
+        assert!(text.contains("@zap_exception_is_a"), "text:\n{text}");
+        assert!(text.contains("iconst 3"), "text:\n{text}");
+    }
+
     // --- Python interop (ticket #27, D-0012) ---
 
     #[test]

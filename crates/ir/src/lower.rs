@@ -20770,6 +20770,7 @@ fn exception_type_id_name(name: &str) -> Option<i64> {
         "FileNotFoundError" => 20,
         "ResponseTooLargeError" => 21,
         "NullReferenceError" => 22,
+        "RegexError" => 23,
         _ => return None,
     })
 }
