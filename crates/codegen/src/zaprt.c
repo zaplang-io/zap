@@ -4427,9 +4427,16 @@ int64_t zap_array_count(void *a) { return zap_array_count_of((ZapArray *)a); }
 int64_t zap_array_dim(void *ap, int64_t axis) {
     ZapArray *a = (ZapArray *)ap;
     if (axis < 0 || axis >= a->ndim) {
-        fprintf(stderr, "zap: array axis %lld out of range (ndim %lld)\n",
-                (long long)axis, (long long)a->ndim);
-        abort();
+        char buf[96];
+        int n = snprintf(buf, sizeof(buf), "array axis %lld out of range (ndim %lld)",
+                         (long long)axis, (long long)a->ndim);
+        if (n < 0) {
+            n = 0;
+        }
+        if (n > (int)sizeof(buf) - 1) {
+            n = (int)sizeof(buf) - 1;
+        }
+        zap_panic_typed(ZAP_EXC_INDEX_ERROR, zap_str_new(buf, (int64_t)n));
     }
     return a->dims[axis];
 }
@@ -4441,8 +4448,8 @@ int64_t zap_array_dim(void *ap, int64_t axis) {
  * fresh buffer (never an interior pointer into the parent's dims) and advances
  * `off`; `data` stays at the shared base. A full multi-axis index `m[i, j]` is
  * lowered as a fold of rows down to a rank-1 view followed by a 1-D get, so this
- * is only ever called with n >= 2. Python-style out-of-range aborts (catchable
- * index exceptions are a documented follow-up, matching 1-D `a[i]`). */
+ * is only ever called with n >= 2. Python-style out-of-range raises a catchable
+ * `IndexError` (#1566), matching 1-D `a[i]`. */
 /* The effective element stride of `axis` (#502): an explicit per-axis stride for
  * a view, else the canonical row-major stride (product of the dims below it). */
 static int64_t zap_array_stride_of(const ZapArray *a, int64_t axis) {
@@ -4508,16 +4515,23 @@ static int64_t zap_array_phys_nd(const ZapArray *a, int64_t flat) {
  * is validated here against THAT axis's own length — exactly the per-axis check
  * the former `zap_array_row` / `zap_array_index_axis` fold performed (so e.g.
  * `m[0, 5]` on a (3, 3) array still raises, instead of silently reading the flat
- * slot 5). Out-of-range aborts, matching 1-D `a[i]` (catchable index exceptions
- * are a documented follow-up). Returns the validated index so the lowering can
+ * slot 5). Out-of-range raises a catchable `IndexError` (#1566), matching 1-D
+ * `a[i]`. Returns the validated index so the lowering can
  * thread it straight into the offset arithmetic. */
 int64_t zap_array_ckidx(void *ap, int64_t axis, int64_t i) {
     ZapArray *a = (ZapArray *)ap;
     int64_t dim = a->dims[axis];
     if (i < 0 || i >= dim) {
-        fprintf(stderr, "zap: array index %lld out of range (len %lld)\n",
-                (long long)i, (long long)dim);
-        abort();
+        char buf[96];
+        int m = snprintf(buf, sizeof(buf), "array index %lld out of range (len %lld)",
+                         (long long)i, (long long)dim);
+        if (m < 0) {
+            m = 0;
+        }
+        if (m > (int)sizeof(buf) - 1) {
+            m = (int)sizeof(buf) - 1;
+        }
+        zap_panic_typed(ZAP_EXC_INDEX_ERROR, zap_str_new(buf, (int64_t)m));
     }
     return i;
 }
@@ -4576,14 +4590,22 @@ void *zap_array_contig(void *ap) {
  * (#500/#502). Shares the parent buffer base (GC-safe) and advances `off` by
  * `i` strides of that axis; the surviving axes keep their effective strides, so
  * a contiguous axis-0 index stays contiguous (NULL strides) while any other case
- * carries explicit strides. Out-of-range aborts, like 1-D `a[i]`. */
+ * carries explicit strides. Out-of-range raises a catchable `IndexError`
+ * (#1566), like 1-D `a[i]`. */
 void *zap_array_index_axis(void *ap, int64_t axis, int64_t i) {
     ZapArray *a = (ZapArray *)ap;
     int64_t dim = a->dims[axis];
     if (i < 0 || i >= dim) {
-        fprintf(stderr, "zap: array index %lld out of range (len %lld)\n",
-                (long long)i, (long long)dim);
-        abort();
+        char buf[96];
+        int m = snprintf(buf, sizeof(buf), "array index %lld out of range (len %lld)",
+                         (long long)i, (long long)dim);
+        if (m < 0) {
+            m = 0;
+        }
+        if (m > (int)sizeof(buf) - 1) {
+            m = (int)sizeof(buf) - 1;
+        }
+        zap_panic_typed(ZAP_EXC_INDEX_ERROR, zap_str_new(buf, (int64_t)m));
     }
     int64_t ndim = a->ndim - 1;
     ZapArray *v = (ZapArray *)zap_obj(&zap_desc_array);
@@ -4673,7 +4695,8 @@ void *zap_array_slice_axis(void *ap, int64_t axis, int64_t lo, int64_t hi,
     int64_t n = a->dims[axis];
     int64_t st = has_step ? step : 1;
     if (st == 0) {
-        zap_panic(zap_str_new("slice step cannot be zero", 25));
+        /* #1566: a zero step is a catchable ValueError (matches list/str/bytes). */
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new("slice step cannot be zero", 25));
     }
     int64_t start, stop;
     if (st > 0) {
@@ -4715,8 +4738,8 @@ void *zap_array_slice_axis(void *ap, int64_t axis, int64_t lo, int64_t hi,
     return v;
 }
 
-/* Out-of-range access aborts (shape-mismatch exceptions wait for a follow-up,
- * matching the list bounds behaviour above). */
+/* Out-of-range access raises a catchable `IndexError` (#1566), matching the
+ * list bounds behaviour above (shape-mismatch exceptions are a separate item). */
 /* The typed get/set bound is the TOTAL element count (product of all dims), not
  * `dims[0]`: these take a FLAT element index into the contiguous window. That is
  * how N-D construction fills the buffer (flat 0..count), and for a rank-1 array
@@ -4726,9 +4749,16 @@ void *zap_array_slice_axis(void *ap, int64_t axis, int64_t lo, int64_t hi,
 static void zap_array_bounds(ZapArray *a, int64_t i) {
     int64_t n = zap_array_count_of(a);
     if (i < 0 || i >= n) {
-        fprintf(stderr, "zap: array index %lld out of range (len %lld)\n",
-                (long long)i, (long long)n);
-        abort();
+        char buf[96];
+        int k = snprintf(buf, sizeof(buf), "array index %lld out of range (len %lld)",
+                         (long long)i, (long long)n);
+        if (k < 0) {
+            k = 0;
+        }
+        if (k > (int)sizeof(buf) - 1) {
+            k = (int)sizeof(buf) - 1;
+        }
+        zap_panic_typed(ZAP_EXC_INDEX_ERROR, zap_str_new(buf, (int64_t)k));
     }
 }
 
