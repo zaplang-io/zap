@@ -188,6 +188,7 @@ pub fn desugar_registering_decorators(
             &fn_rets,
             &struct_method_params,
             &fn_sigs,
+            &source_fns,
             &mut diags,
         ) {
             if let Some(a) = adapter {
@@ -446,6 +447,7 @@ fn try_build_rebind(
     fn_rets: &HashMap<String, Option<Type>>,
     struct_method_params: &MethodParams,
     fn_sigs: &HashMap<String, Vec<Param>>,
+    source_fns: &HashSet<String>,
     diags: &mut Vec<TypeError>,
 ) -> Option<(Registration, Option<Function>)> {
     // The outermost dotted decorator (first in source order) decides the form
@@ -522,6 +524,8 @@ fn try_build_rebind(
                 &f.params,
                 &f.ret,
                 context_ty.as_ref(),
+                fn_sigs,
+                source_fns,
                 f.span,
                 diags,
             );
@@ -773,80 +777,129 @@ fn namespace_getter_for(t: &Option<Type>) -> Option<(&'static str, Option<&'stat
 /// A parameter that is neither the context nor an argv-sourced scalar is a
 /// decoration-site error (ZAP5048); the synthesized call keeps its arity so the
 /// module stays well-formed and the error is the reported failure.
+#[allow(clippy::too_many_arguments)]
 fn synth_namespace_adapter(
     orig_name: &str,
     impl_name: &str,
     params: &[Param],
     ret: &Option<Type>,
     context_ty: Option<&Type>,
+    fn_sigs: &HashMap<String, Vec<Param>>,
+    source_fns: &HashSet<String>,
     span: Span,
     diags: &mut Vec<TypeError>,
 ) -> (Function, String) {
     let adapter_name = format!("{orig_name}$adapter");
     let ns = "$ns";
     let ctx = "$ctx";
+    // Reuse the `Depends(...)` resolver (D-0092/#466): an injected parameter is
+    // resolved deps-first, once each, into a `<provider>$dep` local emitted before
+    // the handler call (#1646). The builder owns the diagnostics for its lifetime.
+    let mut builder = DepBuilder {
+        fn_sigs,
+        source_fns,
+        diags,
+        resolved: HashMap::new(),
+        lets: Vec::new(),
+    };
     let mut call_args: Vec<Arg> = Vec::with_capacity(params.len());
     for (i, p) in params.iter().enumerate() {
-        // The handler's first parameter, under a context seam, receives the
-        // dispatcher-supplied context when it is a non-argv (non-scalar) type.
-        let is_context = i == 0 && context_ty.is_some() && namespace_getter_for(&p.ty).is_none();
-        if is_context {
-            call_args.push(arg(Expr::Name(ctx.to_string(), span)));
-            continue;
-        }
-        match namespace_getter_for(&p.ty) {
-            Some((getter, convert)) => {
-                // `ns.get_<kind>("<param>")`, wrapped in a conversion to the
-                // declared type when it is narrower than the getter's (#1625).
-                let read = Expr::Call {
-                    callee: Box::new(Expr::Attr {
-                        base: Box::new(Expr::Name(ns.to_string(), span)),
-                        name: getter.to_string(),
-                        span,
-                    }),
-                    args: vec![arg(str_lit(&p.name, span))],
-                    span,
-                };
-                let value = match convert {
-                    Some(conv) => Expr::Call {
-                        callee: Box::new(Expr::Name(conv.to_string(), span)),
-                        args: vec![arg(read)],
-                        span,
-                    },
-                    None => read,
-                };
-                call_args.push(arg(value));
+        match classify_param(p, source_fns) {
+            // An injected dependency `T x = Depends(provider)`: resolved from its
+            // provider in the adapter body, never read from the namespace (#1646).
+            ParamKind::Depends { provider } => {
+                let mut stack = HashSet::new();
+                let local = builder.resolve(&provider, p.ty.clone(), p.span, &mut stack);
+                call_args.push(arg(Expr::Name(local, p.span)));
             }
-            None => {
-                diags.push(err(
+            // `@request_source` injection resolves against a request value, which a
+            // command-line handler does not have — a clear error, not a miscompile.
+            ParamKind::Source { .. } => {
+                builder.diags.push(err(
                     format!(
-                        "handler parameter `{}` has a type that cannot be bound from the \
-                         command-line namespace; an argparse-backed handler takes scalar \
-                         parameters (bool, str, char, bytes, the integer types \
-                         int/int32/uint8..uint64/usize, and float/float32) plus an optional \
-                         typed context as its first parameter",
+                        "`@request_source` parameter `{}` is not available in an \
+                         argparse-backed handler: there is no request value to resolve it \
+                         against; use `Depends(...)` or a command-line scalar instead",
                         p.name
                     ),
                     p.span,
                 ));
-                // Keep the arity right so the synthesized call is well-formed; the
-                // diagnostic above is the reported failure.
                 call_args.push(arg(Expr::Name(p.name.clone(), span)));
+            }
+            ParamKind::BadDepends { message, span: s }
+            | ParamKind::BadSource { message, span: s } => {
+                builder.diags.push(err(message, s));
+                // Keep the arity right so the synthesized call stays well-formed.
+                call_args.push(arg(Expr::Name(p.name.clone(), span)));
+            }
+            // An ordinary parameter (no injection marker): bind it from the
+            // namespace (a scalar), supply the dispatcher context (the first,
+            // non-scalar parameter under a context seam, #1621), or reject it.
+            ParamKind::PassThrough => {
+                let is_context =
+                    i == 0 && context_ty.is_some() && namespace_getter_for(&p.ty).is_none();
+                if is_context {
+                    call_args.push(arg(Expr::Name(ctx.to_string(), span)));
+                    continue;
+                }
+                match namespace_getter_for(&p.ty) {
+                    Some((getter, convert)) => {
+                        // `ns.get_<kind>("<param>")`, wrapped in a conversion to the
+                        // declared type when it is narrower than the getter's (#1625).
+                        let read = Expr::Call {
+                            callee: Box::new(Expr::Attr {
+                                base: Box::new(Expr::Name(ns.to_string(), span)),
+                                name: getter.to_string(),
+                                span,
+                            }),
+                            args: vec![arg(str_lit(&p.name, span))],
+                            span,
+                        };
+                        let value = match convert {
+                            Some(conv) => Expr::Call {
+                                callee: Box::new(Expr::Name(conv.to_string(), span)),
+                                args: vec![arg(read)],
+                                span,
+                            },
+                            None => read,
+                        };
+                        call_args.push(arg(value));
+                    }
+                    None => {
+                        builder.diags.push(err(
+                            format!(
+                                "handler parameter `{}` has a type that cannot be bound from the \
+                                 command-line namespace; an argparse-backed handler takes scalar \
+                                 parameters (bool, str, char, bytes, the integer types \
+                                 int/int32/uint8..uint64/usize, and float/float32), an optional \
+                                 typed context as its first parameter, and injected `Depends(...)` \
+                                 parameters",
+                                p.name
+                            ),
+                            p.span,
+                        ));
+                        // Keep the arity right so the synthesized call is well-formed;
+                        // the diagnostic above is the reported failure.
+                        call_args.push(arg(Expr::Name(p.name.clone(), span)));
+                    }
+                }
             }
         }
     }
+    // Body: the dependency `let`s (deps-first), then the handler call.
+    let mut stmts = builder.lets;
     let call = Expr::Call {
         callee: Box::new(Expr::Name(impl_name.to_string(), span)),
         args: call_args,
         span,
     };
-    let stmt = match ret {
+    stmts.push(match ret {
         Some(_) => Stmt::Return {
             value: Some(call),
             span,
         },
         None => Stmt::Expr(call),
-    };
+    });
     let ns_param = Param {
         decorators: Vec::new(),
         ty: Some(Type::Named {
@@ -886,10 +939,7 @@ fn synth_namespace_adapter(
         generics: Vec::new(),
         params: adapter_params,
         ret: ret.clone(),
-        body: Block {
-            stmts: vec![stmt],
-            span,
-        },
+        body: Block { stmts, span },
         span,
     };
     (adapter, adapter_name)
@@ -2980,6 +3030,125 @@ mod tests {
             args.iter().any(|a| a.name.as_deref() == Some("handler")
                 && matches!(&a.value, Expr::Name(n, _) if n == "greet$adapter")),
             "the adapter is passed to `handler` by keyword: {args:?}"
+        );
+    }
+
+    // ---- #1646: injected Depends parameters in the argparse adapter ----------
+
+    #[test]
+    fn namespace_adapter_injects_depends_alongside_context_and_scalars() {
+        // #1646: an injected `Depends(provider)` parameter composes with the #1621
+        // context and the namespace scalars. The adapter resolves the provider into
+        // a `<provider>$dep` local (deps-first) and passes it to the handler; the
+        // context flows from the dispatcher, the scalar from the namespace. The seam
+        // is NOT widened by the injected parameter.
+        let mut m = module(
+            "struct Context:\n    str command_name\n\
+             struct DB:\n    int64 conn\n\
+             def get_db() -> DB:\n    return DB(conn=1)\n\
+             struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, fn(Context, Namespace) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(Context ctx, DB db = Depends(get_db), str name) -> str:\n    return name\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let adapter = func(&m, "greet$adapter").expect("adapter synthesized");
+        assert_eq!(
+            adapter.params.len(),
+            2,
+            "a Depends parameter does not widen the (Context, Namespace) seam"
+        );
+        let ctx_name = adapter.params[0].name.clone();
+        let stmts = body(adapter);
+        // Deps-first: `DB get_db$dep = get_db()` precedes the handler call.
+        let (dep_callee, _) =
+            let_call(&stmts[0], "get_db$dep").expect("Depends `let` emitted first");
+        assert!(
+            is_name(dep_callee, "get_db"),
+            "the provider is called by name"
+        );
+        let Stmt::Return {
+            value: Some(Expr::Call { callee, args, .. }),
+            ..
+        } = stmts.last().unwrap()
+        else {
+            panic!("expected `return greet$impl(...)`");
+        };
+        assert!(is_name(callee, "greet$impl"));
+        assert_eq!(args.len(), 3);
+        assert!(
+            is_name(&args[0].value, &ctx_name),
+            "ctx from the dispatcher"
+        );
+        assert!(
+            is_name(&args[1].value, "get_db$dep"),
+            "db from the resolved provider local"
+        );
+        assert_eq!(
+            getter_call(&args[2].value),
+            Some(("get_str".into(), "name".into())),
+            "name from the namespace"
+        );
+    }
+
+    #[test]
+    fn namespace_adapter_depends_as_first_param_leaves_context_unused() {
+        // #1646: a `Depends` first parameter is injected, not treated as the
+        // context (the context is the first UNMARKED non-scalar). The scalar still
+        // binds from the namespace.
+        let mut m = module(
+            "struct Context:\n    str command_name\n\
+             struct DB:\n    int64 conn\n\
+             def get_db() -> DB:\n    return DB(conn=1)\n\
+             struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, fn(Context, Namespace) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(DB db = Depends(get_db), str name) -> str:\n    return name\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let adapter = func(&m, "greet$adapter").expect("adapter synthesized");
+        let stmts = body(adapter);
+        assert!(
+            let_call(&stmts[0], "get_db$dep").is_some(),
+            "the first parameter's Depends is injected"
+        );
+        let Stmt::Return {
+            value: Some(Expr::Call { args, .. }),
+            ..
+        } = stmts.last().unwrap()
+        else {
+            panic!("expected tail return");
+        };
+        assert_eq!(args.len(), 2);
+        assert!(is_name(&args[0].value, "get_db$dep"));
+        assert_eq!(
+            getter_call(&args[1].value),
+            Some(("get_str".into(), "name".into()))
+        );
+    }
+
+    #[test]
+    fn namespace_adapter_rejects_request_source_param() {
+        // #1646: `@request_source` injection resolves against a request value; an
+        // argparse-backed handler has none, so such a parameter is a precise error
+        // rather than a miscompile.
+        let mut m = module(
+            "struct Req:\n    str path\n\
+             @request_source\ndef Query(Req r, str name) -> str:\n    return r.path\n\
+             struct Context:\n    str command_name\n\
+             struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, fn(Context, Namespace) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(Context ctx, str q = Query()) -> str:\n    return q\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("`q`") && d.message.contains("request")),
+            "expected a request-source-not-available error for `q`, got: {diags:?}"
         );
     }
 
