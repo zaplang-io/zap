@@ -4613,24 +4613,26 @@ impl Mono<'_> {
     /// `T`, or a field type `zero_expr` still cannot build (e.g. a function
     /// type), is a clean error.
     fn rewrite_reflect_construct(
-        &self,
+        &mut self,
         ty_arg: &Expr,
         span: Span,
     ) -> Result<(Expr, CTy), LowerError> {
         let Expr::Name(t, _) = ty_arg else {
             return Err(err("reflect.construct(T) expects a type name"));
-        }; // Resolve a type parameter to its concrete type; a bare concrete name
-           // (not a parameter) is used as-is.
-        let concrete = match self.cur_subst.get(t) {
-            Some(Type::Named { name, args, .. }) if args.is_empty() => name.clone(),
-            Some(Type::Named { name, .. }) => {
-                return Err(err(format!(
-                    "reflect.construct: a generic instance (`{name}[…]`) is not supported yet (#1454)"
-                )));
-            }
-            Some(_) => return Err(err("reflect.construct(T) expects a named struct type")),
-            None => t.clone(),
         };
+        // Resolve a type parameter to its concrete type; a bare concrete name
+        // (not a parameter) is used as-is. A generic instance (`Pair[int64, str]`)
+        // is zero-constructed as its monomorphized instance (#1561); a
+        // non-generic struct is the original #1454 path below.
+        let (gname, gargs): (String, Vec<Type>) = match self.cur_subst.get(t) {
+            Some(Type::Named { name, args, .. }) => (name.clone(), args.clone()),
+            Some(_) => return Err(err("reflect.construct(T) expects a named struct type")),
+            None => (t.clone(), Vec::new()),
+        };
+        if !gargs.is_empty() {
+            return self.reflect_construct_generic(&gname, &gargs, span);
+        }
+        let concrete = gname;
         let Some(def) = self.structs.get(concrete.as_str()).copied() else {
             return Err(err(format!(
                 "reflect.construct: `{concrete}` is not a non-generic struct in scope (#1454)"
@@ -4663,6 +4665,170 @@ impl Mono<'_> {
         Ok((call, CTy::Ty(self.named(&concrete, Vec::new()))))
     }
 
+    /// Zero-construct a **generic struct instance** `name[args…]` for
+    /// `reflect.construct(T)` (#1561), the generic counterpart of the
+    /// non-generic path above. Each field type is substituted with the
+    /// instance's type arguments, zero-built by `zero_expr`, and the instance is
+    /// requested so the construction names its monomorphized symbol:
+    /// `Name$args(zero(f0'), …)`. A field that substitutes to another generic
+    /// instance (a nested generic) is `zero_expr`'s existing "unsupported yet"
+    /// error, not a crash.
+    fn reflect_construct_generic(
+        &mut self,
+        name: &str,
+        args: &[Type],
+        span: Span,
+    ) -> Result<(Expr, CTy), LowerError> {
+        let Some(def) = self.gstructs.get(name).copied() else {
+            return Err(err(format!(
+                "reflect.construct: `{name}[…]` is not a generic struct in scope (#1561)"
+            )));
+        };
+        // Substitute the instance's type arguments into each field type.
+        let smap = self.subst_map(name, args);
+        let refmap: HashMap<&str, &Type> = smap.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        let mut zargs = Vec::with_capacity(def.fields.len());
+        // A generic instance is a distinct name per argument set; the by-value
+        // cycle guard starts empty (a field of the *same* instance would recurse
+        // through `zero_expr`'s non-generic struct path, which has its own guard).
+        let mut visiting: Vec<String> = Vec::new();
+        for f in &def.fields {
+            let fty = subst_type(&f.ty, &refmap);
+            let z = zero_expr(&fty, span, &self.structs, &mut visiting).map_err(|e| {
+                err(format!(
+                    "reflect.construct: field `{}` of `{name}[…]`: {}",
+                    f.name, e.message
+                ))
+            })?;
+            zargs.push(Arg {
+                name: None,
+                value: z,
+                spread: ArgSpread::None,
+                span,
+            });
+        }
+        let mangled = self.request(name, args);
+        let call = Expr::Call {
+            callee: Box::new(Expr::Name(mangled, span)),
+            args: zargs,
+            span,
+        };
+        Ok((call, CTy::Ty(self.named(name, args.to_vec()))))
+    }
+
+    /// Rewrite `reflect.construct_variant(T, comptime i, payload…)` (#1561) to a
+    /// construction of the `i`-th variant of the concrete enum `T` is
+    /// substituted to: `ConcreteEnum.Variant(payload…)`, or the bare
+    /// `ConcreteEnum.Variant` for a payload-free variant. The enum counterpart
+    /// of `reflect.construct`, it is the one primitive a decoder needs to build
+    /// the variant it selected at comptime from `reflect.type_info(T).variants`.
+    /// `T` must be a **non-generic enum**; a generic enum instance is a clean
+    /// error (a further extension). The index is a comptime constant (the
+    /// generator folds `comptime v.index` to a literal before this runs); it is
+    /// bounds-checked against the enum's variants, and the payload arity against
+    /// the variant's fields, so a mismatch is a compile error, never a crash.
+    fn rewrite_reflect_construct_variant(
+        &mut self,
+        ty_arg: &Expr,
+        idx_arg: &Expr,
+        payload: &[Arg],
+        span: Span,
+        env: &mut Env,
+        _expected: Option<&Type>,
+    ) -> Result<(Expr, CTy), LowerError> {
+        let Expr::Name(t, _) = ty_arg else {
+            return Err(err(
+                "reflect.construct_variant(T, i, …) expects a type name",
+            ));
+        };
+        let concrete = match self.cur_subst.get(t) {
+            Some(Type::Named { name, args, .. }) if args.is_empty() => name.clone(),
+            Some(Type::Named { name, .. }) => {
+                return Err(err(format!(
+                    "reflect.construct_variant: a generic enum instance (`{name}[…]`) is \
+                     not supported yet (#1561)"
+                )));
+            }
+            Some(_) => {
+                return Err(err(
+                    "reflect.construct_variant(T, …) expects a named enum type",
+                ));
+            }
+            None => t.clone(),
+        };
+        let Some(def) = self.enums.get(concrete.as_str()).copied() else {
+            return Err(err(format!(
+                "reflect.construct_variant: `{concrete}` is not a non-generic enum in scope (#1561)"
+            )));
+        };
+        // The variant index is a comptime constant — the generator folds
+        // `comptime v.index` to an integer literal, which may still be wrapped in
+        // the `comptime` marker (`Expr::Comptime`) when it reaches mono.
+        fn unwrap_comptime(e: &Expr) -> &Expr {
+            match e {
+                Expr::Comptime { expr, .. } => unwrap_comptime(expr),
+                _ => e,
+            }
+        }
+        let idx = match unwrap_comptime(idx_arg) {
+            Expr::Int(s, _) => s.parse::<usize>().ok(),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            err("reflect.construct_variant: the variant index must be a comptime integer (`comptime v.index`)")
+        })?;
+        let Some(variant) = def.variants.get(idx) else {
+            return Err(err(format!(
+                "reflect.construct_variant: variant index {idx} is out of range for `{concrete}` \
+                 ({} variant(s))",
+                def.variants.len()
+            )));
+        };
+        let variant_name = variant.name.clone();
+        let field_tys: Vec<Type> = variant.fields.iter().map(|f| f.ty.clone()).collect();
+        if payload.len() != field_tys.len() {
+            return Err(err(format!(
+                "reflect.construct_variant: `{concrete}.{variant_name}` takes {} payload value(s), \
+                 but {} were given",
+                field_tys.len(),
+                payload.len()
+            )));
+        }
+        // A payload-free variant is a bare `ConcreteEnum.Variant` (an `Attr`, as
+        // `Color.Red` is written), never a zero-argument call.
+        if field_tys.is_empty() {
+            let node = Expr::Attr {
+                base: Box::new(Expr::Name(concrete.clone(), span)),
+                name: variant_name,
+                span,
+            };
+            return Ok((node, CTy::Ty(self.named(&concrete, Vec::new()))));
+        }
+        // Rewrite each payload value, pinning it to the variant field type so an
+        // inference-ambiguous argument resolves the way a direct construction's
+        // would.
+        let mut nargs = Vec::with_capacity(payload.len());
+        for (i, a) in payload.iter().enumerate() {
+            let (val, _cty) = self.rewrite_expr(&a.value, env, field_tys.get(i))?;
+            nargs.push(Arg {
+                name: None,
+                value: val,
+                spread: ArgSpread::None,
+                span,
+            });
+        }
+        let node = Expr::Call {
+            callee: Box::new(Expr::Attr {
+                base: Box::new(Expr::Name(concrete.clone(), span)),
+                name: variant_name,
+                span,
+            }),
+            args: nargs,
+            span,
+        };
+        Ok((node, CTy::Ty(self.named(&concrete, Vec::new()))))
+    }
+
     fn rewrite_call(
         &mut self,
         callee: &Expr,
@@ -4693,6 +4859,29 @@ impl Mono<'_> {
                 && args.len() == 1
             {
                 return self.rewrite_reflect_construct(&args[0].value, span);
+            }
+        }
+        // `reflect.construct_variant(T, comptime i, payload…)` (#1561): build the
+        // i-th variant of enum `T`, the enum counterpart of `reflect.construct`.
+        // The first argument is a TYPE, the second a comptime-folded variant
+        // index, and the rest are the variant's payload values. At specialization
+        // `T` is substituted to a concrete enum and this rewrites to
+        // `ConcreteEnum.Variant(payload…)` (a bare `Attr` for a payload-free
+        // variant) — the existing enum-variant construction form.
+        if let Expr::Attr { base, name, .. } = callee {
+            if name == "construct_variant"
+                && matches!(&**base, Expr::Name(m, _) if m == "reflect")
+                && env.lookup("reflect").is_none()
+                && args.len() >= 2
+            {
+                return self.rewrite_reflect_construct_variant(
+                    &args[0].value,
+                    &args[1].value,
+                    &args[2..],
+                    span,
+                    env,
+                    expected,
+                );
             }
         }
         // Rewrite the arguments once; keep their inferred types for unification.

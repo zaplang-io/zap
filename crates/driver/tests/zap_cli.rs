@@ -1325,6 +1325,88 @@ def main():
     );
 }
 
+#[test]
+fn reflect_construct_variant_builds_an_enum_variant() {
+    // #1561: a decode generator builds an enum variant it selected at comptime
+    // from `reflect.type_info(T).variants` via `reflect.construct_variant(T,
+    // comptime v.index, payload…)` — the enum counterpart of `reflect.construct`.
+    // A payload-free known variant and the `Unknown(str)` fallback both resolve.
+    let src = "\
+@derivable(EDec)
+def _derive_edec[T](str s) -> T:
+    comptime for v in reflect.type_info(T).variants:
+        if len(v.fields) == 0:
+            if s == v.name:
+                return reflect.construct_variant(T, comptime v.index)
+    comptime for v in reflect.type_info(T).variants:
+        if len(v.fields) == 1:
+            return reflect.construct_variant(T, comptime v.index, s)
+    return reflect.construct_variant(T, comptime 0)
+
+interface EDec:
+    def edec(str s) -> Self
+
+@derive(Json, EDec)
+@json(open)
+enum Flavor:
+    Vanilla
+    Chocolate
+    Unknown(str value)
+
+def main():
+    print(Flavor.edec(\"Chocolate\").to_json())
+    print(Flavor.edec(\"Mango\").to_json())
+"
+    .to_string();
+    let f = write_zap("construct-variant", &src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "an enum variant must be constructible by reflection; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown name") && !stderr.contains("not a non-generic"),
+        "construct_variant must build the variant, not fail name resolution: {stderr}"
+    );
+}
+
+#[test]
+fn reflect_construct_builds_a_generic_struct_instance() {
+    // #1561: `reflect.construct(T)` where `T` resolves to a generic instance
+    // (`Pair[int64, str]`) zero-constructs that monomorphized instance — the
+    // generic counterpart of the non-generic `reflect.construct`.
+    let src = "\
+@derivable(Mk)
+def _derive_mk[T](str s) -> T:
+    return reflect.construct(T)
+
+interface Mk:
+    def mk(str s) -> Self
+
+struct Pair[A, B]:
+    A a
+    B b
+
+def main():
+    auto p = _derive_mk[Pair[int64, str]](\"\")
+    print(p.a)
+    print(p.b)
+"
+    .to_string();
+    let f = write_zap("construct-generic", &src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a generic struct instance must be constructible by reflection; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not supported yet"),
+        "the generic-instance reflect.construct path must be implemented: {stderr}"
+    );
+}
+
 // --- E3d (#1293): a @derive that cannot apply is an average-programmer-grade
 // compile error pointing at the user's field, not an internal symbol. ---
 
