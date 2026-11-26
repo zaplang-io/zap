@@ -1,9 +1,8 @@
 # diff: match
-# #1648: ljust/rjust/center repeat the whole fill codepoint, producing valid
-# UTF-8 that matches CPython. Only cases where Zap and CPython agree appear here:
-# ljust/rjust always agree; center is included only where its padding split
-# matches CPython (even width, or even padding) — Zap's odd-width centered split
-# puts the smaller half on the left, a separate pre-existing divergence.
+# #1648/#1656: ljust/rjust/center repeat the whole fill codepoint (valid UTF-8)
+# and center splits odd padding the CPython way (extra fill on the left when both
+# width and margin are odd). Every case here agrees with CPython, including the
+# odd-width centered cases that were previously excluded (#1656).
 def main():
     print("x".ljust(3, "é"))
     print("x".rjust(3, "é"))
@@ -17,3 +16,8 @@ def main():
     print("hi".rjust(5, "*"))
     print(len("x".ljust(3, "😀")))
     print("".ljust(3, "é"))
+    # odd-width centered padding (now matches CPython's left-biased split, #1656)
+    print(f"[{'hi'.center(5)}]")
+    print(f"[{'ab'.center(5, '-')}]")
+    print("x".center(5, "é"))
+    print("abc".center(6, "·"))

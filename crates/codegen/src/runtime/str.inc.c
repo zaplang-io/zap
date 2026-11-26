@@ -368,7 +368,9 @@ static void *zap_str_pad(void *sp, int64_t width, void *fillp, int side) {
     } else if (side == 1) {
         left = pad;
     } else {
-        left = pad / 2;
+        /* center: CPython biases the extra fill to the LEFT when both the total
+         * width and the margin are odd (`marg & width & 1`), #1656. */
+        left = pad / 2 + (pad & width & 1);
         right = pad - left;
     }
     /* total = s->len + pad * fw, checked (pad >= 1, fw in 1..=4). */
