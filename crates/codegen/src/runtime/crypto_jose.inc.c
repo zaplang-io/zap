@@ -4537,7 +4537,13 @@ void *zap_http_url(void *host_, int64_t port, void *path_) {
     size_t cap = hlen + plen + 48;
     char *out = (char *)malloc(cap);
     if (!out) {
-        zap_net_panic("http: out of memory");
+        /* A bounded temp-buffer allocation failure is a recoverable
+         * `MemoryError` (#1581, SPEC §10), caught by a `try`/`except MemoryError`
+         * via the invoke edge the `http.url` lowering now carries — not the
+         * generic `zap_net_panic` Exception. Distinct from GC heap-exhaustion
+         * fail-stop (D-0119). */
+        const char *m = "http: out of memory";
+        zap_panic_typed(ZAP_EXC_MEMORY_ERROR, zap_str_new(m, (int64_t)strlen(m)));
         return NULL;
     }
     int n = snprintf(out, cap, "http://%.*s:%ld", (int)hlen, host->data, (long)port);

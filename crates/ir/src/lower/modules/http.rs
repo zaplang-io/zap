@@ -51,7 +51,9 @@ fn lower(
         // redirect-following accessors (#987): pure reads on the response handle.
         "final_url" => call_ret(lowerer, "zap_http_final_url", a, Ty::Ptr, false),
         "redirects" => call_ret(lowerer, "zap_http_redirects", a, Ty::Ptr, false),
-        "url" => call_ret(lowerer, "zap_http_url", a, Ty::Ptr, false),
+        // Builds a bounded URL buffer; raises a catchable `MemoryError` on
+        // allocation failure (#1581), so it needs an unwind edge inside a `try`.
+        "url" => call_ret(lowerer, "zap_http_url", a, Ty::Ptr, true),
         // server
         // The request handle, like the response handle, is sema-typed `bytes`.
         "read_request" => call_ret(lowerer, "zap_http_read_request", a, Ty::Bytes, true),

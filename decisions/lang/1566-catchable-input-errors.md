@@ -104,7 +104,9 @@ These policy/contract forks are flagged, not decided:
    documented fail-stop is a genuine policy fork — left unchanged.
 3. **`MemoryError` vs fail-stop** — D-0119 (heap-exhaustion fail-stop) vs SPEC
    §10 ("an allocation failure raises `MemoryError`") plus the temp-alloc
-   wrappers in `str.expandtabs`/`str.translate`/`http.url`. Reconciliation is a
-   policy decision — left unchanged.
+   wrappers in `str.expandtabs`/`str.translate`/`http.url`. **Resolved by #1581**
+   (decisions/lang/1581-memoryerror-reconciliation.md): bounded/temp allocations
+   raise catchable `MemoryError`; the GC's own infrastructure allocation stays
+   fail-stop, so D-0119 was always the narrower (GC-site) policy.
 
 <!-- Related: [lang/882-memoryerror-exception](882-memoryerror-exception.md). -->
