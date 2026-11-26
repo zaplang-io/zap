@@ -39,6 +39,9 @@ struct Sink:
     def emit_nil(self):
         self.toks.append("nil")
 
+    def emit_variant(self, str name):
+        self.toks.append(name)
+
     def begin_seq(self):
         self.toks.append("[")
 
@@ -97,6 +100,11 @@ struct Src:
             return False
         return True
 
+    def read_variant(self) -> str:
+        auto t = self.toks[self.pos]
+        self.pos = self.pos + 1
+        return t
+
     def begin_seq(self, str field) -> int64:
         return 0
 
@@ -138,6 +146,11 @@ struct Opt:
     int64 id
     Optional[int64] maybe
     Optional[str] note
+
+enum Status:
+    Active
+    Paused
+    Done
 
 def main():
     # Serialize a user struct through the imported serde driver + a local backend.
@@ -195,3 +208,20 @@ def main():
         case Optional.None:
             note_none = True
     print(opt2.id == 1 and got == 9 and note_none)
+
+    # Constant (payload-free) enum: encode emits the variant name, decode
+    # reconstructs the variant from that name (breadth slice 4). The driver
+    # dispatches on kind == "enum" at the top level — no struct frame is opened.
+    auto ws = Sink()
+    serde.serialize(Status.Paused, ws)
+    print(",".join(ws.toks) == "Paused")
+    auto st = serde.deserialize[Status, Src](Src(["Active"], 0))
+    bool is_active = False
+    match st:
+        case Status.Active:
+            is_active = True
+        case Status.Paused:
+            is_active = False
+        case Status.Done:
+            is_active = False
+    print(is_active)

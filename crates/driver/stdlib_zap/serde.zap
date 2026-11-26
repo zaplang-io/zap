@@ -14,10 +14,11 @@
 # version-coherent implementation for the whole ecosystem, no `zap add`.
 #
 # Supported field kinds: `int64`, `uint64`, `float64`, `str`, `bool`, `bytes`, a
-# nested derived struct (encode recurses into the field's own specialization),
-# `list[T]` / `dict[str, V]` of scalar elements, and `Optional[T]` of a scalar
-# (all both directions). Enum and generic-struct DESERIALIZE are blocked on the
-# `reflect.construct` generalization (#1561) and are a later addition.
+# nested derived struct, `list[T]` / `dict[str, V]` of scalar elements, `Optional[T]`
+# of a scalar (all both directions), and `enum` types (encode: all variants;
+# decode: payload-free/constant variants, via reflect.construct_variant). Generic
+# structs encode/decode via reflect.construct; payload-carrying enum DECODE is a
+# later addition.
 
 # A format backend emits a value as a sequence of visitor events. A concrete
 # codec implements this once; `field_name` may be a no-op for positional formats.
@@ -32,6 +33,8 @@ interface Serializer:
     def emit_bytes(self, bytes v)
     # `Optional` None; a `Some` emits the inner value directly.
     def emit_nil(self)
+    # An enum variant's tag (its name); any payload values follow via `emit_*`.
+    def emit_variant(self, str name)
     # Sequence (list) and map (dict) framing. The driver calls `begin_*`, emits
     # the elements / key+value pairs, then `end_*`. A length-prefixed backend
     # buffers and backfills the header at `end_*` (no count up front on encode).
@@ -55,17 +58,45 @@ interface Deserializer:
     # `Optional`: return True and leave the value to be read (a `Some`), or consume
     # a nil and return False (a `None`).
     def begin_optional(self, str field) -> bool
+    # An enum variant's tag (its name), read before any payload values.
+    def read_variant(self) -> str
     def begin_seq(self, str field) -> int64
     def end_seq(self)
     def begin_map(self, str field) -> int64
     def end_map(self)
     def end_struct(self)
 
-# Serialize `value` of any struct type `T` into the backend `s`. The backend is a
-# `[S: Serializer]` type parameter, so each (T, S) pair is a distinct, fully
-# monomorphized specialization. A nested struct field recurses with both type
-# arguments inferred from the value arguments.
+# Serialize `value` of any struct or enum type `T` into the backend `s`. The
+# backend is a `[S: Serializer]` type parameter, so each (T, S) pair is a distinct,
+# fully monomorphized specialization. The top-level kind dispatch is pruned per
+# instantiation (a struct never compiles the enum arm, and vice versa).
 def serialize[T, S: Serializer](T value, S s):
+    if reflect.type_info(T).kind.name == "enum":
+        # An enum serializes as its variant tag followed by any payload values.
+        match value:
+            case comptime v in reflect.type_info(T).variants as payload:
+                s.emit_variant(comptime v.name)
+                comptime for pf in v.fields:
+                    if comptime pf.ty.name == "int64":
+                        s.emit_int(reflect.field(payload, comptime pf.index))
+                    elif comptime pf.ty.name == "uint64":
+                        s.emit_uint(reflect.field(payload, comptime pf.index))
+                    elif comptime pf.ty.name == "float64":
+                        s.emit_float(reflect.field(payload, comptime pf.index))
+                    elif comptime pf.ty.name == "str":
+                        s.emit_str(reflect.field(payload, comptime pf.index))
+                    elif comptime pf.ty.name == "bool":
+                        s.emit_bool(reflect.field(payload, comptime pf.index))
+                    elif comptime pf.ty.name == "bytes":
+                        s.emit_bytes(reflect.field(payload, comptime pf.index))
+                    else:
+                        comptime.error(comptime pf.span, "serde.serialize: unsupported enum payload kind")
+    else:
+        _serialize_struct(value, s)
+
+# A nested struct field recurses through `serialize` (the dispatcher), so a nested
+# enum field is handled too. This helper is only instantiated for a struct `T`.
+def _serialize_struct[T, S: Serializer](T value, S s):
     s.begin_struct()
     comptime for f in reflect.type_info(T).fields:
         s.field_name(comptime f.name)
@@ -159,11 +190,26 @@ def serialize[T, S: Serializer](T value, S s):
             comptime.error(f.span, "serde.serialize: unsupported field kind")
     s.end_struct()
 
-# Deserialize a value of struct type `T` from the backend `d`. Both type arguments
-# are explicit at the call site (`serde.deserialize[T, D](d)`): `T` is the
-# construct target and cannot be inferred. A codec library typically wraps this as
-# `unpack[T](bytes) -> T`.
+# Deserialize a value of struct or enum type `T` from the backend `d`. Both type
+# arguments are explicit at the call site (`serde.deserialize[T, D](d)`): `T` is
+# the construct target and cannot be inferred. A codec library typically wraps
+# this as `unpack[T](bytes) -> T`. Enum decode this release is payload-free
+# (constant) variants; a payload-carrying variant is a clear compile error.
 def deserialize[T, D: Deserializer](D d) -> T:
+    if reflect.type_info(T).kind.name == "enum":
+        auto tag = d.read_variant()
+        comptime for v in reflect.type_info(T).variants:
+            comptime for pf in v.fields:
+                comptime.error(comptime pf.span, "serde.deserialize: payload-carrying enum variants are not supported yet (#1561 payload decode)")
+            auto vn = comptime v.name
+            if tag == vn:
+                return reflect.construct_variant(T, comptime v.index)
+        raise ValueError("serde.deserialize: unknown enum variant '" + tag + "'")
+    else:
+        return _deserialize_struct[T, D](d)
+
+# Decode a struct `T`. Only instantiated for a struct (the enum arm returns first).
+def _deserialize_struct[T, D: Deserializer](D d) -> T:
     auto out = reflect.construct(T)
     d.begin_struct()
     comptime for f in reflect.type_info(T).fields:

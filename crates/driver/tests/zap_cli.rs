@@ -3958,6 +3958,8 @@ struct Sink:
         self.toks.append(str(v))
     def emit_nil(self):
         self.toks.append(\"nil\")
+    def emit_variant(self, str name):
+        self.toks.append(name)
     def begin_seq(self):
         self.toks.append(\"[\")
     def end_seq(self):
@@ -4000,6 +4002,10 @@ struct Src:
         return uint64(int(t))
     def begin_optional(self, str field) -> bool:
         return True
+    def read_variant(self) -> str:
+        auto t = self.toks[self.pos]
+        self.pos = self.pos + 1
+        return t
     def begin_seq(self, str field) -> int64:
         return 0
     def end_seq(self):
@@ -4021,6 +4027,11 @@ struct Coll:
     dict[str, int64] tags
     uint64 big
 
+enum Status:
+    Active
+    Paused
+    Done
+
 def main():
     auto p = Point(3, \"hi\", True)
     auto w = Sink()
@@ -4032,6 +4043,11 @@ def main():
     auto wc = Sink()
     serde.serialize(c, wc)
     print(\",\".join(wc.toks))
+    auto ws = Sink()
+    serde.serialize(Status.Paused, ws)
+    print(\",\".join(ws.toks))
+    auto st = serde.deserialize[Status, Src](Src([\"Active\"], 0))
+    print(st)
 ";
     let f = write_zap("e6-serde-bundled", src);
     let out = zap().arg("ir").arg(&f).output().unwrap();
@@ -4062,6 +4078,20 @@ def main():
     assert!(
         stdout.contains("@Sink__begin_seq") && stdout.contains("@Sink__begin_map"),
         "list/dict framing calls the backend's begin_seq / begin_map directly: {stdout}"
+    );
+    // A constant (payload-free) enum specializes too: the driver dispatches on
+    // kind == \"enum\" and reconstructs the variant by reflection on decode.
+    assert!(
+        stdout.contains("serde__serialize$Status$Sink"),
+        "serde.serialize specializes at an enum across the module boundary: {stdout}"
+    );
+    assert!(
+        stdout.contains("serde__deserialize$Status$Src"),
+        "serde.deserialize specializes at an enum across the module boundary: {stdout}"
+    );
+    assert!(
+        stdout.contains("@Sink__emit_variant") && stdout.contains("@Src__read_variant"),
+        "enum (de)serialization drives the backend's emit_variant / read_variant: {stdout}"
     );
 }
 
