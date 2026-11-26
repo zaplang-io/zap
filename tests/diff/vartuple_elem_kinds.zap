@@ -12,10 +12,11 @@ def main():
     print(len(tuple([1.5, 2.5, 3.5])))
     print(tuple([1.5, 2.5, 3.5])[1])
 
-    # bool elements (== by value; a bool-element tuple's *repr* via tuple(iterable)
-    # is a known follow-up — iterating a list[bool] yields the physical i64 word,
-    # so it would render 1/0 rather than True/False, a limitation shared with
-    # list(iterable)/set(iterable), out of scope for this coverage pass).
+    # bool elements: repr now preserves bool identity through tuple(iterable) /
+    # list(iterable) (#1513), so these render True/False (not 1/0), CPython-exact.
+    print(tuple([True, False]))
+    print(list([True, False]))
+    print(tuple([True]))
     print(tuple([True, False]) == tuple([True, False]))
 
     # int ops: slicing combinations

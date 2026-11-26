@@ -1,0 +1,18 @@
+[True, False, True]
+(True, False)
+(True,)
+['a', 'b', 'c']
+('a', 'b', 'c')
+('x', 'y')
+('m',)
+['a', 'bb']
+('p', 'q')
+{True}
+{'z'}
+2
+[]
+()
+[True, False]
+['a', 'b', 'c']
+[True, False, True]
+[False, True, False]

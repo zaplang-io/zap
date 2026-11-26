@@ -12559,7 +12559,12 @@ impl<'a> FnLower<'a> {
                 Expr::Starred { value, .. } => {
                     if let (Some(kind), Expr::List(_, _)) = (elem.get(), value.as_ref()) {
                         let (source, _) = self.expr_collection_context(value, Ty::List(kind))?;
-                        self.iterate_list(source, kind, |s, v, t| push(s, v, t))?;
+                        // Narrow a `bool`/`char` element back to its logical type
+                        // so `push` re-derives the correct element kind (#1513) —
+                        // the same narrowing the general `iterate` path does — so
+                        // `[True, *[False]]` builds a `list[bool]`, not a rejected
+                        // `i64`/`bool` mismatch.
+                        self.iterate_list_logical(source, kind, |s, v, t| push(s, v, t))?;
                     } else {
                         self.iterate(value, |s, v, t| push(s, v, t))?;
                     }
