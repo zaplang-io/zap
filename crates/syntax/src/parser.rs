@@ -7195,19 +7195,23 @@ mod tests {
     }
 
     #[test]
-    fn prelude_registers_no_derivable_today_so_the_hook_is_inert() {
-        // #1596 is inert until the prelude registers a library derive (the Json
-        // retire #1558 is the first): the prelude has no `@derivable` generator,
-        // so `references_prelude_derivable` never fires and every current program
-        // stays byte-for-byte unchanged (no extra prelude injection).
+    fn prelude_derivable_hook_is_gated_to_json_deriving_programs() {
+        // The prelude registers the Json codec's `@derivable` generators (#1558,
+        // via `json_derive.zap`), so `prelude_derivable_generators()` is now
+        // non-empty — but the #1596 hook still only fires for a program that
+        // routes one of them. A program that does not derive Json (no reference to
+        // a generator) leaves `references_prelude_derivable` false, so it gets no
+        // extra prelude injection and stays byte-for-byte unchanged.
+        let gens = prelude_derivable_generators();
         assert!(
-            prelude_derivable_generators().is_empty(),
-            "no prelude @derivable exists yet; adding one activates the #1596 hook"
+            gens.iter().any(|g| g == "__derive_json_to")
+                && gens.iter().any(|g| g == "__derive_json_from"),
+            "the prelude Json codec generators must be registered: {gens:?}"
         );
         let m = parse_ok("@derive(Eq)\nstruct S:\n    int64 a\n\ndef main():\n    pass\n");
         assert!(
             !references_prelude_derivable(&m),
-            "with no prelude derivable, the hook must not trigger prelude injection"
+            "a non-Json-deriving program must not trigger the prelude derivable injection"
         );
     }
 
