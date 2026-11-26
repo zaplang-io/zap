@@ -7912,7 +7912,12 @@ impl Checker {
                     // comptime i, v)` is desugared to a field assignment at
                     // monomorphization; sema accepts both as comptime calls of
                     // statically-unknown type without inferring their arguments.
-                    | "construct" | "set_field"
+                    // `construct_variant(T, comptime i, payload…)` (#1561) builds
+                    // the i-th variant of enum `T` — its first two arguments are a
+                    // type and a comptime index, so it is accepted here on the same
+                    // footing (the payload values are checked at monomorphization,
+                    // like `set_field`'s value argument).
+                    | "construct" | "set_field" | "construct_variant"
                 )
             {
                 return Ty::Unknown;
