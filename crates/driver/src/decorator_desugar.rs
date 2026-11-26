@@ -545,8 +545,12 @@ fn try_build_rebind(
     // The INNERMOST wrap (the one handed the handler, processed first) passes the
     // synthesized adapter to the handler parameter **by name** when the seam named
     // it (#1626), so optional metadata parameters keep their defaults regardless
-    // of declaration order. A raw handler (no seam) and the outer wraps (which
-    // thread the composed object) stay the trailing positional argument.
+    // of declaration order. When that decorator carries POSITIONAL metadata around
+    // a NON-LAST handler parameter, those positionals are routed onto the
+    // receiver's parameter names *skipping the handler's slot* (#1645), so a
+    // positional never lands on — or double-binds — the handler parameter. A raw
+    // handler (no seam) and the outer wraps (which thread the composed object) stay
+    // the trailing positional argument.
     let mut chain = Expr::Name(base_name, f.span);
     for (i, d) in dotted.iter().rev().enumerate() {
         let Some(rd) = resolve_dotted(
@@ -561,14 +565,24 @@ fn try_build_rebind(
         ) else {
             continue;
         };
-        let mut args = d.args.clone();
-        let inner_name = if i == 0 { handler_param.clone() } else { None };
-        args.push(Arg {
-            name: inner_name,
-            value: chain,
-            spread: ArgSpread::None,
-            span: d.span,
-        });
+        let args = match (i, handler_param.as_deref()) {
+            // Innermost decorator with a named handler seam: pass the adapter by
+            // the handler parameter's name and route any positional metadata around
+            // its slot (#1626/#1645).
+            (0, Some(hp)) => innermost_wrap_args(&d.args, &rd.params, hp, chain, d.span),
+            // A raw handler (no seam) or an outer wrap: the inner value is the
+            // trailing positional argument, unchanged.
+            _ => {
+                let mut args = d.args.clone();
+                args.push(Arg {
+                    name: None,
+                    value: chain,
+                    spread: ArgSpread::None,
+                    span: d.span,
+                });
+                args
+            }
+        };
         chain = Expr::Call {
             callee: Box::new(rd.callee),
             args,
@@ -589,6 +603,84 @@ fn try_build_rebind(
         },
         adapter,
     ))
+}
+
+/// Build the innermost decorator's call arguments when the synthesized handler
+/// reaches its parameter *by name* (#1626), routing positional metadata around a
+/// non-last handler slot (#1645).
+///
+/// The synthesized `adapter` is always passed to the handler parameter
+/// `handler_param` by keyword, so optional named metadata (`name=`/`help=`) keeps
+/// its defaults regardless of the handler's position. The decorator's own
+/// arguments (`decorator_args`) are kept; keyword metadata binds by its own name.
+///
+/// Positional metadata needs care only when a positional would reach the handler's
+/// slot — i.e. there are more leading positionals than the handler's parameter
+/// index. Then every positional from the handler's index onward is bound by the
+/// receiver parameter's *name*, shifted one past the handler (`params[pos + 1]`),
+/// so the handler's slot is skipped and no positional lands on (or double-binds)
+/// it. Positionals before the handler's index keep their position, and when no
+/// positional reaches the handler the arguments are kept verbatim — so the
+/// handler-last and keyword-only-metadata cases (#1544/#1626) are byte-for-byte
+/// unchanged.
+fn innermost_wrap_args(
+    decorator_args: &[Arg],
+    params: &[(String, Option<Type>)],
+    handler_param: &str,
+    adapter: Expr,
+    span: Span,
+) -> Vec<Arg> {
+    let handler_kw = Arg {
+        name: Some(handler_param.to_string()),
+        value: adapter,
+        spread: ArgSpread::None,
+        span,
+    };
+    let handler_idx = params.iter().position(|(n, _)| n == handler_param);
+    // Leading positional metadata arguments (Zap requires positionals before
+    // keywords, so the leading run is the full positional count).
+    let positional = decorator_args
+        .iter()
+        .take_while(|a| a.name.is_none())
+        .count();
+    // Only route around the handler when a positional would reach or pass its slot.
+    let needs_remap = handler_idx.is_some_and(|idx| positional > idx);
+    if !needs_remap {
+        let mut args = decorator_args.to_vec();
+        args.push(handler_kw);
+        return args;
+    }
+    let handler_idx = handler_idx.expect("needs_remap implies a handler index");
+    let mut args: Vec<Arg> = Vec::with_capacity(decorator_args.len() + 1);
+    let mut pos = 0usize; // ordinal among the decorator's positional arguments
+    for a in decorator_args {
+        if a.name.is_some() {
+            // Keyword metadata binds by its own name — unchanged.
+            args.push(a.clone());
+            continue;
+        }
+        if pos < handler_idx {
+            // Before the handler's slot: keep the positional in place.
+            args.push(a.clone());
+        } else {
+            // At or beyond the handler's slot: bind by the receiver parameter's
+            // name, shifted one past the handler so its slot is skipped. An
+            // overflow (more positionals than parameters) is a user arity error
+            // left to sema; keep it positional so the argument count is preserved.
+            match params.get(pos + 1) {
+                Some((pname, _)) => args.push(Arg {
+                    name: Some(pname.clone()),
+                    value: a.value.clone(),
+                    spread: a.spread,
+                    span: a.span,
+                }),
+                None => args.push(a.clone()),
+            }
+        }
+        pos += 1;
+    }
+    args.push(handler_kw);
+    args
 }
 
 /// Classify the trailing-parameter type `t` of a returning decorator's receiver
@@ -2765,5 +2857,118 @@ mod tests {
             "raw handler stays a positional argument"
         );
         assert!(matches!(&last.value, Expr::Name(n, _) if n == "greet$impl"));
+    }
+
+    // ---- #1645: positional metadata around a non-last handler parameter ------
+
+    #[test]
+    fn positional_metadata_skips_nonlast_handler_slot() {
+        // #1645: positional decorator metadata with a NON-LAST handler parameter.
+        // `argument(str name, fn(Namespace) handler, str metavar = "")` with two
+        // positional metadata arguments — the handler is at index 1, so the second
+        // positional must be routed PAST it to `metavar` by name. It must not land
+        // on the handler slot (which the adapter fills by keyword), nor double-bind
+        // it.
+        let mut m = module(
+            "struct Arg:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def argument(self, str name, fn(Namespace) -> str handler, str metavar = \"\") -> Arg:\n        return Arg()\n\
+             @cli.argument(\"pos-name\", \"META\")\ndef greet(str who) -> str:\n    return who\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let args = rebind_call_args(&main_stmts(&m)[1], "greet").expect("greet rebound");
+        // Exactly one positional ("pos-name" → the pre-handler `name`); the handler
+        // slot is never filled positionally.
+        assert_eq!(
+            args.iter().filter(|a| a.name.is_none()).count(),
+            1,
+            "only the pre-handler positional stays positional: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.name.is_none()
+                && matches!(&a.value, Expr::Str { value, .. } if value == "pos-name")),
+            "the first positional binds the pre-handler `name` parameter: {args:?}"
+        );
+        // The post-handler positional is routed PAST the handler to `metavar`.
+        assert!(
+            args.iter().any(|a| a.name.as_deref() == Some("metavar")
+                && matches!(&a.value, Expr::Str { value, .. } if value == "META")),
+            "the post-handler positional binds `metavar` by name, skipping the handler: {args:?}"
+        );
+        // The adapter reaches the handler parameter by keyword.
+        assert!(
+            args.iter().any(|a| a.name.as_deref() == Some("handler")
+                && matches!(&a.value, Expr::Name(n, _) if n == "greet$adapter")),
+            "the adapter is passed to `handler` by keyword: {args:?}"
+        );
+    }
+
+    #[test]
+    fn positional_metadata_skips_first_handler_slot() {
+        // #1645: the handler is the FIRST parameter, with positional metadata after
+        // it. Both positionals route past the leading handler slot to `name`/
+        // `metavar` by name, leaving the handler to the by-keyword adapter.
+        let mut m = module(
+            "struct Arg:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def argument(self, fn(Namespace) -> str handler, str name, str metavar = \"\") -> Arg:\n        return Arg()\n\
+             @cli.argument(\"pos-name\", \"META\")\ndef greet(str who) -> str:\n    return who\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let args = rebind_call_args(&main_stmts(&m)[1], "greet").expect("greet rebound");
+        // No positional survives — all route past the leading handler slot by name.
+        assert_eq!(
+            args.iter().filter(|a| a.name.is_none()).count(),
+            0,
+            "no positional lands on the leading handler slot: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.name.as_deref() == Some("name")
+                && matches!(&a.value, Expr::Str { value, .. } if value == "pos-name")),
+            "first positional binds `name` by name: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.name.as_deref() == Some("metavar")
+                && matches!(&a.value, Expr::Str { value, .. } if value == "META")),
+            "second positional binds `metavar` by name: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.name.as_deref() == Some("handler")
+                && matches!(&a.value, Expr::Name(n, _) if n == "greet$adapter")),
+            "the adapter is passed to `handler` by keyword: {args:?}"
+        );
+    }
+
+    #[test]
+    fn positional_before_handler_slot_stays_verbatim() {
+        // #1645 guard: a single positional that does NOT reach the handler slot is
+        // kept verbatim — no spurious keyword rewrite — matching #1626. With
+        // `argument(str name, fn(Namespace) handler, str metavar = "")`, one
+        // positional fills `name` positionally and `metavar` keeps its default.
+        let mut m = module(
+            "struct Arg:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def argument(self, str name, fn(Namespace) -> str handler, str metavar = \"\") -> Arg:\n        return Arg()\n\
+             @cli.argument(\"pos-name\")\ndef greet(str who) -> str:\n    return who\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let args = rebind_call_args(&main_stmts(&m)[1], "greet").expect("greet rebound");
+        assert!(
+            args.iter().any(|a| a.name.is_none()
+                && matches!(&a.value, Expr::Str { value, .. } if value == "pos-name")),
+            "the lone positional stays positional (fills `name`): {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.name.as_deref() == Some("metavar")),
+            "no spurious `metavar` keyword when the positional does not reach the handler: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.name.as_deref() == Some("handler")
+                && matches!(&a.value, Expr::Name(n, _) if n == "greet$adapter")),
+            "the adapter is passed to `handler` by keyword: {args:?}"
+        );
     }
 }
