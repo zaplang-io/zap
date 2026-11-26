@@ -819,6 +819,61 @@ mod tests {
     }
 
     #[test]
+    fn token_urlsafe_alloc_failure_caught_by_except_memoryerror_1600() {
+        // #1600: crypto.token_urlsafe now raises a catchable MemoryError (not
+        // ValueError) when its scratch allocation fails. Inside
+        // `try: … except MemoryError`, the call is an `invoke` whose unwind edge
+        // reaches the handler, and the handler dispatch tests the MemoryError
+        // type id (18) — the same id the runtime raises (ZAP_EXC_MEMORY_ERROR),
+        // so `except MemoryError` actually catches the allocation failure. The
+        // entropy-failure (OSError) catchability of the same call site is pinned
+        // by `csprng_failure_caught_by_except_oserror`.
+        let m = lower_ok(
+            "def main():\n    \
+                 int64 n = 37\n    \
+                 try:\n        \
+                     auto t = crypto.token_urlsafe(n)\n    \
+                 except MemoryError as e:\n        \
+                     print(\"no memory\")\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("invoke @zap_crypto_token_urlsafe") && text.contains("unwind"),
+            "crypto.token_urlsafe in a `try` must be an invoke with an unwind edge, text:\n{text}"
+        );
+        assert!(
+            text.contains("landingpad"),
+            "expected a landing pad, text:\n{text}"
+        );
+        // `except MemoryError` lowers to a `zap_exception_is_a(exc, <id>)` test;
+        // <id> must be the MemoryError type id 18 (ZAP_EXC_MEMORY_ERROR in
+        // zaprt.c), or the catch would never fire for the allocation failure.
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        let id_arg = main
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find_map(|i| match i {
+                Inst::Call { func, args, .. } if func == "zap_exception_is_a" => Some(args[1]),
+                _ => None,
+            })
+            .expect("except MemoryError must emit a zap_exception_is_a membership test");
+        let id_val = main
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find_map(|i| match i {
+                Inst::IConst { dest, val } if *dest == id_arg => Some(*val),
+                _ => None,
+            })
+            .expect("the MemoryError type id must be a constant");
+        assert_eq!(
+            id_val, 18,
+            "MemoryError must map to type id 18 (ZAP_EXC_MEMORY_ERROR)"
+        );
+    }
+
+    #[test]
     fn lower_array_collection_contract_fixtures() {
         let module = lower_ok(include_str!(
             "../../../tests/conformance/array_contract.zap"

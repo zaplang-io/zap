@@ -87,12 +87,19 @@ buffer into `zap_crypto_fill_random`, so no scratch-and-copy was needed.
   and `uuid` random surfaces; the **uncaught** form still prints the normal
   `Uncaught exception: <message>` diagnostic and exits 1. Intentional termination
   elsewhere (`sys.exit`, signals, heap-exhaustion fail-stop) is unchanged.
-- `zap_crypto_token_urlsafe` leaks its one `malloc`'d scratch buffer on the raising
-  path (the unwind bypasses its `free`). This is immaterial: a CSPRNG failure is a
-  process-level, typically one-shot catastrophic condition, and the buffer is a
-  single small allocation that is not caller-visible. Rewriting it to free on the
-  unwind path was judged not worth the churn; noted here so it is a deliberate
-  choice, not an oversight.
+- ~~`zap_crypto_token_urlsafe` leaks its one `malloc`'d scratch buffer on the
+  raising path (the unwind bypasses its `free`). This is immaterial: a CSPRNG
+  failure is a process-level, typically one-shot catastrophic condition, and the
+  buffer is a single small allocation that is not caller-visible. Rewriting it to
+  free on the unwind path was judged not worth the churn; noted here so it is a
+  deliberate choice, not an oversight.~~ **Superseded by
+  [lang/1600-token-urlsafe-scratch](1600-token-urlsafe-scratch.md):** a caller
+  that catches the `OSError` and retries leaks one buffer per failure, so the
+  scratch is now freed on the unwind path. `token_urlsafe` fills through a
+  non-raising CSPRNG core (`zap_crypto_fill_random_try`) and `free()`s its scratch
+  before raising; the other CSPRNG callers keep the raising
+  `zap_crypto_fill_random` wrapper because their buffers are GC- or stack-owned
+  and are safely dropped on the unwind.
 - A CSPRNG failure is **not reproducible on a healthy host**, so there is no
   end-to-end golden for the failure path. Host ZIR checks
   (`crates/ir/src/lib.rs`) pin the invoke edge for every CSPRNG-backed entry point
