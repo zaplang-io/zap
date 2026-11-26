@@ -1958,6 +1958,320 @@ def main():
     );
 }
 
+// --- #1639 (E7, epic #1248): the CROSS-TYPE instantiation frame. When deriving
+// `Inner` fails and `Inner` was pulled in by a field of an enclosing type that
+// also derives the trait, the backtrace prepends `required because of field `x`
+// of `Outer`` above `Inner`'s own within-type chain — the full Outer → … → Inner
+// path. These exercise the whole pipeline through `zap ir` (the comptime.error
+// fires in monomorphization, before codegen, so no LLVM is needed). ---
+
+/// The shared `@derivable(Ser)` generator for the #1639 cross-type goldens: it
+/// succeeds on enums and on any struct without a `Bad` field, and rejects a
+/// `Bad`-typed field with a library `comptime.error`. The leaf failure therefore
+/// lives in whichever struct declares a `Bad` field; the cross-type chain is
+/// reconstructed structurally from the enclosing types' own field declarations.
+const SER_GEN_1639: &str = "\
+@derivable(Ser)
+def _derive_ser[T](T value):
+    if reflect.type_info(T).kind.name == \"enum\":
+        pass
+    else:
+        comptime for f in reflect.type_info(T).fields:
+            if f.ty.name == \"Bad\":
+                comptime.error(f.span, \"`Ser` is not implemented for `Bad`\")
+
+interface Ser:
+    def ser(self)
+
+struct Bad:
+    int64 marker
+";
+
+#[test]
+fn a_nested_derive_failure_names_the_outer_field_that_required_it() {
+    // One level: `Outer` has a field `inner` of the derived type `Inner`, and
+    // `Inner` has an unsupported `Bad` field. The header names `Inner` (where the
+    // cause is), and the chain climbs `field `b` of `Inner`` → `field `inner` of
+    // `Outer``, giving the full cross-type path (#1639).
+    let src = format!(
+        "{SER_GEN_1639}\
+@derive(Ser)
+struct Inner:
+    int64 i
+    Bad b
+@derive(Ser)
+struct Outer:
+    int64 id
+    Inner inner
+
+def main():
+    auto o = Outer(1, Inner(2, Bad(3)))
+    o.ser()
+"
+    );
+    let f = write_zap("x1639-one-level", &src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "the nested derive must fail to compile"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error[ZAP7003]: cannot derive `Ser` for `Inner`"),
+        "header names the type whose own field is unsupported: {stderr}"
+    );
+    assert!(
+        stderr.contains("required because of field `b` of `Inner`"),
+        "the within-type frame at Inner's own field: {stderr}"
+    );
+    assert!(
+        stderr.contains("required because of field `inner` of `Outer`"),
+        "the cross-type frame at the outer field that pulled Inner in: {stderr}"
+    );
+    assert!(
+        stderr.contains("the generator reported: `Ser` is not implemented for `Bad`"),
+        "the library's own message as the root cause: {stderr}"
+    );
+    // The two frames must appear in order: Inner's own field nearest the cause,
+    // then the outer field climbing outward (the renderer prints inner-first).
+    let inner_at = stderr.find("field `b` of `Inner`").unwrap();
+    let outer_at = stderr.find("field `inner` of `Outer`").unwrap();
+    assert!(
+        inner_at < outer_at,
+        "the chain climbs from Inner's field outward to Outer's: {stderr}"
+    );
+    // No mangled internal symbol leaks into the diagnostic.
+    assert!(
+        !stderr.contains("_derive_ser") && !stderr.contains('$'),
+        "no comptime-internal symbol in the diagnostic: {stderr}"
+    );
+}
+
+#[test]
+fn a_multi_level_nested_derive_failure_renders_the_full_cross_type_chain() {
+    // Three levels: `Outer{mid: Mid}`, `Mid{inner: Inner}`, `Inner{b: Bad}`. The
+    // chain must show every hop outermost-last: Inner's own field, then Mid's
+    // field, then Outer's field (#1639).
+    let src = format!(
+        "{SER_GEN_1639}\
+@derive(Ser)
+struct Inner:
+    Bad b
+@derive(Ser)
+struct Mid:
+    Inner inner
+@derive(Ser)
+struct Outer:
+    int64 id
+    Mid mid
+
+def main():
+    auto o = Outer(1, Mid(Inner(Bad(2))))
+    o.ser()
+"
+    );
+    let f = write_zap("x1639-multi-level", &src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "the nested derive must fail to compile"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error[ZAP7003]: cannot derive `Ser` for `Inner`"),
+        "header names the innermost failing type: {stderr}"
+    );
+    for frame in [
+        "required because of field `b` of `Inner`",
+        "required because of field `inner` of `Mid`",
+        "required because of field `mid` of `Outer`",
+    ] {
+        assert!(stderr.contains(frame), "missing frame `{frame}`: {stderr}");
+    }
+    // Strict inner-to-outer ordering across all three hops.
+    let b = stderr.find("field `b` of `Inner`").unwrap();
+    let inner = stderr.find("field `inner` of `Mid`").unwrap();
+    let mid = stderr.find("field `mid` of `Outer`").unwrap();
+    assert!(
+        b < inner && inner < mid,
+        "frames climb Inner → Mid → Outer: {stderr}"
+    );
+    assert!(
+        !stderr.contains("_derive_ser") && !stderr.contains('$'),
+        "no comptime-internal symbol in the diagnostic: {stderr}"
+    );
+}
+
+#[test]
+fn a_container_wrapped_nested_derive_failure_crosses_the_container_level() {
+    // The outer field wraps the nested derived type in a container
+    // (`list[Inner]`, `dict[str, Inner]`, `Optional[Inner]`, tuple). The
+    // cross-type frame must cross the container level just like the within-type
+    // chain does (#1293), so the reader sees both the container and the field.
+    for (tag, field_ty, field_name, container_label) in [
+        (
+            "list",
+            "list[Inner]",
+            "items",
+            "the element type of `list[Inner]`",
+        ),
+        (
+            "dict",
+            "dict[str, Inner]",
+            "by_name",
+            "the value type of `dict[str, Inner]`",
+        ),
+        (
+            "optional",
+            "Optional[Inner]",
+            "maybe",
+            "the element type of `Optional[Inner]`",
+        ),
+        (
+            "tuple",
+            "(int64, Inner)",
+            "pair",
+            "element 2 of `(int64, Inner)`",
+        ),
+    ] {
+        let src = format!(
+            "{SER_GEN_1639}\
+@derive(Ser)
+struct Inner:
+    Bad b
+@derive(Ser)
+struct Outer:
+    {field_ty} {field_name}
+
+def main():
+    print(1)
+"
+        );
+        let f = write_zap(&format!("x1639-container-{tag}"), &src);
+        let out = zap().arg("ir").arg(&f).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "the {tag}-wrapped nested derive must fail to compile"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("error[ZAP7003]: cannot derive `Ser` for `Inner`"),
+            "[{tag}] header names Inner: {stderr}"
+        );
+        assert!(
+            stderr.contains("required because of field `b` of `Inner`"),
+            "[{tag}] within-type frame: {stderr}"
+        );
+        assert!(
+            stderr.contains(container_label),
+            "[{tag}] the container level `{container_label}`: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "required because of field `{field_name}` of `Outer`"
+            )),
+            "[{tag}] the outer field frame: {stderr}"
+        );
+        // Ordering: Inner's own field (nearest cause) → the container level →
+        // the outer field (outermost).
+        let b = stderr.find("field `b` of `Inner`").unwrap();
+        let cont = stderr.find(container_label).unwrap();
+        let outer = stderr
+            .find(&format!("field `{field_name}` of `Outer`"))
+            .unwrap();
+        assert!(
+            b < cont && cont < outer,
+            "[{tag}] Inner → container → Outer ordering: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn an_enum_outer_names_the_variant_in_the_cross_type_frame() {
+    // The enclosing type is an enum whose variant payload is the nested derived
+    // struct. The cross-type frame must name the variant, mirroring the
+    // within-type enum attribution (#1616): `payload field `inner` of variant
+    // `Wrap` of `Outer``.
+    let src = format!(
+        "{SER_GEN_1639}\
+@derive(Ser)
+struct Inner:
+    Bad b
+@derive(Ser)
+enum Outer:
+    Empty
+    Wrap(Inner inner)
+
+def main():
+    print(1)
+"
+    );
+    let f = write_zap("x1639-enum-outer", &src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "the enum-outer nested derive must fail"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error[ZAP7003]: cannot derive `Ser` for `Inner`"),
+        "header names the inner struct: {stderr}"
+    );
+    assert!(
+        stderr.contains("required because of field `b` of `Inner`"),
+        "within-type frame: {stderr}"
+    );
+    assert!(
+        stderr.contains("required because of payload field `inner` of variant `Wrap` of `Outer`"),
+        "the cross-type frame names the enum variant that carried Inner: {stderr}"
+    );
+    assert!(
+        !stderr.contains("_derive_ser") && !stderr.contains('$'),
+        "no comptime-internal symbol in the diagnostic: {stderr}"
+    );
+}
+
+#[test]
+fn a_standalone_derive_failure_adds_no_cross_type_frame() {
+    // Regression guard: when the failing type is not required by any other
+    // deriving type's field, the within-type chain (#1616) must render exactly as
+    // before — no spurious cross-type frame is invented (#1639).
+    let src = format!(
+        "{SER_GEN_1639}\
+@derive(Ser)
+struct Lonely:
+    int64 n
+    Bad b
+
+def main():
+    auto l = Lonely(1, Bad(2))
+    l.ser()
+"
+    );
+    let f = write_zap("x1639-standalone", &src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "the standalone derive must still fail"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error[ZAP7003]: cannot derive `Ser` for `Lonely`"),
+        "header names the standalone type: {stderr}"
+    );
+    assert!(
+        stderr.contains("required because of field `b` of `Lonely`"),
+        "its own within-type frame: {stderr}"
+    );
+    // Exactly one `required because of` note — the within-type field — with no
+    // invented outer frame.
+    assert_eq!(
+        stderr.matches("required because of").count(),
+        1,
+        "a standalone failure has a single within-type frame: {stderr}"
+    );
+}
+
 #[test]
 fn an_enum_derive_recurses_through_an_enum_typed_variant_payload() {
     // #1401: a `@derive` generator may recurse through a variant payload that is

@@ -305,11 +305,26 @@ and a `ZAP7xxx` code:
   (`payload field `r` of variant `Circle` of `Shape``); a generator fault
   additionally dual-spans the generator line and the instantiation site.
 
+  The chain also crosses **type boundaries**: when a nested *derived* type
+  `Inner` fails and was pulled in by a field of an enclosing type `Outer` that
+  also derives the trait, the frames climb outward through each enclosing field,
+  giving the full `Outer → … → Inner` path (the header still names `Inner`, where
+  the unsupported leaf is):
+
+  ```
+  error[ZAP7003]: cannot derive `Ser` for `Inner`
+    note: required because of field `b` of `Inner`
+    note: required because of field `inner` of `Mid`
+    note: required because of field `mid` of `Outer`
+    note: the generator reported: `Ser` is not implemented for `Bad`
+  ```
+
+  A cross-type frame crosses container levels and names an enum-outer's variant
+  exactly like a within-type frame; a standalone derive failure (one not required
+  by another deriving type's field) shows its within-type chain alone.
+
 The backtrace is what turns "something deep in a nested generic codec failed"
-into a readable path back to the type the user wrote. (Linking a failing nested
-*derived* type back to the outer type's field that required it — a cross-type
-frame — is a tracked follow-up; the chain today is complete within one derived
-type.)
+into a readable path back to the type the user wrote.
 
 ---
 

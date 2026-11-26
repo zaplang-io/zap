@@ -556,6 +556,35 @@ fn push_container_frames(frames: &mut Vec<(String, Span)>, field_ty: &Type, caus
     }
 }
 
+/// The span of the first `Named` type node whose head is `name`, found by a
+/// left-to-right pre-order walk of a declared type (#1639). Used to locate where
+/// a nested derived type `Inner` is referenced inside an enclosing field's
+/// declared type (`Inner`, `list[Inner]`, `dict[str, Inner]`, `(int64, Inner)`,
+/// …) so the cross-type backtrace can walk the container levels toward it with
+/// [`push_container_frames`]. The pre-order visits a node before its children and
+/// each `dict`'s key before its value, matching [`descend_toward`]'s reachability
+/// so the span this returns is always one the container walk can descend to.
+/// Returns `None` when the type does not mention `name` (so no cross-type frame).
+fn find_named_span(t: &Type, name: &str) -> Option<Span> {
+    match t {
+        Type::Named {
+            name: n,
+            args,
+            span,
+        } => {
+            if n == name && args.is_empty() {
+                return Some(*span);
+            }
+            args.iter().find_map(|a| find_named_span(a, name))
+        }
+        Type::Tuple { elems, .. } => elems.iter().find_map(|e| find_named_span(e, name)),
+        Type::Func { params, ret, .. } => params
+            .iter()
+            .find_map(|p| find_named_span(p, name))
+            .or_else(|| ret.as_ref().and_then(|r| find_named_span(r, name))),
+    }
+}
+
 /// The trait a free function registers via `@derivable(Trait)` (one positional
 /// identifier), or `None` (E3a, #1290). Mirrors the driver's synthesis scan.
 fn derivable_trait(f: &Function) -> Option<String> {
@@ -2538,14 +2567,29 @@ impl<'a> Mono<'a> {
             .derivable_generators
             .get(func)
             .and_then(|tr| args.first().map(|ty| (tr.clone(), type_name(ty))));
-        let saved_derive = std::mem::replace(&mut self.cur_derive, derive_ctx);
+        let saved_derive = std::mem::replace(&mut self.cur_derive, derive_ctx.clone());
         let spec = self.rewrite_fn_inner(f, None, Some(mangled));
         self.cur_subst = saved_subst;
         self.cur_proj = saved_proj;
         self.cur_self = saved_self;
         self.cur_derive = saved_derive;
-        self.spec_funcs.push(spec?);
-        Ok(())
+        match spec {
+            Ok(s) => {
+                self.spec_funcs.push(s);
+                Ok(())
+            }
+            // A derivable generator's instance failed. If the type it derives was
+            // pulled in by a field of an enclosing type that also derives the
+            // trait, prepend the cross-type `required because of field … of
+            // Outer` frame(s) so the diagnostic shows the full Outer → … → Inner
+            // instantiation path, not just Inner's own within-type chain (#1639).
+            Err(mut le) => {
+                if let Some((_, inner_ty)) = &derive_ctx {
+                    self.prepend_cross_type_frames(&mut le, func, inner_ty);
+                }
+                Err(le)
+            }
+        }
     }
 
     /// Emit the specialized body of a generic method and queue it for attachment
@@ -2911,6 +2955,113 @@ impl Mono<'_> {
             }
         }
         le
+    }
+
+    /// The `required because of …` frames for one cross-type hop (#1639): the
+    /// first field of `outer` (a struct field or an enum variant payload field)
+    /// whose declared type references `inner`, rendered as the top field frame
+    /// plus one frame per container level crossed toward `inner` (`list`/`dict`/
+    /// `Optional`/tuple), outermost-first. `None` when `outer` is not a known
+    /// type or none of its fields reference `inner`. Reuses the within-type
+    /// descent machinery (#1293/#1616) anchored on the *outer* type's own source
+    /// field spans, so the frame points at the user's real declaration.
+    fn field_frames_referencing(&self, outer: &str, inner: &str) -> Option<Vec<(String, Span)>> {
+        let anchors = match (self.structs.get(outer), self.enums.get(outer)) {
+            (Some(s), _) => struct_anchors(s),
+            (_, Some(e)) => enum_anchors(e),
+            _ => return None,
+        };
+        for (f, variant) in &anchors {
+            if let Some(cause) = find_named_span(&f.ty, inner) {
+                let mut frames =
+                    vec![(derive_top_label(&f.name, variant.as_deref(), outer), f.span)];
+                push_container_frames(&mut frames, &f.ty, cause);
+                return Some(frames);
+            }
+        }
+        None
+    }
+
+    /// The nearest type `outer` that *requires* a derive of `inner` for the same
+    /// generator (#1639): a type (other than `inner`) whose generator instance
+    /// `gen$outer` was actually requested this build (so it really derives the
+    /// trait) and which has a field referencing `inner`. Candidates are scanned
+    /// in a stable (name-sorted) order so a diamond resolves deterministically.
+    /// Returns the outer type's name and the `required because of …` frames for
+    /// that hop.
+    fn cross_type_requirer(
+        &self,
+        gen_fn: &str,
+        inner: &str,
+    ) -> Option<(String, Vec<(String, Span)>)> {
+        let mut names: Vec<&String> = self.structs.keys().chain(self.enums.keys()).collect();
+        names.sort();
+        for outer in names {
+            if outer.as_str() == inner {
+                continue;
+            }
+            // `outer` derives the same trait iff its generator instance was
+            // requested (its forwarding stub forced `gen$outer`, #1290/#1292).
+            let outer_ty = self.named(outer, Vec::new());
+            let key = self.mangle_name(gen_fn, std::slice::from_ref(&outer_ty));
+            if !self.requested_funcs.contains(&key) {
+                continue;
+            }
+            if let Some(frames) = self.field_frames_referencing(outer, inner) {
+                return Some((outer.clone(), frames));
+            }
+        }
+        None
+    }
+
+    /// The full cross-type prefix for a failing derive of `start` (#1639): walk
+    /// `start → requirer → requirer → …` through the structural requires-graph,
+    /// collecting each hop's frames, and flatten them outermost-first so the
+    /// outermost consumer's field frame leads. A `visited` set guards against a
+    /// recursive / mutually-recursive type cycle. Empty when nothing derives the
+    /// trait through a field of `start` (a standalone derive failure).
+    fn cross_type_chain(&self, gen_fn: &str, start: &str) -> Vec<(String, Span)> {
+        let mut hops: Vec<Vec<(String, Span)>> = Vec::new();
+        let mut cur = start.to_string();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        visited.insert(cur.clone());
+        // A declared type graph is finite; the bound is a defensive backstop.
+        for _ in 0..256 {
+            let Some((outer, frames)) = self.cross_type_requirer(gen_fn, &cur) else {
+                break;
+            };
+            if !visited.insert(outer.clone()) {
+                break;
+            }
+            hops.push(frames);
+            cur = outer;
+        }
+        // `hops` is innermost-requirer-first; the backtrace stores frames
+        // outermost-first, so reverse the hops before flattening.
+        hops.into_iter().rev().flatten().collect()
+    }
+
+    /// Prepend the cross-type instantiation frames to a derive failure (#1639):
+    /// when deriving `inner_ty` (via generator `gen_fn`) fails and `inner_ty` was
+    /// pulled in by a field of an enclosing type that also derives the trait,
+    /// prefix `required because of field `x` of `Outer`` (and any container
+    /// levels) ahead of `inner_ty`'s own within-type chain, giving the full
+    /// `Outer → … → Inner` path. A no-op when the error is not a consumer derive
+    /// failure (no `trait_and_type`) or nothing structurally requires `inner_ty`.
+    fn prepend_cross_type_frames(&self, le: &mut LowerError, gen_fn: &str, inner_ty: &str) {
+        let Some(di) = le.derive.as_mut() else {
+            return;
+        };
+        if di.trait_and_type.is_none() {
+            return;
+        }
+        let prefix = self.cross_type_chain(gen_fn, inner_ty);
+        if prefix.is_empty() {
+            return;
+        }
+        let mut frames = prefix;
+        frames.append(&mut di.frames);
+        di.frames = frames;
     }
 
     /// Rewrite an expression, returning the rewritten node only.
@@ -6069,6 +6220,200 @@ mod tests {
         // Spans zoom inward toward the cause, same invariant as the struct chain.
         assert!(span_contains(frames[0].1, frames[1].1));
         assert!(span_contains(frames.last().unwrap().1, cause));
+    }
+
+    // ---- cross-type instantiation frame (#1639, E7) -----------------------
+
+    #[test]
+    fn find_named_span_locates_a_type_through_every_container() {
+        // Bare, list element, dict value, dict key, tuple element, and a nested
+        // `list[dict[str, Inner]]` — each finds the `Inner` node's own span, and
+        // a type that does not mention `Inner` finds nothing.
+        let m = one_field_struct(
+            "struct Inner:\n    int64 i\n\
+             struct S:\n\
+             \x20   Inner a\n\
+             \x20   list[Inner] b\n\
+             \x20   dict[str, Inner] c\n\
+             \x20   dict[Inner, str] d\n\
+             \x20   (int64, Inner) e\n\
+             \x20   list[dict[str, Inner]] f\n\
+             \x20   dict[str, int64] g\n",
+        );
+        let s = struct_named(&m, "S").unwrap();
+        let field = |n: &str| s.fields.iter().find(|f| f.name == n).unwrap();
+        // The located span must be exactly an `Inner` node (a bare, arg-free
+        // `Named` whose head is `Inner`), reachable by the container walk.
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            let f = field(name);
+            let span = find_named_span(&f.ty, "Inner")
+                .unwrap_or_else(|| panic!("`Inner` found in field `{name}`"));
+            // `push_container_frames` must be able to descend to it.
+            let mut frames = Vec::new();
+            push_container_frames(&mut frames, &f.ty, span);
+            assert!(
+                frames.iter().all(|(_, s)| span_contains(*s, span)),
+                "every frame encloses the located span for field `{name}`"
+            );
+        }
+        // A field with no `Inner` anywhere yields `None`.
+        assert!(
+            find_named_span(&field("g").ty, "Inner").is_none(),
+            "a type that never names `Inner` has no span"
+        );
+        // The located span for the bare field `a` is the field type's own span.
+        assert_eq!(
+            find_named_span(&field("a").ty, "Inner"),
+            Some(field("a").ty.span())
+        );
+    }
+
+    /// Build a `Mono` over `src` and mark `gen$<ty>` as requested for each named
+    /// type, so the structural requires-graph (#1639) sees them as deriving the
+    /// trait this build. Returns the populated `Mono` (borrowing `module`).
+    fn mono_with_requested<'a>(
+        module: &'a Module,
+        types: &'a TypeMap,
+        gen: &str,
+        requested: &[&str],
+    ) -> Mono<'a> {
+        let mut m = Mono::new(module, types);
+        for ty in requested {
+            let key = m.mangle_name(gen, std::slice::from_ref(&m.named(ty, Vec::new())));
+            m.requested_funcs.insert(key);
+        }
+        m
+    }
+
+    #[test]
+    fn field_frames_referencing_builds_the_outer_field_frame_and_container_levels() {
+        let module = one_field_struct(
+            "struct Inner:\n    int64 i\n\
+             struct Direct:\n    Inner x\n\
+             struct Listed:\n    list[Inner] xs\n\
+             struct Mapped:\n    dict[str, Inner] by\n\
+             enum Wrapped:\n    None\n    Node(Inner inner)\n",
+        );
+        let types = TypeMap::default();
+        let m = Mono::new(&module, &types);
+
+        // A bare field: a single top frame, no container levels.
+        let direct = m.field_frames_referencing("Direct", "Inner").unwrap();
+        assert_eq!(
+            direct.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
+            vec!["field `x` of `Direct`"],
+        );
+        // A `list[Inner]` field: field frame + element level, outermost-first.
+        let listed = m.field_frames_referencing("Listed", "Inner").unwrap();
+        assert_eq!(
+            listed.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
+            vec![
+                "field `xs` of `Listed`",
+                "the element type of `list[Inner]`",
+            ],
+        );
+        // A `dict[str, Inner]` field: field frame + value level.
+        let mapped = m.field_frames_referencing("Mapped", "Inner").unwrap();
+        assert_eq!(
+            mapped.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
+            vec![
+                "field `by` of `Mapped`",
+                "the value type of `dict[str, Inner]`",
+            ],
+        );
+        // An enum payload field names the variant.
+        let wrapped = m.field_frames_referencing("Wrapped", "Inner").unwrap();
+        assert_eq!(
+            wrapped.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
+            vec!["payload field `inner` of variant `Node` of `Wrapped`"],
+        );
+        // A type that does not reference `Inner`, and an unknown type, yield None.
+        assert!(m.field_frames_referencing("Inner", "Direct").is_none());
+        assert!(m
+            .field_frames_referencing("DoesNotExist", "Inner")
+            .is_none());
+    }
+
+    #[test]
+    fn cross_type_requirer_only_counts_types_whose_generator_was_instantiated() {
+        // `Outer` has an `Inner` field but is only a requirer when its generator
+        // instance `gen$Outer` was actually requested (i.e. it derives the trait
+        // this build). `Bare` references `Inner` too but never derives.
+        let module = one_field_struct(
+            "struct Inner:\n    int64 i\n\
+             struct Outer:\n    Inner x\n\
+             struct Bare:\n    Inner y\n",
+        );
+        let types = TypeMap::default();
+
+        // Nothing requested -> no requirer, even though two types reference Inner.
+        let none = Mono::new(&module, &types);
+        assert!(none.cross_type_requirer("gen", "Inner").is_none());
+
+        // Only `Outer`'s generator requested -> `Outer` is the requirer.
+        let only_outer = mono_with_requested(&module, &types, "gen", &["Outer"]);
+        let (outer, frames) = only_outer.cross_type_requirer("gen", "Inner").unwrap();
+        assert_eq!(outer, "Outer");
+        assert_eq!(frames[0].0, "field `x` of `Outer`");
+
+        // Both requested -> a stable (name-sorted) pick: `Bare` precedes `Outer`.
+        let both = mono_with_requested(&module, &types, "gen", &["Outer", "Bare"]);
+        let (pick, _) = both.cross_type_requirer("gen", "Inner").unwrap();
+        assert_eq!(pick, "Bare", "diamond resolves deterministically by name");
+    }
+
+    #[test]
+    fn cross_type_chain_prepends_each_hop_outermost_first() {
+        // `Outer{mid: Mid}`, `Mid{inner: Inner}`: failing on `Inner` walks up two
+        // hops, flattened outermost-first (Outer's field leads, Mid's follows).
+        let module = one_field_struct(
+            "struct Inner:\n    int64 i\n\
+             struct Mid:\n    Inner inner\n\
+             struct Outer:\n    Mid mid\n",
+        );
+        let types = TypeMap::default();
+        let m = mono_with_requested(&module, &types, "gen", &["Inner", "Mid", "Outer"]);
+
+        let chain = m.cross_type_chain("gen", "Inner");
+        assert_eq!(
+            chain.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
+            vec!["field `mid` of `Outer`", "field `inner` of `Mid`"],
+            "outermost consumer leads; the renderer prints the chain inner-first",
+        );
+    }
+
+    #[test]
+    fn cross_type_chain_is_empty_for_a_standalone_derive() {
+        // No type references `Inner`, so a failure on `Inner` has no cross-type
+        // prefix — the within-type chain (#1616) renders unchanged.
+        let module = one_field_struct(
+            "struct Inner:\n    int64 i\n\
+             struct Other:\n    int64 n\n",
+        );
+        let types = TypeMap::default();
+        let m = mono_with_requested(&module, &types, "gen", &["Inner", "Other"]);
+        assert!(m.cross_type_chain("gen", "Inner").is_empty());
+    }
+
+    #[test]
+    fn cross_type_chain_guards_against_recursive_type_cycles() {
+        // A mutually recursive pair (each holds an `Optional` of the other) must
+        // not loop forever; the `visited` guard stops after each is seen once.
+        let module = one_field_struct(
+            "struct A:\n    Optional[B] b\n\
+             struct B:\n    Optional[A] a\n",
+        );
+        let types = TypeMap::default();
+        let m = mono_with_requested(&module, &types, "gen", &["A", "B"]);
+        // Starting from `A`: `B` requires `A` (its `Optional[A]` field) is the one
+        // hop; the next step would re-reach the already-visited `A`, so the
+        // `visited` guard stops the walk instead of looping.
+        let chain = m.cross_type_chain("gen", "A");
+        assert_eq!(
+            chain.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
+            vec!["field `a` of `B`", "the element type of `Optional[A]`",],
+            "a mutually recursive cycle is walked once, then terminates",
+        );
     }
 
     // ---- transparent type aliases (#606, D-0105) --------------------------
