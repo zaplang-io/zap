@@ -1905,10 +1905,11 @@ def main():
 #[test]
 fn an_inapplicable_enum_derive_points_at_the_variant_payload_field() {
     // #1375 (E3d): a derive generator that rejects an enum variant's payload
-    // field must render the consumer `ZAP7003` pointing at that payload field,
-    // with a `required because of field … of <Enum>` frame — the enum analog of
-    // the struct-field attribution (#1293/#1346), now that variant payload
-    // fields are attributed in the chain.
+    // field must render the consumer `ZAP7003` pointing at that payload field.
+    // #1616 (E7) refines the frame to name the variant — `required because of
+    // payload field `inner` of variant `Bad` of `E`` — so the chain says which
+    // variant carried the failing type (the enum analog of the struct-field
+    // attribution, #1293/#1346).
     let src = "\
 @derivable(Ser)
 def _derive_ser[T](T value):
@@ -1944,8 +1945,8 @@ def main():
         "consumer header naming the enum: {stderr}"
     );
     assert!(
-        stderr.contains("required because of field `inner` of `E`"),
-        "the frame attributes the offending variant payload field: {stderr}"
+        stderr.contains("required because of payload field `inner` of variant `Bad` of `E`"),
+        "the frame names the offending variant and payload field (#1616): {stderr}"
     );
     assert!(
         stderr.contains("the generator reported: `Ser` is not implemented for a struct payload"),
