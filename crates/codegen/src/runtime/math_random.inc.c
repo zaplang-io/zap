@@ -578,8 +578,8 @@ double zap_random_uniform(double a, double b) {
 
 int64_t zap_random_randint(int64_t a, int64_t b) {
     if (b < a) {
-        fprintf(stderr, "zap: random.randint(a, b) requires a <= b\n");
-        abort();
+        const char *m = "random.randint(a, b) requires a <= b";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
     }
     uint64_t span = (uint64_t)(b - a) + 1ULL; /* inclusive, wrap-safe */
     zap_np_lock(&zap_rng_mu);
@@ -595,8 +595,8 @@ int64_t zap_random_randint(int64_t a, int64_t b) {
 int64_t zap_random_list_index(void *l) {
     ZapList *list = (ZapList *)l;
     if (list->len <= 0) {
-        fprintf(stderr, "zap: random.choice from an empty sequence\n");
-        abort();
+        const char *m = "random.choice from an empty sequence";
+        zap_panic_typed(ZAP_EXC_INDEX_ERROR, zap_str_new(m, (int64_t)strlen(m)));
     }
     zap_np_lock(&zap_rng_mu);
     zap_rng_ensure_locked();

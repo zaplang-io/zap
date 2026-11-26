@@ -1660,8 +1660,10 @@ mod tests {
         assert!(text.contains("alloca heap[i64]"), "text:\n{text}");
         assert!(text.contains("call @zap_heap_new"), "text:\n{text}");
         assert!(text.contains("call @zap_heap_push_i64"), "text:\n{text}");
-        assert!(text.contains("call @zap_heap_pop_i64"), "text:\n{text}");
-        assert!(text.contains("call @zap_heap_peek_i64"), "text:\n{text}");
+        // pop/peek are catchable (#1566): in `main` (implicit top-level handler)
+        // they lower to an `invoke`, so match either prefix.
+        assert!(text.contains("@zap_heap_pop_i64"), "text:\n{text}");
+        assert!(text.contains("@zap_heap_peek_i64"), "text:\n{text}");
         assert!(text.contains("call @zap_heap_len"), "text:\n{text}");
         assert!(text.contains("call @zap_heap_items"), "text:\n{text}");
     }
@@ -1681,8 +1683,9 @@ mod tests {
         let text = format!("{m}");
         assert!(text.contains("alloca heap[ptr]"), "text:\n{text}");
         assert!(text.contains("call @zap_heap_push_ptr"), "text:\n{text}");
-        assert!(text.contains("call @zap_heap_pop_ptr"), "text:\n{text}");
-        assert!(text.contains("call @zap_heap_peek_ptr"), "text:\n{text}");
+        // pop/peek are catchable (#1566): `invoke` in `main`, so match either.
+        assert!(text.contains("@zap_heap_pop_ptr"), "text:\n{text}");
+        assert!(text.contains("@zap_heap_peek_ptr"), "text:\n{text}");
     }
 
     #[test]
@@ -1804,7 +1807,8 @@ mod tests {
         );
         let text = format!("{m}");
         assert!(text.contains("call @zap_heap_push_i64"), "text:\n{text}");
-        assert!(text.contains("call @zap_heap_pop_i64"), "text:\n{text}");
+        // pop is catchable (#1566): `invoke` in `main`, so match either prefix.
+        assert!(text.contains("@zap_heap_pop_i64"), "text:\n{text}");
     }
 
     #[test]
@@ -2034,6 +2038,246 @@ mod tests {
         let text = format!("{m}");
         assert!(text.contains("call @zap_list_get_i64"), "text:\n{text}");
         assert!(text.contains("invoke @get"), "text:\n{text}");
+    }
+
+    /// #1566: assert that a runtime call which can raise a *recoverable* fault
+    /// lowers to an `invoke` (not a plain `call`) when it sits inside a `try`, so
+    /// the exception reaches the local handler instead of terminating the
+    /// process. Each `src` is lowered and its `main` must contain
+    /// `invoke @<symbol>`. Covers the scalar/string/bytes/sequence/stdlib surfaces
+    /// of PR1 (numeric `array[T]` indexing/slicing is the sequenced follow-up).
+    fn assert_try_invoke(src: &str, symbol: &str) {
+        let m = lower_ok(src);
+        let text = format!("{m}");
+        assert!(
+            text.contains(&format!("invoke @{symbol}")) && text.contains("unwind"),
+            "a `{symbol}` call inside `try` must lower to an invoke, text:\n{text}"
+        );
+        assert!(text.contains("landingpad"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_str_bytes_faults_catchable_1566() {
+        // str.index / str.rindex raise ValueError when the substring is absent.
+        assert_try_invoke(
+            "def main():\n    \
+                 try:\n        \
+                     auto v = \"x\".index(\"y\")\n    \
+                 except ValueError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_str_index_of",
+        );
+        assert_try_invoke(
+            "def main():\n    \
+                 try:\n        \
+                     auto v = \"x\".rindex(\"y\")\n    \
+                 except ValueError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_str_rindex",
+        );
+        // chr(n) / char(n) raise ValueError on an invalid Unicode scalar.
+        assert_try_invoke(
+            "def main():\n    \
+                 int64 n = -1\n    \
+                 try:\n        \
+                     auto c = chr(n)\n    \
+                 except ValueError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_chr",
+        );
+        // bytes indexing raises IndexError out of range.
+        assert_try_invoke(
+            "def main():\n    \
+                 bytes b = b\"x\"\n    \
+                 int64 i = 5\n    \
+                 try:\n        \
+                     auto v = b[i]\n    \
+                 except IndexError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_bytes_index",
+        );
+        // str / bytes slice with a zero step raise ValueError.
+        assert_try_invoke(
+            "def main():\n    \
+                 str s = \"abc\"\n    \
+                 int64 st = 0\n    \
+                 try:\n        \
+                     auto v = s[::st]\n    \
+                 except ValueError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_str_slice",
+        );
+        assert_try_invoke(
+            "def main():\n    \
+                 bytes b = b\"abc\"\n    \
+                 int64 st = 0\n    \
+                 try:\n        \
+                     auto v = b[::st]\n    \
+                 except ValueError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_bytes_slice",
+        );
+    }
+
+    #[test]
+    fn lower_sequence_faults_catchable_1566() {
+        // list slice with a zero step raises ValueError.
+        assert_try_invoke(
+            "def main():\n    \
+                 list[int64] xs = [1, 2, 3]\n    \
+                 int64 st = 0\n    \
+                 try:\n        \
+                     auto v = xs[::st]\n    \
+                 except ValueError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_list_slice",
+        );
+        // deque pop on an empty deque raises IndexError.
+        assert_try_invoke(
+            "def main():\n    \
+                 auto d = deque[int64]()\n    \
+                 try:\n        \
+                     auto v = d.pop()\n    \
+                 except IndexError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_deque_pop_i64",
+        );
+        // deque subscript out of range raises IndexError.
+        assert_try_invoke(
+            "def main():\n    \
+                 auto d = deque[int64]()\n    \
+                 int64 i = 0\n    \
+                 try:\n        \
+                     auto v = d[i]\n    \
+                 except IndexError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_deque_get_i64",
+        );
+        // heap pop / peek on an empty heap raise IndexError (replace keeps its
+        // documented abort, D-0236 — not exercised here).
+        assert_try_invoke(
+            "def main():\n    \
+                 auto h = heap[int64]()\n    \
+                 try:\n        \
+                     auto v = h.pop()\n    \
+                 except IndexError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_heap_pop_i64",
+        );
+        assert_try_invoke(
+            "def main():\n    \
+                 auto h = heap[int64]()\n    \
+                 try:\n        \
+                     auto v = h.peek()\n    \
+                 except IndexError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_heap_peek_i64",
+        );
+    }
+
+    #[test]
+    fn lower_funckey_hash_catchable_1566() {
+        // A composite (tuple) dict key containing a float routes through the
+        // function-key entry point whose generated `__hash__` NaN-rejects; the
+        // dict op must carry an unwind edge so the ValueError is catchable.
+        assert_try_invoke(
+            "def main():\n    \
+                 auto d = dict[(float64, int64), int64]()\n    \
+                 float64 f = 1.0\n    \
+                 try:\n        \
+                     d[(f, 1)] = 5\n    \
+                 except ValueError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_dict_set_fn",
+        );
+    }
+
+    #[test]
+    fn lower_stdlib_faults_catchable_1566() {
+        // AtomicArray negative capacity raises ValueError.
+        assert_try_invoke(
+            "def main():\n    \
+                 int64 cap = -1\n    \
+                 try:\n        \
+                     auto a = AtomicArray[int64](cap)\n    \
+                 except ValueError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_atomicarray_new",
+        );
+        // sync.done past zero raises (negative WaitGroup counter).
+        assert_try_invoke(
+            "def main():\n    \
+                 auto w = sync.waitgroup()\n    \
+                 try:\n        \
+                     sync.done(w)\n    \
+                 except Exception as e:\n        \
+                     print(\"caught\")\n",
+            "zap_waitgroup_done",
+        );
+        // sync.rlock_unlock of an un-acquired lock raises.
+        assert_try_invoke(
+            "def main():\n    \
+                 auto l = sync.rlock()\n    \
+                 try:\n        \
+                     sync.rlock_unlock(l)\n    \
+                 except Exception as e:\n        \
+                     print(\"caught\")\n",
+            "zap_rlock_unlock",
+        );
+        // argparse duplicate flag registration raises.
+        assert_try_invoke(
+            "def main():\n    \
+                 argparse.add_flag(\"dup\")\n    \
+                 try:\n        \
+                     argparse.add_flag(\"dup\")\n    \
+                 except Exception as e:\n        \
+                     print(\"caught\")\n",
+            "zap_argparse_add_flag",
+        );
+        // random.randint with reversed bounds raises ValueError.
+        assert_try_invoke(
+            "def main():\n    \
+                 try:\n        \
+                     auto v = random.randint(2, 1)\n    \
+                 except ValueError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_random_randint",
+        );
+        // random.choice of an empty list raises IndexError.
+        assert_try_invoke(
+            "def main():\n    \
+                 list[int64] xs = []\n    \
+                 try:\n        \
+                     auto v = random.choice(xs)\n    \
+                 except IndexError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_random_list_index",
+        );
+    }
+
+    #[test]
+    fn lower_regex_faults_catchable_1566() {
+        // An invalid regex pattern raises a catchable ValueError (#1566); the
+        // runtime previously `exit(1)`-ed uncatchably.
+        assert_try_invoke(
+            "def main():\n    \
+                 str s = \"x\"\n    \
+                 try:\n        \
+                     auto m = s =~ m/(/\n    \
+                 except ValueError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_regex_match",
+        );
+        // A bad replacement group reference in a substitution raises.
+        assert_try_invoke(
+            "def main():\n    \
+                 str s = \"x\"\n    \
+                 try:\n        \
+                     auto r = s =~ s/(x)/$2/\n    \
+                 except ValueError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_regex_subst",
+        );
     }
 
     #[test]
@@ -2799,9 +3043,10 @@ mod tests {
         // and named capture groups, `!~`, and first/global s/// substitution.
         let m = lower_ok(include_str!("../../../tests/golden/regex.zap"));
         let text = format!("{m}");
-        // m// lowers to a match-object call; s/// to a substitution call.
-        assert!(text.contains("call @zap_regex_match"), "text:\n{text}");
-        assert!(text.contains("call @zap_regex_subst"), "text:\n{text}");
+        // m// lowers to a match-object call; s/// to a substitution call. Both
+        // are catchable (#1566) — an `invoke` in `main` — so match either prefix.
+        assert!(text.contains("@zap_regex_match("), "text:\n{text}");
+        assert!(text.contains("@zap_regex_subst("), "text:\n{text}");
         // Capture-group access lowers to the positional and named accessors.
         assert!(text.contains("call @zap_regex_group("), "text:\n{text}");
         assert!(
@@ -2827,7 +3072,8 @@ mod tests {
             "def main():\n    auto mt = \"x1\" =~ m/(\\d)/\n    auto no = \"x\" !~ m/\\d/\n    print(mt.group(1))\n    if no:\n        print(\"none\")\n",
         );
         let text = format!("{m}");
-        assert!(text.contains("= call @zap_regex_match"), "text:\n{text}");
+        // match is catchable (#1566): `invoke` in `main`, so match either prefix.
+        assert!(text.contains("@zap_regex_match("), "text:\n{text}");
         // The group accessor returns a string (pointer), which `print` prints.
         assert!(text.contains("= call @zap_regex_group("), "text:\n{text}");
     }
@@ -2842,10 +3088,8 @@ mod tests {
             "def main():\n    for mt in \"a1 b2\" =~ m/(\\w)(\\d)/g:\n        print(mt.group(1))\n",
         );
         let text = format!("{m}");
-        assert!(
-            text.contains("= call @zap_regex_match_all"),
-            "text:\n{text}"
-        );
+        // match_all is catchable (#1566): `invoke` in `main`, so match either.
+        assert!(text.contains("@zap_regex_match_all("), "text:\n{text}");
         assert!(text.contains("= call @zap_regex_group("), "text:\n{text}");
     }
 
@@ -2866,9 +3110,10 @@ mod tests {
         assert!(text.contains("call @zap_py_from_f64("), "text:\n{text}");
         assert!(text.contains("call @zap_py_from_str("), "text:\n{text}");
         // Result marshaling: `int64(...)` converts a Python int back, and
-        // `print` of a Python handle renders it via its str().
+        // `print` of a Python handle renders it via its str(). `zap_py_str` is
+        // catchable (#1566) — an `invoke` in `main` — so match either prefix.
         assert!(text.contains("@zap_py_to_i64("), "text:\n{text}");
-        assert!(text.contains("call @zap_py_str("), "text:\n{text}");
+        assert!(text.contains("@zap_py_str("), "text:\n{text}");
         // The argument vector for a call is a `list[ptr]` of marshaled handles.
         assert!(text.contains("call @zap_list_new("), "text:\n{text}");
         assert!(text.contains("call @zap_list_push_ptr("), "text:\n{text}");

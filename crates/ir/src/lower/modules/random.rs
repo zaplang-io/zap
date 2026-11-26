@@ -441,21 +441,24 @@ fn lower_choice(
             n
         }
     };
+    // Sampling more than the population without replacement raises a catchable
+    // `ValueError` in the runtime (#1566), so the fill carries an unwind edge to
+    // a `try` in the calling frame.
     if let Some((arr, nd)) = size_array(lowerer, args, Dtype::I64)? {
-        lowerer.emit(Inst::Call {
-            dest: None,
-            func: "zap_random_gen_choice_fill".to_string(),
-            args: vec![g, arr, pop, replace, p, shuffle],
-        });
+        lowerer.throwing_call(
+            None,
+            "zap_random_gen_choice_fill",
+            vec![g, arr, pop, replace, p, shuffle],
+        );
         Ok((arr, Ty::Array(Dtype::I64, nd)))
     } else {
         let one = lowerer.iconst(Ty::I64, 1);
         let arr = lowerer.array_alloc_shaped(Dtype::I64, &[one]);
-        lowerer.emit(Inst::Call {
-            dest: None,
-            func: "zap_random_gen_choice_fill".to_string(),
-            args: vec![g, arr, pop, replace, p, shuffle],
-        });
+        lowerer.throwing_call(
+            None,
+            "zap_random_gen_choice_fill",
+            vec![g, arr, pop, replace, p, shuffle],
+        );
         let zero = lowerer.iconst(Ty::I64, 0);
         let d = lowerer.new_value(Ty::I64);
         lowerer.emit(Inst::Call {
@@ -489,11 +492,8 @@ fn lower_python(
             let a = i64_req(lowerer, &positional(args), 0)?;
             let b = i64_req(lowerer, &positional(args), 1)?;
             let d = lowerer.new_value(Ty::I64);
-            lowerer.emit(Inst::Call {
-                dest: Some(d),
-                func: "zap_random_randint".to_string(),
-                args: vec![a, b],
-            });
+            // Reversed bounds (b < a) raise a catchable `ValueError` (#1566).
+            lowerer.throwing_call(Some(d), "zap_random_randint", vec![a, b]);
             Ok(Some((d, Ty::I64)))
         }
         _ => Ok(None),
@@ -528,11 +528,9 @@ fn lower_python_overloaded(
                 _ => return Err(err("random.choice expects a list")),
             };
             let idx = lowerer.new_value(Ty::I64);
-            lowerer.emit(Inst::Call {
-                dest: Some(idx),
-                func: "zap_random_list_index".to_string(),
-                args: vec![a0],
-            });
+            // `random.choice` of an empty sequence raises a catchable
+            // `IndexError` (#1566).
+            lowerer.throwing_call(Some(idx), "zap_random_list_index", vec![a0]);
             let d = lowerer.new_value(elem.ty());
             lowerer.emit(Inst::Call {
                 dest: Some(d),

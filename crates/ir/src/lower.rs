@@ -7255,17 +7255,33 @@ impl<'a> FnLower<'a> {
     /// otherwise a plain [`Inst::Call`] (the exception, if any, unwinds through
     /// this frame to a caller's handler or to the top-level). The caller sets the
     /// terminator (e.g. `Unreachable` after `zap_panic`).
-    /// Emit a dict/set runtime call that may raise on a **NaN float key/member**
-    /// (#803, D-0138). A float dict KEY or set MEMBER operation (insert, lookup,
-    /// `in`, `del`) canonicalizes and NaN-rejects in the runtime, so when the key
-    /// kind is [`Elem::F64`] it may throw a catchable `ValueError` and must lower
-    /// through [`throwing_call`] — an `invoke` to the active landing pad inside a
-    /// `try`, a plain `call` otherwise. Every other key/member kind cannot raise
-    /// here, so it stays an ordinary non-throwing `call`. (Key *read-back* —
-    /// `zap_dict_keys_f64` — and float *values* never carry a NaN, so they are not
-    /// routed here.)
+    /// Emit a dict/set runtime call that may raise from its **key/member hash or
+    /// equality** path, routing it through [`throwing_call`] — an `invoke` to the
+    /// active landing pad inside a `try`, a plain `call` otherwise — so the
+    /// exception reaches a handler in the calling frame instead of escaping past
+    /// it (#1566; same unwind-edge requirement as #383/#803).
+    ///
+    /// Two key kinds can raise:
+    /// - A bare **float** dict KEY / set MEMBER ([`Elem::F64`]): the runtime
+    ///   canonicalizes `-0.0` and NaN-rejects with a catchable `ValueError`
+    ///   (#803, D-0138).
+    /// - A **function-key** key ([`Elem::Struct`] / [`Elem::VarTuple`], key
+    ///   suffix `fn`): the operation dispatches through the key's generated
+    ///   `__hash__` / `__eq__` (tuple / `Optional` / value-struct / sum-enum), a
+    ///   float leaf of which NaN-rejects via `zap_f64_value_key_word`, and a
+    ///   user-authored `__hash__` / `__eq__` may raise anything. We route *every*
+    ///   function-key op through the unwind edge rather than trying to prove a
+    ///   particular key layout float-free: a missed edge terminates the process
+    ///   (the #1566 failure mode), whereas an unused edge to a callback that does
+    ///   not raise is inert, so over-approximating here is the safe direction.
+    ///
+    /// Every other key/member kind (int / bool / char / enum / `str` / `bytes` /
+    /// nested-collection) cannot raise in its hash/eq, so it stays an ordinary
+    /// non-throwing `call`. (Key *read-back* and float *values* never carry a
+    /// NaN, so they are not routed here.)
     fn key_rt_call(&mut self, dest: Option<Value>, func: String, args: Vec<Value>, key: Elem) {
-        if key == Elem::F64 {
+        let may_raise = matches!(key, Elem::F64 | Elem::Struct(_) | Elem::VarTuple(_));
+        if may_raise {
             self.throwing_call(dest, &func, args);
         } else {
             self.emit(Inst::Call { dest, func, args });
@@ -9223,11 +9239,12 @@ impl<'a> FnLower<'a> {
                             .get(tyname)
                             .ok_or_else(|| err("unknown struct in from_json"))?;
                         let d = self.new_value(Ty::Struct(sid));
-                        self.emit(Inst::Call {
-                            dest: Some(d),
-                            func: fnname,
-                            args: vec![s],
-                        });
+                        // The derived decoders raise a catchable exception on
+                        // malformed input (#1566: YAML tab-indent via
+                        // `__yaml_loads`; the JSON/CSV decode cores likewise),
+                        // so the call must carry an unwind edge to a `try` in
+                        // the calling frame.
+                        self.throwing_call(Some(d), &fnname, vec![s]);
                         return Ok((d, Ty::Struct(sid)));
                     }
                 }
@@ -9526,11 +9543,11 @@ impl<'a> FnLower<'a> {
                         let (v, vt) = self.expr(&a.value)?;
                         let s = if vt == Ty::Py {
                             let s = self.new_value(Ty::Ptr);
-                            self.emit(Inst::Call {
-                                dest: Some(s),
-                                func: "zap_py_str".to_string(),
-                                args: vec![v],
-                            });
+                            // A Python `__str__` that raises or returns a non-str
+                            // is translated into a catchable Zap exception by
+                            // `zap_py_str` (#1566), so this must carry an unwind
+                            // edge to a `try` in the printing frame.
+                            self.throwing_call(Some(s), "zap_py_str", vec![v]);
                             s
                         } else if matches!(vt, Ty::Struct(sid) if self.is_any_view_sid(sid)) {
                             let Ty::Struct(sid) = vt else { unreachable!() };
@@ -9597,11 +9614,9 @@ impl<'a> FnLower<'a> {
                     // `Print` renders it like any other string.
                     if vt == Ty::Py {
                         let s = self.new_value(Ty::Ptr);
-                        self.emit(Inst::Call {
-                            dest: Some(s),
-                            func: "zap_py_str".to_string(),
-                            args: vec![v],
-                        });
+                        // `zap_py_str` raises a catchable Zap exception when the
+                        // Python `__str__` raises or returns a non-str (#1566).
+                        self.throwing_call(Some(s), "zap_py_str", vec![v]);
                         vals.push(s);
                     } else if matches!(vt, Ty::Struct(sid) if self.is_any_view_sid(sid)) {
                         // print(view) (#1082): materialize the borrowed bytes to an
@@ -10374,11 +10389,10 @@ impl<'a> FnLower<'a> {
                 let (v, vt) = self.expr(&args[0].value)?;
                 let v = self.coerce(v, vt, Ty::I64);
                 let d = self.new_value(Ty::Char);
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: "zap_chr".to_string(),
-                    args: vec![v],
-                });
+                // An out-of-range / surrogate codepoint raises a catchable
+                // `ValueError` (#1566), so this carries an unwind edge to a
+                // `try` in the calling frame.
+                self.throwing_call(Some(d), "zap_chr", vec![v]);
                 return Ok((d, Ty::Char));
             }
             if fname == "bigint" {
@@ -13364,11 +13378,9 @@ impl<'a> FnLower<'a> {
         let elem_is_ptr = !matches!(elem, Elem::I64);
         let flag = self.iconst(Ty::I64, i64::from(elem_is_ptr));
         let a = self.new_value(Ty::AtomicArray(elem));
-        self.emit(Inst::Call {
-            dest: Some(a),
-            func: "zap_atomicarray_new".to_string(),
-            args: vec![cap, flag],
-        });
+        // A negative capacity raises a catchable `ValueError` in the runtime
+        // (#1566), so the constructor carries an unwind edge to a `try` here.
+        self.throwing_call(Some(a), "zap_atomicarray_new", vec![cap, flag]);
         Ok((a, Ty::AtomicArray(elem)))
     }
 
@@ -15379,11 +15391,13 @@ impl<'a> FnLower<'a> {
                     return Err(err("pop() takes no arguments"));
                 }
                 let d = self.new_value(elem.ty());
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: format!("zap_heap_pop_{}", elem.val_suffix()),
-                    args: vec![recv],
-                });
+                // `pop` on an empty heap raises a catchable `IndexError`
+                // (#1566), so it carries an unwind edge to a `try` here.
+                self.throwing_call(
+                    Some(d),
+                    &format!("zap_heap_pop_{}", elem.val_suffix()),
+                    vec![recv],
+                );
                 Ok((d, elem.ty()))
             }
             "peek" => {
@@ -15391,11 +15405,12 @@ impl<'a> FnLower<'a> {
                     return Err(err("peek() takes no arguments"));
                 }
                 let d = self.new_value(elem.ty());
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: format!("zap_heap_peek_{}", elem.val_suffix()),
-                    args: vec![recv],
-                });
+                // `peek` on an empty heap raises a catchable `IndexError` (#1566).
+                self.throwing_call(
+                    Some(d),
+                    &format!("zap_heap_peek_{}", elem.val_suffix()),
+                    vec![recv],
+                );
                 Ok((d, elem.ty()))
             }
             // `replace(x)` (heapreplace) and `pushpop(x)` (heappushpop): both pop
@@ -15672,11 +15687,9 @@ impl<'a> FnLower<'a> {
                     return Err(err(format!("{name}() takes no arguments")));
                 }
                 let d = self.new_value(elem.ty());
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: format!("zap_deque_{name}_{suffix}"),
-                    args: vec![recv],
-                });
+                // `pop`/`popleft` on an empty deque raise a catchable
+                // `IndexError` (#1566), so they carry an unwind edge here.
+                self.throwing_call(Some(d), &format!("zap_deque_{name}_{suffix}"), vec![recv]);
                 Ok((d, elem.ty()))
             }
             "get" => {
@@ -15686,11 +15699,8 @@ impl<'a> FnLower<'a> {
                 let (i, it) = self.expr(&args[0].value)?;
                 let i = self.coerce(i, it, Ty::I64);
                 let d = self.new_value(elem.ty());
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: format!("zap_deque_get_{suffix}"),
-                    args: vec![recv, i],
-                });
+                // Out-of-range raises a catchable `IndexError` (#1566).
+                self.throwing_call(Some(d), &format!("zap_deque_get_{suffix}"), vec![recv, i]);
                 Ok((d, elem.ty()))
             }
             "clear" => {
@@ -17439,18 +17449,18 @@ impl<'a> FnLower<'a> {
             }
             // `deque[T]` indexing (#983): `d[i]` yields the element at left-index
             // `i` (0 == leftmost), the method-free form of `d.get(i)`. Out-of-
-            // range aborts (like a list before #383's catchable path), so a plain
-            // call suffices.
+            // range raises a catchable `IndexError` (#1566), so it carries an
+            // unwind edge to a `try` in the calling frame.
             Ty::Deque(elem) => {
                 let (iv, it) = self.expr(index)?;
                 let iv = self.coerce_index(iv, it);
                 let ety = self.elem_ty(elem);
                 let d = self.new_value(ety);
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: format!("zap_deque_get_{}", elem.val_suffix()),
-                    args: vec![bv, iv],
-                });
+                self.throwing_call(
+                    Some(d),
+                    &format!("zap_deque_get_{}", elem.val_suffix()),
+                    vec![bv, iv],
+                );
                 Ok((d, ety))
             }
             Ty::Dict(kk, vk) => {
@@ -17494,11 +17504,9 @@ impl<'a> FnLower<'a> {
                 let (iv, it) = self.expr(index)?;
                 let iv = self.coerce_index(iv, it);
                 let d = self.new_value(Ty::I64);
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: "zap_bytes_index".to_string(),
-                    args: vec![bv, iv],
-                });
+                // Out-of-range indexing raises a catchable `IndexError` (#1566),
+                // so `b[i]` carries an unwind edge to a `try` in this frame.
+                self.throwing_call(Some(d), "zap_bytes_index", vec![bv, iv]);
                 Ok((d, Ty::I64))
             }
             // `str` lowers to `Ptr`; `s[i]` yields the codepoint at codepoint
@@ -17573,11 +17581,13 @@ impl<'a> FnLower<'a> {
                 let (st_v, has_st) = self.slice_bound(step)?;
                 let out = Ty::List(elem);
                 let d = self.new_value(out);
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: "zap_list_slice".to_string(),
-                    args: vec![bv, lo_v, hi_v, st_v, has_lo, has_hi, has_st],
-                });
+                // A zero step raises a catchable `ValueError` (#1566), so the
+                // slice carries an unwind edge to a `try` in this frame.
+                self.throwing_call(
+                    Some(d),
+                    "zap_list_slice",
+                    vec![bv, lo_v, hi_v, st_v, has_lo, has_hi, has_st],
+                );
                 Ok((d, out))
             }
             // A `tuple[T]` slice is a fresh `tuple[T]` (#1475): the buffer is a
@@ -17588,11 +17598,12 @@ impl<'a> FnLower<'a> {
                 let (st_v, has_st) = self.slice_bound(step)?;
                 let out = Ty::VarTuple(elem);
                 let d = self.new_value(out);
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: "zap_list_slice".to_string(),
-                    args: vec![bv, lo_v, hi_v, st_v, has_lo, has_hi, has_st],
-                });
+                // A zero step raises a catchable `ValueError` (#1566).
+                self.throwing_call(
+                    Some(d),
+                    "zap_list_slice",
+                    vec![bv, lo_v, hi_v, st_v, has_lo, has_hi, has_st],
+                );
                 Ok((d, out))
             }
             // `array[T]` slice -> a VIEW sharing the buffer (D-0030, #502). A
@@ -17637,6 +17648,8 @@ impl<'a> FnLower<'a> {
 
     /// Shared tail for the `str`/`bytes` slice path: emit a call to `func` with
     /// the three Python slice bounds `(lo, hi, step)` and their present-flags.
+    /// A zero step raises a catchable `ValueError` (#1566), so this lowers
+    /// through an unwind edge (`throwing_call`) to a `try` in the calling frame.
     fn emit_seq_slice(
         &mut self,
         bv: Value,
@@ -17650,11 +17663,11 @@ impl<'a> FnLower<'a> {
         let (hi_v, has_hi) = self.slice_bound(hi)?;
         let (st_v, has_st) = self.slice_bound(step)?;
         let d = self.new_value(out_ty);
-        self.emit(Inst::Call {
-            dest: Some(d),
-            func: func.to_string(),
-            args: vec![bv, lo_v, hi_v, st_v, has_lo, has_hi, has_st],
-        });
+        self.throwing_call(
+            Some(d),
+            func,
+            vec![bv, lo_v, hi_v, st_v, has_lo, has_hi, has_st],
+        );
         Ok((d, out_ty))
     }
 
