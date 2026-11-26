@@ -36,6 +36,9 @@ struct Sink:
     def emit_uint(self, uint64 v):
         self.toks.append(str(v))
 
+    def emit_nil(self):
+        self.toks.append("nil")
+
     def begin_seq(self):
         self.toks.append("[")
 
@@ -88,6 +91,12 @@ struct Src:
         self.pos = self.pos + 1
         return uint64(int(t))
 
+    def begin_optional(self, str field) -> bool:
+        if self.toks[self.pos] == "nil":
+            self.pos = self.pos + 1
+            return False
+        return True
+
     def begin_seq(self, str field) -> int64:
         return 0
 
@@ -125,6 +134,11 @@ struct Coll:
 struct Unsigned:
     uint64 n
 
+struct Opt:
+    int64 id
+    Optional[int64] maybe
+    Optional[str] note
+
 def main():
     # Serialize a user struct through the imported serde driver + a local backend.
     auto p = Point(3, "hi", True)
@@ -160,3 +174,24 @@ def main():
     # uint64 scalar round-trips.
     auto u2 = serde.deserialize[Unsigned, Src](Src(["42"], 0))
     print(u2.n == uint64(42))
+
+    # Optional[T] fields: Some emits the inner value, None emits a nil (breadth
+    # slice 3). The decoder's begin_optional distinguishes them.
+    auto opt = Opt(1, Optional.Some(9), Optional.None)
+    auto wopt = Sink()
+    serde.serialize(opt, wopt)
+    print(",".join(wopt.toks) == "<,1,9,nil,>")
+    auto opt2 = serde.deserialize[Opt, Src](Src(["1", "9", "nil"], 0))
+    int64 got = -1
+    match opt2.maybe:
+        case Optional.Some(x):
+            got = x
+        case Optional.None:
+            got = -1
+    bool note_none = False
+    match opt2.note:
+        case Optional.Some(y):
+            note_none = False
+        case Optional.None:
+            note_none = True
+    print(opt2.id == 1 and got == 9 and note_none)
