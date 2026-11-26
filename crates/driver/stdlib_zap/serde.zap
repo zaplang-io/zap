@@ -13,10 +13,12 @@
 # resolved by `import serde` as a built-in pure-Zap stdlib module — one blessed,
 # version-coherent implementation for the whole ecosystem, no `zap add`.
 #
-# Supported field kinds: `int64`, `float64`, `str`, `bool`, `bytes`, and a nested
-# derived struct (encode recurses into the field's own specialization). Enum and
+# Supported field kinds: `int64`, `uint64`, `float64`, `str`, `bool`, `bytes`, a
+# nested derived struct (encode recurses into the field's own specialization), and
+# `list[T]` / `dict[str, V]` of scalar elements (both directions). Enum and
 # generic-struct DESERIALIZE are blocked on the `reflect.construct` generalization
-# (#1561) and are a later addition; collection / Optional breadth is a follow-up.
+# (#1561); `Optional` awaits a multi-inner-type comptime formulation; both are
+# later additions.
 
 # A format backend emits a value as a sequence of visitor events. A concrete
 # codec implements this once; `field_name` may be a no-op for positional formats.
@@ -24,20 +26,35 @@ interface Serializer:
     def begin_struct(self)
     def field_name(self, str name)
     def emit_int(self, int64 v)
+    def emit_uint(self, uint64 v)
     def emit_float(self, float64 v)
     def emit_str(self, str v)
     def emit_bool(self, bool v)
     def emit_bytes(self, bytes v)
+    # Sequence (list) and map (dict) framing. The driver calls `begin_*`, emits
+    # the elements / key+value pairs, then `end_*`. A length-prefixed backend
+    # buffers and backfills the header at `end_*` (no count up front on encode).
+    def begin_seq(self)
+    def end_seq(self)
+    def begin_map(self)
+    def end_map(self)
     def end_struct(self)
 
-# The decode mirror: a backend reads scalar values in field order.
+# The decode mirror: a backend reads scalar values in field order. For a sequence
+# or map, `begin_seq` / `begin_map` return the element / entry count, then the
+# driver reads that many elements / key+value pairs, then `end_seq` / `end_map`.
 interface Deserializer:
     def begin_struct(self)
     def read_int(self, str field) -> int64
+    def read_uint(self, str field) -> uint64
     def read_float(self, str field) -> float64
     def read_str(self, str field) -> str
     def read_bool(self, str field) -> bool
     def read_bytes(self, str field) -> bytes
+    def begin_seq(self, str field) -> int64
+    def end_seq(self)
+    def begin_map(self, str field) -> int64
+    def end_map(self)
     def end_struct(self)
 
 # Serialize `value` of any struct type `T` into the backend `s`. The backend is a
@@ -58,6 +75,42 @@ def serialize[T, S: Serializer](T value, S s):
             s.emit_bool(reflect.field(value, comptime f.index))
         elif f.ty.name == "bytes":
             s.emit_bytes(reflect.field(value, comptime f.index))
+        elif f.ty.name == "uint64":
+            s.emit_uint(reflect.field(value, comptime f.index))
+        elif f.ty.kind.name == "list":
+            s.begin_seq()
+            for el in reflect.field(value, comptime f.index):
+                if comptime f.ty.elem.name == "int64":
+                    s.emit_int(el)
+                elif comptime f.ty.elem.name == "uint64":
+                    s.emit_uint(el)
+                elif comptime f.ty.elem.name == "float64":
+                    s.emit_float(el)
+                elif comptime f.ty.elem.name == "str":
+                    s.emit_str(el)
+                elif comptime f.ty.elem.name == "bool":
+                    s.emit_bool(el)
+                else:
+                    comptime.error(comptime f.span, "serde.serialize: unsupported list element kind")
+            s.end_seq()
+        elif f.ty.kind.name == "dict":
+            s.begin_map()
+            auto dm = reflect.field(value, comptime f.index)
+            for k in dm:
+                s.emit_str(k)
+                if comptime f.ty.value.name == "int64":
+                    s.emit_int(dm[k])
+                elif comptime f.ty.value.name == "uint64":
+                    s.emit_uint(dm[k])
+                elif comptime f.ty.value.name == "float64":
+                    s.emit_float(dm[k])
+                elif comptime f.ty.value.name == "str":
+                    s.emit_str(dm[k])
+                elif comptime f.ty.value.name == "bool":
+                    s.emit_bool(dm[k])
+                else:
+                    comptime.error(comptime f.span, "serde.serialize: unsupported dict value kind")
+            s.end_map()
         elif f.ty.kind.name == "struct":
             serialize(reflect.field(value, comptime f.index), s)
         else:
@@ -82,6 +135,81 @@ def deserialize[T, D: Deserializer](D d) -> T:
             reflect.set_field(out, comptime f.index, d.read_bool(comptime f.name))
         elif f.ty.name == "bytes":
             reflect.set_field(out, comptime f.index, d.read_bytes(comptime f.name))
+        elif f.ty.name == "uint64":
+            reflect.set_field(out, comptime f.index, d.read_uint(comptime f.name))
+        elif f.ty.kind.name == "list":
+            if comptime f.ty.elem.name == "int64":
+                list[int64] xs = []
+                auto n = d.begin_seq(comptime f.name)
+                for _ in range(n):
+                    xs.append(d.read_int(comptime f.name))
+                d.end_seq()
+                reflect.set_field(out, comptime f.index, xs)
+            elif comptime f.ty.elem.name == "uint64":
+                list[uint64] xs = []
+                auto n = d.begin_seq(comptime f.name)
+                for _ in range(n):
+                    xs.append(d.read_uint(comptime f.name))
+                d.end_seq()
+                reflect.set_field(out, comptime f.index, xs)
+            elif comptime f.ty.elem.name == "float64":
+                list[float64] xs = []
+                auto n = d.begin_seq(comptime f.name)
+                for _ in range(n):
+                    xs.append(d.read_float(comptime f.name))
+                d.end_seq()
+                reflect.set_field(out, comptime f.index, xs)
+            elif comptime f.ty.elem.name == "str":
+                list[str] xs = []
+                auto n = d.begin_seq(comptime f.name)
+                for _ in range(n):
+                    xs.append(d.read_str(comptime f.name))
+                d.end_seq()
+                reflect.set_field(out, comptime f.index, xs)
+            elif comptime f.ty.elem.name == "bool":
+                list[bool] xs = []
+                auto n = d.begin_seq(comptime f.name)
+                for _ in range(n):
+                    xs.append(d.read_bool(comptime f.name))
+                d.end_seq()
+                reflect.set_field(out, comptime f.index, xs)
+            else:
+                comptime.error(comptime f.span, "serde.deserialize: unsupported list element kind")
+        elif f.ty.kind.name == "dict":
+            if comptime f.ty.value.name == "int64":
+                dict[str, int64] dm = {}
+                auto n = d.begin_map(comptime f.name)
+                for _ in range(n):
+                    auto k = d.read_str(comptime f.name)
+                    dm[k] = d.read_int(comptime f.name)
+                d.end_map()
+                reflect.set_field(out, comptime f.index, dm)
+            elif comptime f.ty.value.name == "float64":
+                dict[str, float64] dm = {}
+                auto n = d.begin_map(comptime f.name)
+                for _ in range(n):
+                    auto k = d.read_str(comptime f.name)
+                    dm[k] = d.read_float(comptime f.name)
+                d.end_map()
+                reflect.set_field(out, comptime f.index, dm)
+            elif comptime f.ty.value.name == "str":
+                dict[str, str] dm = {}
+                auto n = d.begin_map(comptime f.name)
+                for _ in range(n):
+                    auto k = d.read_str(comptime f.name)
+                    dm[k] = d.read_str(comptime f.name)
+                d.end_map()
+                reflect.set_field(out, comptime f.index, dm)
+            elif comptime f.ty.value.name == "bool":
+                dict[str, bool] dm = {}
+                auto n = d.begin_map(comptime f.name)
+                for _ in range(n):
+                    auto k = d.read_str(comptime f.name)
+                    dm[k] = d.read_bool(comptime f.name)
+                d.end_map()
+                reflect.set_field(out, comptime f.index, dm)
+            else:
+                comptime.error(comptime f.span, "serde.deserialize: unsupported dict value kind")
         else:
             comptime.error(f.span, "serde.deserialize: unsupported field kind")
     d.end_struct()

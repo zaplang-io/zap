@@ -33,6 +33,21 @@ struct Sink:
     def emit_bytes(self, bytes v):
         self.toks.append(str(v))
 
+    def emit_uint(self, uint64 v):
+        self.toks.append(str(v))
+
+    def begin_seq(self):
+        self.toks.append("[")
+
+    def end_seq(self):
+        self.toks.append("]")
+
+    def begin_map(self):
+        self.toks.append("{")
+
+    def end_map(self):
+        self.toks.append("}")
+
     def end_struct(self):
         self.toks.append(">")
 
@@ -68,6 +83,23 @@ struct Src:
         self.pos = self.pos + 1
         return bytes(t)
 
+    def read_uint(self, str field) -> uint64:
+        auto t = self.toks[self.pos]
+        self.pos = self.pos + 1
+        return uint64(int(t))
+
+    def begin_seq(self, str field) -> int64:
+        return 0
+
+    def end_seq(self):
+        pass
+
+    def begin_map(self, str field) -> int64:
+        return 0
+
+    def end_map(self):
+        pass
+
     def end_struct(self):
         pass
 
@@ -84,6 +116,14 @@ struct Measure:
     int64 id
     float64 score
     bytes tag
+
+struct Coll:
+    list[int64] nums
+    dict[str, int64] tags
+    uint64 big
+
+struct Unsigned:
+    uint64 n
 
 def main():
     # Serialize a user struct through the imported serde driver + a local backend.
@@ -109,3 +149,14 @@ def main():
     print(",".join(wm.toks) == "<,1,1.5,ok,>")
     auto m2 = serde.deserialize[Measure, Src](Src(["1", "1.5", "ok"], 0))
     print(m2.id == 1 and m2.score == 1.5 and m2.tag == bytes("ok"))
+
+    # list[int64] / dict[str,int64] / uint64 ENCODE through the bundled serde
+    # (breadth slice 2). A single-entry dict keeps the token order deterministic.
+    auto c = Coll([1, 2], {"k": 9}, uint64(7))
+    auto wc = Sink()
+    serde.serialize(c, wc)
+    print(",".join(wc.toks) == "<,[,1,2,],{,k,9,},7,>")
+
+    # uint64 scalar round-trips.
+    auto u2 = serde.deserialize[Unsigned, Src](Src(["42"], 0))
+    print(u2.n == uint64(42))

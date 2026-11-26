@@ -3872,6 +3872,16 @@ struct Sink:
         self.toks.append(str(v))
     def emit_bytes(self, bytes v):
         self.toks.append(str(v))
+    def emit_uint(self, uint64 v):
+        self.toks.append(str(v))
+    def begin_seq(self):
+        self.toks.append(\"[\")
+    def end_seq(self):
+        self.toks.append(\"]\")
+    def begin_map(self):
+        self.toks.append(\"{\")
+    def end_map(self):
+        self.toks.append(\"}\")
     def end_struct(self):
         self.toks.append(\">\")
 
@@ -3900,6 +3910,18 @@ struct Src:
         auto t = self.toks[self.pos]
         self.pos = self.pos + 1
         return bytes(t)
+    def read_uint(self, str field) -> uint64:
+        auto t = self.toks[self.pos]
+        self.pos = self.pos + 1
+        return uint64(int(t))
+    def begin_seq(self, str field) -> int64:
+        return 0
+    def end_seq(self):
+        pass
+    def begin_map(self, str field) -> int64:
+        return 0
+    def end_map(self):
+        pass
     def end_struct(self):
         pass
 
@@ -3908,6 +3930,11 @@ struct Point:
     str label
     bool active
 
+struct Coll:
+    list[int64] nums
+    dict[str, int64] tags
+    uint64 big
+
 def main():
     auto p = Point(3, \"hi\", True)
     auto w = Sink()
@@ -3915,6 +3942,10 @@ def main():
     print(\",\".join(w.toks))
     auto p2 = serde.deserialize[Point, Src](Src([\"3\", \"hi\", \"True\"], 0))
     print(p2.x == 3 and p2.label == \"hi\" and p2.active == True)
+    auto c = Coll([1, 2], {\"k\": 9}, uint64(7))
+    auto wc = Sink()
+    serde.serialize(c, wc)
+    print(\",\".join(wc.toks))
 ";
     let f = write_zap("e6-serde-bundled", src);
     let out = zap().arg("ir").arg(&f).output().unwrap();
@@ -3935,6 +3966,16 @@ def main():
     assert!(
         stdout.contains("serde__deserialize$Point$Src"),
         "serde.deserialize specializes at (Point, user backend) across the module boundary: {stdout}"
+    );
+    // list / dict / uint64 breadth specializes too, and the sequence/map framing
+    // dispatches to the backend directly.
+    assert!(
+        stdout.contains("serde__serialize$Coll$Sink"),
+        "serde.serialize specializes at a struct with list/dict/uint fields: {stdout}"
+    );
+    assert!(
+        stdout.contains("@Sink__begin_seq") && stdout.contains("@Sink__begin_map"),
+        "list/dict framing calls the backend's begin_seq / begin_map directly: {stdout}"
     );
 }
 
