@@ -77,8 +77,10 @@ so never compiled) is left untouched.
   float key) through `throwing_call`. This also makes a user-authored `__hash__`
   / `__eq__` that raises catchable, which is correct.
 - **`heap` pop/peek vs replace.** `pop`/`peek` on an empty heap now raise
-  `IndexError`; `replace` **keeps its documented abort** (see Held items) via a
-  separate runtime guard, so this ADR does not change the D-0236 contract.
+  `IndexError`. Empty `replace` was deliberately left aborting here (a D-0236
+  contract change held for sign-off); it was subsequently made catchable in
+  [lang/1579-heap-replace-catchable](1579-heap-replace-catchable.md), resolving
+  Held item 1 below.
 
 ## Consequences
 
@@ -96,9 +98,10 @@ so never compiled) is left untouched.
 
 These policy/contract forks are flagged, not decided:
 
-1. **Empty `heap.replace`** is documented (D-0236) to abort like `pop`. Making it
-   raise `IndexError` is a contract change; held for sign-off. (`replace` still
-   aborts; only `pop`/`peek` were made catchable.)
+1. **Empty `heap.replace`** — RESOLVED in
+   [lang/1579-heap-replace-catchable](1579-heap-replace-catchable.md): empty
+   `replace` now raises a catchable `IndexError` (superseding the D-0236 abort),
+   matching `pop`/`peek`.
 2. **CSPRNG entropy failure** (`zap_crypto_fill_random`; shared by crypto
    random/token and UUID/NanoID) still `abort()`s. Catchable `OSError` vs a
    documented fail-stop is a genuine policy fork — left unchanged.

@@ -3910,19 +3910,9 @@ static int64_t zap_heap_pop_word(ZapHeap *h) {
     return top;
 }
 
-/* `replace` on an empty heap aborts: D-0236 documents empty `replace` as
- * aborting like `pop`, and changing that is a contract change held for maintainer
- * sign-off (#1566). `pop`/`peek` instead raise a catchable `IndexError` via
- * `zap_heap_require_live` below. */
-static void zap_heap_require(const ZapHeap *h, const char *op) {
-    if (h->len == 0) {
-        fprintf(stderr, "zap: heap %s on an empty heap\n", op);
-        abort();
-    }
-}
-
-/* pop/peek on an empty heap raise a catchable `IndexError` (#1566), matching
- * out-of-range sequence indexing. */
+/* pop/peek/replace on an empty heap raise a catchable `IndexError`, matching
+ * out-of-range sequence indexing. pop/peek were made catchable in #1566;
+ * `replace` joined them in #1579 (superseding the D-0236 abort). */
 static void zap_heap_require_live(const ZapHeap *h, const char *op) {
     if (h->len == 0) {
         char buf[64];
@@ -4089,17 +4079,17 @@ static int64_t zap_heap_pushpop_word(ZapHeap *h, int64_t x) {
 
 int64_t zap_heap_replace_i64(void *hp, int64_t x) {
     ZapHeap *h = (ZapHeap *)hp;
-    zap_heap_require(h, "replace");
+    zap_heap_require_live(h, "replace");
     return zap_heap_replace_word(h, x);
 }
 void *zap_heap_replace_ptr(void *hp, void *x) {
     ZapHeap *h = (ZapHeap *)hp;
-    zap_heap_require(h, "replace");
+    zap_heap_require_live(h, "replace");
     return (void *)(intptr_t)zap_heap_replace_word(h, (int64_t)(intptr_t)x);
 }
 double zap_heap_replace_f64(void *hp, double x) {
     ZapHeap *h = (ZapHeap *)hp;
-    zap_heap_require(h, "replace");
+    zap_heap_require_live(h, "replace");
     return zap_f64_from_bits(zap_heap_replace_word(h, zap_f64_bits(x)));
 }
 
