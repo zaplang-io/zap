@@ -2453,6 +2453,96 @@ def main():\n    \
     }
 
     #[test]
+    fn lower_sort_alloc_memoryerror_catchable_1598() {
+        // #1598: `zap_list_sort_by` allocates three temporary scratch buffers
+        // with libc `malloc`; a failure now releases any that already succeeded
+        // and raises a *catchable* `MemoryError` (SPEC §10 temp-allocation
+        // policy) instead of aborting. Both public entry points — the in-place
+        // `list.sort(...)` and the copying `sorted(...)` — route the single
+        // `zap_list_sort_by` call, so each must lower to an `invoke` (not a plain
+        // `call`) inside a `try`; a missed unwind edge would terminate the
+        // process instead of reaching the local handler, and only an LLVM build
+        // catches that at run time.
+        //
+        // In-place `xs.sort(key=...)`.
+        assert_try_invoke(
+            "def ident(int64 x) -> int64:\n    \
+                 return x\n\
+def main():\n    \
+                 list[int64] xs = [3, 2, 1]\n    \
+                 try:\n        \
+                     xs.sort(key=ident)\n    \
+                 except MemoryError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_list_sort_by",
+        );
+        // Bare `xs.sort()` (no key projection) takes the same path.
+        assert_try_invoke(
+            "def main():\n    \
+                 list[int64] xs = [3, 2, 1]\n    \
+                 try:\n        \
+                     xs.sort()\n    \
+                 except MemoryError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_list_sort_by",
+        );
+        // Copying `sorted(xs)`.
+        assert_try_invoke(
+            "def main():\n    \
+                 list[int64] xs = [3, 2, 1]\n    \
+                 try:\n        \
+                     auto ys = sorted(xs)\n    \
+                 except MemoryError as e:\n        \
+                     print(\"caught\")\n",
+            "zap_list_sort_by",
+        );
+        // `MemoryError` descends from `Exception`, so a plain `except Exception`
+        // handler must also take the unwind edge — catchability is a property of
+        // the call site, not of the clause type.
+        assert_try_invoke(
+            "def main():\n    \
+                 list[int64] xs = [3, 2, 1]\n    \
+                 try:\n        \
+                     xs.sort()\n    \
+                 except Exception as e:\n        \
+                     print(\"caught\")\n",
+            "zap_list_sort_by",
+        );
+    }
+
+    #[test]
+    fn sort_plain_call_without_handler_1598() {
+        // In a helper with no active landing pad (no enclosing `try`, and —
+        // unlike `main` — no implicit top-level handler) the sort lowers to a
+        // plain `call`: a raised `MemoryError` unwinds through this frame to the
+        // caller's handler. This pins that the invoke edge is driven by an active
+        // handler, not emitted unconditionally.
+        let m = lower_ok(
+            "def dosort(list[int64] xs):\n    \
+                 xs.sort()\n\
+def main():\n    \
+                 list[int64] xs = [3, 2, 1]\n    \
+                 dosort(xs)\n",
+        );
+        let f = m.funcs.iter().find(|f| f.name == "dosort").unwrap();
+        let text = format!("{m}");
+        let has_plain_call = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::Call { func, .. } if func == "zap_list_sort_by"));
+        let has_invoke = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::Invoke { func, .. } if func == "zap_list_sort_by"));
+        assert!(
+            has_plain_call && !has_invoke,
+            "without an active handler, sort is a plain call, text:\n{text}"
+        );
+    }
+
+    #[test]
     fn lower_sequence_faults_catchable_1566() {
         // list slice with a zero step raises ValueError.
         assert_try_invoke(

@@ -2972,13 +2972,26 @@ void zap_list_sort_by(void *dstp, void *keysp, int64_t cmp_kind, int64_t reverse
         return;
     }
     /* All scratch is plain C memory, freed before returning: this routine makes
-     * no allocation that can trigger a collection, so raw buffers are safe. */
+     * no allocation that can trigger a collection, so raw buffers are safe. The
+     * three scratch buffers are allocated before any element is read or moved,
+     * so a failure here can release whatever already succeeded and raise without
+     * having disturbed `dst`/`keys`. */
     int64_t *idx = (int64_t *)malloc((size_t)n * sizeof(int64_t));
     int64_t *tmp = (int64_t *)malloc((size_t)n * sizeof(int64_t));
     int64_t *out = (int64_t *)malloc((size_t)n * sizeof(int64_t));
     if (!idx || !tmp || !out) {
-        fprintf(stderr, "zap: out of memory sorting a list of %lld\n", (long long)n);
-        abort();
+        /* A bounded/temp-buffer allocation failure is a recoverable
+         * `MemoryError` (#1598, SPEC §10), not a fail-stop: `list.sort` and
+         * `sorted` lower through an invoke so a `try`/`except MemoryError`
+         * catches it, and the input list is untouched (still sortable again).
+         * Release any sibling allocation that did succeed before unwinding;
+         * `free(NULL)` is a no-op. Distinct from the GC's own heap-exhaustion
+         * fail-stop abort (D-0119). */
+        free(idx);
+        free(tmp);
+        free(out);
+        const char *m = "out of memory sorting a list";
+        zap_panic_typed(ZAP_EXC_MEMORY_ERROR, zap_str_new(m, (int64_t)strlen(m)));
     }
     for (int64_t i = 0; i < n; i++) {
         idx[i] = i;
