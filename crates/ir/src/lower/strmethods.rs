@@ -304,12 +304,11 @@ impl<'a> FnLower<'a> {
                     "rjust" => "zap_str_rjust",
                     _ => "zap_str_center",
                 };
+                // A fill that is not exactly one codepoint raises a catchable
+                // TypeError (#1648), so this must be a throwing call for
+                // `try`/`except` to intercept it.
                 let d = self.new_value(Ty::Ptr);
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: func.to_string(),
-                    args: vec![recv, width, fill],
-                });
+                self.throwing_call(Some(d), func, vec![recv, width, fill]);
                 Ok((d, Ty::Ptr))
             }
             "zfill" => {

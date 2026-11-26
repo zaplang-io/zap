@@ -339,13 +339,24 @@ void *zap_str_strip_chars(void *sp, void *charsp, int64_t mode) {
     return zap_str_new(d + a, b - a);
 }
 
-/* Pad `s` to `width` CODEPOINTS using the first byte of `fill` (ASCII; space
- * when `fill` is empty). `side`: 0 left-justify (pad right), 1 right-justify
- * (pad left), 2 center. If `s` is already wide enough it is returned unchanged. */
+/* Pad `s` to `width` CODEPOINTS with the fill character. `fill` must be exactly
+ * one codepoint (Python; #1648, superseding D-0210's ASCII-fill-byte clause): an
+ * empty or multi-character fill raises a catchable `TypeError`, matching
+ * CPython's message, and the check runs even when no padding is needed. The
+ * fill's full UTF-8 bytes are repeated at each padding position, so a multibyte
+ * fill produces valid UTF-8. Width counts codepoints while the allocation counts
+ * bytes (checked for overflow). `side`: 0 ljust (pad right), 1 rjust (pad left),
+ * 2 center. If `s` is already wide enough it is returned unchanged. */
 static void *zap_str_pad(void *sp, int64_t width, void *fillp, int side) {
     const ZapStr *s = (const ZapStr *)sp;
     const ZapStr *fill = (const ZapStr *)fillp;
-    char fc = (fill && fill->len > 0) ? fill->data[0] : ' ';
+    /* The fill must be exactly one codepoint: fw (its byte width) == fill->len. */
+    int64_t fl = fill ? fill->len : 0;
+    int fw = (fl > 0) ? zap_utf8_width((unsigned char)fill->data[0]) : 0;
+    if (fl == 0 || (int64_t)fw != fl) {
+        const char *m = "The fill character must be exactly one character long";
+        zap_panic_typed(ZAP_EXC_TYPE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
     int64_t cur = zap_str_len_cp(sp);
     if (width <= cur) {
         return zap_str_new(s->data, s->len);
@@ -360,16 +371,23 @@ static void *zap_str_pad(void *sp, int64_t width, void *fillp, int side) {
         left = pad / 2;
         right = pad - left;
     }
-    int64_t total = s->len + left + right;
+    /* total = s->len + pad * fw, checked (pad >= 1, fw in 1..=4). */
+    if (pad > (INT64_MAX - s->len) / fw) {
+        const char *m = "out of memory";
+        zap_panic_typed(ZAP_EXC_MEMORY_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    }
+    int64_t total = s->len + pad * fw;
     char *buf = (char *)zap_buf((size_t)(total > 0 ? total : 1));
     int64_t w = 0;
     for (int64_t i = 0; i < left; i++) {
-        buf[w++] = fc;
+        memcpy(buf + w, fill->data, (size_t)fw);
+        w += fw;
     }
     memcpy(buf + w, s->data, (size_t)s->len);
     w += s->len;
     for (int64_t i = 0; i < right; i++) {
-        buf[w++] = fc;
+        memcpy(buf + w, fill->data, (size_t)fw);
+        w += fw;
     }
     return zap_str_adopt(buf, total);
 }
