@@ -2531,7 +2531,11 @@ impl Mono<'_> {
                     ..
                 } = st
                 {
-                    let type_subst = self.type_subst_names();
+                    // The full concrete substitution (#1604): a parameter may map
+                    // to a container (`list[int64]`) or generic instance, which a
+                    // name-only map cannot carry — needed to prune a kind `if`
+                    // dispatching on a nested-collection element type.
+                    let type_subst = self.cur_subst.clone();
                     if let Some(taken) = comptime_for::select_comptime_if(
                         branches,
                         else_block,
@@ -2571,16 +2575,6 @@ impl Mono<'_> {
     /// `reflect.type_info(T)` when pruning a generator's kind-dispatch `if`. Only
     /// `Named` concrete types are carried (a container/tuple instantiation is not
     /// a nominal kind-dispatch target).
-    fn type_subst_names(&self) -> HashMap<String, String> {
-        self.cur_subst
-            .iter()
-            .filter_map(|(k, v)| match v {
-                Type::Named { name, .. } => Some((k.clone(), name.clone())),
-                _ => None,
-            })
-            .collect()
-    }
-
     fn try_unroll_comptime_for(
         &self,
         target: &Expr,
@@ -4171,7 +4165,68 @@ impl Mono<'_> {
     /// nested one-parameter generic over a tuple (`Optional[(bytes, bytes)]`,
     /// `list[(bytes, bytes)]`) keeps the tuple whole as its single argument,
     /// while `dict[K, V]` still splits into two (#1478, #1479).
+    /// Resolve a reflected type expression (#1604) to a concrete type against the
+    /// active substitution `cur_subst`: `reflect.type_info(E)` yields `E`'s
+    /// concrete type, and the container accessors `.elem` (list) / `.inner`
+    /// (Optional) / `.key` / `.value` (dict) descend into it. Returns `None` for
+    /// anything that is not such an expression, so an ordinary type-name
+    /// expression falls through to `expr_to_type`'s normal handling. This is the
+    /// `expr_to_type`-level counterpart of the comptime `reflect.type_info(T)`
+    /// evaluator, letting a generic helper name a container element type as a
+    /// type argument and recurse (`gen[reflect.type_info(E).elem](x)`).
+    fn resolve_reflect_type_expr(&self, e: &Expr) -> Option<Type> {
+        match e {
+            // `reflect.type_info(X)` — `X`'s type, with its parameters substituted.
+            Expr::Call { callee, args, .. } => {
+                let Expr::Attr { base, name, .. } = callee.as_ref() else {
+                    return None;
+                };
+                if name != "type_info"
+                    || !matches!(base.as_ref(), Expr::Name(m, _) if m == "reflect")
+                    || args.len() != 1
+                    || args[0].name.is_some()
+                {
+                    return None;
+                }
+                // The argument names a type (often a type parameter). Convert it
+                // with the ordinary type-expr reader, then substitute parameters.
+                let arg_ty = self.expr_to_type(&args[0].value)?;
+                let refmap: HashMap<&str, &Type> = self
+                    .cur_subst
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v))
+                    .collect();
+                Some(subst_type(&arg_ty, &refmap))
+            }
+            // `<reflect-type-expr>.elem` / `.inner` / `.key` / `.value`.
+            Expr::Attr { base, name, .. } => {
+                let inner = self.resolve_reflect_type_expr(base)?;
+                let Type::Named { name: tn, args, .. } = &inner else {
+                    return None;
+                };
+                match (name.as_str(), tn.as_str(), args.len()) {
+                    ("elem", "list", 1) => Some(args[0].clone()),
+                    ("inner", "Optional", 1) => Some(args[0].clone()),
+                    ("key", "dict", 2) => Some(args[0].clone()),
+                    ("value", "dict", 2) => Some(args[1].clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn expr_to_type(&self, e: &Expr) -> Option<Type> {
+        // A reflected type expression used as a type argument (#1604):
+        // `reflect.type_info(E)`, or its container accessors
+        // `reflect.type_info(E).elem` / `.key` / `.value` / `.inner`. Resolved
+        // against the active substitution, so a generic helper can recurse into a
+        // container's element type (`gen[reflect.type_info(E).elem](x)`) — the
+        // shape a nested-collection codec needs. Checked first because such an
+        // expression is an `Attr`/`Call`, not an ordinary type-name expression.
+        if let Some(ty) = self.resolve_reflect_type_expr(e) {
+            return Some(ty);
+        }
         match e {
             Expr::Name(n, span) => Some(Type::Named {
                 name: n.clone(),

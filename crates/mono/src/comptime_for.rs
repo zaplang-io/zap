@@ -28,7 +28,7 @@ use zapc_comptime::{
     desugar_reflect_field, error_code, reflect_field, seed_kind_constants, specialize_one,
     type_info_of_enum, unroll, CtError, CtErrorKind, Env, Evaluator, TypeInfo, TypeRegistry, Value,
 };
-use zapc_syntax::ast::{Block, EnumDef, Expr, Function, MatchArm, Module, Stmt, StructDef};
+use zapc_syntax::ast::{Block, EnumDef, Expr, Function, MatchArm, Module, Stmt, StructDef, Type};
 use zapc_syntax::span::Span;
 
 use crate::{DeriveErrorInfo, LowerError};
@@ -130,7 +130,7 @@ pub fn select_comptime_if<'b>(
     branches: &'b [(Expr, Block)],
     else_block: &'b Option<Block>,
     registry: &TypeRegistry,
-    type_subst: HashMap<String, String>,
+    type_subst: HashMap<String, Type>,
 ) -> Result<Option<&'b [Stmt]>, LowerError> {
     let mut ev = Evaluator::new()
         .with_registry(registry)

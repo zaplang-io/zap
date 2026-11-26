@@ -215,12 +215,14 @@ pub struct Evaluator<'a> {
     /// element accessors (`.elem`/`.key`/…) and `field.ty` are unavailable
     /// (they report the out-of-fragment error as in #1250).
     registry: Option<&'a TypeRegistry>,
-    /// Type-parameter substitution (#1394): maps a generic parameter name (e.g.
-    /// `T`) to the concrete type name of the active instantiation, so
-    /// `reflect.type_info(T)` inside a specialized generic generator resolves to
-    /// the concrete type. Empty for non-generic evaluation (the `comptime for`
-    /// path resolves `T` in mono and binds `info`, so it leaves this empty).
-    type_subst: HashMap<String, String>,
+    /// Type-parameter substitution (#1394, widened #1604): maps a generic
+    /// parameter name (e.g. `T`) to the concrete **type** of the active
+    /// instantiation, so `reflect.type_info(T)` inside a specialized generic
+    /// resolves to that type — including a container type such as `list[int64]`
+    /// (a nested-collection element), which a name-only map could not represent.
+    /// Empty for non-generic evaluation (the `comptime for` path resolves `T` in
+    /// mono and binds `info`, so it leaves this empty).
+    type_subst: HashMap<String, zapc_syntax::ast::Type>,
 }
 
 impl<'a> Default for Evaluator<'a> {
@@ -251,21 +253,19 @@ impl<'a> Evaluator<'a> {
         self
     }
 
-    /// Attach a type-parameter substitution (#1394) so `reflect.type_info(T)`
-    /// resolves a generic parameter `T` to the concrete instantiation's type.
-    /// Maps each parameter name to its concrete type name.
-    pub fn with_type_subst(mut self, subst: HashMap<String, String>) -> Self {
+    /// Attach a type-parameter substitution (#1394, widened #1604) so
+    /// `reflect.type_info(T)` resolves a generic parameter `T` to the concrete
+    /// instantiation's type. Maps each parameter name to its concrete type
+    /// (a named type, a generic instance, or a container like `list[int64]`).
+    pub fn with_type_subst(mut self, subst: HashMap<String, zapc_syntax::ast::Type>) -> Self {
         self.type_subst = subst;
         self
     }
 
-    /// The concrete type name a type parameter resolves to under the active
-    /// substitution (#1394), or the name unchanged when it is not a parameter.
-    pub(crate) fn resolve_type_param<'n>(&'n self, name: &'n str) -> &'n str {
-        self.type_subst
-            .get(name)
-            .map(String::as_str)
-            .unwrap_or(name)
+    /// The concrete type a generic parameter resolves to under the active
+    /// substitution (#1394/#1604), or `None` when `name` is not a parameter.
+    pub(crate) fn resolve_type_param_ty(&self, name: &str) -> Option<&zapc_syntax::ast::Type> {
+        self.type_subst.get(name)
     }
 
     /// An evaluator that can call any of `funcs` by name (the common case:
