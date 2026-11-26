@@ -641,8 +641,8 @@ void zap_random_gen_choice_fill(void *g, void *arr_i64, int64_t pop, int64_t rep
     }
     /* replace == 0 */
     if (count > pop) {
-        fprintf(stderr, "zap: random.choice: sample larger than population without replacement\n");
-        abort();
+        const char *m = "random.choice: sample larger than population without replacement";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
     }
     if (p != NULL) {
         double *pp = (double *)malloc((size_t)pop * sizeof(double));

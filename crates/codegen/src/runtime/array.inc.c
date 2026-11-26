@@ -3690,8 +3690,8 @@ void *zap_str_slice(void *sp, int64_t lo, int64_t hi, int64_t step, int64_t has_
     int64_t n = zap_str_len_cp(sp);
     int64_t st = has_step ? step : 1;
     if (st == 0) {
-        fprintf(stderr, "zap: slice step cannot be zero\n");
-        abort();
+        const char *m = "slice step cannot be zero";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
     }
     int64_t start;
     int64_t stop;
@@ -3724,12 +3724,12 @@ void *zap_str_slice(void *sp, int64_t lo, int64_t hi, int64_t step, int64_t has_
 }
 
 /* char(n) / chr(n): validate `n` is a Unicode scalar (not a surrogate, in
- * range) and return it as a `char`. Faults on an invalid value (the typed
- * `ValueError` lands with the exception runtime). */
+ * range) and return it as a `char`. Raises a catchable `ValueError` on an
+ * invalid value (#1566). */
 int32_t zap_chr(int64_t n) {
     if (n < 0 || n > 0x10FFFF || (n >= 0xD800 && n <= 0xDFFF)) {
-        fprintf(stderr, "zap: chr() argument is not a valid Unicode scalar value\n");
-        abort();
+        const char *m = "chr() argument is not a valid Unicode scalar value";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
     }
     return (int32_t)n;
 }
@@ -4396,13 +4396,13 @@ int64_t zap_str_find(void *sp, void *subp) {
     return k;
 }
 
-/* index(sub): like find, but faults when `sub` is absent (Python's ValueError;
- * the typed exception lands with the exception runtime). */
+/* index(sub): like find, but raises a catchable `ValueError` when `sub` is
+ * absent (Python's ValueError; #1566). */
 int64_t zap_str_index_of(void *sp, void *subp) {
     int64_t r = zap_str_find(sp, subp);
     if (r < 0) {
-        fprintf(stderr, "zap: substring not found\n");
-        abort();
+        const char *m = "substring not found";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
     }
     return r;
 }

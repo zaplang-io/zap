@@ -2407,7 +2407,9 @@ void *zap_list_slice(void *lp, int64_t lo, int64_t hi, int64_t step, int64_t has
     int64_t n = l->len;
     int64_t st = has_step ? step : 1;
     if (st == 0) {
-        zap_panic(zap_str_new("slice step cannot be zero", 25));
+        /* #1566: a zero step is a catchable ValueError (matches CPython and the
+         * extended-slice-assignment length-mismatch path below). */
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new("slice step cannot be zero", 25));
     }
     int64_t start;
     int64_t stop;
@@ -2443,7 +2445,8 @@ void zap_list_set_slice(void *lp, void *yp, int64_t lo, int64_t hi, int64_t step
     int64_t n = l->len;
     int64_t st = has_step ? step : 1;
     if (st == 0) {
-        zap_panic(zap_str_new("slice step cannot be zero", 25));
+        /* #1566: zero step is a catchable ValueError (see zap_list_slice). */
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new("slice step cannot be zero", 25));
     }
     /* Snapshot the RHS elements up front (aliasing-safe). */
     int64_t m = ys->len;
@@ -3907,12 +3910,30 @@ static int64_t zap_heap_pop_word(ZapHeap *h) {
     return top;
 }
 
-/* pop/peek on an empty heap aborts (no exception runtime path yet, like an
- * out-of-range list index). */
+/* `replace` on an empty heap aborts: D-0236 documents empty `replace` as
+ * aborting like `pop`, and changing that is a contract change held for maintainer
+ * sign-off (#1566). `pop`/`peek` instead raise a catchable `IndexError` via
+ * `zap_heap_require_live` below. */
 static void zap_heap_require(const ZapHeap *h, const char *op) {
     if (h->len == 0) {
         fprintf(stderr, "zap: heap %s on an empty heap\n", op);
         abort();
+    }
+}
+
+/* pop/peek on an empty heap raise a catchable `IndexError` (#1566), matching
+ * out-of-range sequence indexing. */
+static void zap_heap_require_live(const ZapHeap *h, const char *op) {
+    if (h->len == 0) {
+        char buf[64];
+        int n = snprintf(buf, sizeof(buf), "heap %s on an empty heap", op);
+        if (n < 0) {
+            n = 0;
+        }
+        if (n > (int)sizeof(buf) - 1) {
+            n = (int)sizeof(buf) - 1;
+        }
+        zap_panic_typed(ZAP_EXC_INDEX_ERROR, zap_str_new(buf, (int64_t)n));
     }
 }
 
@@ -3935,23 +3956,23 @@ void zap_heap_push_ptr(void *h, void *v) {
 
 int64_t zap_heap_pop_i64(void *hp) {
     ZapHeap *h = (ZapHeap *)hp;
-    zap_heap_require(h, "pop");
+    zap_heap_require_live(h, "pop");
     return zap_heap_pop_word(h);
 }
 void *zap_heap_pop_ptr(void *hp) {
     ZapHeap *h = (ZapHeap *)hp;
-    zap_heap_require(h, "pop");
+    zap_heap_require_live(h, "pop");
     return (void *)(intptr_t)zap_heap_pop_word(h);
 }
 
 int64_t zap_heap_peek_i64(void *hp) {
     ZapHeap *h = (ZapHeap *)hp;
-    zap_heap_require(h, "peek");
+    zap_heap_require_live(h, "peek");
     return h->data[0];
 }
 void *zap_heap_peek_ptr(void *hp) {
     ZapHeap *h = (ZapHeap *)hp;
-    zap_heap_require(h, "peek");
+    zap_heap_require_live(h, "peek");
     return (void *)(intptr_t)h->data[0];
 }
 
@@ -3964,12 +3985,12 @@ void zap_heap_push_f64(void *h, double v) {
 }
 double zap_heap_pop_f64(void *hp) {
     ZapHeap *h = (ZapHeap *)hp;
-    zap_heap_require(h, "pop");
+    zap_heap_require_live(h, "pop");
     return zap_f64_from_bits(zap_heap_pop_word(h));
 }
 double zap_heap_peek_f64(void *hp) {
     ZapHeap *h = (ZapHeap *)hp;
-    zap_heap_require(h, "peek");
+    zap_heap_require_live(h, "peek");
     return zap_f64_from_bits(h->data[0]);
 }
 

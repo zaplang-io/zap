@@ -1480,7 +1480,9 @@ surface is frozen, D-0076, so they are additive). Full design in
 ## 14. Regular expressions (D-0010)
 
 Perl-style literals with PCRE2; `m`/`s` prefixes required. Full details in
-`design/0001-perl-regex.md`.
+`design/0001-perl-regex.md`. An invalid pattern or a bad replacement-group
+reference raises a catchable `ValueError` carrying the PCRE2 diagnostic (#1566);
+a dedicated regex error type may later subclass `ValueError`.
 
 ```python
 if line =~ m/\bfoo\d+\b/:

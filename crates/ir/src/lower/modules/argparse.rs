@@ -75,10 +75,13 @@ fn lower(
     Ok(Some(match method {
         "set_prog" => call_void(lowerer, "zap_argparse_set_prog", a, false),
         "set_description" => call_void(lowerer, "zap_argparse_set_description", a, false),
-        "add_flag" => call_void(lowerer, "zap_argparse_add_flag", a, false),
-        "add_positional" => call_void(lowerer, "zap_argparse_add_positional", a, false),
-        "add_option" => call_void(lowerer, "zap_argparse_add_option", a, false),
-        "add_int" => call_void(lowerer, "zap_argparse_add_int", a, false),
+        // Registration raises a catchable exception on a duplicate name or when
+        // the registration limit is hit (#1566), so these lower through an
+        // unwind edge to the calling frame's handler.
+        "add_flag" => call_void(lowerer, "zap_argparse_add_flag", a, true),
+        "add_positional" => call_void(lowerer, "zap_argparse_add_positional", a, true),
+        "add_option" => call_void(lowerer, "zap_argparse_add_option", a, true),
+        "add_int" => call_void(lowerer, "zap_argparse_add_int", a, true),
         "parse" => call_void(lowerer, "zap_argparse_parse", a, true),
         "get" => call_ret(lowerer, "zap_argparse_get", a, Ty::Ptr, true),
         "get_int" => call_ret(lowerer, "zap_argparse_get_int", a, Ty::I64, true),

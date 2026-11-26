@@ -3,9 +3,11 @@
 //! Emits the backing `zap_mutex_*` / `zap_waitgroup_*` / `zap_once_*` runtime
 //! calls. The handle is a `Ptr`; the count argument is an `int64` word.
 //! [`lower_args`] passes the handle through and coerces integer arguments to
-//! `i64`. These are infallible from the lowering's view (a negative `WaitGroup`
-//! counter panics in the runtime, matching the collections' abort-on-misuse
-//! convention), so they lower to plain (non-throwing) calls.
+//! `i64`. Most are infallible from the lowering's view and lower to plain
+//! (non-throwing) calls. The misuse paths that raise a **catchable** exception
+//! in the runtime — a negative `WaitGroup` counter (`add`/`done`) and releasing
+//! an un-acquired `RLock` (`rlock_unlock`) — lower through an unwind edge
+//! (`throwing: true`) so `try/except` in the calling frame catches them (#1566).
 
 use zapc_syntax::ast;
 
@@ -38,8 +40,10 @@ fn lower(
         "trylock" => call_bool(lowerer, "zap_mutex_trylock", a),
         // WaitGroup
         "waitgroup" => call_ret(lowerer, "zap_waitgroup_new", a, Ty::Bytes, false),
-        "add" => call_void(lowerer, "zap_waitgroup_add", a, false),
-        "done" => call_void(lowerer, "zap_waitgroup_done", a, false),
+        // A negative resulting counter raises a catchable exception in the
+        // runtime (#1566), so `add`/`done` must lower through an unwind edge.
+        "add" => call_void(lowerer, "zap_waitgroup_add", a, true),
+        "done" => call_void(lowerer, "zap_waitgroup_done", a, true),
         "wait" => call_void(lowerer, "zap_waitgroup_wait", a, false),
         // Once
         "once" => call_ret(lowerer, "zap_once_new", a, Ty::Bytes, false),
@@ -50,7 +54,8 @@ fn lower(
         // RLock (I#175).
         "rlock" => call_ret(lowerer, "zap_rlock_new", a, Ty::Bytes, false),
         "rlock_lock" => call_void(lowerer, "zap_rlock_lock", a, false),
-        "rlock_unlock" => call_void(lowerer, "zap_rlock_unlock", a, false),
+        // Releasing an un-acquired RLock raises a catchable exception (#1566).
+        "rlock_unlock" => call_void(lowerer, "zap_rlock_unlock", a, true),
         "rlock_trylock" => call_bool(lowerer, "zap_rlock_trylock", a),
         // Event (I#175).
         "event" => call_ret(lowerer, "zap_event_new", a, Ty::Bytes, false),

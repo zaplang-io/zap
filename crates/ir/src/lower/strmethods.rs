@@ -124,17 +124,19 @@ impl<'a> FnLower<'a> {
             }
             "find" | "index" => {
                 let a = one_str(self)?;
-                let func = if name == "find" {
-                    "zap_str_find"
-                } else {
-                    "zap_str_index_of"
-                };
                 let d = self.new_value(Ty::I64);
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: func.to_string(),
-                    args: vec![recv, a],
-                });
+                if name == "find" {
+                    // `find` returns -1 when absent — infallible.
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_str_find".to_string(),
+                        args: vec![recv, a],
+                    });
+                } else {
+                    // `index` raises a catchable `ValueError` when absent (#1566),
+                    // so it must carry an unwind edge to a `try` in this frame.
+                    self.throwing_call(Some(d), "zap_str_index_of", vec![recv, a]);
+                }
                 Ok((d, Ty::I64))
             }
             "replace" => {
@@ -204,17 +206,23 @@ impl<'a> FnLower<'a> {
             }
             "count" | "rfind" | "rindex" => {
                 let a = one_str(self)?;
-                let func = match name {
-                    "count" => "zap_str_count",
-                    "rfind" => "zap_str_rfind",
-                    _ => "zap_str_rindex",
-                };
                 let d = self.new_value(Ty::I64);
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: func.to_string(),
-                    args: vec![recv, a],
-                });
+                if name == "rindex" {
+                    // `rindex` raises a catchable `ValueError` when absent
+                    // (#1566); `count`/`rfind` are infallible.
+                    self.throwing_call(Some(d), "zap_str_rindex", vec![recv, a]);
+                } else {
+                    let func = if name == "count" {
+                        "zap_str_count"
+                    } else {
+                        "zap_str_rfind"
+                    };
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: func.to_string(),
+                        args: vec![recv, a],
+                    });
+                }
                 Ok((d, Ty::I64))
             }
             "removeprefix" | "removesuffix" => {

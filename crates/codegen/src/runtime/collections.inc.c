@@ -102,8 +102,8 @@ static void zap_deque_appendleft_word(ZapDeque *d, int64_t v) {
 
 static int64_t zap_deque_pop_word(ZapDeque *d) {
     if (d->len == 0) {
-        fprintf(stderr, "zap: pop from an empty deque\n");
-        abort();
+        const char *m = "pop from an empty deque";
+        zap_panic_typed(ZAP_EXC_INDEX_ERROR, zap_str_new(m, (int64_t)strlen(m)));
     }
     int64_t v = d->data[(d->head + d->len - 1) % d->cap];
     d->len--;
@@ -112,8 +112,8 @@ static int64_t zap_deque_pop_word(ZapDeque *d) {
 
 static int64_t zap_deque_popleft_word(ZapDeque *d) {
     if (d->len == 0) {
-        fprintf(stderr, "zap: pop from an empty deque\n");
-        abort();
+        const char *m = "pop from an empty deque";
+        zap_panic_typed(ZAP_EXC_INDEX_ERROR, zap_str_new(m, (int64_t)strlen(m)));
     }
     int64_t v = d->data[d->head];
     d->head = (d->head + 1) % d->cap;
@@ -123,9 +123,16 @@ static int64_t zap_deque_popleft_word(ZapDeque *d) {
 
 static int64_t zap_deque_get_word(ZapDeque *d, int64_t i) {
     if (i < 0 || i >= d->len) {
-        fprintf(stderr, "zap: deque index %lld out of range (len %lld)\n", (long long)i,
-                (long long)d->len);
-        abort();
+        char buf[96];
+        int n = snprintf(buf, sizeof(buf), "deque index %lld out of range (len %lld)",
+                         (long long)i, (long long)d->len);
+        if (n < 0) {
+            n = 0;
+        }
+        if (n > (int)sizeof(buf) - 1) {
+            n = (int)sizeof(buf) - 1;
+        }
+        zap_panic_typed(ZAP_EXC_INDEX_ERROR, zap_str_new(buf, (int64_t)n));
     }
     return d->data[(d->head + i) % d->cap];
 }

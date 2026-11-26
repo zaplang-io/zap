@@ -35,19 +35,19 @@ fn lower(
             .copied()
             .ok_or_else(|| err("JsonValue unavailable (built-in prelude missing)"))?;
         let d = lowerer.new_value(Ty::Struct(sid));
-        lowerer.emit(Inst::Call {
-            dest: Some(d),
-            func: "__yaml_loads".to_string(),
-            args: vec![s],
-        });
+        // Malformed YAML (e.g. tab indentation) raises a catchable exception in
+        // the `zap_yaml_to_json` C transpiler reached through `__yaml_loads`
+        // (#1566), so this must lower through an unwind edge to the handler.
+        lowerer.throwing_call(Some(d), "__yaml_loads", vec![s]);
         return Ok(Some((d, Ty::Struct(sid))));
     }
     let a = lower_args(lowerer, args)?;
     Ok(Some(match method {
         // yaml.dump(v) -> str: the prelude block-style serializer.
         "dump" => call_ret(lowerer, "__yaml_dumps", a, Ty::Ptr, false),
-        // Internal YAML -> JSON transpiler (C runtime).
-        "_to_json" => call_ret(lowerer, "zap_yaml_to_json", a, Ty::Ptr, false),
+        // Internal YAML -> JSON transpiler (C runtime). Raises a catchable
+        // exception on malformed YAML (#1566).
+        "_to_json" => call_ret(lowerer, "zap_yaml_to_json", a, Ty::Ptr, true),
         _ => return Ok(None),
     }))
 }

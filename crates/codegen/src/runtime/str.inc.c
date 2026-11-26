@@ -225,13 +225,13 @@ int64_t zap_str_rfind(void *sp, void *subp) {
     return -1;
 }
 
-/* rindex(sub): like rfind, but faults when absent (Python's ValueError), the
- * same abort contract as `zap_str_index_of`. */
+/* rindex(sub): like rfind, but raises a catchable `ValueError` when absent
+ * (Python's ValueError; #1566), the same contract as `zap_str_index_of`. */
 int64_t zap_str_rindex(void *sp, void *subp) {
     int64_t r = zap_str_rfind(sp, subp);
     if (r < 0) {
-        fprintf(stderr, "zap: substring not found\n");
-        abort();
+        const char *m = "substring not found";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
     }
     return r;
 }
@@ -740,14 +740,26 @@ static uint32_t zap_regex_compile_opts(int64_t flags) {
     return o;
 }
 
-/* Report a regex error and abort (exit 1). Literal-pattern validation is a
- * runtime check for now; a compile-time check would need PCRE2 in the compiler,
- * which must stay host-safe (buildable without LLVM/PCRE2 on the host). */
-static void zap_regex_fail(const char *what, int errorcode) {
+/* Raise a catchable regex error carrying the PCRE2 diagnostic (#1566). The
+ * error TYPE is `ValueError` (the reasonable default the issue names — a bad
+ * pattern/replacement is a value error — until a dedicated `RegexError` type is
+ * chosen). The uncaught form still reports the diagnostic and exits 1, exactly
+ * as the former direct `exit(1)` did. Literal-pattern validation is a runtime
+ * check for now; a compile-time check would need PCRE2 in the compiler, which
+ * must stay host-safe (buildable without LLVM/PCRE2 on the host). */
+__attribute__((noreturn)) static void zap_regex_fail(const char *what, int errorcode) {
     PCRE2_UCHAR msg[256];
     pcre2_get_error_message(errorcode, msg, sizeof(msg));
-    fprintf(stderr, "regex error: %s: %s\n", what, (const char *)msg);
-    exit(1);
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf), "regex error: %s: %s", what, (const char *)msg);
+    if (n < 0) {
+        n = 0;
+    }
+    if (n > (int)sizeof(buf) - 1) {
+        n = (int)sizeof(buf) - 1;
+    }
+    zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(buf, (int64_t)n));
+    abort(); /* unreachable: zap_panic_typed unwinds */
 }
 
 static pcre2_code *zap_regex_compile(const ZapStr *pattern, int64_t flags) {

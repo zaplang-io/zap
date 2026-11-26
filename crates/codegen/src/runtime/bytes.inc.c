@@ -30,8 +30,8 @@ int64_t zap_bytes_index(void *bp, int64_t idx) {
         idx += n;
     }
     if (idx < 0 || idx >= n) {
-        fprintf(stderr, "zap: bytes index out of range\n");
-        abort();
+        const char *m = "bytes index out of range";
+        zap_panic_typed(ZAP_EXC_INDEX_ERROR, zap_str_new(m, (int64_t)strlen(m)));
     }
     return (int64_t)(unsigned char)b->data[idx];
 }
@@ -44,8 +44,8 @@ void *zap_bytes_slice(void *bp, int64_t lo, int64_t hi, int64_t step, int64_t ha
     int64_t n = b->len;
     int64_t st = has_step ? step : 1;
     if (st == 0) {
-        fprintf(stderr, "zap: slice step cannot be zero\n");
-        abort();
+        const char *m = "slice step cannot be zero";
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
     }
     int64_t start;
     int64_t stop;

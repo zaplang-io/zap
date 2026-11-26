@@ -39,19 +39,14 @@ impl<'a> FnLower<'a> {
             let elem = Elem::Nested(self.ctx.nested.borrow_mut().intern(Ty::Match));
             let list_ty = Ty::List(elem);
             let l = self.new_value(list_ty);
-            self.emit(Inst::Call {
-                dest: Some(l),
-                func: "zap_regex_match_all".to_string(),
-                args: vec![sv, pv, fv],
-            });
+            // An invalid pattern raises a catchable `ValueError` in the runtime
+            // (#1566), so the match carries an unwind edge to a `try` here.
+            self.throwing_call(Some(l), "zap_regex_match_all", vec![sv, pv, fv]);
             return Ok((l, list_ty));
         }
         let m = self.new_value(Ty::Match);
-        self.emit(Inst::Call {
-            dest: Some(m),
-            func: "zap_regex_match".to_string(),
-            args: vec![sv, pv, fv],
-        });
+        // An invalid pattern raises a catchable `ValueError` (#1566).
+        self.throwing_call(Some(m), "zap_regex_match", vec![sv, pv, fv]);
         if !negated {
             return Ok((m, Ty::Match));
         }
@@ -87,11 +82,10 @@ impl<'a> FnLower<'a> {
         let rv = self.strconst(replacement);
         let fv = self.iconst(Ty::I64, regex_flag_bits(flags));
         let d = self.new_value(Ty::Ptr);
-        self.emit(Inst::Call {
-            dest: Some(d),
-            func: "zap_regex_subst".to_string(),
-            args: vec![sv, pv, rv, fv],
-        });
+        // An invalid pattern or a bad replacement group reference raises a
+        // catchable `ValueError` in the runtime (#1566), so the substitution
+        // carries an unwind edge to a `try` in the calling frame.
+        self.throwing_call(Some(d), "zap_regex_subst", vec![sv, pv, rv, fv]);
         Ok((d, Ty::Ptr))
     }
 }
