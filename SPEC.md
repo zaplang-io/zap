@@ -1028,6 +1028,14 @@ String operations are **methods on `str`** (there is no `strings` module):
 | `s.startswith(p)` / `s.endswith(p)` / `s.contains(sub)` | `bool` | |
 | `s.encode()` | `list[int]` | UTF-8 byte values |
 
+The position- and character-oriented methods operate in **codepoints**, not
+UTF-8 bytes, consistent with indexing, slicing and `len` (#1638): `find`/`index`
+and `rfind`/`rindex` return codepoint indices; `count("")` is `len(s) + 1`;
+`expandtabs` advances one column per codepoint; char-set `strip`/`lstrip`/
+`rstrip` trim whole codepoints (so the result is always valid UTF-8); and
+`translate` keys its `dict[str, str]` by whole codepoint. ASCII classification
+(`is*`) and case folding remain ASCII-only in v1.
+
 ### 9.3 Interpolation (f-strings, #285/D-0026)
 
 An f-string `f"...{expr[!conv][:spec]}..."` interpolates expressions. Each

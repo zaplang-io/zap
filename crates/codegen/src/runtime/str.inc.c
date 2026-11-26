@@ -187,14 +187,16 @@ void *zap_str_splitlines(void *sp) {
     return out;
 }
 
-/* count(sub): non-overlapping occurrences (byte scan). An empty `sub` returns
- * byte-length + 1 (Python's count-of-empty, byte-based here). */
+/* count(sub): non-overlapping occurrences. An empty `sub` returns len(s) + 1 in
+ * CODEPOINTS (CPython; #1634) — the occurrence count for a non-empty needle is
+ * the same whether scanned by byte or codepoint, so only the empty case needs
+ * the codepoint length. */
 int64_t zap_str_count(void *sp, void *subp) {
     const ZapStr *s = (const ZapStr *)sp;
     const ZapStr *sub = (const ZapStr *)subp;
     int64_t n = s->len, m = sub->len;
     if (m == 0) {
-        return n + 1;
+        return zap_str_len_cp(sp) + 1;
     }
     int64_t c = 0, i = 0;
     while (i + m <= n) {
@@ -277,27 +279,64 @@ void *zap_str_removesuffix(void *sp, void *xp) {
     return zap_str_new(s->data, s->len);
 }
 
-/* strip(chars, mode): mode 0 both / 1 left / 2 right. Trim any byte that appears
- * in the `chars` set (Python `strip(chars)`). An empty set trims nothing. */
+/* Is the whole codepoint `[cp, cp+w)` one of the codepoints spelled in the
+ * char set `[cs, cs+cl)`? Scans the set a codepoint at a time (#1636): the set
+ * is treated as a set of CHARACTERS (CPython), not of raw bytes, so a multibyte
+ * character matches only as a whole and the trim never splits a codepoint. */
+static int zap_str_cp_in_set(const char *cs, int64_t cl, const char *cp, int w) {
+    int64_t i = 0;
+    while (i < cl) {
+        int cw = zap_utf8_width((unsigned char)cs[i]);
+        if (i + cw > cl) {
+            cw = (int)(cl - i); /* malformed tail: compare what remains */
+        }
+        if (cw == w && memcmp(cs + i, cp, (size_t)w) == 0) {
+            return 1;
+        }
+        i += cw;
+    }
+    return 0;
+}
+
+/* strip(chars, mode): mode 0 both / 1 left / 2 right. Trim any CHARACTER that
+ * appears in `chars` (#1636, superseding D-0210's byte-based form): whole
+ * codepoints are matched and removed, so a multibyte character in `chars` or in
+ * the haystack is handled and the result is always valid UTF-8. ASCII results
+ * are unchanged. The no-argument whitespace form is a separate path. */
 void *zap_str_strip_chars(void *sp, void *charsp, int64_t mode) {
     const ZapStr *s = (const ZapStr *)sp;
     const ZapStr *cs = (const ZapStr *)charsp;
+    const char *d = s->data;
     int64_t a = 0, b = s->len;
-    uint8_t set[256] = {0};
-    for (int64_t i = 0; i < cs->len; i++) {
-        set[(unsigned char)cs->data[i]] = 1;
-    }
-    if (mode != 2) {
-        while (a < b && set[(unsigned char)s->data[a]]) {
-            a++;
+    if (mode != 2) { /* trim the left end */
+        while (a < b) {
+            int w = zap_utf8_width((unsigned char)d[a]);
+            if (a + w > b) {
+                break; /* truncated codepoint: stop rather than over-read */
+            }
+            if (!zap_str_cp_in_set(cs->data, cs->len, d + a, w)) {
+                break;
+            }
+            a += w;
         }
     }
-    if (mode != 1) {
-        while (b > a && set[(unsigned char)s->data[b - 1]]) {
-            b--;
+    if (mode != 1) { /* trim the right end */
+        while (b > a) {
+            int64_t p = b - 1; /* step back over continuation bytes to the lead */
+            while (p > a && ((unsigned char)d[p] & 0xC0) == 0x80) {
+                p--;
+            }
+            int w = zap_utf8_width((unsigned char)d[p]);
+            if (p + w != b) {
+                break; /* malformed boundary: stop */
+            }
+            if (!zap_str_cp_in_set(cs->data, cs->len, d + p, w)) {
+                break;
+            }
+            b = p;
         }
     }
-    return zap_str_new(s->data + a, b - a);
+    return zap_str_new(d + a, b - a);
 }
 
 /* Pad `s` to `width` CODEPOINTS using the first byte of `fill` (ASCII; space
@@ -1416,7 +1455,9 @@ static char *zap_strbuf_ensure(char *buf, size_t need, size_t *cap) {
 
 /* str.expandtabs([tabsize]) -> str: expand each '\t' to the next tab stop
  * (column rounded up to a multiple of tabsize). '\n'/'\r' reset the column;
- * tabsize 0 drops tabs. CPython `str.expandtabs`. */
+ * tabsize 0 drops tabs. The column advances one per CODEPOINT, not per byte
+ * (#1635), so tab stops land correctly after multibyte characters. CPython
+ * `str.expandtabs`. */
 void *zap_str_expandtabs(void *sp, int64_t tabsize) {
     const ZapStr *s = (const ZapStr *)sp;
     if (tabsize < 0) {
@@ -1425,8 +1466,9 @@ void *zap_str_expandtabs(void *sp, int64_t tabsize) {
     size_t cap = 0, len = 0;
     char *buf = NULL;
     int64_t col = 0;
-    for (int64_t i = 0; i < s->len; i++) {
-        char c = s->data[i];
+    int64_t i = 0;
+    while (i < s->len) {
+        unsigned char c = (unsigned char)s->data[i];
         if (c == '\t') {
             int64_t n = tabsize > 0 ? tabsize - (col % tabsize) : 0;
             buf = zap_strbuf_ensure(buf, len + (size_t)n, &cap);
@@ -1434,14 +1476,22 @@ void *zap_str_expandtabs(void *sp, int64_t tabsize) {
                 buf[len++] = ' ';
             }
             col += n;
+            i++;
         } else if (c == '\n' || c == '\r') {
             buf = zap_strbuf_ensure(buf, len + 1, &cap);
-            buf[len++] = c;
+            buf[len++] = (char)c;
             col = 0;
+            i++;
         } else {
-            buf = zap_strbuf_ensure(buf, len + 1, &cap);
-            buf[len++] = c;
-            col++;
+            int w = zap_utf8_width(c);
+            if (i + w > s->len) {
+                w = (int)(s->len - i); /* truncated tail: copy what remains */
+            }
+            buf = zap_strbuf_ensure(buf, len + (size_t)w, &cap);
+            memcpy(buf + len, s->data + i, (size_t)w);
+            len += (size_t)w;
+            col++; /* one column per codepoint */
+            i += w;
         }
     }
     void *r = zap_str_new(buf ? buf : "", (int64_t)len);
@@ -1456,11 +1506,18 @@ void *zap_str_expandtabs(void *sp, int64_t tabsize) {
  * `maketrans` step is needed). */
 void *zap_str_translate(void *sp, void *table_) {
     const ZapStr *s = (const ZapStr *)sp;
+    const char *d = s->data;
     size_t cap = 0, len = 0;
     char *buf = NULL;
-    for (int64_t i = 0; i < s->len; i++) {
-        char c = s->data[i];
-        void *key = zap_str_new(&c, 1);
+    /* Iterate by CODEPOINT and look up a whole-codepoint key (#1637): a
+     * multibyte character key in `table` now matches, remaps and deletes like
+     * CPython; ASCII (single-byte) keys behave as before. */
+    for (int64_t i = 0; i < s->len;) {
+        int w = zap_utf8_width((unsigned char)d[i]);
+        if (i + w > s->len) {
+            w = (int)(s->len - i); /* truncated tail: treat as a 1-wide unit */
+        }
+        void *key = zap_str_new(d + i, w);
         if (zap_dict_contains_str(table_, key)) {
             const ZapStr *rep = (const ZapStr *)zap_dict_get_str_ptr(table_, key);
             if (rep && rep->len > 0) {
@@ -1470,9 +1527,11 @@ void *zap_str_translate(void *sp, void *table_) {
             }
             /* empty replacement => delete the character */
         } else {
-            buf = zap_strbuf_ensure(buf, len + 1, &cap);
-            buf[len++] = c;
+            buf = zap_strbuf_ensure(buf, len + (size_t)w, &cap);
+            memcpy(buf + len, d + i, (size_t)w);
+            len += (size_t)w;
         }
+        i += w;
     }
     void *r = zap_str_new(buf ? buf : "", (int64_t)len);
     free(buf);
