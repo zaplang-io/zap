@@ -11451,7 +11451,8 @@ impl Checker {
         // Methods taking a single `str` argument, with their result type.
         let one_str_arg: Option<Ty> = match name {
             "startswith" | "endswith" | "contains" => Some(Ty::Bool),
-            // find/index/rfind/rindex return a byte offset; count a tally (#971).
+            // find/index/rfind/rindex return a codepoint index (#1630); count a
+            // tally (#971).
             "find" | "index" | "rfind" | "rindex" | "count" => Some(Ty::Int64),
             // prefix/suffix trimming (#971).
             "removeprefix" | "removesuffix" => Some(Ty::Str),
