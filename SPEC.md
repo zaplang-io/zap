@@ -1032,9 +1032,11 @@ The position- and character-oriented methods operate in **codepoints**, not
 UTF-8 bytes, consistent with indexing, slicing and `len` (#1638): `find`/`index`
 and `rfind`/`rindex` return codepoint indices; `count("")` is `len(s) + 1`;
 `expandtabs` advances one column per codepoint; char-set `strip`/`lstrip`/
-`rstrip` trim whole codepoints (so the result is always valid UTF-8); and
-`translate` keys its `dict[str, str]` by whole codepoint. ASCII classification
-(`is*`) and case folding remain ASCII-only in v1.
+`rstrip` trim whole codepoints (so the result is always valid UTF-8);
+`translate` keys its `dict[str, str]` by whole codepoint; and `ljust`/`rjust`/
+`center` repeat a one-codepoint `fill` (a `fill` that is not exactly one
+codepoint raises a catchable `TypeError`, #1648). ASCII classification (`is*`)
+and case folding remain ASCII-only in v1.
 
 ### 9.3 Interpolation (f-strings, #285/D-0026)
 
