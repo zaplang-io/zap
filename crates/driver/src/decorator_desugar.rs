@@ -144,7 +144,7 @@ pub fn desugar_registering_decorators(
     // argparse seam `fn(Namespace) -> R`, the decorated handler (of any signature)
     // is adapted into that seam rather than passed raw. Imported-module receivers
     // read the same from `fn_sigs` below.
-    let struct_method_trailing = collect_struct_method_trailing_params(module);
+    let struct_method_params = collect_struct_method_params(module);
 
     // Imported-module receivers (#1519, the cli#4 surface): a dotted decorator
     // whose root is an IMPORTED module (`import factory; @factory.command`)
@@ -186,7 +186,7 @@ pub fn desugar_registering_decorators(
             &recv_struct,
             import_prefixes,
             &fn_rets,
-            &struct_method_trailing,
+            &struct_method_params,
             &fn_sigs,
             &mut diags,
         ) {
@@ -242,7 +242,7 @@ pub fn desugar_registering_decorators(
                 &struct_ret,
                 import_prefixes,
                 &fn_rets,
-                &struct_method_trailing,
+                &struct_method_params,
                 &fn_sigs,
             ) {
                 Some(r) => (r.callee, r.root),
@@ -354,15 +354,26 @@ fn collect_struct_method_rets(module: &Module) -> HashMap<String, HashMap<String
 /// parameter's type is what decides whether an argparse-backed adapter is
 /// synthesized (`fn(Namespace) -> R`) or the raw handler is passed. A method with
 /// no explicit trailing parameter type maps to `None`.
-fn collect_struct_method_trailing_params(
-    module: &Module,
-) -> HashMap<String, HashMap<String, Option<Type>>> {
-    let mut out: HashMap<String, HashMap<String, Option<Type>>> = HashMap::new();
+/// A snapshot of struct methods' parameters, keyed `struct -> method ->
+/// [(param name, param type)]`, with the implicit `self` dropped (#1626).
+type MethodParams = HashMap<String, HashMap<String, Vec<(String, Option<Type>)>>>;
+
+fn collect_struct_method_params(module: &Module) -> MethodParams {
+    let mut out: MethodParams = HashMap::new();
     for it in &module.items {
         if let Item::Struct(s) = it {
             let methods = out.entry(s.name.clone()).or_default();
             for m in &s.methods {
-                methods.insert(m.name.clone(), m.params.last().and_then(|p| p.ty.clone()));
+                // Drop the implicit `self` receiver: a decorator call supplies no
+                // argument for it, so the stored parameters align with the call's
+                // arguments (and with the handler the desugar passes).
+                let params = m
+                    .params
+                    .iter()
+                    .filter(|p| p.name != "self")
+                    .map(|p| (p.name.clone(), p.ty.clone()))
+                    .collect();
+                methods.insert(m.name.clone(), params);
             }
         }
     }
@@ -433,7 +444,7 @@ fn try_build_rebind(
     recv_struct: &HashMap<String, String>,
     import_prefixes: &HashMap<String, String>,
     fn_rets: &HashMap<String, Option<Type>>,
-    struct_trailing: &HashMap<String, HashMap<String, Option<Type>>>,
+    struct_method_params: &MethodParams,
     fn_sigs: &HashMap<String, Vec<Param>>,
     diags: &mut Vec<TypeError>,
 ) -> Option<(Registration, Option<Function>)> {
@@ -447,7 +458,7 @@ fn try_build_rebind(
         struct_ret,
         import_prefixes,
         fn_rets,
-        struct_trailing,
+        struct_method_params,
         fn_sigs,
     )?;
     // Non-void return → rebind; void or unknown/unresolvable receiver →
@@ -483,8 +494,16 @@ fn try_build_rebind(
     // order. The chain then threads the adapter, not the raw handler. Any other
     // trailing type (e.g. the handler's own fixed `fn(str) -> str`, #1527) passes
     // the raw implementation, unchanged.
+    //
+    // The seam parameter may appear ANYWHERE among the receiver method's
+    // parameters, not only last (#1626) — e.g. `command(str name="",
+    // fn(Namespace) handler)` or `command(fn(Namespace) handler, str name="")`.
+    // So the synthesized adapter is passed to the handler parameter *by name*,
+    // leaving the decorator's optional named metadata (`name=`, `help=`) to bind
+    // by default or keyword as usual.
     let mut adapter: Option<Function> = None;
     let mut base_name = impl_name.clone();
+    let mut handler_param: Option<String> = None;
     if let Some(innermost) = dotted.last() {
         let ri = resolve_dotted(
             &innermost.name,
@@ -493,10 +512,10 @@ fn try_build_rebind(
             struct_ret,
             import_prefixes,
             fn_rets,
-            struct_trailing,
+            struct_method_params,
             fn_sigs,
         );
-        if let Some(context_ty) = ri.and_then(|r| namespace_seam(&r.trailing_param)) {
+        if let Some((pname, context_ty)) = ri.as_ref().and_then(|r| seam_param(&r.params)) {
             let (a, aname) = synth_namespace_adapter(
                 &orig_name,
                 &impl_name,
@@ -508,6 +527,7 @@ fn try_build_rebind(
             );
             base_name = aname;
             adapter = Some(a);
+            handler_param = Some(pname);
         }
     }
 
@@ -521,8 +541,14 @@ fn try_build_rebind(
     // imported module function (#1519) — with the decorator's own arguments
     // (stacked `@option`/`@argument` metadata) kept as that call's leading
     // arguments.
+    //
+    // The INNERMOST wrap (the one handed the handler, processed first) passes the
+    // synthesized adapter to the handler parameter **by name** when the seam named
+    // it (#1626), so optional metadata parameters keep their defaults regardless
+    // of declaration order. A raw handler (no seam) and the outer wraps (which
+    // thread the composed object) stay the trailing positional argument.
     let mut chain = Expr::Name(base_name, f.span);
-    for d in dotted.iter().rev() {
+    for (i, d) in dotted.iter().rev().enumerate() {
         let Some(rd) = resolve_dotted(
             &d.name,
             d.span,
@@ -530,14 +556,15 @@ fn try_build_rebind(
             struct_ret,
             import_prefixes,
             fn_rets,
-            struct_trailing,
+            struct_method_params,
             fn_sigs,
         ) else {
             continue;
         };
         let mut args = d.args.clone();
+        let inner_name = if i == 0 { handler_param.clone() } else { None };
         args.push(Arg {
-            name: None,
+            name: inner_name,
             value: chain,
             spread: ArgSpread::None,
             span: d.span,
@@ -593,11 +620,18 @@ fn namespace_seam(t: &Option<Type>) -> Option<Option<Type>> {
     }
 }
 
-/// The argparse `Namespace` typed getter for a handler parameter's declared type
-/// (#1544): `int`→`get_int`, `float`→`get_float`, `bool`→`get_flag`, `str`→
-/// `get_str`. `None` for any other type — a parameter that cannot be bound from
-/// the command line in v1 (no `Context`/struct binding), reported at synthesis.
-fn namespace_getter_for(t: &Option<Type>) -> Option<&'static str> {
+/// How a handler parameter's declared type binds from the argparse `Namespace`
+/// (#1544/#1625): the typed getter to call, and an optional conversion builtin to
+/// wrap its result in when the parameter is narrower than the getter's type. The
+/// `Namespace` exposes `get_int` (`int64`), `get_float` (`float64`), `get_flag`
+/// (`bool`) and `get_str` (`str`); a narrower scalar reads the wide getter and
+/// converts, e.g. `int32 n` → `int32(ns.get_int("n"))`, `float32 r` →
+/// `float32(ns.get_float("r"))`.
+///
+/// `None` for any other type — a parameter that cannot be bound from the command
+/// line in v1 (no `Context`/struct binding, and the non-conversion scalars
+/// `int8`/`int16`/`char`/`bytes`/`bigint`/`complex`), reported at synthesis.
+fn namespace_getter_for(t: &Option<Type>) -> Option<(&'static str, Option<&'static str>)> {
     let Some(Type::Named { name, args, .. }) = t else {
         return None;
     };
@@ -605,10 +639,17 @@ fn namespace_getter_for(t: &Option<Type>) -> Option<&'static str> {
         return None;
     }
     match name.as_str() {
-        "int64" | "int" | "i64" => Some("get_int"),
-        "float64" | "float" | "f64" => Some("get_float"),
-        "bool" => Some("get_flag"),
-        "str" => Some("get_str"),
+        "int64" | "int" | "i64" => Some(("get_int", None)),
+        "int32" | "i32" => Some(("get_int", Some("int32"))),
+        "uint8" | "u8" => Some(("get_int", Some("uint8"))),
+        "uint16" | "u16" => Some(("get_int", Some("uint16"))),
+        "uint32" | "u32" => Some(("get_int", Some("uint32"))),
+        "uint64" | "u64" => Some(("get_int", Some("uint64"))),
+        "usize" => Some(("get_int", Some("usize"))),
+        "float64" | "float" | "f64" => Some(("get_float", None)),
+        "float32" | "f32" => Some(("get_float", Some("float32"))),
+        "bool" => Some(("get_flag", None)),
+        "str" => Some(("get_str", None)),
         _ => None,
     }
 }
@@ -654,22 +695,35 @@ fn synth_namespace_adapter(
             continue;
         }
         match namespace_getter_for(&p.ty) {
-            Some(getter) => call_args.push(arg(Expr::Call {
-                callee: Box::new(Expr::Attr {
-                    base: Box::new(Expr::Name(ns.to_string(), span)),
-                    name: getter.to_string(),
+            Some((getter, convert)) => {
+                // `ns.get_<kind>("<param>")`, wrapped in a conversion to the
+                // declared type when it is narrower than the getter's (#1625).
+                let read = Expr::Call {
+                    callee: Box::new(Expr::Attr {
+                        base: Box::new(Expr::Name(ns.to_string(), span)),
+                        name: getter.to_string(),
+                        span,
+                    }),
+                    args: vec![arg(str_lit(&p.name, span))],
                     span,
-                }),
-                args: vec![arg(str_lit(&p.name, span))],
-                span,
-            })),
+                };
+                let value = match convert {
+                    Some(conv) => Expr::Call {
+                        callee: Box::new(Expr::Name(conv.to_string(), span)),
+                        args: vec![arg(read)],
+                        span,
+                    },
+                    None => read,
+                };
+                call_args.push(arg(value));
+            }
             None => {
                 diags.push(err(
                     format!(
                         "handler parameter `{}` has a type that cannot be bound from the \
-                         command-line namespace; an argparse-backed handler takes only scalar \
-                         parameters (int, float, bool, str) plus an optional typed context as \
-                         its first parameter",
+                         command-line namespace; an argparse-backed handler takes scalar \
+                         parameters (bool, str, the integer types int/int32/uint8..uint64/usize, \
+                         and float/float32) plus an optional typed context as its first parameter",
                         p.name
                     ),
                     p.span,
@@ -757,10 +811,12 @@ struct ResolvedRecv {
     /// resolved (unknown receiver); `Some(None)` = void; `Some(Some(T))` =
     /// non-void. Only a non-void target rebinds.
     ret: Option<Option<Type>>,
-    /// The declared type of the method's trailing (handler) parameter (#1544),
-    /// if any. When it is the uniform argparse seam `fn(Namespace) -> R`, the
-    /// decorated handler is adapted into that seam.
-    trailing_param: Option<Type>,
+    /// The receiver method's parameters `(name, type)` in declaration order, with
+    /// the implicit `self` dropped (#1544/#1626). The handler parameter — the one
+    /// typed as the uniform argparse seam `fn([C,] Namespace) -> R` — may appear
+    /// anywhere among them (e.g. before optional `name=`/`help=` metadata), so the
+    /// decorated handler is adapted and passed to it *by name*, not positionally.
+    params: Vec<(String, Option<Type>)>,
 }
 
 /// Resolve a dotted decorator name `root.method` to the call it desugars to.
@@ -782,7 +838,7 @@ fn resolve_dotted(
     struct_ret: &HashMap<String, HashMap<String, Option<Type>>>,
     import_prefixes: &HashMap<String, String>,
     fn_rets: &HashMap<String, Option<Type>>,
-    struct_trailing: &HashMap<String, HashMap<String, Option<Type>>>,
+    struct_method_params: &MethodParams,
     fn_sigs: &HashMap<String, Vec<Param>>,
 ) -> Option<ResolvedRecv> {
     let (recv_expr, method, root) = split_registering(name, span)?;
@@ -791,11 +847,11 @@ fn resolve_dotted(
             .get(struct_name)
             .and_then(|mm| mm.get(&method))
             .cloned();
-        let trailing_param = struct_trailing
+        let params = struct_method_params
             .get(struct_name)
             .and_then(|mm| mm.get(&method))
             .cloned()
-            .flatten();
+            .unwrap_or_default();
         return Some(ResolvedRecv {
             callee: Expr::Attr {
                 base: Box::new(recv_expr),
@@ -804,24 +860,43 @@ fn resolve_dotted(
             },
             root,
             ret,
-            trailing_param,
+            params,
         });
     }
     if let Some(prefix) = import_prefixes.get(&root) {
         let fn_name = format!("{prefix}{method}");
         let ret = fn_rets.get(&fn_name).cloned();
-        let trailing_param = fn_sigs
+        // An imported-module receiver is a merged free function — no `self` — so
+        // its parameters map directly.
+        let params = fn_sigs
             .get(&fn_name)
-            .and_then(|ps| ps.last())
-            .and_then(|p| p.ty.clone());
+            .map(|ps| {
+                ps.iter()
+                    .filter(|p| p.name != "self")
+                    .map(|p| (p.name.clone(), p.ty.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         return Some(ResolvedRecv {
             callee: Expr::Name(fn_name, span),
             root,
             ret,
-            trailing_param,
+            params,
         });
     }
     None
+}
+
+/// Find the receiver method's handler parameter — the one whose type is the
+/// uniform argparse seam `fn([C,] Namespace) -> R` (#1544/#1621) — among `params`
+/// (`self` already dropped). Returns the parameter's name (so the adapter is
+/// passed to it by keyword, independent of any surrounding optional metadata,
+/// #1626) and the seam's optional leading context type. Returns `None` when no
+/// parameter is a seam — the decorator receives the raw handler, unchanged.
+fn seam_param(params: &[(String, Option<Type>)]) -> Option<(String, Option<Type>)> {
+    params
+        .iter()
+        .find_map(|(n, t)| namespace_seam(t).map(|ctx| (n.clone(), ctx)))
 }
 
 /// How a handler/provider parameter is bound by the adapter.
@@ -2483,5 +2558,212 @@ mod tests {
             matches!(&args.last().unwrap().value, Expr::Name(n, _) if n == "greet$adapter"),
             "innermost argument is the synthesized adapter, not the raw handler"
         );
+    }
+
+    // ---- #1625: wider scalar parameter types --------------------------------
+
+    // A `conv(ns.get_X("name"))` call: the conversion builtin, the getter, and the
+    // parameter name read.
+    fn conv_getter_call(e: &Expr) -> Option<(String, String, String)> {
+        let Expr::Call { callee, args, .. } = e else {
+            return None;
+        };
+        let Expr::Name(conv, _) = callee.as_ref() else {
+            return None;
+        };
+        let (getter, name) = getter_call(&args.first()?.value)?;
+        Some((conv.clone(), getter, name))
+    }
+
+    #[test]
+    fn wider_scalar_params_bind_via_conversion() {
+        // #1625: `int32`/`uint8`/`float32` read the wide getter and convert.
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, fn(Namespace) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(int32 count, uint8 level, float32 ratio) -> str:\n    return \"x\"\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let adapter = func(&m, "greet$adapter").expect("adapter synthesized");
+        let Stmt::Return {
+            value: Some(Expr::Call { args, .. }),
+            ..
+        } = &body(adapter)[0]
+        else {
+            panic!("expected return call");
+        };
+        assert_eq!(
+            conv_getter_call(&args[0].value),
+            Some(("int32".into(), "get_int".into(), "count".into()))
+        );
+        assert_eq!(
+            conv_getter_call(&args[1].value),
+            Some(("uint8".into(), "get_int".into(), "level".into()))
+        );
+        assert_eq!(
+            conv_getter_call(&args[2].value),
+            Some(("float32".into(), "get_float".into(), "ratio".into()))
+        );
+    }
+
+    #[test]
+    fn wide_scalar_params_bind_without_conversion() {
+        // The getter-native types are read directly, with no conversion wrapper.
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, fn(Namespace) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(int64 a, float64 b) -> str:\n    return \"x\"\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let adapter = func(&m, "greet$adapter").expect("adapter synthesized");
+        let Stmt::Return {
+            value: Some(Expr::Call { args, .. }),
+            ..
+        } = &body(adapter)[0]
+        else {
+            panic!("expected return call");
+        };
+        assert_eq!(
+            getter_call(&args[0].value),
+            Some(("get_int".into(), "a".into()))
+        );
+        assert_eq!(
+            getter_call(&args[1].value),
+            Some(("get_float".into(), "b".into()))
+        );
+    }
+
+    #[test]
+    fn non_conversion_scalar_param_errors() {
+        // `int8`/`char` have no scalar conversion builtin, so they cannot be bound.
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, fn(Namespace) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(char c) -> str:\n    return \"x\"\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(
+            diags.iter().any(|d| d.message.contains("`c`")),
+            "expected an unsupported-parameter diagnostic for `c`, got: {diags:?}"
+        );
+    }
+
+    // ---- #1626: handler reaches its parameter past optional metadata ---------
+
+    // The arguments of the `root.method(...)` rebind call for `name`, if it is one.
+    fn rebind_call_args<'a>(stmt: &'a Stmt, name: &str) -> Option<&'a [Arg]> {
+        let Stmt::Let {
+            name: n,
+            value: Expr::Call { args, .. },
+            ..
+        } = stmt
+        else {
+            return None;
+        };
+        (n == name).then_some(args.as_slice())
+    }
+
+    #[test]
+    fn handler_passed_by_name_before_optional_metadata() {
+        // #1626: optional metadata precedes the handler parameter. The synthesized
+        // adapter must reach the `handler` parameter by name, leaving `name=` to
+        // its default — not fill the `name` slot positionally.
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, str name, fn(Namespace) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(str who) -> str:\n    return who\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let args = rebind_call_args(&main_stmts(&m)[1], "greet").expect("greet rebound");
+        let handler_arg = args
+            .iter()
+            .find(|a| a.name.as_deref() == Some("handler"))
+            .expect("adapter passed by the `handler` keyword");
+        assert!(
+            matches!(&handler_arg.value, Expr::Name(n, _) if n == "greet$adapter"),
+            "the `handler` keyword carries the synthesized adapter"
+        );
+    }
+
+    #[test]
+    fn handler_seam_detected_before_trailing_metadata() {
+        // #1626: the handler parameter comes FIRST, with trailing optional
+        // metadata. The seam is detected regardless of position and the adapter is
+        // still passed by name.
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, fn(Namespace) -> str handler, str name) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(str who) -> str:\n    return who\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        assert!(
+            func(&m, "greet$adapter").is_some(),
+            "seam detected on a non-trailing parameter"
+        );
+        let args = rebind_call_args(&main_stmts(&m)[1], "greet").expect("greet rebound");
+        assert!(
+            args.iter().any(|a| a.name.as_deref() == Some("handler")
+                && matches!(&a.value, Expr::Name(n, _) if n == "greet$adapter")),
+            "adapter passed by the `handler` keyword even though it is the first parameter"
+        );
+    }
+
+    #[test]
+    fn handler_by_name_coexists_with_decorator_metadata() {
+        // `@cli.command(name="alias")`: the decorator's own keyword metadata and
+        // the by-name handler coexist on the one call.
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, str name, fn(Namespace) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command(name=\"alias\")\ndef greet(str who) -> str:\n    return who\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let args = rebind_call_args(&main_stmts(&m)[1], "greet").expect("greet rebound");
+        assert!(
+            args.iter().any(|a| a.name.as_deref() == Some("name")
+                && matches!(&a.value, Expr::Str { value, .. } if value == "alias")),
+            "the decorator's `name=` metadata is retained"
+        );
+        assert!(
+            args.iter().any(|a| a.name.as_deref() == Some("handler")
+                && matches!(&a.value, Expr::Name(n, _) if n == "greet$adapter")),
+            "the adapter is passed by the `handler` keyword alongside the metadata"
+        );
+    }
+
+    #[test]
+    fn raw_handler_without_seam_stays_positional() {
+        // No namespace seam (#1527 fixed signature): the raw handler is passed as
+        // the trailing positional argument, unchanged — not by keyword.
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, fn(str) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(str name) -> str:\n    return name\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        assert!(
+            func(&m, "greet$adapter").is_none(),
+            "no adapter for a fixed-signature handler"
+        );
+        let args = rebind_call_args(&main_stmts(&m)[1], "greet").expect("greet rebound");
+        let last = args.last().unwrap();
+        assert!(
+            last.name.is_none(),
+            "raw handler stays a positional argument"
+        );
+        assert!(matches!(&last.value, Expr::Name(n, _) if n == "greet$impl"));
     }
 }
