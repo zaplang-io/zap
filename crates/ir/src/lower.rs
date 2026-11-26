@@ -15417,6 +15417,14 @@ impl<'a> FnLower<'a> {
             // smaller than x, and requires a non-empty heap); pushpop pushes x
             // first then pops (so it returns the min of `{x} ∪ heap` and is
             // defined on the empty heap). Both return the popped element `T`.
+            //
+            // The two diverge in their empty-heap behavior, so they must lower
+            // differently (#1579): `replace` on an empty heap raises a catchable
+            // `IndexError` (like `pop`/`peek`), so it lowers through
+            // `throwing_call` — an `invoke` whose unwind edge reaches the active
+            // `try`; a missed edge would terminate instead of catching. `pushpop`
+            // is total on the empty heap (it returns `x` unchanged) and never
+            // raises, so it stays a plain `Inst::Call`.
             "replace" | "pushpop" => {
                 if args.len() != 1 {
                     return Err(err(format!("{name}() takes exactly one argument")));
@@ -15427,11 +15435,21 @@ impl<'a> FnLower<'a> {
                 }
                 let v = self.coerce(v, vt, elem.ty());
                 let d = self.new_value(elem.ty());
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: format!("zap_heap_{name}_{}", elem.val_suffix()),
-                    args: vec![recv, v],
-                });
+                if name == "replace" {
+                    // Can raise `IndexError` on an empty heap -> invoke (#1579).
+                    self.throwing_call(
+                        Some(d),
+                        &format!("zap_heap_replace_{}", elem.val_suffix()),
+                        vec![recv, v],
+                    );
+                } else {
+                    // `pushpop` is defined on the empty heap and does NOT raise.
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: format!("zap_heap_pushpop_{}", elem.val_suffix()),
+                        args: vec![recv, v],
+                    });
+                }
                 Ok((d, elem.ty()))
             }
             other => Err(err(format!(

@@ -31,7 +31,7 @@ def main():
     print(p2.peek())  # 5  (still the original min)
     print(len(p2))  # 3
 
-    # pushpop on an empty heap returns x (replace would abort instead).
+    # pushpop on an empty heap returns x (replace would raise IndexError).
     list[int64] e = []
     auto pe = heap[int64](e)
     print(pe.pushpop(42))  # 42

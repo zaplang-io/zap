@@ -1720,7 +1720,11 @@ mod tests {
     #[test]
     fn lower_heap_replace_and_pushpop() {
         // heapreplace / heappushpop lower to the element-kind-suffixed entry
-        // points (#978, D-0236).
+        // points (#978, D-0236). `replace` on an empty heap now raises a
+        // catchable `IndexError` (#1579), so in `main` (implicit top-level
+        // handler) it lowers to an `invoke` — match either prefix. `pushpop`
+        // is defined on an empty heap and does NOT raise, so it stays a plain
+        // `call`.
         let m = lower_ok(
             "def main():\n    \
                  auto h = heap[int64]([1, 2, 3])\n    \
@@ -1728,8 +1732,57 @@ mod tests {
                  print(h.pushpop(0))\n",
         );
         let text = format!("{m}");
-        assert!(text.contains("call @zap_heap_replace_i64"), "text:\n{text}");
+        assert!(text.contains("@zap_heap_replace_i64"), "text:\n{text}");
         assert!(text.contains("call @zap_heap_pushpop_i64"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_heap_replace_is_catchable_pushpop_is_not() {
+        // #1579: empty `heap.replace(x)` raises a catchable `IndexError`
+        // (superseding the D-0236 abort), so inside a `try` it must lower to an
+        // `invoke` whose unwind edge reaches the handler's landing pad — a plain
+        // `call` would unwind straight past the `try` and terminate. `pushpop`
+        // is defined on the empty heap and never raises, so it stays a plain
+        // `call` even when a landing pad is active.
+        let m = lower_ok(
+            "def main():\n    \
+                 auto h = heap[int64]()\n    \
+                 try:\n        \
+                     auto v = h.replace(1)\n    \
+                 except IndexError:\n        \
+                     print(\"caught\")\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("invoke @zap_heap_replace_i64"),
+            "replace in a try must be an invoke (catchable), text:\n{text}"
+        );
+        assert!(text.contains("unwind"), "text:\n{text}");
+        assert!(text.contains("landingpad"), "text:\n{text}");
+        assert!(
+            !text.contains("call @zap_heap_replace_i64"),
+            "replace must not emit a plain call, text:\n{text}"
+        );
+
+        // `pushpop` inside the same `try` stays a plain `call` — it is total on
+        // the empty heap and carries no unwind edge.
+        let m = lower_ok(
+            "def main():\n    \
+                 auto h = heap[int64]()\n    \
+                 try:\n        \
+                     auto v = h.pushpop(1)\n    \
+                 except IndexError:\n        \
+                     print(\"caught\")\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("call @zap_heap_pushpop_i64"),
+            "pushpop must stay a plain call (never raises), text:\n{text}"
+        );
+        assert!(
+            !text.contains("invoke @zap_heap_pushpop_i64"),
+            "pushpop must not be an invoke, text:\n{text}"
+        );
     }
 
     #[test]
