@@ -11197,29 +11197,60 @@ impl Checker {
                 if let Ty::Named(owner) = &bt {
                     self.warn_deprecated_call(&format!("{owner}.{name}"), *span);
                 }
-                // Generic type-parameter consistency for a generic method (#1622).
-                // Instance-method arguments are otherwise inferred loosely (no
-                // per-argument type check), so this collects the argument types and
-                // enforces only that a type parameter bound by one argument is
-                // respected by the others — keyed `"Type.method"`, with `self`
-                // dropped from the stored parameters so the indices line up. The
+                // Per-argument type check + generic type-parameter consistency
+                // (#1653 / #1622). The implicit `self` is `sig.params[0]` (a
+                // receiverless `def` is already handled above as an associated
+                // function), so a positional argument `i` is checked `coercible`
+                // against `sig.params[i + 1]` and a keyword against its named
+                // parameter (`check_keyword_arg`); a failure is `ZAP4021` /
+                // `ZAP4022`. Generic consistency then runs keyed `"Type.method"`
+                // (with `self` dropped from the stored parameters so the indices
+                // line up). Arity stays loose — an extra or missing argument is not
+                // flagged, and the variadic / `**kwargs` collector is never treated
+                // as a fixed positional — matching the other receiver paths. The
                 // method's return type stays loose (`sig.ret`) to preserve the
-                // method-chain operator typing this path relies on.
+                // method-chain operator typing this path drives `&`/`|`/`~` dispatch
+                // from; binding a generic method's return type is #1643.
+                let key = if let Ty::Named(owner) = &bt {
+                    format!("{owner}.{name}")
+                } else {
+                    name.clone()
+                };
                 let mut positional_tys: Vec<(Ty, Span)> = Vec::new();
                 let mut keyword_tys: Vec<(String, Ty, Span)> = Vec::new();
+                let mut pidx = 0usize;
                 for a in args {
                     let at = self.infer(&a.value);
+                    let aspan = expr_span(&a.value);
                     match &a.name {
-                        Some(n) => keyword_tys.push((n.clone(), at, expr_span(&a.value))),
-                        None => positional_tys.push((at, expr_span(&a.value))),
+                        Some(n) => {
+                            self.check_keyword_arg(&sig, &key, n, &at, aspan);
+                            keyword_tys.push((n.clone(), at, aspan));
+                        }
+                        None => {
+                            if let Some(p) = sig.params.get(pidx + 1) {
+                                if !p.variadic && !p.kwargs && !self.coercible(&at, &p.ty) {
+                                    self.error(
+                                        ErrorCode::ZAP4021,
+                                        format!(
+                                            "argument {} to '{}' has type {}, expected {}{}",
+                                            pidx + 1,
+                                            key,
+                                            at.display(),
+                                            p.ty.display(),
+                                            self.conformance_detail(&at, &p.ty),
+                                        ),
+                                        aspan,
+                                    );
+                                }
+                            }
+                            positional_tys.push((at, aspan));
+                            pidx += 1;
+                        }
                     }
                 }
-                if let Ty::Named(owner) = &bt {
-                    self.check_generic_arg_consistency(
-                        &format!("{owner}.{name}"),
-                        &positional_tys,
-                        &keyword_tys,
-                    );
+                if matches!(&bt, Ty::Named(_)) {
+                    self.check_generic_arg_consistency(&key, &positional_tys, &keyword_tys);
                 }
                 return sig.ret.clone();
             }
