@@ -99,7 +99,8 @@ pub fn expand_library_derives(module: &mut Module) -> (Vec<TypeError>, Vec<Gener
     // routes `@derive(Trait)` in any module without the user declaring them. The
     // prelude is injected into sema/lowering separately (`with_prelude`), after
     // this pre-sema pass, so its declarations are scanned here explicitly.
-    let prelude = zapc_syntax::parser::prelude_items();
+    let mut prelude = zapc_syntax::parser::prelude_items();
+    prelude.extend(zapc_syntax::parser::json_derive_items());
     expand_library_derives_with(module, &prelude)
 }
 
@@ -206,6 +207,13 @@ fn synthesize_for_type(
     diags: &mut Vec<TypeError>,
     bounds: &mut Vec<GenericDeriveBounds>,
 ) {
+    // `@derive(Json)` is sugar for the two library codec traits (#1558):
+    // `JsonEncode` (`to_json`) + `JsonDecode` (`from_json`), each a single-method
+    // trait with its own prelude generator. Rewrite it before collecting, so the
+    // retired built-in `Json` is served entirely by the prelude library
+    // generators through the ordinary library-derive path.
+    expand_json_derive_sugar(decorators);
+
     // Which library traits does this type derive?
     let derived: Vec<String> = decorators
         .iter()
@@ -289,6 +297,43 @@ fn synthesize_for_type(
 /// non-generic type, or `s.name[p0, p1, …]` (an index/subscript expression that
 /// `expr_to_type` reads back as `Named { name, args }`) for a generic one — the
 /// same shape the parser produces for `generator[Pair[A, B]](…)`.
+/// Rewrite `@derive(Json)` to `@derive(JsonEncode, JsonDecode)` in place (#1558):
+/// the built-in `Json` is now sugar for the two prelude library codec traits.
+/// Each `Json` argument of every `@derive(...)` on the type is replaced by the
+/// two trait-name arguments in order (`@derive(Eq, Json)` →
+/// `@derive(Eq, JsonEncode, JsonDecode)`); any other argument is untouched. A
+/// literal `JsonEncode`/`JsonDecode` is unaffected (idempotent).
+fn expand_json_derive_sugar(decorators: &mut [Decorator]) {
+    for d in decorators.iter_mut() {
+        if d.name != "derive"
+            || !d
+                .args
+                .iter()
+                .any(|a| matches!(&a.value, Expr::Name(n, _) if n == "Json"))
+        {
+            continue;
+        }
+        let mut new_args: Vec<Arg> = Vec::with_capacity(d.args.len() + 1);
+        for a in d.args.drain(..) {
+            match &a.value {
+                Expr::Name(n, sp) if n == "Json" => {
+                    let sp = *sp;
+                    for t in ["__JsonDeriveEncode", "__JsonDeriveDecode"] {
+                        new_args.push(Arg {
+                            name: None,
+                            value: Expr::Name(t.to_string(), sp),
+                            spread: ArgSpread::None,
+                            span: sp,
+                        });
+                    }
+                }
+                _ => new_args.push(a),
+            }
+        }
+        d.args = new_args;
+    }
+}
+
 fn self_type_arg_expr(name: &str, generics: &[TypeParam], sp: Span) -> Expr {
     if generics.is_empty() {
         return Expr::Name(name.to_string(), sp);

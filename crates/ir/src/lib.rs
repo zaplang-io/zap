@@ -3629,20 +3629,13 @@ def main():\n    \
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
-    #[test]
-    fn derive_json_generates_codec() {
-        // @derive(Json) (D-0059, I#100) generates the encode method, the decode
-        // associated function, and its recursive JsonValue core.
-        let (ast, _p, _l) = parse_str("@derive(Json)\nstruct S:\n    int64 x\n    str y\n");
-        let (m, errs) = lower_module(&ast);
-        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
-        for want in ["S__to_json", "S__from_json", "S__from_json_value"] {
-            assert!(
-                m.funcs.iter().any(|f| f.name == want),
-                "missing generated {want}"
-            );
-        }
-    }
+    // `@derive(Json)` is no longer a built-in codec (#1558): it is served by the
+    // prelude library `@derivable` generators, routed by the pre-sema
+    // `expand_library_derives` desugar that raw `lower_module` does not run. Its
+    // codec is exercised end-to-end by the `json_derive_*` / `derive_json_*`
+    // goldens on the CI LLVM matrix, so there is no built-in-codegen unit test
+    // here any more (the former `derive_json_generates_codec` /
+    // `derive_json_and_yaml_share_decode_core` were removed with the built-in).
 
     #[test]
     fn derive_yaml_generates_codec() {
@@ -3657,22 +3650,6 @@ def main():\n    \
                 "missing generated {want}"
             );
         }
-    }
-
-    #[test]
-    fn derive_json_and_yaml_share_decode_core() {
-        // Deriving both must emit the shared `S__from_json_value` exactly once
-        // (deduped), not twice.
-        let (ast, _p, _l) =
-            parse_str("@derive(Json)\n@derive(Yaml)\nstruct S:\n    int64 x\n    str y\n");
-        let (m, errs) = lower_module(&ast);
-        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
-        let n = m
-            .funcs
-            .iter()
-            .filter(|f| f.name == "S__from_json_value")
-            .count();
-        assert_eq!(n, 1, "shared decode core should be generated once, got {n}");
     }
 
     // --- f-string replacement fields (#498) ---

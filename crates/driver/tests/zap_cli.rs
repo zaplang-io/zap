@@ -3411,159 +3411,48 @@ def main():
 }
 
 #[test]
-fn derive_json_supports_list_fields() {
-    // #1530 (epic #1529): the built-in `@derive(Json)` codec encodes a `list[T]`
-    // field as a JSON array and decodes it back, for element types int / str /
-    // nested @derive(Json) struct. Encode string-builds the array recursing into
-    // the per-element encoder; decode reads the DOM array via the `__json_as_array`
-    // prelude accessor and decodes each element. Round-trip output is pinned by
-    // the golden `derive_json_list_field` under the CI LLVM matrix; here we assert
-    // it lowers and wires the array accessor + element recursion.
-    let src = "\
-@derive(Json)
-struct Item:
-    int64 id
-    str tag
-
-@derive(Json)
-struct Bag:
-    list[int64] nums
-    list[str] names
-    list[Item] items
-
-def main():
-    auto b = Bag([1, 2, 3], [\"a\"], [Item(7, \"x\")])
-    auto d = Bag.from_json(b.to_json())
-    print(len(d.nums))
-    print(d.items[0].id)
-";
-    let f = write_zap("derive-json-list-field", src);
-    let out = zap().arg("ir").arg(&f).output().unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "a @derive(Json) struct with list fields must lower; stderr: {stderr}"
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("@Bag__to_json") && stdout.contains("@Bag__from_json_value"),
-        "the built-in list-field codec methods are emitted: {stdout}"
-    );
-    // Decode reads the DOM array through the prelude accessor...
-    assert!(
-        stdout.contains("__json_as_array"),
-        "list decode reads the array via __json_as_array (#1530): {stdout}"
-    );
-    // ...and a nested-struct element recurses into its own codec both ways.
-    assert!(
-        stdout.contains("@Item__to_json") && stdout.contains("@Item__from_json_value"),
-        "a nested-struct list element recurses into its own codec: {stdout}"
-    );
-}
-
-#[test]
-fn derive_json_rejects_unsupported_list_elements_and_other_collections_cleanly() {
-    // #1530: list support is scoped to int/float/str/bytes/nested-struct and (as
-    // of #1533) nested-collection elements. It does NOT extend to a bool/char
-    // element (which collapses to a coarse i64 word) or to a value-position
-    // `Optional` element (a separate follow-up); a `set` field also stays a
-    // follow-up. Each must be a clean compile error, not a miscompile.
-    let cases = [
-        ("list[bool] x", "bool element"),
-        ("list[Optional[int64]] x", "optional element"),
-        ("set[int64] x", "set field"),
-    ];
-    for (field, what) in cases {
-        let src = format!("@derive(Json)\nstruct S:\n    {field}\n\ndef main():\n    print(0)\n");
-        let f = write_zap("derive-json-list-reject", &src);
-        let out = zap().arg("ir").arg(&f).output().unwrap();
-        assert!(
-            !out.status.success(),
-            "{what} must be a clean error, not success"
-        );
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("@derive(Json)"),
-            "{what} errors cleanly via the derive codec: {stderr}"
-        );
-    }
-}
-
-#[test]
-fn derive_json_supports_dict_fields() {
-    // #1531 (epic #1529): the built-in `@derive(Json)` codec encodes a
-    // `dict[str, V]` field as a JSON object and decodes it back, for value types
-    // int / str / nested @derive(Json) struct. Encode string-builds the object
-    // recursing into the per-value encoder; decode reads the DOM object via the
-    // `__json_as_object` prelude accessor and decodes each value keyed by the
-    // object's own string keys. Round-trip output is pinned by the golden
-    // `derive_json_dict_field` under the CI LLVM matrix.
+fn derive_json_is_served_by_the_prelude_library_codec() {
+    // #1558: `@derive(Json)` is retired from built-in codegen and served by the
+    // prelude library `@derivable` codec (`__JsonDeriveEncode` / `__JsonDeriveDecode`).
+    // A struct covering scalars, a nested struct, Optional, and nested collections
+    // compiles, routed to the library generator — no built-in `gen_json_*` symbol
+    // is emitted. Byte-identical round-trips are pinned by the `json_*` /
+    // `derive_json_*` goldens on the CI LLVM matrix.
     let src = "\
 @derive(Json)
 struct Item:
     int64 id
 
 @derive(Json)
-struct M:
-    dict[str, int64] scores
+struct Rec:
+    str name
+    Optional[int64] age
+    list[list[int64]] grid
     dict[str, Item] items
 
 def main():
-    auto m = M({\"a\": 1}, {\"i\": Item(7)})
-    auto d = M.from_json(m.to_json())
-    print(d.scores[\"a\"])
+    auto r = Rec(\"a\", Optional.Some(1), [[1, 2]], {\"i\": Item(7)})
+    auto d = Rec.from_json(r.to_json())
+    print(d.name)
+    print(d.grid[0][1])
     print(d.items[\"i\"].id)
 ";
-    let f = write_zap("derive-json-dict-field", src);
+    let f = write_zap("derive-json-library", src);
     let out = zap().arg("ir").arg(&f).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "a @derive(Json) struct with dict[str,V] fields must lower; stderr: {stderr}"
+        "@derive(Json) must compile through the prelude library codec; stderr: {stderr}"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("@M__to_json") && stdout.contains("@M__from_json_value"),
-        "the built-in dict-field codec methods are emitted: {stdout}"
+        stdout.contains("__derive_json_to") && stdout.contains("__derive_json_from"),
+        "the prelude library Json generators are monomorphized: {stdout}"
     );
-    // Decode reads the DOM object through the prelude accessor + the str keys...
     assert!(
-        stdout.contains("__json_as_object") && stdout.contains("zap_dict_keys_ptr"),
-        "dict decode reads the object via __json_as_object + str keys (#1531): {stdout}"
+        !stdout.contains("@Rec__from_json_value"),
+        "no built-in Json codec symbol is emitted for a @derive(Json) struct: {stdout}"
     );
-    // ...and a nested-struct value recurses into its own codec both ways.
-    assert!(
-        stdout.contains("@Item__to_json") && stdout.contains("@Item__from_json_value"),
-        "a nested-struct dict value recurses into its own codec: {stdout}"
-    );
-}
-
-#[test]
-fn derive_json_rejects_non_str_dict_keys_and_unsupported_dict_values() {
-    // #1531: a JSON object has string keys, so only `dict[str, V]` is supported —
-    // a non-str key is a clean error. The value follows the same element allowlist
-    // as a list, so a bool value or a value-position `Optional` is a clean error,
-    // not a miscompile. (A nested-collection value — `dict[str, list[...]]` — is
-    // supported as of #1533, so it is not a reject case.)
-    let cases = [
-        ("dict[int64, int64] m", "non-str key"),
-        ("dict[str, bool] m", "bool value"),
-        ("dict[str, Optional[int64]] m", "optional value"),
-    ];
-    for (field, what) in cases {
-        let src = format!("@derive(Json)\nstruct S:\n    {field}\n\ndef main():\n    print(0)\n");
-        let f = write_zap("derive-json-dict-reject", &src);
-        let out = zap().arg("ir").arg(&f).output().unwrap();
-        assert!(
-            !out.status.success(),
-            "{what} must be a clean error, not success"
-        );
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("@derive(Json)"),
-            "{what} errors cleanly via the derive codec: {stderr}"
-        );
-    }
 }
 
 #[test]
@@ -3633,51 +3522,6 @@ def main():
     assert!(
         stderr.contains("@derive(Yaml)") && stderr.contains("nested-struct"),
         "the nested-struct yaml element errors cleanly: {stderr}"
-    );
-}
-
-#[test]
-fn derive_json_supports_nested_collection_fields() {
-    // #1533 (epic #1529): a collection whose element/value is itself a collection
-    // — list[list[T]], dict[str, list[T]], list[dict[str, T]], and a struct leaf
-    // (list[list[Nested]]). The codec recovers the nested element's full Ty from
-    // the Elem::Nested interner (ctx.nested) and recurses through the same
-    // per-element codec. Round-trip output is pinned by the golden
-    // `derive_json_nested_collection_field` under the CI LLVM matrix.
-    let src = "\
-@derive(Json)
-struct Item:
-    int64 id
-
-@derive(Json)
-struct N:
-    list[list[int64]] grid
-    dict[str, list[int64]] groups
-    list[list[Item]] items2d
-
-def main():
-    auto n = N([[1, 2]], {\"a\": [3]}, [[Item(9)]])
-    auto d = N.from_json(n.to_json())
-    print(d.grid[0][1])
-    print(d.groups[\"a\"][0])
-    print(d.items2d[0][0].id)
-";
-    let f = write_zap("derive-json-nested-collection", src);
-    let out = zap().arg("ir").arg(&f).output().unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "a @derive(Json) struct with nested-collection fields must lower; stderr: {stderr}"
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("@N__to_json") && stdout.contains("@N__from_json_value"),
-        "the nested-collection codec methods are emitted: {stdout}"
-    );
-    // A struct leaf inside the nested collection recurses into its own codec.
-    assert!(
-        stdout.contains("@Item__to_json") && stdout.contains("@Item__from_json_value"),
-        "a struct leaf in a nested collection recurses into its own codec (#1533): {stdout}"
     );
 }
 
