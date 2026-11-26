@@ -62,8 +62,12 @@ fn uuid_raw(lowerer: &mut FnLower, uuid_val: Value) -> Result<Value, LowerError>
 }
 
 /// Emit a zero-argument generator call returning 16 raw bytes, then wrap it.
-fn gen0(lowerer: &mut FnLower, func: &str) -> Result<(Value, Ty), LowerError> {
-    let (raw, _) = call_ret(lowerer, func, Vec::new(), Ty::Bytes, false);
+/// `throwing` is set for the CSPRNG-backed versions (uuid1/uuid4/uuid7, #1580):
+/// an OS entropy failure in `zap_crypto_fill_random` raises a catchable
+/// `OSError`, so the call needs the unwind edge. The constant generators
+/// (`nil`/`max`/namespace constants) draw no entropy and stay non-throwing.
+fn gen0(lowerer: &mut FnLower, func: &str, throwing: bool) -> Result<(Value, Ty), LowerError> {
+    let (raw, _) = call_ret(lowerer, func, Vec::new(), Ty::Bytes, throwing);
     build_uuid(lowerer, raw)
 }
 
@@ -73,16 +77,18 @@ fn lower(
     args: &[ast::Arg],
 ) -> Result<Option<(Value, Ty)>, LowerError> {
     Ok(Some(match method {
-        // Zero-argument generators + the Appendix C namespace constants.
-        "uuid4" => gen0(lowerer, "zap_uuid_v4")?,
-        "uuid7" => gen0(lowerer, "zap_uuid_v7")?,
-        "uuid1" => gen0(lowerer, "zap_uuid_v1")?,
-        "nil" => gen0(lowerer, "zap_uuid_nil")?,
-        "max" => gen0(lowerer, "zap_uuid_max")?,
-        "namespace_dns" => gen0(lowerer, "zap_uuid_ns_dns")?,
-        "namespace_url" => gen0(lowerer, "zap_uuid_ns_url")?,
-        "namespace_oid" => gen0(lowerer, "zap_uuid_ns_oid")?,
-        "namespace_x500" => gen0(lowerer, "zap_uuid_ns_x500")?,
+        // Zero-argument generators + the Appendix C namespace constants. The
+        // random versions (uuid1/uuid4/uuid7) are CSPRNG-backed and throwing
+        // (#1580); the constant generators draw no entropy and are infallible.
+        "uuid4" => gen0(lowerer, "zap_uuid_v4", true)?,
+        "uuid7" => gen0(lowerer, "zap_uuid_v7", true)?,
+        "uuid1" => gen0(lowerer, "zap_uuid_v1", true)?,
+        "nil" => gen0(lowerer, "zap_uuid_nil", false)?,
+        "max" => gen0(lowerer, "zap_uuid_max", false)?,
+        "namespace_dns" => gen0(lowerer, "zap_uuid_ns_dns", false)?,
+        "namespace_url" => gen0(lowerer, "zap_uuid_ns_url", false)?,
+        "namespace_oid" => gen0(lowerer, "zap_uuid_ns_oid", false)?,
+        "namespace_x500" => gen0(lowerer, "zap_uuid_ns_x500", false)?,
         // uuid3(ns, name) / uuid5(ns, name): hash(ns.raw || name).
         "uuid3" | "uuid5" => {
             if args.len() != 2 {

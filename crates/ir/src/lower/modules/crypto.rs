@@ -133,6 +133,12 @@ fn call_crypto(
             | "zap_crypto_chacha20poly1305_encrypt"
             | "zap_crypto_chacha20poly1305_decrypt"
             | "zap_crypto_token_urlsafe"
+            // CSPRNG-backed secrets APIs (#1580): a hardware/OS entropy failure in
+            // zap_crypto_fill_random now raises a catchable OSError, so the call
+            // needs the unwind edge. (token_urlsafe/randbelow above are also
+            // CSPRNG-backed; they were already throwing for their ValueError paths.)
+            | "zap_crypto_random_bytes"
+            | "zap_crypto_token_hex"
             | "zap_crypto_hmac_new"
             | "zap_crypto_randbelow"
             | "zap_crypto_rsa_sha384_sign"
