@@ -56,7 +56,7 @@ def main():
     print("hi".ljust(5, "*"))  # hi***
     print("hi".rjust(5, "*"))  # ***hi
     print("hi".center(6, "-"))  # --hi--
-    print("hi".center(5, "-"))  # -hi--
+    print("hi".center(5, "-"))  # --hi- (CPython split: extra fill on the left, #1656)
     print("42".zfill(5))  # 00042
     print("-42".zfill(5))  # -0042
     print("hello".ljust(3))  # hello (already wider; unchanged)

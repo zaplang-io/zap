@@ -4,10 +4,8 @@
 # not exactly one codepoint raises a catchable TypeError (CPython). Follow-up to
 # the Unicode string audit, epic #1638.
 #
-# NOTE: center's odd-padding split puts the smaller half on the LEFT (pad // 2),
-# a pre-existing D-0210 choice that differs from CPython's right-smaller
-# rounding. That split is out of scope here; the center cases below assert Zap's
-# actual split.
+# center's odd-padding split now matches CPython: the extra fill goes on the LEFT
+# when both the width and the margin are odd (#1656, superseding D-0210).
 def main():
     # -- 2-byte fill (é) ------------------------------------------------------
     print("x".ljust(3, "é"))  # xéé
@@ -31,10 +29,10 @@ def main():
     print("αβ".ljust(4, "γ"))  # αβγγ
     print("αβ".rjust(4, "γ"))  # γγαβ
 
-    # -- odd centered padding (Zap split: smaller half on the left) -----------
-    print("x".center(4, "é"))  # éxéé (pad 3: left 1, right 2)
+    # -- odd centered padding (CPython split: extra fill on the left) ---------
+    print("x".center(4, "é"))  # éxéé (width 4 even: left 1, right 2)
     print(len("x".center(4, "é")))  # 4
-    print("ab".center(5, "é"))  # éabéé (pad 3: left 1, right 2)
+    print("ab".center(5, "é"))  # ééabé (width & margin odd: left 2, right 1)
 
     # -- default (space) and explicit ASCII fill are unchanged ----------------
     print(f"[{'hi'.ljust(5)}]")  # [hi   ]
