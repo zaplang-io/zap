@@ -1264,6 +1264,67 @@ def main():
     assert!(!out.stdout.is_empty(), "expected ZIR on stdout");
 }
 
+#[test]
+fn reflected_type_argument_resolves_in_a_derive_generator() {
+    // #1575: a derive generator names a nested derived element type through
+    // reflection — `gen[f.ty.elem]` for a `list` element and `gen[f.ty.value]`
+    // for a `dict` value. Comptime specialization rewrites the reflected
+    // type-argument subscript to the concrete element type, so the enclosing
+    // generic call resolves. Before #1575 the subscript kept its comptime
+    // `f.ty.elem` reference and sema read the callee as an unknown value being
+    // indexed (`unknown variable '_derive_rt'`).
+    let src = "\
+@derivable(Rt)
+def _derive_rt[T](T value) -> int64:
+    comptime for f in reflect.type_info(T).fields:
+        if f.ty.kind.name == \"list\":
+            for x in reflect.field(value, comptime f.index):
+                if f.ty.elem.kind.name == \"struct\":
+                    return _derive_rt[f.ty.elem](x)
+        elif f.ty.kind.name == \"dict\":
+            auto d = reflect.field(value, comptime f.index)
+            for k in d.keys():
+                if f.ty.value.kind.name == \"struct\":
+                    return _derive_rt[f.ty.value](d[k])
+        elif f.ty.name == \"int64\":
+            return reflect.field(value, comptime f.index)
+    return 0
+
+interface Rt:
+    def rt(self) -> int64
+
+@derive(Rt)
+struct Item:
+    int64 id
+
+@derive(Rt)
+struct C:
+    list[Item] items
+    dict[str, Item] m
+
+def main():
+    auto c = C([Item(7)], {\"a\": Item(9)})
+    print(c.rt())
+"
+    .to_string();
+    let f = write_zap("reflected-type-arg", &src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a reflected type argument must resolve; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown variable") && !stderr.contains("cannot infer type argument"),
+        "the generic element decoder must resolve, not read as an unknown/uninferred name: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("_derive_rt") && stdout.contains("Item"),
+        "the element generator must be monomorphized for `Item`; ZIR:\n{stdout}"
+    );
+}
+
 // --- E3d (#1293): a @derive that cannot apply is an average-programmer-grade
 // compile error pointing at the user's field, not an internal symbol. ---
 

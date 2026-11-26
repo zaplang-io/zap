@@ -588,6 +588,30 @@ fn specialize_expr(e: &Expr, env: &mut Env, ev: &mut Evaluator) -> Result<Expr, 
             crate::eval::expr_span(e),
         ));
     }
+    // #1575: an explicit type-argument position whose argument is a comptime
+    // type — `gen[f.ty.elem](...)` / `gen[f.ty](...)` / `gen[f.ty.value](...)`.
+    // The subscript folds to a `Value::Type` carrying the use-site declared
+    // `AstType`; rewrite it to an `Expr::TypeArg` (which `mono::expr_to_type`
+    // unwraps) so the enclosing generic call resolves against the concrete type
+    // after specialization. Without this the subscript keeps its comptime `f`
+    // reference, and sema reads the callee as an unknown value being indexed
+    // (`unknown variable 'gen'`). This is the construction/decode counterpart to
+    // the method recursion an encoder uses (`x.to_...()` on a known value): a
+    // decoder must name the element type, which only reflection can supply here.
+    // Only a type-valued subscript is rewritten — an ordinary runtime index
+    // (`list[i]`, `dict[k]`, `array[dtype]`) never folds to a `Value::Type`.
+    if let Expr::Index { base, index, span } = e {
+        if let Ok(Value::Type(_, Some(decl))) = ev.eval(index, env) {
+            return Ok(Expr::Index {
+                base: Box::new(specialize_expr(base, env, ev)?),
+                index: Box::new(Expr::TypeArg {
+                    ty: Box::new((*decl).clone()),
+                    span: crate::eval::expr_span(index),
+                }),
+                span: *span,
+            });
+        }
+    }
     if let Ok(v) = ev.eval(e, env) {
         if let Some(lit) = materialize(&v, crate::eval::expr_span(e)) {
             return Ok(lit);
