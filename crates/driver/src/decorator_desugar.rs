@@ -713,16 +713,19 @@ fn namespace_seam(t: &Option<Type>) -> Option<Option<Type>> {
 }
 
 /// How a handler parameter's declared type binds from the argparse `Namespace`
-/// (#1544/#1625): the typed getter to call, and an optional conversion builtin to
-/// wrap its result in when the parameter is narrower than the getter's type. The
-/// `Namespace` exposes `get_int` (`int64`), `get_float` (`float64`), `get_flag`
-/// (`bool`) and `get_str` (`str`); a narrower scalar reads the wide getter and
-/// converts, e.g. `int32 n` → `int32(ns.get_int("n"))`, `float32 r` →
-/// `float32(ns.get_float("r"))`.
+/// (#1544/#1625/#1655): the typed getter to call, and an optional conversion
+/// builtin to wrap its result in when the parameter is narrower than the getter's
+/// type. The `Namespace` exposes `get_int` (`int64`), `get_float` (`float64`),
+/// `get_flag` (`bool`), `get_str` (`str`), and the non-numeric `get_char` (`char`)
+/// and `get_bytes` (`bytes`, the argument's UTF-8 encoding). A narrower numeric
+/// scalar reads the wide getter and converts, e.g. `int32 n` →
+/// `int32(ns.get_int("n"))`, `float32 r` → `float32(ns.get_float("r"))`; a
+/// non-numeric scalar reads its dedicated getter directly (no wrap).
 ///
 /// `None` for any other type — a parameter that cannot be bound from the command
-/// line in v1 (no `Context`/struct binding, and the non-conversion scalars
-/// `int8`/`int16`/`char`/`bytes`/`bigint`/`complex`), reported at synthesis.
+/// line in v1 (no `Context`/struct binding, and the still-unsupported scalars
+/// `int8`/`int16` (no scalar type, epic #1644/#1654) and `bigint`/`complex` (no
+/// `str`-parse getter yet, #1655)), reported at synthesis.
 fn namespace_getter_for(t: &Option<Type>) -> Option<(&'static str, Option<&'static str>)> {
     let Some(Type::Named { name, args, .. }) = t else {
         return None;
@@ -742,6 +745,11 @@ fn namespace_getter_for(t: &Option<Type>) -> Option<(&'static str, Option<&'stat
         "float32" | "f32" => Some(("get_float", Some("float32"))),
         "bool" => Some(("get_flag", None)),
         "str" => Some(("get_str", None)),
+        // Non-numeric scalars read a dedicated typed getter that returns the final
+        // type directly, so no conversion wrapper is needed (#1655). `char` is a
+        // single-codepoint parse, `bytes` the argument's UTF-8 encoding.
+        "char" => Some(("get_char", None)),
+        "bytes" => Some(("get_bytes", None)),
         _ => None,
     }
 }
@@ -814,8 +822,9 @@ fn synth_namespace_adapter(
                     format!(
                         "handler parameter `{}` has a type that cannot be bound from the \
                          command-line namespace; an argparse-backed handler takes scalar \
-                         parameters (bool, str, the integer types int/int32/uint8..uint64/usize, \
-                         and float/float32) plus an optional typed context as its first parameter",
+                         parameters (bool, str, char, bytes, the integer types \
+                         int/int32/uint8..uint64/usize, and float/float32) plus an optional \
+                         typed context as its first parameter",
                         p.name
                     ),
                     p.span,
@@ -2731,17 +2740,19 @@ mod tests {
 
     #[test]
     fn non_conversion_scalar_param_errors() {
-        // `int8`/`char` have no scalar conversion builtin, so they cannot be bound.
+        // `bigint`/`complex` have no `str`-parse namespace getter yet (#1655), and
+        // `int8`/`int16` are not scalar types (epic #1644/#1654), so none can be
+        // bound — a precise decoration-site error.
         let mut m = module(
             "struct Command:\n    def run(self):\n        print(\"ran\")\n\
              struct Cli:\n    def command(self, fn(Namespace) -> str handler) -> Command:\n        return Command()\n\
-             @cli.command\ndef greet(char c) -> str:\n    return \"x\"\n\
+             @cli.command\ndef greet(bigint n) -> str:\n    return \"x\"\n\
              def main():\n    auto cli = Cli()\n    greet.run()\n",
         );
         let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert!(
-            diags.iter().any(|d| d.message.contains("`c`")),
-            "expected an unsupported-parameter diagnostic for `c`, got: {diags:?}"
+            diags.iter().any(|d| d.message.contains("`n`")),
+            "expected an unsupported-parameter diagnostic for `n`, got: {diags:?}"
         );
     }
 
@@ -2969,6 +2980,58 @@ mod tests {
             args.iter().any(|a| a.name.as_deref() == Some("handler")
                 && matches!(&a.value, Expr::Name(n, _) if n == "greet$adapter")),
             "the adapter is passed to `handler` by keyword: {args:?}"
+        );
+    }
+
+    // ---- #1655: non-numeric scalar getters (char / bytes) --------------------
+
+    #[test]
+    fn char_and_bytes_params_bind_via_dedicated_getters() {
+        // #1655: `char`/`bytes` read a dedicated typed getter (`get_char`/
+        // `get_bytes`) that returns the final type directly — no conversion
+        // wrapper, unlike the narrowing numeric scalars (#1625).
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, fn(Namespace) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(char c, bytes b) -> str:\n    return \"x\"\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let adapter = func(&m, "greet$adapter").expect("adapter synthesized");
+        let Stmt::Return {
+            value: Some(Expr::Call { args, .. }),
+            ..
+        } = &body(adapter)[0]
+        else {
+            panic!("expected return call");
+        };
+        // Read directly with the dedicated getter — not wrapped in a conversion
+        // builtin (so `getter_call`, which rejects a wrapper, matches).
+        assert_eq!(
+            getter_call(&args[0].value),
+            Some(("get_char".into(), "c".into()))
+        );
+        assert_eq!(
+            getter_call(&args[1].value),
+            Some(("get_bytes".into(), "b".into()))
+        );
+    }
+
+    #[test]
+    fn complex_param_still_errors_pending_str_parse() {
+        // #1655: `complex` (and `bigint`) have no `str`-parse namespace getter yet
+        // — a core dependency — so they remain a precise decoration-site error.
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, fn(Namespace) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(complex z) -> str:\n    return \"x\"\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(
+            diags.iter().any(|d| d.message.contains("`z`")),
+            "expected an unsupported-parameter diagnostic for `z`, got: {diags:?}"
         );
     }
 }
