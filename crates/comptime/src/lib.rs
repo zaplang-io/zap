@@ -139,6 +139,17 @@ pub const DEFAULT_STEP_CAP: u64 = 1_000_000;
 /// non-recursive call chain.
 pub const DEFAULT_DEPTH_CAP: usize = 128;
 
+/// The default ceiling on the number of elements a single `comptime for` may
+/// unroll (E7, #1617). Like the step and depth caps it is a *fixed hard limit*
+/// with a clear diagnostic, not a tunable quota (epic #1249, HQ5): a pathological
+/// `comptime for` over a huge comptime sequence fails fast with a bounded-cost
+/// error instead of exploding the specialized output. It is deliberately
+/// generous — every shipped codec unrolls over a struct's fields or an enum's
+/// variants, orders of magnitude under it — so it is a safety net, not a
+/// constraint real code meets. The total work across nested loops is bounded
+/// separately by [`DEFAULT_STEP_CAP`]; this bounds each loop's breadth.
+pub const DEFAULT_ITER_CAP: u64 = 100_000;
+
 /// A lexically-scoped binding environment for comptime `let`s and function
 /// parameters.
 ///
@@ -205,6 +216,13 @@ pub struct Evaluator<'a> {
     steps: u64,
     step_cap: u64,
     depth_cap: usize,
+    /// The per-`comptime for` unroll-breadth ceiling ([`DEFAULT_ITER_CAP`]).
+    iter_cap: u64,
+    /// Cumulative count of `comptime for` iterations unrolled by this evaluator
+    /// (across nested loops) — the compile-time-cost telemetry the E7 cost
+    /// controls expose (#1617), alongside the step counter and the registry's
+    /// `MemoStats`. Read with [`unrolled_iterations`](Evaluator::unrolled_iterations).
+    unrolled: u64,
     /// Names of the functions currently on the comptime call stack, for
     /// recursion detection (direct or transitive self-calls are out of
     /// fragment).
@@ -239,6 +257,8 @@ impl<'a> Evaluator<'a> {
             steps: 0,
             step_cap: DEFAULT_STEP_CAP,
             depth_cap: DEFAULT_DEPTH_CAP,
+            iter_cap: DEFAULT_ITER_CAP,
+            unrolled: 0,
             active: Vec::new(),
             registry: None,
             type_subst: HashMap::new(),
@@ -294,6 +314,55 @@ impl<'a> Evaluator<'a> {
     pub fn with_depth_cap(mut self, cap: usize) -> Self {
         self.depth_cap = cap;
         self
+    }
+
+    /// Override the per-`comptime for` unroll-breadth cap (default
+    /// [`DEFAULT_ITER_CAP`]). Like the other `with_*_cap` builders this exists so
+    /// tests can drive the limit at a small, observable value; production uses
+    /// the fixed default (#1617).
+    pub fn with_iter_cap(mut self, cap: u64) -> Self {
+        self.iter_cap = cap;
+        self
+    }
+
+    /// The per-`comptime for` unroll-breadth cap in force (#1617).
+    pub fn iter_cap(&self) -> u64 {
+        self.iter_cap
+    }
+
+    /// Evaluation steps charged so far — one per expression/statement visited
+    /// (#1617 telemetry). A deterministic compile-time-cost metric, comparable
+    /// across runs for the same input.
+    pub fn steps_used(&self) -> u64 {
+        self.steps
+    }
+
+    /// `comptime for` iterations unrolled so far by this evaluator, summed across
+    /// nested loops (#1617 telemetry).
+    pub fn unrolled_iterations(&self) -> u64 {
+        self.unrolled
+    }
+
+    /// Enter a `comptime for` that will unroll `count` elements: fail fast with a
+    /// clean [`CtError::budget`] when one loop's breadth exceeds
+    /// [`iter_cap`](Evaluator::iter_cap), else record the iterations in the
+    /// [`unrolled_iterations`](Evaluator::unrolled_iterations) telemetry (#1617).
+    /// `span` points at the loop's iterable. Called once per loop (nested loops
+    /// each call it, so a product of loops is bounded by the step cap, each
+    /// loop's breadth by this one).
+    pub(crate) fn enter_unroll(&mut self, count: u64, span: Span) -> Result<(), CtError> {
+        if count > self.iter_cap {
+            return Err(CtError::budget(
+                format!(
+                    "comptime `for` would unroll {count} iterations, over the \
+                     limit ({} iterations)",
+                    self.iter_cap
+                ),
+                span,
+            ));
+        }
+        self.unrolled += count;
+        Ok(())
     }
 
     /// Evaluate a single comptime expression in `env`.

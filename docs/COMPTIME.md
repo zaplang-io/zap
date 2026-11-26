@@ -315,20 +315,26 @@ type.)
 
 ## 8. The compile-time cost model
 
-Comptime evaluation is bounded so a pathological derive cannot blow up the
-build:
+Comptime evaluation is bounded by three **fixed hard limits** (not tunable
+quotas) so a pathological derive cannot blow up the build:
 
-- a **step cap** on total expressions/statements evaluated (a hard limit; a
-  comptime `for` is bounded by its field/variant count, which is bounded by this
-  cap),
-- a **call-depth cap** on nested comptime calls (recursion is rejected outright,
-  so this only bounds finite nesting),
-- and **memoization** of `reflect.type_info(T)` per canonical type, with
-  `computed`/`reused` telemetry — the stable, deterministic metric for tracking
-  compile-time comptime cost across the shipped codecs.
+- a **step cap** on total expressions/statements evaluated across all loops
+  (default 1 000 000) — the total-work bound;
+- a **call-depth cap** on nested comptime calls (default 128; recursion is
+  rejected outright, so this only bounds finite nesting);
+- an **unroll-breadth cap** on the elements a single `comptime for` may unroll
+  (default 100 000) — a per-loop bound that layers under the step cap. It is
+  deliberately generous: a derive unrolls over a type's fields or variants (a
+  handful), far under it.
 
-Exceeding a cap is a clean `ZAP7001` budget diagnostic (carrying the §7
-backtrace), not a crash. Memoization is in-process only (no on-disk cache).
+Exceeding any cap is a clean `ZAP7001` budget diagnostic (carrying the §7
+backtrace), not a crash.
+
+Comptime cost is **observable**: the evaluator reports `steps_used()` and
+`unrolled_iterations()`, and `reflect.type_info(T)` is **memoized** per canonical
+type with `computed`/`reused` telemetry (`MemoStats`). Together these are a
+stable, deterministic, comparable compile-time-cost metric — the CI
+regression signal. Memoization is in-process only (no on-disk cache).
 
 ---
 
