@@ -29,3 +29,15 @@ def main():
         print(a)
     except ValueError:
         print("empty-sep-caught")
+
+    # Non-ASCII regression (#1630): rpartition slices the raw UTF-8 buffer at
+    # the LAST separator, so it must keep using the byte offset even though the
+    # public rfind/rindex now report codepoint indices.
+    auto h5, s5, t5 = "éxéx".rpartition("x")
+    print(h5)  # éxé
+    print(s5)  # x
+    print(len(t5))  # 0
+    auto h6, s6, t6 = "é=é=é".rpartition("=")
+    print(h6)  # é=é
+    print(s6)  # =
+    print(t6)  # é

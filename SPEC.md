@@ -1023,6 +1023,7 @@ String operations are **methods on `str`** (there is no `strings` module):
 | `s.split(sep)` | `list[str]` | non-empty `sep` |
 | `sep.join(parts)` | `str` | `parts : list[str]` |
 | `s.find(sub)` / `s.index(sub)` | `int` | codepoint index; `find` → -1, `index` raises when absent |
+| `s.rfind(sub)` / `s.rindex(sub)` | `int` | last-match codepoint index (#1630); `rfind` → -1, `rindex` raises when absent; empty `sub` → `len(s)` |
 | `s.replace(old, new)` | `str` | all occurrences |
 | `s.startswith(p)` / `s.endswith(p)` / `s.contains(sub)` | `bool` | |
 | `s.encode()` | `list[int]` | UTF-8 byte values |

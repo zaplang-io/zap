@@ -208,11 +208,11 @@ int64_t zap_str_count(void *sp, void *subp) {
     return c;
 }
 
-/* rfind(sub): last byte offset of `sub`, or -1. An empty `sub` returns the
- * byte length (Python). */
-int64_t zap_str_rfind(void *sp, void *subp) {
-    const ZapStr *s = (const ZapStr *)sp;
-    const ZapStr *sub = (const ZapStr *)subp;
+/* Last BYTE offset of `sub` in `s`, or -1. An empty `sub` returns the byte
+ * length (matches Python's `rfind("") == len`). Internal helper: the public
+ * `rfind`/`rindex` convert this to a codepoint index (#1630), while
+ * `rpartition` slices the raw UTF-8 buffer and needs the byte offset directly. */
+static int64_t zap_str_rfind_bytes(const ZapStr *s, const ZapStr *sub) {
     int64_t n = s->len, m = sub->len;
     if (m == 0) {
         return n;
@@ -223,6 +223,26 @@ int64_t zap_str_rfind(void *sp, void *subp) {
         }
     }
     return -1;
+}
+
+/* rfind(sub): codepoint index of the LAST match, or -1 (#1630, superseding the
+ * byte-offset form of D-0210). Reports in the same codepoint units as `find`,
+ * `len`, indexing and slicing, so `s[s.rfind(x)]` is well-formed. An empty
+ * `sub` returns `len(s)` — the codepoint length (Python). */
+int64_t zap_str_rfind(void *sp, void *subp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    int64_t off = zap_str_rfind_bytes(s, (const ZapStr *)subp);
+    if (off < 0) {
+        return -1;
+    }
+    int64_t k = 0;
+    int64_t j = 0;
+    const unsigned char *d = (const unsigned char *)s->data;
+    while (j < off) {
+        j += zap_utf8_width(d[j]);
+        k++;
+    }
+    return k;
 }
 
 /* rindex(sub): like rfind, but raises a catchable `ValueError` when absent
@@ -1595,7 +1615,10 @@ void *zap_str_rpartition(void *sp, void *sepp) {
         const char *m = "empty separator";
         zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
     }
-    int64_t idx = zap_str_rfind(sp, sepp); /* last occurrence, or -1 */
+    /* BYTE offset of the last occurrence (or -1): the slices below index the
+     * raw UTF-8 buffer, so this must stay byte-based even though the public
+     * `rfind`/`rindex` now report codepoint indices (#1630). */
+    int64_t idx = zap_str_rfind_bytes(s, sep);
     ZapStrPart *r = (ZapStrPart *)zap_obj(&zap_desc_strpart);
     if (idx < 0) {
         r->head = (ZapStr *)zap_str_new("", 0);
