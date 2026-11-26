@@ -11208,9 +11208,8 @@ impl Checker {
                 // line up). Arity stays loose — an extra or missing argument is not
                 // flagged, and the variadic / `**kwargs` collector is never treated
                 // as a fixed positional — matching the other receiver paths. The
-                // method's return type stays loose (`sig.ret`) to preserve the
-                // method-chain operator typing this path drives `&`/`|`/`~` dispatch
-                // from; binding a generic method's return type is #1643.
+                // method's return type is bound from the arguments when the method
+                // is generic (#1643), otherwise it stays loose (`sig.ret`).
                 let key = if let Ty::Named(owner) = &bt {
                     format!("{owner}.{name}")
                 } else {
@@ -11249,10 +11248,27 @@ impl Checker {
                         }
                     }
                 }
-                if matches!(&bt, Ty::Named(_)) {
-                    self.check_generic_arg_consistency(&key, &positional_tys, &keyword_tys);
-                }
-                return sig.ret.clone();
+                // #1643: `check_generic_arg_consistency` returns the call's result
+                // type with the bound type parameters substituted into the generic
+                // return (`Some` only when the method is generic; a type parameter
+                // the arguments did not bind becomes `Unknown`). Use it in place of
+                // the erased `sig.ret` only when the method is generic AND the
+                // substitution produced a concrete type — so a generic method whose
+                // return binds (`o.make(int64, 1) -> T` → `int64`) is typed
+                // precisely and a mismatched target is rejected, while a non-generic
+                // method (returns `None` here) and a generic method whose return did
+                // not bind (`Unknown`) keep the loose `sig.ret`. Keeping those loose
+                // preserves the method-chain operator typing this path drives
+                // `&`/`|`/`~` dispatch off the returned struct from.
+                let bound_ret = if matches!(&bt, Ty::Named(_)) {
+                    self.check_generic_arg_consistency(&key, &positional_tys, &keyword_tys)
+                } else {
+                    None
+                };
+                return match bound_ret {
+                    Some(ret) if !matches!(ret, Ty::Unknown) => ret,
+                    _ => sig.ret.clone(),
+                };
             }
             // An enum instance-method call `recv.method(args)` (#1642). Enum
             // receivers are excluded from `struct_info`, so the struct path above
