@@ -603,10 +603,45 @@ fn subst_method_sig(m: &MethodSig, subst: &HashMap<&str, &Type>) -> MethodSig {
 /// name the cases above do not reach — is an `Err`, the user-facing
 /// "unsupported yet" error, mirroring the derive codegen's field-type
 /// restrictions.
+/// Render a [`Type`] as the expression the parser would produce for it in type
+/// position (#1608): `Named{n, []}` → `n`, `Named{n, args}` → `n[args…]` (a
+/// subscript, a tuple index for several args), a tuple → `(…)`, a function type
+/// → an `Expr::TypeArg`. Used to emit a typed empty-collection constructor
+/// (`list[E]()`), whose type a bare `[]` literal cannot carry to an `auto`
+/// binding. Inverse of `expr_to_type`.
+fn type_to_expr(ty: &Type, span: Span) -> Expr {
+    match ty {
+        Type::Named { name, args, .. } => {
+            if args.is_empty() {
+                Expr::Name(name.clone(), span)
+            } else {
+                let index = if args.len() == 1 {
+                    type_to_expr(&args[0], span)
+                } else {
+                    Expr::Tuple(args.iter().map(|a| type_to_expr(a, span)).collect(), span)
+                };
+                Expr::Index {
+                    base: Box::new(Expr::Name(name.clone(), span)),
+                    index: Box::new(index),
+                    span,
+                }
+            }
+        }
+        Type::Tuple { elems, .. } => {
+            Expr::Tuple(elems.iter().map(|e| type_to_expr(e, span)).collect(), span)
+        }
+        Type::Func { .. } => Expr::TypeArg {
+            ty: Box::new(ty.clone()),
+            span,
+        },
+    }
+}
+
 fn zero_expr(
     ty: &Type,
     span: Span,
     structs: &HashMap<String, &StructDef>,
+    enums: &HashMap<String, &EnumDef>,
     visiting: &mut Vec<String>,
 ) -> Result<Expr, LowerError> {
     let empty_str = |bytes: bool| Expr::Str {
@@ -623,7 +658,7 @@ fn zero_expr(
         Type::Tuple { elems, .. } => {
             let mut zs = Vec::with_capacity(elems.len());
             for e in elems {
-                zs.push(zero_expr(e, span, structs, visiting)?);
+                zs.push(zero_expr(e, span, structs, enums, visiting)?);
             }
             Ok(Expr::Tuple(zs, span))
         }
@@ -666,7 +701,7 @@ fn zero_expr(
                 visiting.push(nm.to_string());
                 let mut zargs = Vec::with_capacity(def.fields.len());
                 for f in &def.fields {
-                    let z = zero_expr(&f.ty, span, structs, visiting)?;
+                    let z = zero_expr(&f.ty, span, structs, enums, visiting)?;
                     zargs.push(Arg {
                         name: None,
                         value: z,
@@ -677,6 +712,53 @@ fn zero_expr(
                 visiting.pop();
                 Ok(Expr::Call {
                     callee: Box::new(Expr::Name(nm.to_string(), span)),
+                    args: zargs,
+                    span,
+                })
+            }
+            // A non-generic enum field (#1603) → its FIRST variant (declaration
+            // order). An enum has no natural zero; the first variant is a
+            // throwaway base a decoder immediately overwrites via `set_field`,
+            // the enum analogue of a struct's zero-field construction. A
+            // payload-free variant is the bare `Enum.Variant`; a payload-carrying
+            // one zero-builds each payload field (guarded against a by-value
+            // cycle through `visiting`, like a struct).
+            (nm, 0) if enums.contains_key(nm) => {
+                let def = enums[nm];
+                let Some(v0) = def.variants.first() else {
+                    return Err(err(format!(
+                        "no zero-initializer for empty enum `{nm}` (#1603)"
+                    )));
+                };
+                let variant = Expr::Attr {
+                    base: Box::new(Expr::Name(nm.to_string(), span)),
+                    name: v0.name.clone(),
+                    span,
+                };
+                if v0.fields.is_empty() {
+                    return Ok(variant);
+                }
+                if visiting.iter().any(|v| v == nm) {
+                    return Err(err(format!(
+                        "enum `{nm}` contains itself by value in its first variant \
+                         (a zero-initializer cycle); break it with an `Optional`, \
+                         `list`, `dict` or `set` payload field (#1603)"
+                    )));
+                }
+                visiting.push(nm.to_string());
+                let mut zargs = Vec::with_capacity(v0.fields.len());
+                for f in &v0.fields {
+                    let z = zero_expr(&f.ty, span, structs, enums, visiting)?;
+                    zargs.push(Arg {
+                        name: None,
+                        value: z,
+                        spread: ArgSpread::None,
+                        span,
+                    });
+                }
+                visiting.pop();
+                Ok(Expr::Call {
+                    callee: Box::new(variant),
                     args: zargs,
                     span,
                 })
@@ -4684,6 +4766,38 @@ impl Mono<'_> {
             Some(_) => return Err(err("reflect.construct(T) expects a named struct type")),
             None => (t.clone(), Vec::new()),
         };
+        // A `list` / `dict` / `set` type (#1608): zero-construct it as the TYPED
+        // empty constructor `list[E]()` / `dict[K, V]()` / `set[E]()`, not a bare
+        // `[]` literal — so an `auto` binding (`auto acc = reflect.construct(E)`)
+        // pins the element type and a later `acc.append(…)` type-checks. This is
+        // the base a recursive nested-collection decoder appends into.
+        if matches!(gname.as_str(), "list" | "dict" | "set") {
+            let full_ty = Type::Named {
+                name: gname.clone(),
+                args: gargs.clone(),
+                span,
+            };
+            let ctor = Expr::Call {
+                callee: Box::new(type_to_expr(&full_ty, span)),
+                args: Vec::new(),
+                span,
+            };
+            return Ok((ctor, CTy::Ty(full_ty)));
+        }
+        // An `Optional` type (#1608) or a non-generic enum (#1603): zero-construct
+        // via `zero_expr` — `None` for an Optional, the first variant for an enum
+        // (the decoder overwrites it via `set_field`, so the slot pins the type).
+        if gname == "Optional" || (gargs.is_empty() && self.enums.contains_key(gname.as_str())) {
+            let full_ty = Type::Named {
+                name: gname.clone(),
+                args: gargs.clone(),
+                span,
+            };
+            let mut visiting = Vec::new();
+            let z = zero_expr(&full_ty, span, &self.structs, &self.enums, &mut visiting)
+                .map_err(|e| err(format!("reflect.construct: {}", e.message)))?;
+            return Ok((z, CTy::Ty(full_ty)));
+        }
         if !gargs.is_empty() {
             return self.reflect_construct_generic(&gname, &gargs, span);
         }
@@ -4699,12 +4813,13 @@ impl Mono<'_> {
         // a cycle rather than recursing forever (#1490).
         let mut visiting = vec![concrete.clone()];
         for f in &def.fields {
-            let z = zero_expr(&f.ty, span, &self.structs, &mut visiting).map_err(|e| {
-                err(format!(
-                    "reflect.construct: field `{}` of `{concrete}`: {}",
-                    f.name, e.message
-                ))
-            })?;
+            let z =
+                zero_expr(&f.ty, span, &self.structs, &self.enums, &mut visiting).map_err(|e| {
+                    err(format!(
+                        "reflect.construct: field `{}` of `{concrete}`: {}",
+                        f.name, e.message
+                    ))
+                })?;
             zargs.push(Arg {
                 name: None,
                 value: z,
@@ -4749,12 +4864,13 @@ impl Mono<'_> {
         let mut visiting: Vec<String> = Vec::new();
         for f in &def.fields {
             let fty = subst_type(&f.ty, &refmap);
-            let z = zero_expr(&fty, span, &self.structs, &mut visiting).map_err(|e| {
-                err(format!(
-                    "reflect.construct: field `{}` of `{name}[…]`: {}",
-                    f.name, e.message
-                ))
-            })?;
+            let z =
+                zero_expr(&fty, span, &self.structs, &self.enums, &mut visiting).map_err(|e| {
+                    err(format!(
+                        "reflect.construct: field `{}` of `{name}[…]`: {}",
+                        f.name, e.message
+                    ))
+                })?;
             zargs.push(Arg {
                 name: None,
                 value: z,

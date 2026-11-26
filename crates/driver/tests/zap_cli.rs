@@ -1457,6 +1457,49 @@ def main():
     );
 }
 
+#[test]
+fn reflect_construct_zero_inits_an_enum_field_and_builds_a_container() {
+    // #1603 + #1608: `reflect.construct(T)` now zero-inits an enum-typed FIELD
+    // (to the enum's first variant) and builds a TYPED empty container
+    // (`list[E]()`), so a decoder can construct a struct with an enum field and
+    // an `auto` accumulator for a nested collection.
+    let src = "\
+@derivable(Mk)
+def _mk[T](str s) -> T:
+    return reflect.construct(T)
+
+interface Mk:
+    def mk(str s) -> Self
+
+enum Tag:
+    A
+    B
+
+@derive(Mk)
+struct Holder:
+    int64 n
+    Tag t
+    list[list[int64]] grid
+
+def main():
+    auto h = _mk[Holder](\"\")
+    print(h.n)
+    print(len(h.grid))
+"
+    .to_string();
+    let f = write_zap("reflect-construct-enum-container", &src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "reflect.construct must zero-init an enum field and a container; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no zero-initializer") && !stderr.contains("not a non-generic struct"),
+        "the enum-field / container reflect.construct paths must be implemented: {stderr}"
+    );
+}
+
 // --- E3d (#1293): a @derive that cannot apply is an average-programmer-grade
 // compile error pointing at the user's field, not an internal symbol. ---
 
