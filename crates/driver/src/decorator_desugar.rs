@@ -496,9 +496,16 @@ fn try_build_rebind(
             struct_trailing,
             fn_sigs,
         );
-        if ri.is_some_and(|r| is_namespace_seam(&r.trailing_param)) {
-            let (a, aname) =
-                synth_namespace_adapter(&orig_name, &impl_name, &f.params, &f.ret, f.span, diags);
+        if let Some(context_ty) = ri.and_then(|r| namespace_seam(&r.trailing_param)) {
+            let (a, aname) = synth_namespace_adapter(
+                &orig_name,
+                &impl_name,
+                &f.params,
+                &f.ret,
+                context_ty.as_ref(),
+                f.span,
+                diags,
+            );
             base_name = aname;
             adapter = Some(a);
         }
@@ -557,17 +564,33 @@ fn try_build_rebind(
     ))
 }
 
-/// Is `t` the uniform argparse handler seam `fn(Namespace) -> R` (#1544)? That is
-/// the trailing-parameter type a returning decorator declares to receive a
-/// synthesized adapter instead of the handler verbatim.
-fn is_namespace_seam(t: &Option<Type>) -> bool {
-    matches!(
-        t,
-        Some(Type::Func { params, .. })
-            if params.len() == 1
-                && matches!(&params[0], Type::Named { name, args, .. }
-                    if name == "Namespace" && args.is_empty())
-    )
+/// Classify the trailing-parameter type `t` of a returning decorator's receiver
+/// method as the uniform argparse handler seam (#1544/#1621), the signal that the
+/// decorated handler should be adapted rather than passed verbatim. The seam's
+/// LAST function parameter is `Namespace`:
+///
+/// - `fn(Namespace) -> R`  ⇒ `Some(None)` — no context (#1544).
+/// - `fn(C, Namespace) -> R` ⇒ `Some(Some(C))` — an explicit typed context `C`
+///   supplied by the dispatcher as the handler's first parameter (#1621, cli#7).
+///
+/// Any other shape (not a function type, last parameter not `Namespace`, or more
+/// than one leading parameter) is `None` — not a seam, so the raw handler is
+/// passed, unchanged.
+fn namespace_seam(t: &Option<Type>) -> Option<Option<Type>> {
+    let Some(Type::Func { params, .. }) = t else {
+        return None;
+    };
+    let last = params.last()?;
+    let is_ns = matches!(last, Type::Named { name, args, .. }
+        if name == "Namespace" && args.is_empty());
+    if !is_ns {
+        return None;
+    }
+    match params.len() {
+        1 => Some(None),
+        2 => Some(Some(params[0].clone())),
+        _ => None,
+    }
 }
 
 /// The argparse `Namespace` typed getter for a handler parameter's declared type
@@ -590,12 +613,23 @@ fn namespace_getter_for(t: &Option<Type>) -> Option<&'static str> {
     }
 }
 
-/// Synthesize the argparse-backed handler adapter (#1544). Given a handler kept
-/// as `impl_name` with the declared `params`/`ret`, build
-/// `def <orig>$adapter(Namespace $ns) -> R:` whose body reads each handler
-/// parameter from the namespace by name with the type-matched getter and calls
-/// the handler in signature order (`return <impl>(...)`, or a bare call for a
-/// void handler). A parameter whose type is not an argv-sourced scalar is a
+/// Synthesize the argparse-backed handler adapter (#1544, #1621). Given a handler
+/// kept as `impl_name` with the declared `params`/`ret`, build
+/// `def <orig>$adapter([C $ctx, ]Namespace $ns) -> R:` whose body reads each
+/// handler parameter from the namespace by name with the type-matched getter and
+/// calls the handler in signature order (`return <impl>(...)`, or a bare call for
+/// a void handler).
+///
+/// When `context_ty` is `Some(C)` the seam is `fn(C, Namespace)`: the adapter
+/// takes a leading context parameter of type `C` that the dispatcher supplies
+/// directly, and the handler's **first** parameter, when it is a non-argv type
+/// (not a namespace scalar), receives that context value rather than a namespace
+/// read (#1621, cli#7 — "a handler may declare `Context ctx` as its first
+/// parameter"). The context is optional on the handler: a handler whose first
+/// parameter is a scalar binds every parameter from the namespace and the context
+/// argument is unused.
+///
+/// A parameter that is neither the context nor an argv-sourced scalar is a
 /// decoration-site error (ZAP5048); the synthesized call keeps its arity so the
 /// module stays well-formed and the error is the reported failure.
 fn synth_namespace_adapter(
@@ -603,13 +637,22 @@ fn synth_namespace_adapter(
     impl_name: &str,
     params: &[Param],
     ret: &Option<Type>,
+    context_ty: Option<&Type>,
     span: Span,
     diags: &mut Vec<TypeError>,
 ) -> (Function, String) {
     let adapter_name = format!("{orig_name}$adapter");
     let ns = "$ns";
+    let ctx = "$ctx";
     let mut call_args: Vec<Arg> = Vec::with_capacity(params.len());
-    for p in params {
+    for (i, p) in params.iter().enumerate() {
+        // The handler's first parameter, under a context seam, receives the
+        // dispatcher-supplied context when it is a non-argv (non-scalar) type.
+        let is_context = i == 0 && context_ty.is_some() && namespace_getter_for(&p.ty).is_none();
+        if is_context {
+            call_args.push(arg(Expr::Name(ctx.to_string(), span)));
+            continue;
+        }
         match namespace_getter_for(&p.ty) {
             Some(getter) => call_args.push(arg(Expr::Call {
                 callee: Box::new(Expr::Attr {
@@ -625,7 +668,8 @@ fn synth_namespace_adapter(
                     format!(
                         "handler parameter `{}` has a type that cannot be bound from the \
                          command-line namespace; an argparse-backed handler takes only scalar \
-                         parameters (int, float, bool, str)",
+                         parameters (int, float, bool, str) plus an optional typed context as \
+                         its first parameter",
                         p.name
                     ),
                     p.span,
@@ -663,11 +707,29 @@ fn synth_namespace_adapter(
         positional_only: false,
         span,
     };
+    // A context seam prepends the typed context parameter, carrying the seam's
+    // declared context type verbatim so sema checks the handler's context
+    // parameter against it.
+    let mut adapter_params = Vec::with_capacity(2);
+    if let Some(cty) = context_ty {
+        adapter_params.push(Param {
+            decorators: Vec::new(),
+            ty: Some(cty.clone()),
+            name: ctx.to_string(),
+            default: None,
+            variadic: false,
+            kwargs: false,
+            keyword_only: false,
+            positional_only: false,
+            span,
+        });
+    }
+    adapter_params.push(ns_param);
     let adapter = Function {
         decorators: Vec::new(),
         name: adapter_name.clone(),
         generics: Vec::new(),
-        params: vec![ns_param],
+        params: adapter_params,
         ret: ret.clone(),
         body: Block {
             stmts: vec![stmt],
@@ -2252,6 +2314,138 @@ mod tests {
         assert!(
             matches!(&args.last().unwrap().value, Expr::Name(n, _) if n == "greet$adapter"),
             "the imported receiver gets the synthesized adapter"
+        );
+    }
+
+    // ---- #1621: explicit typed context through the adapter --------------------
+
+    #[test]
+    fn context_seam_passes_context_and_binds_scalars() {
+        // #1621 / cli PR #7: a handler may declare `Context ctx` as its first
+        // parameter; the dispatcher supplies it directly. The receiver method
+        // opts in with the seam `fn(Context, Namespace) -> R`. The synthesized
+        // adapter takes `(Context ctx, Namespace ns)`, passes `ctx` to the
+        // handler's context parameter, and reads the remaining scalars from the
+        // namespace by name — in the handler's signature order.
+        let mut m = module(
+            "struct Context:\n    str command_name\n\
+             struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, fn(Context, Namespace) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(Context ctx, int64 count, str name) -> str:\n    return name\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+
+        let adapter = func(&m, "greet$adapter").expect("adapter synthesized");
+        assert_eq!(
+            adapter.params.len(),
+            2,
+            "adapter takes (Context, Namespace)"
+        );
+        assert!(
+            matches!(&adapter.params[0].ty, Some(Type::Named { name, .. }) if name == "Context"),
+            "first adapter parameter is the context type from the seam"
+        );
+        assert!(
+            matches!(&adapter.params[1].ty, Some(Type::Named { name, .. }) if name == "Namespace"),
+            "second adapter parameter is the Namespace"
+        );
+        let ctx_name = adapter.params[0].name.clone();
+        let Stmt::Return {
+            value: Some(Expr::Call { callee, args, .. }),
+            ..
+        } = &body(adapter)[0]
+        else {
+            panic!("expected `return greet$impl(...)`");
+        };
+        assert!(matches!(callee.as_ref(), Expr::Name(n, _) if n == "greet$impl"));
+        assert_eq!(args.len(), 3);
+        // ctx is passed through; count/name come from the namespace.
+        assert!(
+            matches!(&args[0].value, Expr::Name(n, _) if n == &ctx_name),
+            "the context parameter receives the adapter's context argument"
+        );
+        assert_eq!(
+            getter_call(&args[1].value),
+            Some(("get_int".into(), "count".into()))
+        );
+        assert_eq!(
+            getter_call(&args[2].value),
+            Some(("get_str".into(), "name".into()))
+        );
+    }
+
+    #[test]
+    fn context_seam_without_context_param_binds_all_from_namespace() {
+        // The context parameter is OPTIONAL on the handler. Under the
+        // `fn(Context, Namespace)` seam, a handler that declares no context still
+        // works: the adapter still takes `(Context, Namespace)` (uniform seam) but
+        // binds every parameter from the namespace and ignores the context.
+        let mut m = module(
+            "struct Context:\n    str command_name\n\
+             struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, fn(Context, Namespace) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(str name) -> str:\n    return name\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let adapter = func(&m, "greet$adapter").expect("adapter synthesized");
+        assert_eq!(adapter.params.len(), 2, "seam shape is preserved");
+        let Stmt::Return {
+            value: Some(Expr::Call { args, .. }),
+            ..
+        } = &body(adapter)[0]
+        else {
+            panic!("expected return call");
+        };
+        assert_eq!(args.len(), 1);
+        assert_eq!(
+            getter_call(&args[0].value),
+            Some(("get_str".into(), "name".into()))
+        );
+    }
+
+    #[test]
+    fn plain_namespace_seam_has_no_context_parameter() {
+        // Back-compat: a `fn(Namespace)` seam (no context) is unchanged — the
+        // adapter takes only the Namespace.
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, fn(Namespace) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(str name) -> str:\n    return name\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let adapter = func(&m, "greet$adapter").expect("adapter synthesized");
+        assert_eq!(
+            adapter.params.len(),
+            1,
+            "no context parameter for a plain Namespace seam"
+        );
+        assert!(
+            matches!(&adapter.params[0].ty, Some(Type::Named { name, .. }) if name == "Namespace"),
+        );
+    }
+
+    #[test]
+    fn context_seam_second_nonscalar_param_errors() {
+        // Only the FIRST parameter may be the context. A second non-scalar
+        // parameter cannot be bound from the namespace — a precise error.
+        let mut m = module(
+            "struct Context:\n    str command_name\n\
+             struct Widget:\n    int64 n\n\
+             struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, fn(Context, Namespace) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(Context ctx, Widget w) -> str:\n    return \"x\"\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(
+            diags.iter().any(|d| d.message.contains("`w`")),
+            "expected an unsupported-parameter diagnostic for `w`, got: {diags:?}"
         );
     }
 
