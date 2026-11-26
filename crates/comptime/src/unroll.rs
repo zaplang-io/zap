@@ -127,6 +127,12 @@ pub fn unroll(
         }
     };
 
+    // Bound this loop's unroll breadth (#1617): a pathological `comptime for`
+    // over a huge comptime sequence fails fast with a clean budget diagnostic
+    // rather than exploding the specialized output. Records the iterations in
+    // the evaluator's cost telemetry.
+    ev.enter_unroll(items.len() as u64, crate::eval::expr_span(iterable))?;
+
     let mut out = Vec::new();
     for item in items.iter() {
         let mut iter_env = base_env.clone();
