@@ -1198,10 +1198,12 @@ finally:
   `choice` and `uuid.uuid1`/`uuid4`/`uuid7`/`nanoid` — also raises `OSError`, and
   the raising call discards any partially-filled buffer (the result is never
   observable on the failure path). A **bounded or temporary** allocation failure
-  raises a catchable `MemoryError` (#882, #1581): the arena `cap`/heap-OOM path,
-  and the bounded temp-buffer wrappers (`str.expandtabs` / `str.translate` /
-  `str.format_map`, `http.url`) that build a sized result and can fail their
-  backing `malloc`/`realloc`. `MemoryError` descends directly from `Exception`, so
+  raises a catchable `MemoryError` (#882, #1581, #1598): the arena `cap`/heap-OOM
+  path, and the bounded temp-buffer wrappers (`str.expandtabs` / `str.translate` /
+  `str.format_map`, `http.url`, and the stable `list.sort` / `sorted` scratch
+  buffers) that build a sized result and can fail their backing `malloc`/`realloc`
+  (a failed wrapper releases any sibling scratch it already holds before
+  unwinding). `MemoryError` descends directly from `Exception`, so
   `except MemoryError` and `except Exception` both catch it, and `finally` / `with`
   cleanup runs on the unwind path. A failure of the **GC's own infrastructure**
   allocation — the collector's block/large-object maps, the `ZAP_GC_HEAP_LIMIT`
