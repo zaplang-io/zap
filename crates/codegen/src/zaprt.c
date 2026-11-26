@@ -845,6 +845,16 @@ enum {
      * #1493. `Optional[T]` keeps its own `None`/unwrap path untouched and is out
      * of scope. */
     ZAP_EXC_NULL_REFERENCE_ERROR = 22,
+    /* Raised by a regex operation whose pattern cannot be compiled or whose
+     * replacement references a bad group (#1582,
+     * decisions/lang/1582-regex-error.md). A subtype of `ValueError`
+     * (`RegexError` ⊂ `ValueError` ⊂ `Exception`), so `except RegexError`
+     * selects just the regex-failure case while `except ValueError` and `except
+     * Exception` still catch it — the dedicated type replaces #1566's
+     * provisional bare `ValueError` (SPEC §14) without breaking any existing
+     * `except ValueError` handler. The message carries the PCRE2 diagnostic
+     * (`regex error: <what>: <pcre2 message>`). Raised by `zap_regex_fail`. */
+    ZAP_EXC_REGEX_ERROR = 23,
 };
 
 void *zap_exception_new(int64_t type_id, void *message) {
@@ -962,6 +972,7 @@ static int64_t zap_exception_parent(int64_t type_id) {
     case ZAP_EXC_INDEX_ERROR: case ZAP_EXC_KEY_ERROR: return ZAP_EXC_LOOKUP_ERROR;
     case ZAP_EXC_FILE_NOT_FOUND_ERROR: case ZAP_EXC_RESPONSE_TOO_LARGE_ERROR:
         return ZAP_EXC_OS_ERROR;
+    case ZAP_EXC_REGEX_ERROR: return ZAP_EXC_VALUE_ERROR;
     case ZAP_EXC_ZERO_DIVISION_ERROR: return ZAP_EXC_ARITHMETIC_ERROR;
     case ZAP_EXC_CANCELLED: return ZAP_EXC_BASE;
     default:

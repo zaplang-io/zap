@@ -740,13 +740,16 @@ static uint32_t zap_regex_compile_opts(int64_t flags) {
     return o;
 }
 
-/* Raise a catchable regex error carrying the PCRE2 diagnostic (#1566). The
- * error TYPE is `ValueError` (the reasonable default the issue names — a bad
- * pattern/replacement is a value error — until a dedicated `RegexError` type is
- * chosen). The uncaught form still reports the diagnostic and exits 1, exactly
- * as the former direct `exit(1)` did. Literal-pattern validation is a runtime
- * check for now; a compile-time check would need PCRE2 in the compiler, which
- * must stay host-safe (buildable without LLVM/PCRE2 on the host). */
+/* Raise a catchable regex error carrying the PCRE2 diagnostic (#1566, #1582).
+ * The error TYPE is `RegexError` (#1582, decisions/lang/1582-regex-error.md), a
+ * dedicated subtype of `ValueError` — a bad pattern/replacement is a kind of
+ * value error, so `except ValueError` keeps catching it with no migration,
+ * while `except RegexError` selects just the regex case. This replaces #1566's
+ * provisional bare `ValueError` (SPEC §14). The uncaught form still reports the
+ * diagnostic and exits 1, exactly as the former direct `exit(1)` did.
+ * Literal-pattern validation is a runtime check for now; a compile-time check
+ * would need PCRE2 in the compiler, which must stay host-safe (buildable
+ * without LLVM/PCRE2 on the host). */
 __attribute__((noreturn)) static void zap_regex_fail(const char *what, int errorcode) {
     PCRE2_UCHAR msg[256];
     pcre2_get_error_message(errorcode, msg, sizeof(msg));
@@ -758,7 +761,7 @@ __attribute__((noreturn)) static void zap_regex_fail(const char *what, int error
     if (n > (int)sizeof(buf) - 1) {
         n = (int)sizeof(buf) - 1;
     }
-    zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(buf, (int64_t)n));
+    zap_panic_typed(ZAP_EXC_REGEX_ERROR, zap_str_new(buf, (int64_t)n));
     abort(); /* unreachable: zap_panic_typed unwinds */
 }
 
@@ -1091,6 +1094,9 @@ static int64_t zap_py_exception_type_id(const char *name) {
     const char *short_name = strrchr(name, '.');
     if (short_name != NULL) name = short_name + 1;
     if (strcmp(name, "ValueError") == 0) return ZAP_EXC_VALUE_ERROR;
+    /* #1582: `RegexError` ⊂ `ValueError`; map a Python-interop regex-style error
+     * name to the dedicated id so it threads through the same hierarchy. */
+    if (strcmp(name, "RegexError") == 0) return ZAP_EXC_REGEX_ERROR;
     if (strcmp(name, "TypeError") == 0) return ZAP_EXC_TYPE_ERROR;
     if (strcmp(name, "IndexError") == 0) return ZAP_EXC_INDEX_ERROR;
     if (strcmp(name, "KeyError") == 0) return ZAP_EXC_KEY_ERROR;
