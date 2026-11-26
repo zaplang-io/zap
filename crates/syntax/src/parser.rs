@@ -2264,6 +2264,18 @@ struct Namespace:
     def get_flag(self, str name) -> bool:
         return self._vals[name] == \"true\"
 
+    # The value as `bytes` — the raw argument string's UTF-8 encoding (#1655).
+    def get_bytes(self, str name) -> bytes:
+        return bytes(self._vals[name])
+
+    # The value as a single `char` (#1655): the argument must be exactly one
+    # Unicode codepoint, otherwise a catchable `ValueError` (empty or multi-char).
+    def get_char(self, str name) -> char:
+        str v = self._vals[name]
+        if len(v) != 1:
+            raise ValueError(\"argument is not a single character: '\" + v + \"'\")
+        return v[0]
+
     # Whether `name` was explicitly supplied on the command line (vs defaulted).
     def has(self, str name) -> bool:
         if name in self._present:
