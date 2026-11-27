@@ -3574,6 +3574,41 @@ impl Mono<'_> {
         })
     }
 
+    /// Best-effort concrete type of a parameter's *default* value expression,
+    /// for the omitted-default inference sink (#1704). A pure (`&self`,
+    /// side-effect-free) typer over the value forms a default commonly takes: a
+    /// literal, a signed / complemented / `not`-ed literal, or a reference to an
+    /// explicitly typed module global. It mirrors the literal and unary arms of
+    /// `rewrite_expr` (the #1117 inference family) without re-running the full
+    /// rewrite — which needs `&mut self` and would speculatively request
+    /// specializations for a default that a supplied argument may override. Any
+    /// other form (a call, a collection or constructor expression, an untyped
+    /// name) yields `None`, so inference fails closed and the call is diagnosed
+    /// when the type parameter has no other source, exactly as before.
+    fn default_cty(&self, e: &Expr) -> Option<Type> {
+        match e {
+            Expr::Bool(..) => Some(self.named("bool", Vec::new())),
+            Expr::Int(..) => Some(self.named("int64", Vec::new())),
+            Expr::Float(..) => Some(self.named("float64", Vec::new())),
+            Expr::Imaginary(..) => Some(self.named("complex", Vec::new())),
+            Expr::Str { bytes, .. } => {
+                Some(self.named(if *bytes { "bytes" } else { "str" }, Vec::new()))
+            }
+            Expr::Unary { op, expr, .. } => match op {
+                // `not x` is boolean regardless of the operand (Python
+                // truthiness), mirroring the `rewrite_expr` unary arm.
+                UnOp::Not => Some(self.named("bool", Vec::new())),
+                // Sign / bitwise-complement keep the operand's (numeric) type, so
+                // `value=-1` infers exactly as `value=1` does.
+                UnOp::Neg | UnOp::Pos | UnOp::BitNot => self.default_cty(expr),
+            },
+            // A default that names an explicitly typed module global / `const`
+            // (epic #661 / D-0112) contributes that global's concrete type.
+            Expr::Name(n, _) => self.globals.get(n).map(|t| self.apply_subst(t)),
+            _ => None,
+        }
+    }
+
     /// The element type produced by *iterating* a value of best-effort type `c`
     /// (a comprehension's `for v in ITER`), mirroring sema's `iterable_elem`
     /// (#1131): `range` → `int64`; `list`/`set`/`heap`/`deque`/`oset` → their
@@ -5013,6 +5048,54 @@ impl Mono<'_> {
             if let (Some(rd), Some(exp)) = (ret, expected) {
                 let rd = subst_with(rd, owner_subst);
                 unify(&rd, exp, tparams, &mut map);
+            }
+        }
+        // Omitted-default sink (#1704): a type parameter still free after
+        // argument unification and the return/expected sink can be pinned by an
+        // *omitted* parameter whose default has a concrete type. The default in
+        // `def setting[T](T value=False)` types the otherwise-free `T` as `bool`
+        // for the no-argument call `setting()`. This is the lowest-precedence
+        // source: a supplied argument (whether positional or keyword) already
+        // unified above and wins, and so does the expected/return sink, so
+        // explicit value and type arguments keep their normal precedence. A
+        // default contributes only when it was omitted at this call site and
+        // `default_cty` can type it; an unmodeled default leaves `T` free to be
+        // diagnosed below. (An omitted default whose type conflicts with a
+        // specialization chosen by another source is a separate, pre-existing
+        // soundness gap in default monomorphization — tracked in #1705 — not
+        // introduced or widened here.)
+        if tparams.iter().any(|p| !map.contains_key(p)) {
+            // Parameter names that received an argument at this call site; their
+            // declared types already participated in unification above.
+            let mut bound: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut pos = 0usize;
+            for (name, _) in argpairs {
+                match name {
+                    Some(pname) => {
+                        bound.insert(pname.as_str());
+                    }
+                    None => {
+                        if let Some((n, _)) = vparams.get(pos) {
+                            bound.insert(n.as_str());
+                        }
+                        pos += 1;
+                    }
+                }
+            }
+            for p in f.params.iter().filter(|p| !(skip_self && p.name == "self")) {
+                if tparams.iter().all(|t| map.contains_key(t)) {
+                    break;
+                }
+                if p.variadic || p.kwargs || bound.contains(p.name.as_str()) {
+                    continue;
+                }
+                let (Some(decl), Some(def)) = (p.ty.as_ref(), p.default.as_ref()) else {
+                    continue;
+                };
+                if let Some(actual) = self.default_cty(def) {
+                    let decl = subst_with(decl, owner_subst);
+                    unify(&decl, &actual, tparams, &mut map);
+                }
             }
         }
         let mut out = Vec::with_capacity(tparams.len());
