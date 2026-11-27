@@ -7,6 +7,7 @@
 //! returns. Richer features — struct fields, generics, interfaces, full
 //! pattern typing — are intentionally handled loosely (as `Unknown`) for now.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use zapc_diag::ErrorCode;
@@ -752,6 +753,17 @@ struct Checker {
     /// the frame at `comp_scopes[0] - 1`. Empty outside any comprehension, where
     /// a walrus binds into the current innermost scope.
     comp_scopes: Vec<usize>,
+    /// Reserved numeric-width type names seen in a type position (#1654, ADR
+    /// `decisions/lang/1654-fixed-width-integer-semantics.md` rule 8), each with
+    /// the span of the use site. [`Self::resolve_type`] is `&self` (it is called
+    /// from read-only query paths such as `reflect_type_info`), so it cannot push
+    /// a diagnostic directly; instead every reserved-name use is recorded here
+    /// through interior mutability and drained once, at the end of
+    /// [`Self::check_module`], into a single `ZAP4091` per distinct use site
+    /// ([`Self::finalize_reserved_type_names`]). Recording — rather than silently
+    /// returning `Ty::Unknown` — is what keeps a reserved name from being
+    /// mistaken for a user type or an opaque unknown.
+    reserved_type_hits: RefCell<Vec<(String, Span)>>,
 }
 
 /// The resolver state retained in analysis mode (I#228), handed to
@@ -1480,6 +1492,7 @@ impl Checker {
             analysis: None,
             def_scopes: Vec::new(),
             comp_scopes: Vec::new(),
+            reserved_type_hits: RefCell::new(Vec::new()),
         }
     }
 
@@ -1497,6 +1510,32 @@ impl Checker {
             message: message.into(),
             span,
         });
+    }
+
+    /// Drain the reserved numeric-width type-name uses recorded by
+    /// [`Self::resolve_type`] (#1654, ADR
+    /// `decisions/lang/1654-fixed-width-integer-semantics.md` rule 8) into one
+    /// `ZAP4091` diagnostic per **distinct use site** (keyed by span, so a name
+    /// resolved more than once — e.g. a signature re-resolved while checking a
+    /// body — is reported exactly once). Called at the end of
+    /// [`Self::check_module`], after every pass that resolves annotations has
+    /// run, so each reserved spelling anywhere in a type position is caught.
+    fn finalize_reserved_type_names(&mut self) {
+        let hits = std::mem::take(&mut *self.reserved_type_hits.borrow_mut());
+        let mut seen: HashSet<(u32, u32)> = HashSet::new();
+        for (name, span) in hits {
+            if !seen.insert((span.start, span.end)) {
+                continue;
+            }
+            self.error(
+                ErrorCode::ZAP4091,
+                format!(
+                    "type `{name}` is reserved for a future version of Zap and \
+                     is not yet available"
+                ),
+                span,
+            );
+        }
     }
 
     // --- scopes ---
@@ -3639,7 +3678,26 @@ impl Checker {
                     span: *span,
                 })
             }
-            Type::Named { name, args, .. } => match name.as_str() {
+            Type::Named { name, args, span } => match name.as_str() {
+                // Reserved numeric-width type names (#1654, ADR
+                // `decisions/lang/1654-fixed-width-integer-semantics.md` rule 8):
+                // recognized in a type position and rejected on purpose so they
+                // are neither silently collapsed to `Ty::Unknown` nor mistaken
+                // for a user-defined type. They carry no semantics yet. Matched
+                // *before* the scalar names and the `other =>` user-type/alias
+                // fall-through. `usize` is implemented (resolves below) and is
+                // deliberately absent here; only `isize` is reserved. The
+                // diagnostic cannot be emitted here (`resolve_type` is `&self`),
+                // so the use site is recorded and drained once in
+                // `finalize_reserved_type_names`; the name still resolves to
+                // `Ty::Unknown` so dependent checking does not cascade.
+                "float8" | "f8" | "float16" | "f16" | "int128" | "i128" | "uint128" | "u128"
+                | "isize" => {
+                    self.reserved_type_hits
+                        .borrow_mut()
+                        .push((name.clone(), *span));
+                    Ty::Unknown
+                }
                 // `int` is the Python-facing name for the 64-bit signed integer
                 // (I#581); `float` is likewise the name for the 64-bit double.
                 "int" | "int64" | "i64" => Ty::Int64,
@@ -4989,6 +5047,9 @@ impl Checker {
             }
         }
         self.pop_scope();
+        // Every annotation-resolving pass has now run, so flush the reserved
+        // numeric-width type-name uses recorded along the way (#1654 rule 8).
+        self.finalize_reserved_type_names();
     }
 
     /// Validate the structural rules on a parameter list (#601): a `V **name`
@@ -23021,6 +23082,132 @@ def main():
             ErrorCode::ZAP4016
         ));
         ok("def main():\n    uint8 c = 0\n    c = 200\n    print(c)\n");
+    }
+
+    // ---- #1654 rule 8: reserved numeric-width type names (ZAP4091) ----------
+    //
+    // Per `decisions/lang/1654-fixed-width-integer-semantics.md` rule 8 the
+    // names below are recognized in a type position and rejected with ZAP4091
+    // ("reserved for a future version") — NOT silently resolved to the opaque
+    // `Ty::Unknown`, and NOT treated as a user-defined type. They have no
+    // semantics yet. `usize` is implemented (#552) and is deliberately NOT in
+    // this set. These tests are a walled garden: every reserved spelling (long
+    // name + short alias) in every type position, plus the `usize` regression
+    // guard, so a later change cannot quietly make a reserved name usable.
+
+    /// Every reserved spelling — long name and short alias — from rule 8.
+    const RESERVED_TYPE_NAMES: &[&str] = &[
+        "float8", "f8", "float16", "f16", "int128", "i128", "uint128", "u128", "isize",
+    ];
+
+    #[test]
+    fn reserved_type_name_in_var_annotation_is_rejected() {
+        for name in RESERVED_TYPE_NAMES {
+            let src = format!("def main():\n    {name} x = 0\n    print(x)\n");
+            let e = errors(&src);
+            assert!(
+                e.iter().any(|d| d.code == ErrorCode::ZAP4091),
+                "expected ZAP4091 for reserved `{name}` in a var annotation, got {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_type_name_in_param_and_return_is_rejected() {
+        // A reserved name in a parameter type and in the return type each fire
+        // once. Exactly two diagnostics (one per distinct use site) and nothing
+        // else: the name resolves to a permissive `Unknown`, so `return x` and
+        // the call never cascade into a type-mismatch error, and the span-keyed
+        // dedupe means re-resolving the signature while checking the body does
+        // not double-report.
+        for name in RESERVED_TYPE_NAMES {
+            let src = format!("def f({name} x) -> {name}:\n    return x\n");
+            let e = errors(&src);
+            assert!(
+                e.iter().all(|d| d.code == ErrorCode::ZAP4091),
+                "unexpected non-ZAP4091 diagnostic for reserved `{name}`: {e:?}"
+            );
+            assert_eq!(
+                e.len(),
+                2,
+                "expected exactly one ZAP4091 per type position for `{name}`, got {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_type_name_in_struct_field_is_rejected() {
+        // One ZAP4091 per reserved field type; `usize` and a plain `int64`
+        // field alongside them stay clean.
+        let src = "struct S:\n    int128 a\n    f16 b\n    usize c\n    int64 d\n";
+        let e = errors(src);
+        assert_eq!(
+            e.iter().filter(|d| d.code == ErrorCode::ZAP4091).count(),
+            2,
+            "expected a ZAP4091 for each of the two reserved field types, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn reserved_type_name_in_container_element_is_rejected() {
+        // Element, dict key, dict value, set element, and a nested element
+        // position all flow through `resolve_type` recursively and are caught.
+        for (src, label) in [
+            ("def f(list[int128] xs):\n    pass\n", "list element"),
+            ("def f(dict[isize, int64] m):\n    pass\n", "dict key"),
+            ("def f(dict[str, u128] m):\n    pass\n", "dict value"),
+            ("def f(set[f16] s):\n    pass\n", "set element"),
+            ("def f(list[list[i128]] xs):\n    pass\n", "nested element"),
+        ] {
+            let e = errors(src);
+            assert!(
+                e.iter().any(|d| d.code == ErrorCode::ZAP4091),
+                "expected ZAP4091 for a reserved {label} in `{src}`, got {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_type_name_through_a_used_alias_is_rejected() {
+        // A transparent alias expands to its target at the use site, so a
+        // reserved target is still caught when the alias is used in a type
+        // position.
+        assert!(has_code(
+            "type T = int128\ndef f(T x):\n    pass\n",
+            ErrorCode::ZAP4091
+        ));
+    }
+
+    #[test]
+    fn reserved_type_name_diagnostic_names_the_reservation() {
+        // Intent documentation: the message tells the user the name is reserved
+        // for a future Zap, so it is clearly not an "unknown type" error.
+        let e = errors("def f(int128 x):\n    pass\n");
+        let d = e
+            .iter()
+            .find(|d| d.code == ErrorCode::ZAP4091)
+            .expect("expected a ZAP4091 diagnostic");
+        assert!(
+            d.message.contains("int128") && d.message.contains("reserved"),
+            "message should name the reserved type, got {:?}",
+            d.message
+        );
+    }
+
+    #[test]
+    fn usize_is_not_reserved() {
+        // `usize` is implemented (#552) and must keep working in every position
+        // where a reserved sibling is now rejected — it never trips ZAP4091.
+        ok("def main():\n    usize n = 0\n    print(n)\n");
+        ok("def widen(usize n) -> usize:\n    return n\n");
+        ok("def f(list[usize] xs):\n    pass\n");
+        ok("def f(dict[usize, int64] m):\n    pass\n");
+        // And the reservation is specific, not a catch-all for unknown type
+        // names: a genuinely-undefined user type does not get ZAP4091.
+        assert!(!has_code(
+            "def f(Widget w):\n    pass\n",
+            ErrorCode::ZAP4091
+        ));
     }
 
     #[test]
