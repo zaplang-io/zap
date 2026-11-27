@@ -263,6 +263,16 @@ fn collect_tyvar_pairs_inner(
                 collect_tyvar_pairs_inner(p, a, generics, from_type_value, out);
             }
         }
+        // A raw (non-`Optional`) value supplied for an `Optional[T]` parameter
+        // lifts into the payload by implicit `Some(T)` wrapping (#1265), so the
+        // argument's type must bind and respect `T` just as the payload type would
+        // (#1682). The `(Optional, Optional)` arm above already handles an
+        // explicitly wrapped argument; this arm handles the bare-payload lift.
+        // (`Unknown`/`py` and the explicit-`Optional` argument are both handled
+        // earlier, so `aty` here is a concrete non-`Optional` value type.)
+        (Ty::Optional(p), _) => {
+            collect_tyvar_pairs_inner(p, aty, generics, from_type_value, out);
+        }
         _ => {}
     }
 }
@@ -3381,6 +3391,15 @@ impl Checker {
                     "ContextVar" => Ty::ContextVar(Box::new(elem(0))),
                     "ContextToken" => Ty::CtxToken,
                     "dict" => Ty::Dict(Box::new(elem(0)), Box::new(elem(1))),
+                    // The prelude generic enum `Optional[T]` (I#154) — resolve its
+                    // payload in the same generic scope (#1682) so a type parameter
+                    // in the payload (`Optional[T]`) is preserved as `Ty::Named(T)`
+                    // rather than erased to `Unknown`. Without this arm `Optional`
+                    // fell through to the unscoped `resolve_type`, which severed the
+                    // payload's connection to the function's type parameters and let
+                    // an incompatible raw payload slip past generic-consistency
+                    // checking once `Type[T]` had bound `T`.
+                    "Optional" => Ty::Optional(Box::new(elem(0))),
                     // A first-class type value `Type[T]` (#1527) — resolve its
                     // represented type in the same generic scope.
                     "Type" => Ty::TypeVal(Box::new(elem(0))),
