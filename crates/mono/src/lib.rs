@@ -3791,8 +3791,19 @@ impl Mono<'_> {
                 }
                 Ok((e.clone(), CTy::NoneLit))
             }
-            Expr::Name(n, _) => {
-                let cty = env.lookup(n).unwrap_or(CTy::Unknown);
+            Expr::Name(n, span) => {
+                // A local binding shadows a top-level function of the same name,
+                // so the environment is consulted first. A bare name that is not
+                // a variable but *is* a known top-level function is a first-class
+                // function value (D-0067); its type is the function's full
+                // callable signature. Synthesizing it here lets generic
+                // argument inference pin a type parameter from a bare callable
+                // reference — `accept(callback)` where `accept[Inner](Inner)` —
+                // exactly as it already does from a typed local binding (#1669).
+                let cty = env
+                    .lookup(n)
+                    .or_else(|| self.fn_value_type(n, *span).map(CTy::Ty))
+                    .unwrap_or(CTy::Unknown);
                 Ok((e.clone(), cty))
             }
             Expr::Call { callee, args, span } => {
@@ -4791,6 +4802,33 @@ impl Mono<'_> {
             span,
         };
         Ok((node, ret_cty))
+    }
+
+    /// The first-class function-value type of a bare top-level function name
+    /// (D-0067, #163), or `None` when `n` is not a known function, is generic,
+    /// or has an un-annotated parameter whose type cannot be formed. Used to give
+    /// a bare callable reference (`callback`) its full `fn(params) -> ret`
+    /// signature so generic argument inference can pin a type parameter from it
+    /// (#1669), the same type a typed local binding would carry.
+    ///
+    /// A generic function is excluded: an un-specialized generic function has no
+    /// single concrete callable type to offer as a value. Every parameter must
+    /// be annotated; an omitted return type is `void` (a bare `fn(...)`), which
+    /// matches how the signature-mismatch diagnostic already renders it.
+    fn fn_value_type(&self, n: &str, span: Span) -> Option<Type> {
+        let f = self.funcs.get(n)?;
+        if !f.generics.is_empty() {
+            return None;
+        }
+        let mut params = Vec::with_capacity(f.params.len());
+        for p in &f.params {
+            params.push(p.ty.as_ref()?.clone());
+        }
+        Some(Type::Func {
+            params,
+            ret: f.ret.clone().map(Box::new),
+            span,
+        })
     }
 
     fn infer_fn_targs(
