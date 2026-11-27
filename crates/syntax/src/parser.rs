@@ -2361,7 +2361,10 @@ struct ArgumentParser:
     # else is a positional consumed in declaration order. `type` (\"str\"/\"int\"/
     # \"float\") validates the value at parse time; `choices` restricts it;
     # `required` forces an optional to appear; `default` (a string) seeds the
-    # value when the argument is absent.
+    # value when the argument is absent. For a boolean flag (`store_true`/
+    # `store_false`) an omitted `default` keeps the action's implied value
+    # (False / True); an explicit `default` must be \"true\" or \"false\" and seeds
+    # the absent flag, leaving it marked not-present (#1692).
     def add_argument(self, str name, str action=\"store\", str type=\"str\", str default=\"\", bool required=False, list[str] choices=[], str help=\"\", str metavar=\"\") -> Argument:
         return self._add(name, action, type, default, required, choices, help, metavar, -1, \"\")
 
@@ -2374,10 +2377,21 @@ struct ArgumentParser:
         auto storev = action == \"store_true\"
         auto dflt = default
         if is_flag:
-            if action == \"store_true\":
-                dflt = \"false\"
+            # A zero-arity flag stores a boolean. With `default` omitted (the \"\"
+            # sentinel) keep the action's implied default — False for store_true,
+            # True for store_false. An explicitly supplied default must be a
+            # canonical boolean string (\"true\"/\"false\", as `get_flag` reads it)
+            # and seeds the absent value verbatim (#1692); anything else is a
+            # declaration error raised as a catchable `ValueError`.
+            if default == \"\":
+                if action == \"store_true\":
+                    dflt = \"false\"
+                else:
+                    dflt = \"true\"
+            elif default == \"true\" or default == \"false\":
+                dflt = default
             else:
-                dflt = \"true\"
+                raise ValueError(\"argument \" + name + \": invalid boolean default: '\" + default + \"' (expected \\\"true\\\" or \\\"false\\\")\")
         auto mv = metavar
         if mv == \"\":
             mv = dest
