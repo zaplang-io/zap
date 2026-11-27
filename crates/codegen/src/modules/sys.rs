@@ -25,4 +25,7 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_sys_stdout", &[], Some(p.into()));
     cg.declare_rt("zap_sys_stderr", &[], Some(p.into()));
     cg.declare_rt("zap_sys_write", &[p.into(), p.into()], Some(i.into()));
+    // Hidden line input (#1684): getpass(prompt: str) -> str. Throwing (OSError
+    // when stdin is not a terminal, EOFError at end-of-input).
+    cg.declare_rt("zap_sys_getpass", &[p.into()], Some(p.into()));
 }

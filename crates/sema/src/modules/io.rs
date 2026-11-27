@@ -31,6 +31,12 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "io", method, args, 1, span);
             Ty::Unit
         }
+        // io.isatty(fd) -> bool (#1685): is `fd` a terminal? A pure query that
+        // never raises — an invalid or redirected fd simply reads as false.
+        "isatty" => {
+            expect_argc(checker, "io", method, args, 1, span);
+            Ty::Bool
+        }
         // Buffered line-oriented input (#969, D-0212). `reader(fd)` returns an
         // opaque handle (a `bytes` value wrapping a pointer-free reader state,
         // the crypto-streaming pattern); the read methods take that handle.

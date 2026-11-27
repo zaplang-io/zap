@@ -637,6 +637,25 @@ fn sys_keyword_and_unknown() {
 }
 
 #[test]
+fn sys_getpass_keyword_and_unknown() {
+    // #1684: sys.getpass([prompt]) binds `prompt` by name, omits it (the lowerer
+    // fills the "Password: " default), and rejects an unknown keyword.
+    assert_ok(&prog("    auto s = sys.getpass(prompt=\"PIN: \")\n"));
+    assert_ok(&prog("    auto s = sys.getpass()\n"));
+    assert_code(
+        &prog("    auto s = sys.getpass(message=\"PIN: \")\n"),
+        "ZAP4023",
+    );
+}
+
+#[test]
+fn io_isatty_keyword_and_unknown() {
+    // #1685: io.isatty(fd) binds `fd` by name and rejects an unknown keyword.
+    assert_ok(&prog("    auto b = io.isatty(fd=1)\n"));
+    assert_code(&prog("    auto b = io.isatty(descriptor=1)\n"), "ZAP4023");
+}
+
+#[test]
 fn time_process_sys_positional_unchanged() {
     assert_ok(&prog("    time.sleep(0.0)\n"));
     assert_ok(&prog("    auto r = process.run([\"echo\"])\n"));
@@ -684,6 +703,9 @@ fn url_io_signal_positional_unchanged() {
     assert_ok(&prog("    auto q = url.quote(\"a b\")\n"));
     assert_ok(&prog("    auto fd = io.open(\"/tmp/x\", \"r\")\n"));
     assert_ok(&prog("    auto ch = signal.notify(Signal.SIGINT)\n"));
+    // #1685 / #1684 positional forms unchanged.
+    assert_ok(&prog("    auto b = io.isatty(1)\n"));
+    assert_ok(&prog("    auto s = sys.getpass(\"PIN: \")\n"));
 }
 
 // ---------------------------------------------------------------------------

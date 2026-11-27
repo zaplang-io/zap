@@ -41,6 +41,7 @@
 #include <signal.h>   /* kill / SIGTERM / SIGKILL: process.run timeout + Popen    */
 #include <spawn.h>    /* posix_spawn: process.run (POSIX)                        */
 #include <sys/wait.h> /* waitpid                                                 */
+#include <termios.h>  /* tcgetattr / tcsetattr: sys.getpass echo toggle (#1684)  */
 #include <time.h>     /* nanosleep: process.run timeout poll                     */
 #endif
 #if defined(__APPLE__)
@@ -513,6 +514,20 @@ void zap_io_close(int64_t fd) {
     if (close((int)fd) != 0) {
         zap_sys_fail_errno("io.close", errno);
     }
+}
+
+/* io.isatty(fd) -> int64 0/1 (#1685): is `fd` connected to a terminal? A pure,
+ * infallible query — it never raises and never touches the descriptor's offset
+ * or the terminal state. A bad / closed / non-terminal descriptor reads as 0
+ * (false), matching CPython `os.isatty`, which also folds EBADF into `False`
+ * rather than raising. Two descriptors in one process answer independently, so
+ * a program can tell a redirected stream from a console. */
+int64_t zap_io_isatty(int64_t fd) {
+#if defined(ZAP_PLATFORM_WINDOWS)
+    return _isatty((int)fd) ? 1 : 0;
+#else
+    return isatty((int)fd) ? 1 : 0;
+#endif
 }
 
 /* --- fs: path-oriented convenience + metadata ------------------------------- */
@@ -2973,6 +2988,186 @@ void *zap_input(void *prompt_) {
     void *s = zap_str_new(buf, (int64_t)len);
     free(buf);
     return s;
+}
+
+/* --- sys.getpass: hidden line input (#1684) -------------------------------- *
+ *
+ * Read one line from stdin (fd 0) with terminal echo suppressed, so a password
+ * or other secret is never shown on screen, then restore the terminal exactly
+ * as it was. The prompt is written to stderr (fd 2), never stdout, so a program
+ * capturing stdout (`pw=$(prog)`) still shows the prompt and never captures it.
+ *
+ * Contract (the acceptance of #1684):
+ *   - stdin MUST be a terminal. A pipe or redirected file raises a catchable
+ *     OSError *before* the prompt is written or any byte is read — there is no
+ *     silent fallback to an echoing read, which would leak the secret.
+ *   - the original terminal state is restored on EVERY exit: a normal return,
+ *     EOF, or an I/O error after echo was already disabled. A terminal that
+ *     already had echo off stays off (save -> modify -> restore).
+ *   - end-of-input with no bytes read raises EOFError, exactly like input().
+ *   - the typed bytes are never echoed and never appear in any diagnostic text.
+ *
+ * Limitation: a hard terminating signal (an uncaught SIGINT) delivered mid-read
+ * is a core signals concern and can still leave echo disabled; EINTR on the
+ * read itself is retried. See decisions/stdlib/1684-getpass-hidden-input.md. */
+
+/* Outcome of the non-raising getpass line read. The read NEVER raises: it hands
+ * the caller a status so the caller can restore the terminal FIRST and only then
+ * turn a non-OK outcome into a Zap exception — echo is therefore never left
+ * disabled across the longjmp that raising performs. */
+typedef enum { ZAP_GP_OK, ZAP_GP_EOF, ZAP_GP_ERR } zap_gp_status;
+
+/* Read one line from fd 0 without echoing and without raising. On ZAP_GP_OK the
+ * line (trailing '\n' and a preceding '\r' stripped) is left in *buf_out /
+ * *len_out as a malloc'd buffer the caller frees; on ZAP_GP_ERR *saved_errno
+ * holds the failing errno; ZAP_GP_EOF means the stream ended before any byte.
+ * EINTR is retried so a benign signal does not abort the read. */
+static zap_gp_status zap_getpass_read_raw(char **buf_out, size_t *len_out, int *saved_errno) {
+    size_t cap = 128, len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) {
+        *saved_errno = ENOMEM;
+        return ZAP_GP_ERR;
+    }
+    int saw_any = 0;
+    for (;;) {
+        char c;
+        ssize_t got;
+        do {
+            got = read(0, &c, 1);
+        } while (got < 0 && errno == EINTR);
+        if (got < 0) {
+            *saved_errno = errno;
+            free(buf);
+            return ZAP_GP_ERR;
+        }
+        if (got == 0) {
+            break; /* EOF */
+        }
+        saw_any = 1;
+        if (c == '\n') {
+            break;
+        }
+        if (len + 1 > cap) {
+            cap *= 2;
+            char *nb = (char *)realloc(buf, cap);
+            if (!nb) {
+                free(buf);
+                *saved_errno = ENOMEM;
+                return ZAP_GP_ERR;
+            }
+            buf = nb;
+        }
+        buf[len++] = c;
+    }
+    if (!saw_any) {
+        free(buf);
+        return ZAP_GP_EOF;
+    }
+    if (len > 0 && buf[len - 1] == '\r') {
+        len--; /* strip a CRLF carriage return */
+    }
+    *buf_out = buf;
+    *len_out = len;
+    return ZAP_GP_OK;
+}
+
+/* Write `s` fully to fd `fd`, retrying short writes and EINTR. Used only for the
+ * prompt; a write failure raises (named for the op, with no secret in it). */
+static void zap_getpass_write(int fd, const char *data, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, data + off, n - off);
+        if (w < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            zap_sys_fail_errno("sys.getpass", errno);
+        }
+        off += (size_t)w;
+    }
+}
+
+/* Turn a non-raising read outcome into the Zap result or the matching raise.
+ * The terminal has already been restored by the caller, so a raise here cannot
+ * leave echo disabled. On OK, copies the bytes into a GC ZapStr and frees the
+ * scratch buffer. */
+static void *zap_getpass_finish(zap_gp_status st, char *buf, size_t len, int saved_errno) {
+    if (st == ZAP_GP_OK) {
+        void *s = zap_str_new(buf, (int64_t)len);
+        free(buf);
+        return s;
+    }
+    if (st == ZAP_GP_EOF) {
+        const char *msg = "EOF when reading a password";
+        zap_panic_typed(ZAP_EXC_EOF_ERROR, zap_str_new(msg, (int64_t)strlen(msg)));
+        return NULL; /* unreachable */
+    }
+    zap_sys_fail_errno("sys.getpass", saved_errno);
+    return NULL; /* unreachable */
+}
+
+/* sys.getpass([prompt]) -> str. prompt defaults to "Password: " in the lowerer. */
+void *zap_sys_getpass(void *prompt_) {
+    const ZapStr *prompt = (const ZapStr *)prompt_;
+    char *buf = NULL;
+    size_t len = 0;
+    int saved_errno = 0;
+    zap_gp_status st;
+#if defined(ZAP_PLATFORM_WINDOWS)
+    /* Windows: the console echo bit lives on the input handle's mode, not on an
+     * fd termios. Fail the same typed way when stdin is not a console — before
+     * the prompt is written or a byte is read. */
+    HANDLE hin = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    if (hin == INVALID_HANDLE_VALUE || !GetConsoleMode(hin, &mode)) {
+        zap_sys_fail_typed(ZAP_EXC_OS_ERROR, "sys.getpass", "stdin is not a terminal");
+        return NULL; /* unreachable */
+    }
+    /* Clear ENABLE_ECHO_INPUT first; keep ENABLE_LINE_INPUT so the console still
+     * does line editing (backspace) and returns the line on Enter. The prompt is
+     * written only after echo is off, matching the POSIX ordering. */
+    SetConsoleMode(hin, mode & ~(DWORD)ENABLE_ECHO_INPUT);
+    if (prompt && prompt->len > 0) {
+        zap_getpass_write(2, prompt->data, (size_t)prompt->len);
+    }
+    st = zap_getpass_read_raw(&buf, &len, &saved_errno);
+    SetConsoleMode(hin, mode); /* restore BEFORE any raise */
+    zap_getpass_write(2, "\n", 1); /* echo was off, so move past the Enter */
+    return zap_getpass_finish(st, buf, len, saved_errno);
+#else
+    /* stdin must be a terminal — fail before writing the prompt or reading a
+     * byte, so a pipe never has its first line silently consumed or echoed. */
+    if (!isatty(0)) {
+        zap_sys_fail_typed(ZAP_EXC_OS_ERROR, "sys.getpass", "stdin is not a terminal");
+        return NULL; /* unreachable */
+    }
+    struct termios old_t, new_t;
+    if (tcgetattr(0, &old_t) != 0) {
+        zap_sys_fail_errno("sys.getpass", errno);
+        return NULL; /* unreachable */
+    }
+    new_t = old_t;
+    new_t.c_lflag &= ~(tcflag_t)ECHO;  /* hide typed characters */
+    new_t.c_lflag |= (tcflag_t)ECHONL; /* but still echo the Enter newline */
+    /* Disable echo FIRST, with TCSAFLUSH so any characters typed ahead (while
+     * echo was still on) are discarded rather than read back visibly. Writing
+     * the prompt only after the flush matches CPython getpass ordering and means
+     * a caller that observes the prompt knows echo is already suppressed. */
+    if (tcsetattr(0, TCSAFLUSH, &new_t) != 0) {
+        zap_sys_fail_errno("sys.getpass", errno); /* termios unchanged on failure */
+        return NULL;                              /* unreachable */
+    }
+    if (prompt && prompt->len > 0) {
+        zap_getpass_write(2, prompt->data, (size_t)prompt->len);
+    }
+    /* The read never raises; it returns a status. Restore the terminal, THEN
+     * convert a non-OK status into a raise — echo is never left off across the
+     * longjmp a raise performs. */
+    st = zap_getpass_read_raw(&buf, &len, &saved_errno);
+    tcsetattr(0, TCSAFLUSH, &old_t);
+    return zap_getpass_finish(st, buf, len, saved_errno);
+#endif
 }
 
 /* Buffered reader over an fd. All fields are pointer-free, so the handle's

@@ -563,6 +563,20 @@ differs in a few places:
   `OSError` (CPython uses `OSError` / `NotImplementedError`; Zap has no
   `NotImplementedError` type yet).
 
+### Terminal I/O — `io.isatty`, `sys.getpass` (#1685, #1684; decisions/stdlib/1685-isatty-terminal-detection.md, decisions/stdlib/1684-getpass-hidden-input.md)
+
+- **`io.isatty(fd)` never raises (CPython `os.isatty` parity).** An invalid or
+  out-of-range descriptor reads as `false`, folding `EBADF` to `false` rather
+  than raising; a pipe or redirected regular file is `false`, a PTY/console is
+  `true`.
+- **`sys.getpass` fails typed on a non-terminal instead of echoing.** CPython's
+  `getpass.getpass` warns and falls back to a visible, echoing read when no tty
+  is available. Zap's `sys.getpass` instead raises a catchable `OSError` before
+  writing the prompt or reading any byte, so a secret is never read or shown on
+  a non-terminal stdin. Otherwise it mirrors `getpass.getpass`: a `"Password: "`
+  default prompt written to stderr, echo suppressed and restored around the
+  read, and an `EOFError` at end-of-input (where Zap's `input()` also raises).
+
 ---
 
 ## Parity backlog

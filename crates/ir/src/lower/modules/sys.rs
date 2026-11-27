@@ -24,6 +24,27 @@ fn lower(
     if let Some(n) = fd {
         return Ok(Some((lowerer.iconst(Ty::I64, n), Ty::I64)));
     }
+    // sys.getpass([prompt]) -> str (#1684). Hidden line input: suppress terminal
+    // echo, read one line, restore. The optional prompt defaults to "Password: "
+    // (filled here, so the runtime always receives the string to write). It can
+    // raise (OSError when stdin is not a terminal, EOFError at end-of-input), so
+    // it is a throwing call that `try` can catch.
+    if method == "getpass" {
+        let prompt = if let Some(a) = args.first() {
+            let (v, _) = lowerer.expr(&a.value)?;
+            v
+        } else {
+            let d = lowerer.new_value(Ty::Ptr);
+            lowerer.emit(Inst::StrConst {
+                dest: d,
+                bytes: b"Password: ".to_vec(),
+            });
+            d
+        };
+        let dest = lowerer.new_value(Ty::Ptr);
+        lowerer.throwing_call(Some(dest), "zap_sys_getpass", vec![prompt]);
+        return Ok(Some((dest, Ty::Ptr)));
+    }
     let a = lower_args(lowerer, args)?;
     Ok(Some(match method {
         "argv" => call_ret(lowerer, "zap_sys_argv", a, Ty::List(Elem::Ptr), false),

@@ -73,3 +73,11 @@ gc-immix = ["llvm"]
 # Opt-in fallback: LLVM codegen with the conservative Boehm GC (`-lgc`) instead
 # of the precise collector. Exercised as the `full` CI check's secondary suite.
 gc-boehm = ["codegen"]
+
+[dev-dependencies]
+# PTY harness for the terminal-I/O tests (io.isatty #1685, sys.getpass #1684):
+# the codegen-gated zap_cli.rs tests spawn the real `zap` under a pseudo-terminal
+# (posix_openpt/grantpt/unlockpt/ptsname) to drive the only paths a pipe cannot —
+# a descriptor that *is* a tty, and echo suppression. Unix-only; the tests that
+# use it are `#[cfg(all(unix, feature = "codegen"))]`.
+libc = { version = "0.2.169" }

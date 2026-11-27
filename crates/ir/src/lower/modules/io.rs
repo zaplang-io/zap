@@ -2,7 +2,9 @@
 
 use zapc_syntax::ast;
 
-use super::support::{call_ret, call_void, line_reader_wrap, lower_args, writer_new_wrap};
+use super::support::{
+    call_bool, call_ret, call_void, line_reader_wrap, lower_args, writer_new_wrap,
+};
 use super::ModuleLower;
 use crate::ir::*;
 use crate::lower::{err, FnLower, LowerError};
@@ -41,6 +43,9 @@ fn lower(
         "read" => call_ret(lowerer, "zap_io_read", a, Ty::Ptr, true),
         "write" => call_ret(lowerer, "zap_io_write", a, Ty::I64, true),
         "close_fd" => call_void(lowerer, "zap_io_close", a, true),
+        // io.isatty(fd) -> bool (#1685). Infallible terminal query (0/1 word
+        // normalized to i1); never raises, so a plain call.
+        "isatty" => call_bool(lowerer, "zap_io_isatty", a),
         // Buffered line-oriented input (#969, D-0212). The handle is an opaque
         // pointer (a `bytes` value whose buffer is a pointer-free reader state,
         // the crypto-streaming pattern). `reader` only allocates; the reads do

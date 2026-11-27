@@ -1,10 +1,11 @@
 //! `sys` module — sema facet (ticket #97, D-0056).
 
+use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
 
-use super::{expect_argc, ModuleCheck};
-use crate::{Checker, Ty};
+use super::{expect_argc, expect_argc_range, ModuleCheck};
+use crate::{assignable, expr_span, Checker, Ty};
 
 pub(super) const MODULE: ModuleCheck = ModuleCheck { name: "sys", check };
 
@@ -53,6 +54,24 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "cpu_sve_vl" => {
             expect_argc(checker, "sys", method, args, 0, span);
             Ty::Int64
+        }
+        // sys.getpass([prompt]) -> str (#1684): read one line from stdin with
+        // terminal echo suppressed. The optional prompt (default "Password: ",
+        // filled by the lowerer) is a str written to stderr. Raises OSError when
+        // stdin is not a terminal and EOFError at end-of-input.
+        "getpass" => {
+            expect_argc_range(checker, "sys", method, args, 0, 1, span);
+            if let Some(arg) = args.first() {
+                let t = checker.infer(&arg.value);
+                if !assignable(&t, &Ty::Str) {
+                    checker.error(
+                        ErrorCode::ZAP4024,
+                        format!("sys.getpass() prompt must be a str, found {}", t.display()),
+                        expr_span(&arg.value),
+                    );
+                }
+            }
+            Ty::Str
         }
         _ => return None,
     })
