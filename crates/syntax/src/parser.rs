@@ -2276,6 +2276,16 @@ struct Namespace:
             raise ValueError(\"argument is not a single character: '\" + v + \"'\")
         return v[0]
 
+    # The value parsed as an arbitrary-precision integer (#1657; raises a
+    # catchable `ValueError` if it is not a valid integer literal).
+    def get_bigint(self, str name) -> bigint:
+        return bigint(self._vals[name])
+
+    # The value parsed as a complex number (#1657; raises a catchable `ValueError`
+    # on a malformed literal, e.g. accepts \"1+2j\").
+    def get_complex(self, str name) -> complex:
+        return complex(self._vals[name])
+
     # Whether `name` was explicitly supplied on the command line (vs defaulted).
     def has(self, str name) -> bool:
         if name in self._present:
