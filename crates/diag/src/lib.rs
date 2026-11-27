@@ -401,6 +401,14 @@ define_codes! {
          comparison, or bitwise operation. Zap performs no implicit \
          signed<->unsigned conversion (#552, D-0019): convert one side \
          explicitly first, e.g. `uint64(x)` or `int64(x)`.";
+    ZAP4016 = 4016 : "integer literal out of range for its type",
+        "An untyped integer literal was inferred into a fixed-width integer \
+         type (a narrow declared/annotated target, or the concrete operand of \
+         a width-stable arithmetic operation) but is not representable in it \
+         (#1654). Fixed-width integer arithmetic is width-stable and the \
+         literal adopts the context type, so it must fit; use the explicit \
+         `uintN(...)` / `intN(...)` wrapping conversion if truncation is \
+         intended.";
     ZAP4020 = 4020 : "wrong number of arguments",
         "A call passed too few or too many arguments for the callee's arity.";
     ZAP4021 = 4021 : "argument type mismatch",

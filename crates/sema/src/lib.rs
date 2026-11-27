@@ -2639,6 +2639,44 @@ impl Checker {
         }
     }
 
+    /// #1654 rule 3: an untyped integer literal inferred into a fixed-width
+    /// integer type must be representable in that type, or it is a compile error
+    /// (`ZAP4016`). Fixed-width integer arithmetic is width-stable and the
+    /// literal adopts its context type (a narrow declared/annotated target, or
+    /// the concrete operand of a width-stable arithmetic op) instead of
+    /// defaulting to `int64`, so an out-of-range literal would silently wrap —
+    /// which this rejects.
+    ///
+    /// Only a *statically-constant* integer literal is checked (a bare literal,
+    /// optionally with a unary sign); a runtime value is never range-checked
+    /// here. An explicit `uintN(...)`/`intN(...)` is a `Call`, not a literal, so
+    /// it never reaches here and keeps its wrapping C-cast semantics
+    /// (D-0019/D-0020). `target` types that do not constrain a literal
+    /// (`int64`, `bigint`, floats, non-numerics) make this a no-op via
+    /// [`int_ty_range`].
+    fn check_int_literal_range(&mut self, e: &Expr, target: &Ty) {
+        let Some((lo, hi)) = int_ty_range(target) else {
+            return;
+        };
+        let Some(v) = const_int_lit(e) else {
+            return;
+        };
+        let v = v as i128;
+        if v < lo || v > hi {
+            self.error(
+                ErrorCode::ZAP4016,
+                format!(
+                    "integer literal {v} is out of range for {} (valid range {lo}..={hi}); \
+                     fixed-width integer arithmetic is width-stable (#1654), so the literal \
+                     must fit — use {}({v}) if a wrapping conversion is intended",
+                    target.display(),
+                    target.display(),
+                ),
+                expr_span(e),
+            );
+        }
+    }
+
     /// Check that struct `sname` structurally conforms to interface `iname`
     /// (D-0016): every interface method is present with a matching signature
     /// (parameter types excluding `self`, and return type). On failure, returns
@@ -4847,6 +4885,9 @@ impl Checker {
                             );
                         }
                         self.check_collection_literal_elems(value, &vt, &dt);
+                        // #1654 rule 3: an untyped literal initializer adopts the
+                        // declared/annotated fixed-width type and must fit it.
+                        self.check_int_literal_range(value, &dt);
                         dt
                     }
                 };
@@ -5354,6 +5395,9 @@ impl Checker {
                             );
                         }
                         self.check_collection_literal_elems(value, &vt, &dt);
+                        // #1654 rule 3: an untyped literal initializer adopts the
+                        // declared/annotated fixed-width type and must fit it.
+                        self.check_int_literal_range(value, &dt);
                         dt
                     }
                 };
@@ -5389,6 +5433,9 @@ impl Checker {
                                 );
                             }
                             self.check_collection_literal_elems(value, &vt, &dt);
+                            // #1654 rule 3: an untyped literal reassigned into a
+                            // fixed-width binding adopts its type and must fit.
+                            self.check_int_literal_range(value, &dt);
                         }
                         None => self.error(
                             ErrorCode::ZAP3002,
@@ -5433,6 +5480,9 @@ impl Checker {
                                         );
                                     }
                                     self.check_collection_literal_elems(value, &vt, &dt);
+                                    // #1654 rule 3: the (single) RHS literal adopts
+                                    // each fixed-width target's type and must fit.
+                                    self.check_int_literal_range(value, &dt);
                                 }
                                 None => self.error(
                                     ErrorCode::ZAP3002,
@@ -5483,6 +5533,12 @@ impl Checker {
                                 Some(ty) => ty,
                                 None => self.arith_result(*op, &tt, &vt, *span),
                             };
+                            // #1654 rule 3: `c += <literal>` keeps `c`'s
+                            // fixed-width type (the counter case), so the literal
+                            // operand must fit it (`c += 300` on a `uint8` is an
+                            // error, `c += 1` wraps). A struct `__iadd__` has a
+                            // non-int `tt`, making this a no-op.
+                            self.check_int_literal_range(value, &tt);
                             if !assignable(&r, &tt) {
                                 self.error(
                                     ErrorCode::ZAP4002,
@@ -6648,7 +6704,16 @@ impl Checker {
                 if let Some(ty) = self.check_struct_binop(*op, &l, &r, *span) {
                     ty
                 } else {
-                    self.arith_result(*op, &l, &r, *span)
+                    let res = self.arith_result(*op, &l, &r, *span);
+                    // #1654 rule 3: in a width-stable arithmetic op an untyped
+                    // literal operand adopts the result's fixed-width type
+                    // (`uint8_v + 300` is an error, `uint8_v + 3` wraps). A
+                    // non-literal operand, or a result that is not a narrow
+                    // fixed-width int (e.g. a `bool` comparison result, `int64`,
+                    // a float), makes this a no-op.
+                    self.check_int_literal_range(lhs, &res);
+                    self.check_int_literal_range(rhs, &res);
+                    res
                 }
             }
             Expr::Compare { first, rest, span } => {
@@ -14159,6 +14224,26 @@ fn enum_discriminant_bits(e: &EnumDef) -> Option<u64> {
 /// Bits needed to represent `n` as an unsigned value (at least 1).
 fn bits_for(n: u64) -> u64 {
     u64::from(64 - n.leading_zeros()).max(1)
+}
+
+/// The inclusive representable range of a fixed-width integer type, as `i128`
+/// (wide enough to hold every bound exactly), or `None` for a type that does not
+/// constrain an untyped integer literal (#1654). `int64` is intentionally
+/// excluded: an untyped literal that survives as `UntypedInt` already fits `i64`
+/// (a wider literal is parsed as `bigint`, not `UntypedInt`), so there is
+/// nothing to range-check there. `uint64`/`usize` carry a `0` lower bound so a
+/// *negative* literal into an unsigned slot is rejected here (the literal is
+/// sign-agnostic to `assignable`, which is why the sign check lives at the
+/// checker, where the value is known).
+fn int_ty_range(t: &Ty) -> Option<(i128, i128)> {
+    Some(match t {
+        Ty::Int32 => (i32::MIN as i128, i32::MAX as i128),
+        Ty::Uint8 => (0, u8::MAX as i128),
+        Ty::Uint16 => (0, u16::MAX as i128),
+        Ty::Uint32 => (0, u32::MAX as i128),
+        Ty::Uint64 | Ty::Usize => (0, u64::MAX as i128),
+        _ => return None,
+    })
 }
 
 /// Evaluate a simple constant integer expression (an int literal, optionally
@@ -22763,6 +22848,149 @@ def main():
         ok("def main():\n    uint8 x = 5\n    auto y = x + 1\n    auto z = x * 2\n    auto w = x << 1\n    print(y)\n    print(z)\n    print(w)\n");
         // The all-signed tower is unaffected.
         ok("def main():\n    int64 s = 1\n    int32 t = 2\n    auto r = s + t\n    print(r)\n");
+    }
+
+    // ---- #1654: width-stable arithmetic typing + literal range check (ZAP4016) ----
+    //
+    // These pin the *type-system* foundation (#1676): `num_join` is width-stable
+    // (verified exhaustively as a unit test in `zapc_sema_types`) and an untyped
+    // integer literal inferred into a fixed-width type must be representable
+    // (`ZAP4016`). The *runtime* wrap (`uint8(200)+uint8(100) == 44`) is the
+    // separate codegen half (#1677) and is pinned by goldens there, not here.
+
+    #[test]
+    fn width_stable_same_width_binding_type_is_pinned() {
+        // A same-width arithmetic result stays that width (not promoted to
+        // uint64/int64): assigning it into the SAME narrow slot is accepted,
+        // which pins the result type without needing the runtime.
+        ok("def main():\n    uint8 a = 10\n    uint8 b = 20\n    uint8 c = a + b\n    print(c)\n");
+        ok("def main():\n    uint16 a = 10\n    uint16 b = 20\n    uint16 c = a * b\n    print(c)\n");
+        ok("def main():\n    uint32 a = 10\n    uint32 b = 20\n    uint32 c = a - b\n    print(c)\n");
+        ok("def main():\n    int32 a = 10\n    int32 b = 20\n    int32 c = a + b\n    print(c)\n");
+        // The adopting-literal form binds back into the narrow slot too.
+        ok("def main():\n    uint8 a = 10\n    uint8 c = a + 5\n    print(c)\n");
+        ok("def main():\n    int32 a = 10\n    int32 c = a * 3\n    print(c)\n");
+    }
+
+    #[test]
+    fn width_stable_mixed_width_binding_widens_to_larger() {
+        // A mixed-width result is the larger operand's type; it binds into the
+        // larger slot, and a same-width implicit widen still works.
+        ok("def main():\n    uint8 a = 1\n    uint16 b = 2\n    uint16 c = a + b\n    print(c)\n");
+        ok("def main():\n    uint8 a = 1\n    uint32 b = 2\n    uint32 c = a + b\n    print(c)\n");
+        ok("def main():\n    int32 a = 1\n    int64 b = 2\n    int64 c = a + b\n    print(c)\n");
+    }
+
+    #[test]
+    fn literal_out_of_range_for_narrow_binding_is_rejected() {
+        // An untyped literal initializer must fit the declared fixed-width type
+        // (#1654 rule 3): oversize positive, and negative-into-unsigned.
+        assert!(has_code(
+            "def main():\n    uint8 x = 300\n    print(x)\n",
+            ErrorCode::ZAP4016
+        ));
+        assert!(has_code(
+            "def main():\n    uint16 x = 70000\n    print(x)\n",
+            ErrorCode::ZAP4016
+        ));
+        assert!(has_code(
+            "def main():\n    uint32 x = 5000000000\n    print(x)\n",
+            ErrorCode::ZAP4016
+        ));
+        assert!(has_code(
+            "def main():\n    int32 x = 5000000000\n    print(x)\n",
+            ErrorCode::ZAP4016
+        ));
+        assert!(has_code(
+            "def main():\n    int32 x = -5000000000\n    print(x)\n",
+            ErrorCode::ZAP4016
+        ));
+        // Negative literal into any unsigned type (the value/sign is known at
+        // the checker; `assignable` treats the bare literal as sign-agnostic).
+        assert!(has_code(
+            "def main():\n    uint8 x = -1\n    print(x)\n",
+            ErrorCode::ZAP4016
+        ));
+        assert!(has_code(
+            "def main():\n    uint64 x = -1\n    print(x)\n",
+            ErrorCode::ZAP4016
+        ));
+        assert!(has_code(
+            "def main():\n    usize x = -1\n    print(x)\n",
+            ErrorCode::ZAP4016
+        ));
+    }
+
+    #[test]
+    fn literal_in_range_for_narrow_binding_is_accepted() {
+        // The boundary values fit, and the context-free `int64` default keeps a
+        // large literal usable where no narrow context forces it.
+        ok("def main():\n    uint8 x = 255\n    print(x)\n");
+        ok("def main():\n    uint8 x = 0\n    print(x)\n");
+        ok("def main():\n    uint16 x = 65535\n    print(x)\n");
+        ok("def main():\n    uint32 x = 4294967295\n    print(x)\n");
+        ok("def main():\n    int32 x = 2147483647\n    print(x)\n");
+        ok("def main():\n    int32 x = -2147483648\n    print(x)\n");
+        ok("def main():\n    int64 x = 5000000000\n    print(x)\n");
+        ok("def main():\n    auto x = 5000000000\n    print(x)\n");
+    }
+
+    #[test]
+    fn explicit_narrowing_cast_still_wraps_and_is_accepted() {
+        // The explicit `uintN(...)`/`intN(...)` wrap escape hatch (D-0019/D-0020)
+        // is a call, not a bare literal, so it never trips ZAP4016 even with an
+        // oversize argument.
+        ok("def main():\n    uint8 x = uint8(300)\n    print(x)\n");
+        ok("def main():\n    int32 x = int32(5000000000)\n    print(x)\n");
+        ok("def main():\n    uint8 x = uint8(-1)\n    print(x)\n");
+    }
+
+    #[test]
+    fn literal_out_of_range_as_arithmetic_operand_is_rejected() {
+        // #1654 rule 3 in arithmetic context: the literal adopts the concrete
+        // operand's width, so it must fit (`uint8_v + 300` is an error), while a
+        // fitting literal is fine (`uint8_v + 3`).
+        assert!(has_code(
+            "def main():\n    uint8 a = 1\n    auto y = a + 300\n    print(y)\n",
+            ErrorCode::ZAP4016
+        ));
+        assert!(has_code(
+            "def main():\n    uint8 a = 1\n    auto y = 300 + a\n    print(y)\n",
+            ErrorCode::ZAP4016
+        ));
+        assert!(has_code(
+            "def main():\n    int32 a = 1\n    auto y = a * 5000000000\n    print(y)\n",
+            ErrorCode::ZAP4016
+        ));
+        ok("def main():\n    uint8 a = 1\n    auto y = a + 3\n    print(y)\n");
+        // A wider operand makes the same literal fit.
+        ok("def main():\n    uint32 a = 1\n    auto y = a + 300\n    print(y)\n");
+    }
+
+    #[test]
+    fn literal_out_of_range_in_augmented_assign_is_rejected() {
+        // The counter case (#1654): `c += <lit>` keeps `c`'s narrow width, so an
+        // oversize literal is rejected while an in-range one is fine.
+        assert!(has_code(
+            "def main():\n    uint8 c = 0\n    c += 300\n    print(c)\n",
+            ErrorCode::ZAP4016
+        ));
+        assert!(has_code(
+            "def main():\n    int32 c = 0\n    c -= 5000000000\n    print(c)\n",
+            ErrorCode::ZAP4016
+        ));
+        ok("def main():\n    uint8 c = 0\n    c += 1\n    print(c)\n");
+    }
+
+    #[test]
+    fn literal_out_of_range_on_reassignment_is_rejected() {
+        // A plain reassignment adopts the binding's narrow type the same way an
+        // initializer does.
+        assert!(has_code(
+            "def main():\n    uint8 c = 0\n    c = 300\n    print(c)\n",
+            ErrorCode::ZAP4016
+        ));
+        ok("def main():\n    uint8 c = 0\n    c = 200\n    print(c)\n");
     }
 
     #[test]
