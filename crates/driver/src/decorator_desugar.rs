@@ -613,6 +613,7 @@ fn try_build_rebind(
     // handler (no seam) and the outer wraps (which thread the composed object) stay
     // the trailing positional argument.
     let mut chain = Expr::Name(base_name, f.span);
+    let n_dotted = dotted.len();
     for (i, d) in dotted.iter().rev().enumerate() {
         let Some(rd) = resolve_dotted(
             &d.name,
@@ -628,7 +629,7 @@ fn try_build_rebind(
         ) else {
             continue;
         };
-        let args = match (i, handler_param.as_deref()) {
+        let mut args = match (i, handler_param.as_deref()) {
             // Innermost decorator with a named handler seam: pass the adapter by
             // the handler parameter's name and route any positional metadata around
             // its slot (#1626/#1645).
@@ -646,6 +647,13 @@ fn try_build_rebind(
                 args
             }
         };
+        // #1665: the OUTERMOST decorator (processed last) defaults an omitted
+        // `str name` parameter to the decorated declaration's name (Click-style
+        // `@command` naming), so a package can recover the decl name when `name=`
+        // is not given.
+        if i + 1 == n_dotted {
+            fill_decl_name(&mut args, &rd.params, &orig_name, d.span);
+        }
         chain = Expr::Call {
             callee: Box::new(rd.callee),
             args,
@@ -744,6 +752,42 @@ fn innermost_wrap_args(
     }
     args.push(handler_kw);
     args
+}
+
+/// Default an OMITTED `str name` parameter of the outermost returning decorator to
+/// the decorated declaration's name `decl_name` (#1665, Click-style `@command`
+/// naming). Fires only when the receiver declares a `str name` parameter and the
+/// call binds it neither by the `name=` keyword nor by a leading positional in its
+/// slot — an explicit name always wins, and a decorator with no `str name`
+/// parameter is left unchanged. Appended as a keyword argument so it never
+/// collides with the by-name handler or the threaded composed object.
+fn fill_decl_name(
+    args: &mut Vec<Arg>,
+    params: &[(String, Option<Type>)],
+    decl_name: &str,
+    span: Span,
+) {
+    let Some(name_idx) = params.iter().position(|(n, t)| {
+        n == "name"
+            && matches!(t, Some(Type::Named { name, args, .. }) if name == "str" && args.is_empty())
+    }) else {
+        return;
+    };
+    // Bound by keyword, or by a leading positional reaching the `name` slot? Then
+    // the caller supplied it — leave it.
+    if args.iter().any(|a| a.name.as_deref() == Some("name")) {
+        return;
+    }
+    let leading_positional = args.iter().take_while(|a| a.name.is_none()).count();
+    if leading_positional > name_idx {
+        return;
+    }
+    args.push(Arg {
+        name: Some("name".to_string()),
+        value: str_lit(decl_name, span),
+        spread: ArgSpread::None,
+        span,
+    });
 }
 
 /// Classify the trailing-parameter type `t` of a returning decorator's receiver
@@ -3505,6 +3549,134 @@ mod tests {
                 .any(|a| matches!(&a.value, Expr::Call { callee, .. }
                 if matches!(callee.as_ref(), Expr::Attr { name, .. } if name == "argument"))),
             "the composed inner argument(...) object is threaded into command(...): {args:?}"
+        );
+    }
+
+    // ---- #1665: decl name defaults an omitted `name` on the outermost decorator --
+
+    // The string value of a keyword argument `kw` in `args`, if present.
+    fn kw_str<'a>(args: &'a [Arg], kw: &str) -> Option<&'a str> {
+        args.iter().find_map(|a| match (&a.name, &a.value) {
+            (Some(n), Expr::Str { value, .. }) if n == kw => Some(value.as_str()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn omitted_name_defaults_to_decl_name() {
+        // #1665: `@cli.command` with no `name=` defaults the receiver's `str name`
+        // parameter to the decorated declaration's name (`"greet"`), Click-style.
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, str name = \"\", fn(Namespace) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(str who) -> str:\n    return who\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let args = rebind_call_args(&main_stmts(&m)[1], "greet").expect("greet rebound");
+        assert_eq!(
+            kw_str(args, "name"),
+            Some("greet"),
+            "the omitted `name` defaults to the decl name: {args:?}"
+        );
+        // The handler is still passed by name alongside it.
+        assert!(args.iter().any(|a| a.name.as_deref() == Some("handler")
+            && matches!(&a.value, Expr::Name(n, _) if n == "greet$adapter")));
+    }
+
+    #[test]
+    fn explicit_name_is_not_overwritten() {
+        // An explicit `name=` wins; the decl name does not override it, and no
+        // duplicate `name` argument is added.
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, str name = \"\", fn(Namespace) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command(name=\"alias\")\ndef greet(str who) -> str:\n    return who\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let args = rebind_call_args(&main_stmts(&m)[1], "greet").expect("greet rebound");
+        assert_eq!(kw_str(args, "name"), Some("alias"), "explicit name kept");
+        assert_eq!(
+            args.iter()
+                .filter(|a| a.name.as_deref() == Some("name"))
+                .count(),
+            1,
+            "no duplicate `name` argument: {args:?}"
+        );
+    }
+
+    #[test]
+    fn no_name_param_is_unaffected() {
+        // A receiver with no `str name` parameter gets no synthesized `name`.
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, fn(Namespace) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(str who) -> str:\n    return who\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let args = rebind_call_args(&main_stmts(&m)[1], "greet").expect("greet rebound");
+        assert!(
+            !args.iter().any(|a| a.name.as_deref() == Some("name")),
+            "no `name` argument synthesized when the receiver has no `str name`: {args:?}"
+        );
+    }
+
+    #[test]
+    fn decl_name_fills_only_the_outermost_decorator() {
+        // #1665: in a stack, only the OUTERMOST decorator's omitted `name` defaults
+        // to the decl name; an inner decorator's omitted `name` keeps its own
+        // default (its command/argument name is its own concern).
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, str name = \"\", fn(Namespace) -> str handler) -> Command:\n        return Command()\n\
+             struct Wrap:\n    def wrap(self, Command inner, str name = \"\") -> Command:\n        return inner\n\
+             @w.wrap\n@cli.command\ndef greet(str who) -> str:\n    return who\n\
+             def main():\n    auto cli = Cli()\n    auto w = Wrap()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        // Outer `w.wrap(...)` call (greet's rebind) carries name="greet".
+        let outer = main_stmts(&m)
+            .iter()
+            .find_map(|s| match s {
+                Stmt::Let {
+                    name,
+                    value: Expr::Call { callee, args, .. },
+                    ..
+                } if name == "greet" => Some((callee, args)),
+                _ => None,
+            })
+            .expect("greet rebound");
+        assert!(
+            matches!(outer.0.as_ref(), Expr::Attr { name, .. } if name == "wrap"),
+            "outermost is w.wrap"
+        );
+        assert_eq!(
+            kw_str(outer.1, "name"),
+            Some("greet"),
+            "outermost gets the decl name"
+        );
+        // The inner `cli.command(...)` object threaded into wrap has NO `name`.
+        let inner_args = outer
+            .1
+            .iter()
+            .find_map(|a| match &a.value {
+                Expr::Call { callee, args, .. }
+                    if matches!(callee.as_ref(), Expr::Attr { name, .. } if name == "command") =>
+                {
+                    Some(args)
+                }
+                _ => None,
+            })
+            .expect("inner command(...) threaded");
+        assert!(
+            !inner_args.iter().any(|a| a.name.as_deref() == Some("name")),
+            "the inner decorator's `name` is NOT auto-filled: {inner_args:?}"
         );
     }
 }

@@ -9,7 +9,11 @@
 #
 #     @cli.command(name="alias")   ==>   greet = cli.command(name="alias",
 #     def greet(...)                                          handler=greet$adapter)
-#     @cli.command                 ==>   plain = cli.command(handler=plain$adapter)
+#     @cli.command                 ==>   plain = cli.command(handler=plain$adapter,
+#     def plain(...)                                          name="plain")
+#
+# An omitted `name=` now defaults to the decorated declaration's name (#1665), so
+# `plain`'s command is labelled "plain" (the second output line).
 
 struct Command:
     str label
