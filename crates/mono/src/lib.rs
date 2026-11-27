@@ -191,6 +191,50 @@ fn int_unsigned(c: &CTy) -> Option<bool> {
     }
 }
 
+/// The bit width of a fixed-width (or `usize`/untyped) integer type by name, for
+/// the width-stable arithmetic join (#1654). `None` for anything that is not a
+/// fixed-width integer (`bigint`, floats, complex, a collection, a user type) —
+/// the caller then falls back to the family promotion in [`Mono::num_join`].
+fn int_name_width(c: &CTy) -> Option<u32> {
+    let CTy::Ty(Type::Named { name, args, .. }) = c else {
+        return None;
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    Some(match name.as_str() {
+        // `int` is the untyped-int literal's name; it joins like `int64`.
+        "int" | "int64" | "i64" => 64,
+        "int32" | "i32" => 32,
+        "int16" | "i16" => 16,
+        "int8" | "i8" => 8,
+        "uint8" | "u8" => 8,
+        "uint16" | "u16" => 16,
+        "uint32" | "u32" => 32,
+        "uint64" | "u64" => 64,
+        "usize" => 64,
+        _ => return None,
+    })
+}
+
+/// True for an untyped integer literal operand — a bare `Expr::Int` or a unary
+/// `+`/`-` of one (#1654). Mono types every int literal as `int64`, so (as in
+/// `zapc_ir` lowering) the AST is the only place the untyped-ness survives; it
+/// lets the width-stable join apply num_join's "a literal adopts the concrete
+/// operand's width" rule. A `uintN(...)`/`intN(...)` cast is a `Call`, so it is a
+/// concrete operand here, not an adopting literal.
+fn is_untyped_int_literal(e: &Expr) -> bool {
+    match e {
+        Expr::Int(..) => true,
+        Expr::Unary {
+            op: UnOp::Neg | UnOp::Pos,
+            expr,
+            ..
+        } => is_untyped_int_literal(expr),
+        _ => false,
+    }
+}
+
 /// `+` on two identical sequence types concatenates to that type, mirroring
 /// sema: `str + str` → `str`, `bytes + bytes` → `bytes`, and
 /// `list[T] + list[U]` → the left list's type. Anything else is not a
@@ -3560,7 +3604,7 @@ impl Mono<'_> {
     /// (#1128). An operand it cannot type leaves the result `Unknown`, so no
     /// previously-inferring site changes behaviour and a genuinely unresolvable
     /// parameter is still rejected.
-    fn binary_result(&self, op: BinOp, l: &CTy, r: &CTy) -> CTy {
+    fn binary_result(&self, op: BinOp, lhs: &Expr, l: &CTy, rhs: &Expr, r: &CTy) -> CTy {
         use BinOp::*;
         match op {
             // Logical, membership and identity operators are always `bool`,
@@ -3589,20 +3633,23 @@ impl Mono<'_> {
                 }
                 _ => CTy::Unknown,
             },
-            // `+` promotes two numbers, or concatenates two equal sequence
-            // types (`str`/`bytes`/`list`).
+            // `+` promotes two numbers (width-stable for fixed-width integers,
+            // #1654), or concatenates two equal sequence types
+            // (`str`/`bytes`/`list`).
             Add => match (num_kind(l), num_kind(r)) {
-                (Some(a), Some(b)) => self.num_join(a, b),
+                (Some(a), Some(b)) => self.arith_join(lhs, l, a, rhs, r, b),
                 _ => same_sequence(l, r),
             },
             // The remaining arithmetic operators require numbers; `//` and `%`
             // additionally reject complex (sema).
             Sub | Mul | Pow => match (num_kind(l), num_kind(r)) {
-                (Some(a), Some(b)) => self.num_join(a, b),
+                (Some(a), Some(b)) => self.arith_join(lhs, l, a, rhs, r, b),
                 _ => CTy::Unknown,
             },
             FloorDiv | Mod => match (num_kind(l), num_kind(r)) {
-                (Some(a), Some(b)) if a != Num::Complex && b != Num::Complex => self.num_join(a, b),
+                (Some(a), Some(b)) if a != Num::Complex && b != Num::Complex => {
+                    self.arith_join(lhs, l, a, rhs, r, b)
+                }
                 _ => CTy::Unknown,
             },
             // Bitwise/shift need (non-bigint) integer operands and yield
@@ -3615,6 +3662,38 @@ impl Mono<'_> {
             // carry no useful inference type.
             MatMul | Send => CTy::Unknown,
         }
+    }
+
+    /// The result type of an arithmetic operation on two numeric operands,
+    /// width-stable for fixed-width integers (#1654) and the family promotion
+    /// (`num_join`) otherwise. When both operands are fixed-width integers the
+    /// result is width-stable, mirroring sema: an untyped literal operand adopts
+    /// the concrete operand's type, two literals keep the `int64` default, and
+    /// two concrete operands widen to the larger. (Mono types every int literal
+    /// as `int64`, so literal-ness is read from the AST, as in `zapc_ir`
+    /// lowering.) A `bigint`/float/complex operand falls through to `num_join`'s
+    /// promote-to-wider-family rule.
+    fn arith_join(&self, le: &Expr, l: &CTy, a: Num, re: &Expr, r: &CTy, b: Num) -> CTy {
+        if let (Some(lw), Some(rw)) = (int_name_width(l), int_name_width(r)) {
+            let l_lit = is_untyped_int_literal(le);
+            let r_lit = is_untyped_int_literal(re);
+            return match (l_lit, r_lit) {
+                // Both untyped → the `int64` default.
+                (true, true) => self.prim("int64"),
+                // An untyped literal adopts the concrete operand's type.
+                (false, true) => l.clone(),
+                (true, false) => r.clone(),
+                // Two concrete operands widen to the larger (ties keep the left).
+                (false, false) => {
+                    if lw >= rw {
+                        l.clone()
+                    } else {
+                        r.clone()
+                    }
+                }
+            };
+        }
+        self.num_join(a, b)
     }
 
     /// A read-only best-effort type for an lvalue/name (no rewriting).
@@ -3924,7 +4003,7 @@ impl Mono<'_> {
                         *span,
                     );
                 }
-                let cty = self.binary_result(*op, &lcty, &rcty);
+                let cty = self.binary_result(*op, lhs, &lcty, rhs, &rcty);
                 Ok((
                     Expr::Binary {
                         op: *op,

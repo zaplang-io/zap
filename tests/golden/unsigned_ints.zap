@@ -8,9 +8,10 @@
 # explicit cross-sign conversions. Every width maximum is built with `uintN(-1)`
 # (a C reinterpret cast) so no 64-bit-unsigned decimal literal is needed.
 #
-# Arithmetic promotes to uint64 and wraps modulo 2^64 (mirroring the signed
-# tower's promotion to int64, D-0019); a narrower unsigned result comes from an
-# explicit `uintN(...)` cast. `usize` is the pointer-width unsigned type.
+# Fixed-width integer arithmetic is WIDTH-STABLE and wraps at the operand width
+# (#1654, decisions/lang/1654-fixed-width-integer-semantics.md; supersedes the
+# promote-to-64 clause of D-0019): `uint8 + uint8` stays `uint8` and wraps modulo
+# 256. `usize` is the pointer-width unsigned type.
 
 def udiv(uint64 a, uint64 b) -> uint64:
     return a // b
@@ -22,11 +23,12 @@ def main():
     print(uint32(-1))  # 4294967295
     print(uint64(-1))  # 18446744073709551615
 
-    # Small-value arithmetic promotes to uint64; a narrowing cast wraps mod 256.
+    # Same-width arithmetic is width-stable: `uint8 + uint8` stays `uint8` and
+    # wraps modulo 256, so 200 + 100 == 44 (no explicit cast needed).
     uint8 a = 200
     uint8 b = 100
-    print(a + b)  # 300  (computed at uint64 width, no 8-bit wrap yet)
-    print(uint8(a + b))  # 44   (explicit narrowing wraps modulo 256)
+    print(a + b)  # 44  (width-stable: wraps modulo 256)
+    print(uint8(a + b))  # 44  (the explicit cast is now redundant)
 
     # Unsigned comparison: 2^64-1 > 1 (a signed read would see the bits as -1).
     uint64 big = uint64(-1)

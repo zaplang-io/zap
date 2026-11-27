@@ -8254,7 +8254,32 @@ impl<'a> FnLower<'a> {
                         });
                         Ok((d, int_ty))
                     }
-                    _ => self.binop(*op, l, lt, r, rt),
+                    _ => {
+                        let (d, rty) = self.binop(*op, l, lt, r, rt)?;
+                        // #1654 / I#1677: fixed-width integer arithmetic is
+                        // width-stable. The arithmetic arms compute at a 64-bit
+                        // width; wrap the result back to the declared width
+                        // (two's-complement) so e.g. `uint8(200) + uint8(100)` is
+                        // `44`, not `300`. `coerce` is a no-op when there is no
+                        // narrowing, and only the arithmetic operators narrow
+                        // (comparisons yield `bool`; bitwise/shift keep 64-bit,
+                        // matching sema).
+                        if matches!(
+                            op,
+                            AstBin::Add
+                                | AstBin::Sub
+                                | AstBin::Mul
+                                | AstBin::Mod
+                                | AstBin::FloorDiv
+                                | AstBin::Pow
+                        ) {
+                            if let Some(narrow) = width_stable_int_result(lhs, lt, rhs, rt, rty) {
+                                let nd = self.coerce(d, rty, narrow);
+                                return Ok((nd, narrow));
+                            }
+                        }
+                        Ok((d, rty))
+                    }
                 }
             }
             // Chained comparison `x0 op1 x1 op2 x2 ...` with Python semantics
@@ -18139,6 +18164,69 @@ fn is_negative_int_literal(e: &Expr) -> bool {
         e,
         Expr::Unary { op: AstUn::Neg, expr, .. } if matches!(expr.as_ref(), Expr::Int(_, _))
     )
+}
+
+/// True for an **untyped integer literal** operand — a bare `Expr::Int` or a
+/// unary `+`/`-` applied to one (e.g. `5`, `-5`, `+5`), the syntactic shape sema
+/// treats as `UntypedInt` (#1654). Lowering types every int literal as `i64`
+/// (`Expr::Int` → `Ty::I64`), so this AST test is the only place the
+/// untyped-ness survives into lowering: it lets [`width_stable_int_result`]
+/// apply num_join's "a literal adopts the concrete operand's width" rule, which
+/// the ZIR operand types alone cannot (a literal and a concrete `int64` are both
+/// `Ty::I64`). A `uintN(...)`/`intN(...)` cast is a `Call`, not a literal, so it
+/// is a concrete operand here (its own width), never an adopting literal.
+fn is_untyped_int_literal(e: &Expr) -> bool {
+    match e {
+        Expr::Int(..) => true,
+        Expr::Unary {
+            op: AstUn::Neg | AstUn::Pos,
+            expr,
+            ..
+        } => is_untyped_int_literal(expr),
+        _ => false,
+    }
+}
+
+/// The width-stable result type of a fixed-width integer arithmetic op (#1654,
+/// I#1677), mirroring sema's `num_join`. The arithmetic arms compute at a 64-bit
+/// width (`wide`, `U64`/`I64`) and return it; this says which narrower
+/// fixed-width type that result must be wrapped back to so the op wraps at the
+/// declared width (two's-complement), or `None` when no narrowing applies (a
+/// non-integer result, the context-free `int64`/`uint64` default, or a 64-bit
+/// result). An untyped integer literal operand adopts the *other* (concrete)
+/// operand's type; two literals keep the 64-bit default; two concrete operands
+/// widen to the larger. Signed↔unsigned mixing is rejected by sema (ZAP4015)
+/// before lowering, so `wide` and the chosen narrow type always share a sign.
+fn width_stable_int_result(lhs: &Expr, lt: Ty, rhs: &Expr, rt: Ty, wide: Ty) -> Option<Ty> {
+    // Both operands must be fixed-width integers (a literal is `I64` here); a
+    // `bigint`/float/other result never narrows.
+    lt.int_width()?;
+    rt.int_width()?;
+    let l_lit = is_untyped_int_literal(lhs);
+    let r_lit = is_untyped_int_literal(rhs);
+    let ty = match (l_lit, r_lit) {
+        // Both untyped literals → the 64-bit default (`5 + 3 → int64`): no narrow.
+        (true, true) => return None,
+        // An untyped literal adopts the concrete operand's type.
+        (false, true) => lt,
+        (true, false) => rt,
+        // Two concrete operands widen to the larger (ties keep the left).
+        (false, false) => {
+            if rt.int_width() > lt.int_width() {
+                rt
+            } else {
+                lt
+            }
+        }
+    };
+    // Only a genuine fixed-width integer narrower than the 64-bit compute type
+    // is wrapped; a 64-bit result (`int64`/`uint64`/`usize`), `char`, or a tier-1
+    // enum word is left at its computed width.
+    if ty != wide && matches!(ty, Ty::I8 | Ty::I16 | Ty::I32 | Ty::U8 | Ty::U16 | Ty::U32) {
+        Some(ty)
+    } else {
+        None
+    }
 }
 
 /// Stable runtime ids for the built-in exception hierarchy (I#471). Keep these
