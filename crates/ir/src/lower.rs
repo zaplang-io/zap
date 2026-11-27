@@ -2385,6 +2385,7 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
             "char" => Ok(Ty::Char),
             "str" => Ok(Ty::Ptr),
             "bytes" => Ok(Ty::Bytes),
+            "bytearray" => Ok(Ty::ByteArray),
             // A borrowed `strview` (#1082) lowers to a by-value tuple
             // `(backing: str, byte_off: int64, byte_len: int64)`. Reusing the
             // tuple/value-aggregate machinery means the `backing` pointer is
@@ -2842,6 +2843,11 @@ fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError
         | Ty::AtomicArray(_)
         | Ty::ContextVar(_)
         | Ty::Deque(_)
+        // A `bytearray` element is a pointer word, but its full type is interned
+        // (like a nested collection, #1385) so read-back recovers `Ty::ByteArray`
+        // — `a[i]`, iteration, `len`, and the mutation methods then dispatch
+        // correctly instead of defaulting the bare pointer to `str`.
+        | Ty::ByteArray
         | Ty::OSet(_) => Ok(Elem::Nested(nested.borrow_mut().intern(t))),
         // A variadic `tuple[T]` element/key is hashable (#1474): its own kind,
         // carrying the interned `Ty::VarTuple(...)` for read-back (like `Nested`)
@@ -6884,6 +6890,7 @@ impl<'a> FnLower<'a> {
         match ty {
             Ty::Ptr => Some("str"),
             Ty::Bytes => Some("bytes"),
+            Ty::ByteArray => Some("bytearray"),
             Ty::List(_) => Some("list"),
             Ty::VarTuple(_) => Some("tuple"),
             Ty::Dict(..) => Some("dict"),
@@ -9520,10 +9527,12 @@ impl<'a> FnLower<'a> {
                     // `bytes`: byte count (I#337). `zap_str_len` returns the
                     // ZapStr length, which is the byte count for a `bytes`.
                     Ty::Bytes => "zap_str_len",
+                    // `bytearray`: byte count (#1385).
+                    Ty::ByteArray => "zap_bytearray_len",
                     _ => {
                         return Err(err(
                             "len() expects a list, dict, set, heap, deque, oset, array, str, \
-                             or bytes",
+                             bytes, or bytearray",
                         ))
                     }
                 };
@@ -10137,6 +10146,17 @@ impl<'a> FnLower<'a> {
                 return match vt {
                     // str / bytes share the ZapStr repr — relabel, no copy.
                     Ty::Ptr | Ty::Bytes => Ok((v, Ty::Bytes)),
+                    // bytes(bytearray) -> a fresh immutable copy (#1385); never
+                    // aliases the source buffer.
+                    Ty::ByteArray => {
+                        let d = self.new_value(Ty::Bytes);
+                        self.emit(Inst::Call {
+                            dest: Some(d),
+                            func: "zap_bytearray_to_bytes".to_string(),
+                            args: vec![v],
+                        });
+                        Ok((d, Ty::Bytes))
+                    }
                     Ty::List(_) => {
                         // Validates each element is 0..=255, raising otherwise.
                         let d = self.new_value(Ty::Bytes);
@@ -10152,7 +10172,62 @@ impl<'a> FnLower<'a> {
                         Ok((d, Ty::Bytes))
                     }
                     _ => Err(err(
-                        "bytes() expects an int, a str, or a list[int64] argument",
+                        "bytes() expects an int, a str, bytes/bytearray, or a list[int64] argument",
+                    )),
+                };
+            }
+            if fname == "bytearray" {
+                // bytearray(): empty; bytearray(int n): n zero bytes; bytearray(str):
+                // UTF-8 bytes (a mutable copy); bytearray(bytes) / bytearray(bytearray):
+                // a copy; bytearray(list[int]): one byte per element, validated to
+                // 0..=255. Every form COPIES into a fresh atomic buffer, so the
+                // result never aliases the source (#1385).
+                if args.is_empty() {
+                    let d = self.new_value(Ty::ByteArray);
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_bytearray_new".to_string(),
+                        args: vec![],
+                    });
+                    return Ok((d, Ty::ByteArray));
+                }
+                if args.len() != 1 {
+                    return Err(err("bytearray() takes at most one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                let d = self.new_value(Ty::ByteArray);
+                return match vt {
+                    // str lowers to Ptr; both str and bytes are the ZapStr repr.
+                    Ty::Ptr | Ty::Bytes => {
+                        self.emit(Inst::Call {
+                            dest: Some(d),
+                            func: "zap_bytearray_from_bytes".to_string(),
+                            args: vec![v],
+                        });
+                        Ok((d, Ty::ByteArray))
+                    }
+                    Ty::ByteArray => {
+                        self.emit(Inst::Call {
+                            dest: Some(d),
+                            func: "zap_bytearray_from_ba".to_string(),
+                            args: vec![v],
+                        });
+                        Ok((d, Ty::ByteArray))
+                    }
+                    Ty::List(_) => {
+                        // Validates each element is 0..=255, raising otherwise.
+                        self.throwing_call(Some(d), "zap_bytearray_from_list", vec![v]);
+                        Ok((d, Ty::ByteArray))
+                    }
+                    // bytearray(int n) -> n zero bytes; a negative count raises a
+                    // catchable ValueError.
+                    Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 => {
+                        let n = self.coerce(v, vt, Ty::I64);
+                        self.throwing_call(Some(d), "zap_bytearray_with_len", vec![n]);
+                        Ok((d, Ty::ByteArray))
+                    }
+                    _ => Err(err(
+                        "bytearray() expects an int, a str, bytes/bytearray, or a list[int] argument",
                     )),
                 };
             }
@@ -10595,6 +10670,10 @@ impl<'a> FnLower<'a> {
                     || matches!(bty, Ty::F32 | Ty::F64 | Ty::Ptr | Ty::Bytes))
             {
                 return self.lower_intrinsic_capability_dunder(recv, bty, name, args);
+            }
+            // `bytearray` mutation methods (#1385): `append` / `extend`.
+            if bty == Ty::ByteArray {
+                return self.lower_bytearray_method(recv, name, args);
             }
             // `str` methods (ticket #284): `str` lowers to `Ptr`, so a method
             // call on a `Ptr` receiver is a string method (sema has already
@@ -16014,6 +16093,15 @@ impl<'a> FnLower<'a> {
                 self.throwing_call(Some(d), "zap_bytes_index", vec![bv, iv]);
                 Ok((d, Ty::I64))
             }
+            // `bytearray` indexing (#1385): `a[i]` yields the byte at index `i` as
+            // an `int64` in 0..=255. Out-of-range raises a catchable `IndexError`.
+            Ty::ByteArray => {
+                let (iv, it) = self.expr(index)?;
+                let iv = self.coerce_index(iv, it);
+                let d = self.new_value(Ty::I64);
+                self.throwing_call(Some(d), "zap_bytearray_get", vec![bv, iv]);
+                Ok((d, Ty::I64))
+            }
             // `str` lowers to `Ptr`; `s[i]` yields the codepoint at codepoint
             // index `i` as a `char` (a distinct IR type over i32, #709), Python
             // semantics (D-0025).
@@ -16146,8 +16234,12 @@ impl<'a> FnLower<'a> {
             }
             Ty::Ptr => self.emit_seq_slice(bv, "zap_str_slice", Ty::Ptr, lo, hi, step),
             Ty::Bytes => self.emit_seq_slice(bv, "zap_bytes_slice", Ty::Bytes, lo, hi, step),
+            // A `bytearray` slice -> a fresh `bytearray` (byte-based, #1385).
+            Ty::ByteArray => {
+                self.emit_seq_slice(bv, "zap_bytearray_slice", Ty::ByteArray, lo, hi, step)
+            }
             _ => Err(err(
-                "slicing is only supported on str, bytes, list, and array values",
+                "slicing is only supported on str, bytes, bytearray, list, and array values",
             )),
         }
     }
@@ -16265,6 +16357,21 @@ impl<'a> FnLower<'a> {
     ) -> Result<(), LowerError> {
         let (bv, bty) = self.expr(base)?;
         match bty {
+            // `bytearray` in-place indexed set (#1385): `a[i] = v`. The value is an
+            // `int`; out-of-range index -> `IndexError`, a value outside 0..=255
+            // -> `ValueError` (both raised by the runtime).
+            Ty::ByteArray => {
+                let (iv, it) = self.expr(index)?;
+                let iv = self.coerce_index(iv, it);
+                let (v, vt) = self.expr(value)?;
+                if vt.int_width().is_none() {
+                    return Err(err("a bytearray element assignment requires an int value"));
+                }
+                let v = self.coerce(v, vt, Ty::I64);
+                self.emit_race_elem(bv, iv, "bytearray element", true, span);
+                self.throwing_call(None, "zap_bytearray_set", vec![bv, iv, v]);
+                Ok(())
+            }
             Ty::List(elem) => {
                 let (iv, it) = self.expr(index)?;
                 let iv = self.coerce_index(iv, it);
@@ -16383,6 +16490,30 @@ impl<'a> FnLower<'a> {
         rhs: Value,
         rt: Ty,
     ) -> Result<(Value, Ty), LowerError> {
+        // `bytearray += bytes|bytearray|list[int]` extends IN PLACE (#1385),
+        // returning the same object — no fresh allocation, unlike the `+`
+        // expression, and it accepts `list[int]` which `+` does not. Sema's
+        // AugAssign check has already restricted the operand types.
+        if matches!(ty, Ty::ByteArray) && matches!(op, AstBin::Add) {
+            match rt {
+                Ty::Bytes => self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_bytearray_extend_bytes".to_string(),
+                    args: vec![cur, rhs],
+                }),
+                Ty::ByteArray => self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_bytearray_extend_ba".to_string(),
+                    args: vec![cur, rhs],
+                }),
+                Ty::List(_) => {
+                    // Each element is validated to 0..=255, raising otherwise.
+                    self.throwing_call(None, "zap_bytearray_extend_list", vec![cur, rhs]);
+                }
+                _ => return Err(err("bytearray `+=` expects bytes, bytearray, or list[int]")),
+            }
+            return Ok((cur, Ty::ByteArray));
+        }
         match (ty, inplace_op_dunder(op)) {
             (Ty::Struct(sid), Some(dunder))
                 if self
@@ -16742,6 +16873,68 @@ impl<'a> FnLower<'a> {
             _ => Err(err(
                 "del is only supported on dict and list subscripts (`del d[k]` / `del xs[i]`)",
             )),
+        }
+    }
+
+    /// Built-in `bytearray` mutation methods (#1385): `append(int)` and
+    /// `extend(bytes|bytearray|list[int])`, each returning a unit value. Both can
+    /// raise a catchable `ValueError` (a byte outside 0..=255), so the runtime
+    /// calls that validate go through `throwing_call`.
+    fn lower_bytearray_method(
+        &mut self,
+        recv: Value,
+        name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        match name {
+            "append" => {
+                if args.len() != 1 {
+                    return Err(err("bytearray.append() takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                if vt.int_width().is_none() {
+                    return Err(err("bytearray.append() expects an int"));
+                }
+                let v = self.coerce(v, vt, Ty::I64);
+                // A byte outside 0..=255 raises a catchable ValueError.
+                self.throwing_call(None, "zap_bytearray_append", vec![recv, v]);
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
+            "extend" => {
+                if args.len() != 1 {
+                    return Err(err("bytearray.extend() takes exactly one argument"));
+                }
+                let (other, ot) = self.expr(&args[0].value)?;
+                match ot {
+                    Ty::Bytes => {
+                        self.emit(Inst::Call {
+                            dest: None,
+                            func: "zap_bytearray_extend_bytes".to_string(),
+                            args: vec![recv, other],
+                        });
+                    }
+                    Ty::ByteArray => {
+                        self.emit(Inst::Call {
+                            dest: None,
+                            func: "zap_bytearray_extend_ba".to_string(),
+                            args: vec![recv, other],
+                        });
+                    }
+                    Ty::List(_) => {
+                        // Each element is validated to 0..=255, raising otherwise.
+                        self.throwing_call(None, "zap_bytearray_extend_list", vec![recv, other]);
+                    }
+                    _ => {
+                        return Err(err(
+                            "bytearray.extend() expects bytes, bytearray, or list[int]",
+                        ))
+                    }
+                }
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
+            other => Err(err(format!(
+                "bytearray has no method '{other}' (supported: append, extend)"
+            ))),
         }
     }
 

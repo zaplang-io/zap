@@ -1398,6 +1398,82 @@ impl<'a> FnLower<'a> {
         // `ZapStr` byte-wise runtime. Both operands share the physical repr, so
         // the comparison helpers are identical to `str`'s; `+` yields `bytes`.
         // Sema has checked that both sides are `bytes`.
+        // `bytearray` operands (#1385): `+` concatenates into a NEW `bytearray`
+        // (bytearray+bytearray, and bytearray+bytes / bytes+bytearray); `==`/`!=`
+        // compare by content against another `bytearray` or `bytes`. `+=` is an
+        // in-place extend handled in `aug_combine`, so it never reaches here.
+        if matches!(lt, Ty::ByteArray) || matches!(rt, Ty::ByteArray) {
+            if matches!(op, Add) {
+                if lt == Ty::ByteArray && rt == Ty::ByteArray {
+                    let d = self.new_value(Ty::ByteArray);
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_bytearray_concat".to_string(),
+                        args: vec![l, r],
+                    });
+                    return Ok((d, Ty::ByteArray));
+                }
+                if (lt == Ty::ByteArray && rt == Ty::Bytes)
+                    || (lt == Ty::Bytes && rt == Ty::ByteArray)
+                {
+                    // `a_is_ba` flags whether the LEFT operand is the bytearray,
+                    // so the runtime concatenates in operand order.
+                    let a_is_ba = self.iconst(Ty::I64, if lt == Ty::ByteArray { 1 } else { 0 });
+                    let d = self.new_value(Ty::ByteArray);
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_bytearray_concat_bytes".to_string(),
+                        args: vec![l, r, a_is_ba],
+                    });
+                    return Ok((d, Ty::ByteArray));
+                }
+                return Err(err("bytearray `+` expects a bytearray or bytes operand"));
+            }
+            if matches!(op, Eq | Ne) {
+                let raw = self.new_value(Ty::I64);
+                if lt == Ty::ByteArray && rt == Ty::ByteArray {
+                    self.emit(Inst::Call {
+                        dest: Some(raw),
+                        func: "zap_bytearray_eq".to_string(),
+                        args: vec![l, r],
+                    });
+                } else if lt == Ty::ByteArray && rt == Ty::Bytes {
+                    self.emit(Inst::Call {
+                        dest: Some(raw),
+                        func: "zap_bytearray_eq_bytes".to_string(),
+                        args: vec![l, r],
+                    });
+                } else if lt == Ty::Bytes && rt == Ty::ByteArray {
+                    // Pass the bytearray first (the helper takes ba, bytes).
+                    self.emit(Inst::Call {
+                        dest: Some(raw),
+                        func: "zap_bytearray_eq_bytes".to_string(),
+                        args: vec![r, l],
+                    });
+                } else {
+                    return Err(err(
+                        "bytearray `==`/`!=` expects a bytearray or bytes operand",
+                    ));
+                }
+                let zero = self.iconst(Ty::I64, 0);
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred: if matches!(op, Eq) {
+                        CmpPred::Ne
+                    } else {
+                        CmpPred::Eq
+                    },
+                    lhs: raw,
+                    rhs: zero,
+                });
+                return Ok((d, Ty::I1));
+            }
+            return Err(err(
+                "unsupported operation on bytearray (bytearray supports +, +=, ==, !=)",
+            ));
+        }
+
         if lt == Ty::Bytes && rt == Ty::Bytes {
             if matches!(op, Add) {
                 let d = self.new_value(Ty::Bytes);

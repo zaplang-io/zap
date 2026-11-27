@@ -2304,6 +2304,51 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             );
             self.declare_rt("zap_bytes_from_list", &[p.into()], Some(p.into()));
             self.declare_rt("zap_bytes_to_str", &[p.into()], Some(p.into()));
+            // `bytearray` surface (#1385): the mutable growable byte buffer. The
+            // header is a `ptr`; `a[i]`/iteration yield an `int64` byte. Mutators
+            // return void. `concat_bytes`'s trailing `i64` flags operand order.
+            self.declare_rt("zap_bytearray_new", &[], Some(p.into()));
+            self.declare_rt("zap_bytearray_with_len", &[i.into()], Some(p.into()));
+            self.declare_rt("zap_bytearray_from_bytes", &[p.into()], Some(p.into()));
+            self.declare_rt("zap_bytearray_from_ba", &[p.into()], Some(p.into()));
+            self.declare_rt("zap_bytearray_from_list", &[p.into()], Some(p.into()));
+            self.declare_rt("zap_bytearray_len", &[p.into()], Some(i.into()));
+            self.declare_rt("zap_bytearray_get", &[p.into(), i.into()], Some(i.into()));
+            self.declare_rt("zap_bytearray_set", &[p.into(), i.into(), i.into()], None);
+            self.declare_rt("zap_bytearray_append", &[p.into(), i.into()], None);
+            self.declare_rt("zap_bytearray_extend_bytes", &[p.into(), p.into()], None);
+            self.declare_rt("zap_bytearray_extend_ba", &[p.into(), p.into()], None);
+            self.declare_rt("zap_bytearray_extend_list", &[p.into(), p.into()], None);
+            self.declare_rt(
+                "zap_bytearray_concat",
+                &[p.into(), p.into()],
+                Some(p.into()),
+            );
+            self.declare_rt(
+                "zap_bytearray_concat_bytes",
+                &[p.into(), p.into(), i.into()],
+                Some(p.into()),
+            );
+            self.declare_rt("zap_bytearray_to_bytes", &[p.into()], Some(p.into()));
+            self.declare_rt("zap_bytearray_eq", &[p.into(), p.into()], Some(i.into()));
+            self.declare_rt(
+                "zap_bytearray_eq_bytes",
+                &[p.into(), p.into()],
+                Some(i.into()),
+            );
+            self.declare_rt(
+                "zap_bytearray_slice",
+                &[
+                    p.into(),
+                    i.into(),
+                    i.into(),
+                    i.into(),
+                    i.into(),
+                    i.into(),
+                    i.into(),
+                ],
+                Some(p.into()),
+            );
             // str(bytes, encoding[, errors]) decode (#1459).
             self.declare_rt(
                 "zap_str_decode",
@@ -5125,6 +5170,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             | Ty::ContextVar(_)
             | Ty::CtxToken
             | Ty::Bytes
+            | Ty::ByteArray
             | Ty::Match
             | Ty::Func(_)
             | Ty::Py

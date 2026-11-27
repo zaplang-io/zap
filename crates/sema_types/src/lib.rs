@@ -52,6 +52,15 @@ pub enum Ty {
     Bool,
     Str,
     Bytes,
+    /// A **mutable, growable** byte buffer (#1385) — the mutable sibling of the
+    /// immutable [`Ty::Bytes`]. Physically a dedicated `ZapByteArray {len, cap,
+    /// data}` reference whose `data` is a separate atomic byte buffer, so it maps
+    /// to `ptr` in codegen like `bytes`/`list` (no new IR scalar). Supports
+    /// indexed get/set (`a[i]` / `a[i] = v`, `int64` bytes 0..=255),
+    /// `append`/`extend`/`+=`, `a + b` (a new `bytearray`), `bytes(a)`, `len`,
+    /// byte-wise iteration, and content `==`/`!=` against `bytes` and `bytearray`.
+    /// `bytearray(b)` copies, so mutating the result never writes the source.
+    ByteArray,
     /// A **borrowed, non-owning view** of a `str`'s bytes (#1082, borrowed-bytes
     /// RFC — discussion #1097). A `strview` names an existing string's bytes
     /// `(backing, byte_offset, byte_len)` **without allocating an owned `ZapStr`
@@ -311,6 +320,7 @@ impl Ty {
             Ty::Bool => "bool".into(),
             Ty::Str => "str".into(),
             Ty::Bytes => "bytes".into(),
+            Ty::ByteArray => "bytearray".into(),
             Ty::StrView => "strview".into(),
             Ty::BytesView => "bytesview".into(),
             Ty::Char => "char".into(),
@@ -403,6 +413,7 @@ impl Ty {
             Ty::Bool => named("bool", vec![]),
             Ty::Str => named("str", vec![]),
             Ty::Bytes => named("bytes", vec![]),
+            Ty::ByteArray => named("bytearray", vec![]),
             Ty::Char => named("char", vec![]),
             Ty::Bigint => named("bigint", vec![]),
             Ty::Complex => named("complex", vec![]),

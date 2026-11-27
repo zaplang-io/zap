@@ -551,6 +551,15 @@ pub enum Ty {
     /// operations (`b[i]` -> an `int64` byte, byte-based slicing, `str(b)` UTF-8
     /// decode) that differ from `str`'s codepoint semantics (D-0025).
     Bytes,
+    /// A pointer to a mutable, growable `bytearray` object (#1385): a dedicated
+    /// `ZapByteArray {len, cap, data}` reference whose `data` is a separate atomic
+    /// (pointer-free) leaf byte buffer. Maps to `ptr` in codegen and coerces
+    /// to/from `Ptr` as a no-op bitcast, exactly like `Bytes`. Kept distinct from
+    /// `Ptr`/`Bytes` purely so lowering can route the mutable byte operations —
+    /// `a[i]`/`a[i] = v` (an `int64` byte), `append`/`extend`/`+=`, `a + b` (a new
+    /// bytearray), `bytes(a)`, byte-wise iteration, and content `==` — that the
+    /// immutable `Bytes` and the codepoint-based `str` do not share.
+    ByteArray,
     /// A pointer to a regex match object (ticket #23, D-0010). Null means no
     /// match (falsy); owns its captured groups. Distinct from `Ptr`/`Str` so
     /// lowering can route `.group(...)` method dispatch.
@@ -1473,6 +1482,7 @@ impl fmt::Display for Ty {
             Ty::F64 => "f64",
             Ty::Ptr => "ptr",
             Ty::Bytes => "bytes",
+            Ty::ByteArray => "bytearray",
             Ty::Match => "match",
             Ty::Py => "py",
             Ty::Bigint => "bigint",

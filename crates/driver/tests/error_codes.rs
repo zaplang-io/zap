@@ -834,3 +834,92 @@ fn map_filter_builtin_codes() {
         "ZAP4024",
     );
 }
+
+#[test]
+fn bytearray_codes() {
+    // bytearray v1 (#1385): every constructor form is accepted, and the method /
+    // operator surface types cleanly.
+    let ok = check_source(
+        "def main():\n\
+         \x20   bytearray a = bytearray(b\"abc\")\n\
+         \x20   bytearray z = bytearray(4)\n\
+         \x20   bytearray e = bytearray()\n\
+         \x20   bytearray l = bytearray([65, 66])\n\
+         \x20   bytearray c = bytearray(a)\n\
+         \x20   bytearray s = bytearray(\"hi\")\n\
+         \x20   a[0] = 65\n\
+         \x20   int64 x = a[0]\n\
+         \x20   a.append(66)\n\
+         \x20   a.extend(b\"de\")\n\
+         \x20   a.extend(c)\n\
+         \x20   a.extend([1, 2])\n\
+         \x20   a += b\"zz\"\n\
+         \x20   a += c\n\
+         \x20   a += [9]\n\
+         \x20   bytearray f = a + c\n\
+         \x20   bytearray g = a + b\"xy\"\n\
+         \x20   bool eq1 = a == b\"abc\"\n\
+         \x20   bool eq2 = a == c\n\
+         \x20   bool ne1 = a != c\n\
+         \x20   bytes frozen = bytes(a)\n\
+         \x20   int64 n = len(a)\n\
+         \x20   bytearray h = a[1:3]\n\
+         \x20   for by in a:\n\
+         \x20       x = x + by\n",
+    );
+    assert!(ok.ok, "unexpected diagnostics: {:?}", ok.diagnostics);
+
+    // Constructor arity: more than one argument -> ZAP4025.
+    assert_code(
+        "def main():\n    auto a = bytearray(b\"a\", b\"b\")\n",
+        "ZAP4025",
+    );
+    // Constructor arg type: a float is neither a count, a str/bytes, nor a list
+    // of ints -> ZAP4024.
+    assert_code("def main():\n    auto a = bytearray(1.5)\n", "ZAP4024");
+    // A bigint is not an accepted count either (matches bytes()).
+    assert_code(
+        "def main():\n    auto a = bytearray(10000000000000000000000)\n",
+        "ZAP4024",
+    );
+    // A list of non-ints is rejected.
+    assert_code(
+        "def main():\n    auto a = bytearray([\"x\", \"y\"])\n",
+        "ZAP4024",
+    );
+
+    // append() takes exactly one argument (ZAP4025) and an int value (ZAP4024).
+    assert_code(
+        "def main():\n    auto a = bytearray()\n    a.append(1, 2)\n",
+        "ZAP4025",
+    );
+    assert_code(
+        "def main():\n    auto a = bytearray()\n    a.append(\"x\")\n",
+        "ZAP4024",
+    );
+
+    // extend() takes one argument (ZAP4025) of bytes / bytearray / list[int]
+    // (anything else -> ZAP4024).
+    assert_code(
+        "def main():\n    auto a = bytearray()\n    a.extend(b\"a\", b\"b\")\n",
+        "ZAP4025",
+    );
+    assert_code(
+        "def main():\n    auto a = bytearray()\n    a.extend(5)\n",
+        "ZAP4024",
+    );
+    assert_code(
+        "def main():\n    auto a = bytearray()\n    a.extend(\"nope\")\n",
+        "ZAP4024",
+    );
+    assert_code(
+        "def main():\n    auto a = bytearray()\n    a.extend([\"x\"])\n",
+        "ZAP4024",
+    );
+
+    // An unknown method -> ZAP4080.
+    assert_code(
+        "def main():\n    auto a = bytearray()\n    a.frobnicate()\n",
+        "ZAP4080",
+    );
+}
