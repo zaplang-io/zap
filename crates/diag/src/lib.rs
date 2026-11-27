@@ -532,6 +532,16 @@ define_codes! {
         "A transparent type alias (`type X = …`) expands, directly or through \
          other aliases, back to itself, so it has no underlying type. Break the \
          cycle — a nominal recursive type is a `struct` or `enum` instead.";
+    ZAP4091 = 4091 : "reserved type name",
+        "A numeric-width type name is reserved for a future version of Zap and \
+         is not yet available (#1654, decisions/lang/\
+         1654-fixed-width-integer-semantics.md rule 8): `float8`/`f8`, \
+         `float16`/`f16`, `int128`/`i128`, `uint128`/`u128`, and `isize`. These \
+         names are recognized in a type position and rejected on purpose so they \
+         neither resolve to an opaque unknown type nor are mistaken for a \
+         user-defined type; they carry no semantics yet. (`usize` is implemented \
+         and unaffected.) Use an available width — `int64`/`uint64`/`float64` or \
+         a narrower one — until the reserved type lands.";
 
     // ---- ZAP5xxx — declaration / semantic-rule validation ------------------
     ZAP5001 = 5001 : "recursive value struct",
