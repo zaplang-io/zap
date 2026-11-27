@@ -113,6 +113,11 @@ and matches the `bytes`/`list` slice-read shape).
 - `a + b` (the expression) accepts only byte-like operands (`bytearray`/`bytes`);
   `list[int]` is accepted by `extend` and `+=` (the in-place forms) but not by the
   `+` expression, matching CPython where `bytearray + list` is a `TypeError`.
+- `a += list[int]` is a deliberate **Zap extension** (the brief's "`+=` takes the
+  same operand types as `extend`"): CPython raises `TypeError` on
+  `bytearray += list` and accepts a list only via `.extend([...])`. Zap accepts
+  both. The CPython-differential fixture therefore exercises the list case through
+  `.extend(...)`, not `+=`.
 - Ordering (`< <= > >=`) is **not** provided in v1 (the required surface is content
   `==` / `!=`); it can be added if/when `bytes` ordering is relied upon more widely.
 

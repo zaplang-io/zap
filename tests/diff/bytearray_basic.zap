@@ -18,8 +18,8 @@ def main():
     a.extend([1, 2])
     print(len(a))  # 8
     a += b"gh"
-    a += [3]
-    print(len(a))  # 11
+    a.extend([3])  # NB: `a += [3]` is a Zap extension — CPython TypeErrors on
+    print(len(a))  # `bytearray += list`, so parity uses .extend([3]) here. 11
     auto total = 0
     for by in a:
         total = total + by
