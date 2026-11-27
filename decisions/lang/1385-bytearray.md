@@ -23,10 +23,14 @@ everyday "build up / patch bytes in place" buffer (wire protocols, encoders,
 hashing, I/O framing) that previously had no direct spelling.
 
 `memoryview` — the zero-copy view RFC'd alongside `bytearray` in #1693 — is
-**deferred to its own follow-up issue** (RFC §4, Option A): an escapable,
-writable view under moving Immix is a genuinely new GC mechanism that deserves a
-focused RFC, not a rider on this one. For a zero-copy *read* of a buffer,
-[`bytesview`](1106-bytesview.md) already covers the read-only, intra-frame case.
+**not being built** (decision 2026-11-27, recorded on RFC
+[discussion #1693](https://github.com/zaplang-io/zap/discussions/1693) and
+issue #1385): it is a niche zero-copy tool, the zero-copy *read* case is already
+covered by [`bytesview`](1106-bytesview.md) / [`strview`](1082-borrowed-bytes-strview.md)
+(#1082/#1106) and `array` strided views, and the zero-copy-I/O-into-a-buffer case
+is to be served later by a targeted `read_into`-style API rather than a view type.
+Revisit only if a concrete need appears. So with `bytearray` landed and
+`memoryview` explicitly not built, #1385 is fully resolved.
 
 ### Representation (R1)
 
@@ -93,8 +97,9 @@ Per the RFC, deliberately out of v1 to keep the surface tight:
 
 - **Slice-assignment-with-resize** `a[i:j] = …` and **`del a[i]`** — both can change
   the length mid-buffer; a focused follow-up.
-- **`memoryview`** — its own issue + RFC (see above), landing as the full escapable
-  object (RFC §4, Option C) when taken up.
+
+`memoryview` is **not** on this deferred list — it is not being built at all (see
+the Decision section above).
 
 A plain slice *read* `a[i:j]` → a fresh `bytearray` **is** included (it is cheap
 and matches the `bytes`/`list` slice-read shape).
@@ -115,9 +120,11 @@ and matches the `bytes`/`list` slice-read shape).
 
 `bytearray` delivers the mutable-buffer value immediately with **no new GC
 design**: R1 reuses the list growth model and the string atomic-buffer trace
-discipline, and the single new trace case forwards exactly one slot. Separating it
-from `memoryview` keeps this PR to a sound, fully-testable surface while leaving
-the genuinely-new escapable-view GC question to its own RFC.
+discipline, and the single new trace case forwards exactly one slot. `memoryview`
+is dropped rather than carried as a rider: an escapable, writable view under
+moving Immix would be a genuinely new GC mechanism, and its value is already
+covered by the existing borrowed views and a future `read_into`-style API, so it
+is not worth that cost on current evidence.
 
 ## Consequences
 
