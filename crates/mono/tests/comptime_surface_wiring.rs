@@ -203,3 +203,234 @@ def main():
         other => panic!("expected Named Point, got {other:?}"),
     }
 }
+
+// --- #1686: when a comptime-`if` is folded to a taken branch that
+// unconditionally diverges (an early `return`/`raise`), the statements written
+// after the `if` ran only on the fall-through path and are now statically
+// unreachable in this specialization — they must NOT be spliced into the taken
+// path. A branch that can fall through (e.g. the empty false-specialization, or
+// a plain assignment) keeps them. ---
+
+/// Find the single specialized instantiation of `base` (`base$...`), skipping
+/// `main` and the still-generic template.
+#[track_caller]
+fn specialization(items: &[Item], base: &str) -> Block {
+    let prefix = format!("{base}$");
+    items
+        .iter()
+        .find_map(|i| match i {
+            Item::Function(f) if f.name.starts_with(&prefix) => Some(f.body.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no specialization of `{base}`"))
+}
+
+#[test]
+fn folded_early_return_drops_a_trailing_raise() {
+    // The issue's exact shape: the supported-type specialization folds the
+    // `if` to `return value`; the `raise` that followed it must be gone, so the
+    // body is a lone `return` (not `return` then a dead `raise` the backend
+    // would otherwise lower into the taken path).
+    let src = "\
+def resolve[T](T value) -> T:
+    if reflect.type_info(T).name == \"str\":
+        return value
+    raise ValueError(\"unsupported\")
+def main():
+    auto a = resolve(\"ok\")
+";
+    let body = specialization(&mono(src), "resolve");
+    assert_eq!(
+        body.stmts.len(),
+        1,
+        "only the folded `return` survives: {:?}",
+        body.stmts
+    );
+    assert!(
+        matches!(body.stmts[0], Stmt::Return { value: Some(_), .. }),
+        "the sole statement is the early `return`: {:?}",
+        body.stmts[0]
+    );
+}
+
+#[test]
+fn folded_early_return_drops_a_trailing_side_effect() {
+    // Same ordering hazard with a side-effecting statement (not a `raise`) after
+    // the early return: it is also unreachable and must be dropped.
+    let src = "\
+def log(str m):
+    pass
+def resolve[T](T value) -> T:
+    if reflect.type_info(T).name == \"str\":
+        return value
+    log(\"fallback\")
+    raise ValueError(\"unsupported\")
+def main():
+    auto a = resolve(\"ok\")
+";
+    let body = specialization(&mono(src), "resolve");
+    assert_eq!(
+        body.stmts.len(),
+        1,
+        "the trailing `log(...)` and `raise` are both unreachable: {:?}",
+        body.stmts
+    );
+    assert!(matches!(body.stmts[0], Stmt::Return { .. }));
+}
+
+#[test]
+fn false_specialization_still_reaches_the_fallback() {
+    // The unsupported-type specialization folds the `if` away to nothing (empty
+    // false branch, which can fall through), so the fallback `raise` after it
+    // MUST remain — dropping trailing statements only applies to a diverging
+    // taken branch.
+    let src = "\
+def resolve[T](T value) -> T:
+    if reflect.type_info(T).name == \"str\":
+        return value
+    raise ValueError(\"unsupported\")
+def main():
+    auto b = resolve(5)
+";
+    let body = specialization(&mono(src), "resolve");
+    assert_eq!(
+        body.stmts.len(),
+        1,
+        "the if folds to nothing; only the fallback `raise` is left: {:?}",
+        body.stmts
+    );
+    assert!(
+        matches!(body.stmts[0], Stmt::Raise { .. }),
+        "the fallback `raise` survives: {:?}",
+        body.stmts[0]
+    );
+}
+
+#[test]
+fn both_specializations_coexist_with_correct_control_flow() {
+    // The true and false specializations are generated from one template in the
+    // same program: the supported one returns, the unsupported one raises.
+    let src = "\
+def resolve[T](T value) -> T:
+    if reflect.type_info(T).name == \"str\":
+        return value
+    raise ValueError(\"unsupported\")
+def main():
+    auto a = resolve(\"ok\")
+    auto b = resolve(5)
+";
+    let items = mono(src);
+    let str_fn = items.iter().find_map(|i| match i {
+        Item::Function(f) if f.name == "resolve$str" => Some(f.body.clone()),
+        _ => None,
+    });
+    let int_fn = items.iter().find_map(|i| match i {
+        Item::Function(f) if f.name == "resolve$int64" => Some(f.body.clone()),
+        _ => None,
+    });
+    assert!(matches!(
+        str_fn.expect("resolve$str").stmts.as_slice(),
+        [Stmt::Return { .. }]
+    ));
+    assert!(matches!(
+        int_fn.expect("resolve$int64").stmts.as_slice(),
+        [Stmt::Raise { .. }]
+    ));
+}
+
+#[test]
+fn a_non_diverging_folded_branch_keeps_trailing_statements() {
+    // The taken branch does not diverge (a plain assignment), so control falls
+    // through it and the statement after the `if` is still reachable — it must
+    // be kept. This guards the fix against over-eager dropping.
+    let src = "\
+def resolve[T](T value) -> int64:
+    int64 n = 0
+    if reflect.type_info(T).name == \"str\":
+        n = 1
+    return n
+def main():
+    auto a = resolve(\"ok\")
+";
+    let body = specialization(&mono(src), "resolve");
+    // `int64 n = 0`, folded `n = 1` (branch body), then `return n`.
+    assert_eq!(
+        body.stmts.len(),
+        3,
+        "fall-through branch keeps the trailing `return`: {:?}",
+        body.stmts
+    );
+    assert!(
+        matches!(body.stmts.last(), Some(Stmt::Return { .. })),
+        "the trailing `return` survives a non-diverging folded branch: {:?}",
+        body.stmts
+    );
+}
+
+#[test]
+fn an_if_else_whose_arms_all_diverge_drops_trailing_statements() {
+    // A total `if/else` where both arms diverge is itself diverging: anything
+    // after it is unreachable and must be dropped once the chain is folded in.
+    let src = "\
+def resolve[T](T value) -> T:
+    if reflect.type_info(T).name == \"str\":
+        return value
+    else:
+        raise ValueError(\"x\")
+    raise ValueError(\"unreachable\")
+def main():
+    auto a = resolve(\"ok\")
+";
+    let body = specialization(&mono(src), "resolve");
+    assert_eq!(
+        body.stmts.len(),
+        1,
+        "the trailing unreachable `raise` is dropped: {:?}",
+        body.stmts
+    );
+    assert!(matches!(body.stmts[0], Stmt::Return { .. }));
+}
+
+#[test]
+fn a_runtime_if_in_a_specialization_is_left_intact() {
+    // Negative control: a non-comptime condition inside a specialization is NOT
+    // folded, so it stays a runtime `if` and no trailing statement is dropped.
+    let src = "\
+def resolve[T](T value, bool flag) -> T:
+    if flag:
+        return value
+    raise ValueError(\"unsupported\")
+def main():
+    auto a = resolve(\"ok\", true)
+";
+    let body = specialization(&mono(src), "resolve");
+    assert_eq!(
+        body.stmts.len(),
+        2,
+        "runtime `if` is preserved with its fallthrough `raise`: {:?}",
+        body.stmts
+    );
+    assert!(matches!(body.stmts[0], Stmt::If { .. }));
+    assert!(matches!(body.stmts[1], Stmt::Raise { .. }));
+}
+
+#[test]
+fn a_non_generic_fn_is_never_pruned() {
+    // Negative control: with no active substitution (an ordinary, non-generic
+    // function), the comptime-`if` pruning path is gated off entirely, so even a
+    // literal-true `if` stays a runtime `if` and nothing is dropped.
+    let src = "\
+def f() -> int64:
+    if true:
+        return 1
+    return 2
+";
+    let body = fn_body(&mono(src), "f");
+    assert_eq!(
+        body.stmts.len(),
+        2,
+        "non-generic body is untouched by #1394/#1686 pruning: {:?}",
+        body.stmts
+    );
+    assert!(matches!(body.stmts[0], Stmt::If { .. }));
+}
