@@ -175,6 +175,13 @@ fn subst_ty(ty: &Ty, subst: &HashMap<&str, &Ty>) -> Ty {
         Ty::Chan(e) => Ty::Chan(Box::new(subst_ty(e, subst))),
         Ty::AtomicArray(e) => Ty::AtomicArray(Box::new(subst_ty(e, subst))),
         Ty::ContextVar(e) => Ty::ContextVar(Box::new(subst_ty(e, subst))),
+        Ty::VarTuple(e) => Ty::VarTuple(Box::new(subst_ty(e, subst))),
+        // The prelude generic enum `Optional[T]` substitutes inside its payload
+        // (#1682), so a generic return `-> Optional[T]` binds `T` into the result
+        // type (`wrap[T](T x) -> Optional[T]` called with a `str` yields
+        // `Optional[str]`). Without this arm the payload stayed the `Ty::Named(T)`
+        // type variable and the call's result mis-typed as `Optional[T]`.
+        Ty::Optional(e) => Ty::Optional(Box::new(subst_ty(e, subst))),
         // A type value `Type[T]` substitutes inside its represented type (#1527).
         Ty::TypeVal(e) => Ty::TypeVal(Box::new(subst_ty(e, subst))),
         Ty::Dict(k, v) => Ty::Dict(Box::new(subst_ty(k, subst)), Box::new(subst_ty(v, subst))),

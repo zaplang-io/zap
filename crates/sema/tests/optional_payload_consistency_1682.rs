@@ -220,6 +220,52 @@ fn optional_payload_binds_t_consistent_accepted() {
     );
 }
 
+// ---- generic return substitution through Optional[T] (#1623/#1682) ----------
+//
+// Preserving the payload type variable also fixed the generic-return
+// substitution: `wrap[T](T x) -> Optional[T]` must type a `str` call as
+// `Optional[str]` (assignable to a declared `Optional[str]`), not leave the
+// result as the unsubstituted `Optional[T]`. This is the host-level analogue of
+// the `generics_fn_gc_stress.zap` end-to-end fixture.
+
+const WRAP: &str = "def wrap[T](T x) -> Optional[T]:\n    return Optional.Some(x)\n";
+
+#[test]
+fn generic_optional_return_substitutes_str_payload() {
+    assert_ok(&format!(
+        "{WRAP}def main():\n    str s = \"x\"\n    Optional[str] o = wrap(s)\n    print(o)\n"
+    ));
+}
+
+#[test]
+fn generic_optional_return_substitutes_int_payload() {
+    assert_ok(&format!(
+        "{WRAP}def main():\n    int64 n = 3\n    Optional[int64] q = wrap(n)\n    print(q)\n"
+    ));
+}
+
+#[test]
+fn generic_optional_return_payload_mismatch_is_rejected() {
+    // The substituted result `Optional[str]` is not assignable to a declared
+    // `Optional[int64]` binding.
+    assert_code(
+        &format!("{WRAP}def main():\n    str s = \"x\"\n    Optional[int64] bad = wrap(s)\n    print(bad)\n"),
+        "ZAP4001",
+    );
+}
+
+#[test]
+fn generic_optional_return_through_struct_field() {
+    // The `generics_fn_gc_stress.zap` shape: wrap a generic struct field.
+    assert_ok(
+        "struct Pair[A, B]:\n    A first\n    B second\n\
+         def wrap[T](T x) -> Optional[T]:\n    return Optional.Some(x)\n\
+         def main():\n    Pair[int64, str] p = Pair(1, \"item\")\n    \
+         Optional[str] o = wrap(p.second)\n    Optional[int64] q = wrap(p.first)\n    \
+         print(o)\n    print(q)\n",
+    );
+}
+
 // ---- Unknown / dynamic payload never triggers a false positive --------------
 
 #[test]

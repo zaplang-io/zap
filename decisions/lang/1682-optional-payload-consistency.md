@@ -91,6 +91,12 @@ bound, matching the least-upper-bound widening #1545 already applies to a bare
   parameter types preserve an `Optional[T]` payload's type variable.
 - `collect_tyvar_pairs` gains a bare-payload-lift arm: a non-`Optional` argument
   against an `Optional[T]` parameter recurses payload-to-argument, binding `T`.
+- `subst_ty` gains `Optional` and `VarTuple` arms. Preserving the payload type
+  variable exposed a latent gap in the #1623 generic-return substitution: an
+  `-> Optional[T]` return left its payload as the `Ty::Named(T)` type variable
+  (previously masked because the payload erased to `Unknown`), so a call such as
+  `wrap[T](T x) -> Optional[T]` now substitutes its payload and types the result
+  as `Optional[str]` rather than the unsubstituted `Optional[T]`.
 - A mismatched `Optional[T]` payload is now `error[ZAP4021]`, located at the
   offending argument, with the message naming the type parameter and its binding.
 
