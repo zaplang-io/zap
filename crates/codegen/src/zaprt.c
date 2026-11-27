@@ -1089,6 +1089,69 @@ static ZapComplex *zap_complex_alloc(double re, double im) {
 
 void *zap_complex_new(double re, double im) { return zap_complex_alloc(re, im); }
 void *zap_complex_from_f64(double re) { return zap_complex_alloc(re, 0.0); }
+/* Parse a Python-style complex literal (#1657): `re`, `im j`, or `re +/- im j`,
+ * with optional surrounding whitespace and one layer of parens. A malformed
+ * string raises a catchable ValueError, like `float(str)`. */
+void *zap_complex_from_str(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+#define ZAP_CX_WS(c)                                                           \
+    ((c) == ' ' || (c) == '\t' || (c) == '\n' || (c) == '\r' || (c) == '\f' || \
+     (c) == '\v')
+    int64_t a = 0, b = s->len;
+    while (a < b && ZAP_CX_WS((unsigned char)s->data[a])) a++;
+    while (b > a && ZAP_CX_WS((unsigned char)s->data[b - 1])) b--;
+    if (b - a >= 2 && s->data[a] == '(' && s->data[b - 1] == ')') {
+        a++;
+        b--;
+        while (a < b && ZAP_CX_WS((unsigned char)s->data[a])) a++;
+        while (b > a && ZAP_CX_WS((unsigned char)s->data[b - 1])) b--;
+    }
+    int64_t n = b - a;
+    if (n < 0) n = 0;
+    char stackbuf[128];
+    char *buf = stackbuf;
+    char *heap = NULL;
+    if ((size_t)n >= sizeof(stackbuf)) {
+        heap = (char *)malloc((size_t)n + 1);
+        if (!heap) abort();
+        buf = heap;
+    }
+    memcpy(buf, s->data + a, (size_t)n);
+    buf[n] = '\0';
+    int bad = (n == 0);
+    for (int64_t i = 0; !bad && i < n; i++)
+        if (ZAP_CX_WS((unsigned char)buf[i])) bad = 1;
+    double re = 0.0, im = 0.0;
+    if (!bad) {
+        char *p = buf;
+        char *end = NULL;
+        double x = strtod(p, &end);
+        if (end == p) {
+            bad = 1; /* no leading number (e.g. "j") */
+        } else if (*end == 'j' || *end == 'J') {
+            if (end[1] != '\0') bad = 1; /* trailing junk after `j` */
+            else im = x;                 /* pure imaginary, e.g. "2j" */
+        } else if (*end == '\0') {
+            re = x; /* pure real, e.g. "1.5" */
+        } else if (*end == '+' || *end == '-') {
+            re = x;
+            char *end2 = NULL;
+            double y = strtod(end, &end2); /* the sign is part of the imaginary */
+            if (end2 == end || !(*end2 == 'j' || *end2 == 'J') || end2[1] != '\0')
+                bad = 1; /* e.g. "1+j", "1+2", "1+2j3" */
+            else
+                im = y;
+        } else {
+            bad = 1;
+        }
+    }
+    if (heap) free(heap);
+    if (bad)
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("complex() arg is a malformed string", 35));
+#undef ZAP_CX_WS
+    return zap_complex_new(re, im);
+}
 void *zap_complex_add(void *ap, void *bp) {
     const ZapComplex *a = (const ZapComplex *)ap;
     const ZapComplex *b = (const ZapComplex *)bp;
@@ -1396,7 +1459,11 @@ static ZapBigInt *zap_big_parse_chars(const char *s, int64_t len) {
                    : c >= 'A' && c <= 'F' ? c - 'A' + 10 : radix;
         if (d >= radix) {
             free(limbs);
-            zap_panic(zap_str_new("invalid bigint literal", 22));
+            /* `bigint(str)` on a malformed string raises a catchable ValueError
+             * (#1657), like `int(str)`. The literal path is lexer-validated, so it
+             * never reaches here. */
+            zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                            zap_str_new("invalid literal for bigint", 26));
             return NULL;
         }
         uint64_t carry = d;

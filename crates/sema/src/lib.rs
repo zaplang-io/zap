@@ -10595,18 +10595,24 @@ impl Checker {
                     if args.len() != 1 {
                         self.error(
                             ErrorCode::ZAP4025,
-                            "bigint() takes exactly one numeric argument".to_string(),
+                            "bigint() takes exactly one argument".to_string(),
                             span,
                         );
                     }
                     for a in args {
                         let at = self.infer(&a.value);
-                        if (!at.is_numeric() || matches!(at, Ty::Complex))
-                            && !matches!(at, Ty::Unknown)
-                        {
+                        // A real number converts, or a `str`/`strview` is parsed as
+                        // an arbitrary-precision base-N integer (#1657); `complex`
+                        // and other types are rejected.
+                        let ok = at.is_numeric() && !matches!(at, Ty::Complex)
+                            || matches!(at, Ty::Str | Ty::StrView | Ty::Unknown);
+                        if !ok {
                             self.error(
                                 ErrorCode::ZAP4024,
-                                format!("bigint() expects a real number, found {}", at.display()),
+                                format!(
+                                    "bigint() expects a real number or a string, found {}",
+                                    at.display()
+                                ),
                                 expr_span(&a.value),
                             );
                         }
@@ -10617,16 +10623,34 @@ impl Checker {
                     if args.len() > 2 {
                         self.error(
                             ErrorCode::ZAP4025,
-                            "complex() takes at most two numeric arguments".to_string(),
+                            "complex() takes at most two arguments".to_string(),
                             span,
                         );
                     }
+                    // A single `str`/`strview` argument is parsed as a Python-style
+                    // complex literal (#1657); numbers convert as before. A string
+                    // is only valid as the sole argument, never as `(real, imag)`.
+                    let single = args.len() == 1;
                     for a in args {
                         let at = self.infer(&a.value);
-                        if !at.is_numeric() && !matches!(at, Ty::Unknown) {
+                        let is_str = matches!(at, Ty::Str | Ty::StrView);
+                        if is_str {
+                            if !single {
+                                self.error(
+                                    ErrorCode::ZAP4024,
+                                    "complex(real, imag) arguments must be real numbers, not \
+                                     a string"
+                                        .to_string(),
+                                    expr_span(&a.value),
+                                );
+                            }
+                        } else if !at.is_numeric() && !matches!(at, Ty::Unknown) {
                             self.error(
                                 ErrorCode::ZAP4024,
-                                format!("complex() expects a number, found {}", at.display()),
+                                format!(
+                                    "complex() expects a number or a string, found {}",
+                                    at.display()
+                                ),
                                 expr_span(&a.value),
                             );
                         } else if args.len() == 2 && matches!(at, Ty::Complex) {
@@ -14251,6 +14275,41 @@ mod tests {
         assert!(
             !errors("import math\ndef main():\n    print(math.fma(1.0, 2.0, 3.0, 4.0))\n")
                 .is_empty()
+        );
+    }
+
+    // --- bigint(str) / complex(str) string parse (#1657) -----------------------
+
+    #[test]
+    fn bigint_and_complex_accept_a_string_argument() {
+        // #1657: `bigint(str)` parses an arbitrary-precision integer and
+        // `complex(str)` parses a Python-style complex literal.
+        ok("def main():\n    bigint n = bigint(\"123456789012345678901234567890\")\n    print(n)\n");
+        ok("def main():\n    complex z = complex(\"1+2j\")\n    print(z)\n");
+        // The numeric conversions still type-check.
+        ok("def main():\n    bigint n = bigint(42)\n    complex z = complex(1.0, 2.0)\n    print(n)\n    print(z)\n");
+        // A string flows from a variable too.
+        ok("def main():\n    str s = \"3j\"\n    complex z = complex(s)\n    print(z)\n");
+    }
+
+    #[test]
+    fn complex_two_string_args_is_rejected() {
+        // A string is only valid as the SOLE argument; `complex(real, imag)` stays
+        // numeric-only.
+        assert!(
+            !errors("def main():\n    complex z = complex(\"1\", \"2\")\n    print(z)\n")
+                .is_empty(),
+            "complex(str, str) must be rejected"
+        );
+    }
+
+    #[test]
+    fn bigint_still_rejects_non_string_non_numeric() {
+        // A `bool`-list or other non-numeric, non-string argument is still an error.
+        assert!(
+            !errors("def main():\n    auto b = True\n    bigint n = bigint([b])\n    print(n)\n")
+                .is_empty(),
+            "bigint() of a list must be rejected"
         );
     }
 
