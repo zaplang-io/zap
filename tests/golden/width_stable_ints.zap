@@ -54,3 +54,11 @@ def main():
     uint8 cnt = 255
     cnt += 1
     print(cnt)  # 0      (256 mod 256)
+
+    # Rule 7: narrow MIN / -1 and MIN % -1 wrap two's-complement, consistent
+    # with the int64 case (#742). INT32_MIN // -1 overflows int32 and wraps back
+    # to INT32_MIN (the mathematical +2^31 is not representable); MIN % -1 is 0.
+    int32 mn = -2147483648
+    int32 neg1 = -1
+    print(mn // neg1)  # -2147483648  (INT32_MIN // -1 wraps to INT32_MIN)
+    print(mn % neg1)  # 0
