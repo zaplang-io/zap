@@ -905,6 +905,42 @@ fn reflect_type_info_arg(base: &Expr) -> Option<String> {
     }
 }
 
+/// Does control fall off the end of this statement sequence, or does the
+/// sequence unconditionally diverge (#1686)? A sequence diverges when its last
+/// statement diverges — a `return`/`raise`, a loop `break`/`continue`, or an
+/// `if`/`elif`/`else` chain whose every arm (including a mandatory `else`)
+/// diverges. Used when splicing a pruned comptime-`if`'s taken branch: if that
+/// branch cannot fall through, the statements after the original `if` are
+/// statically unreachable and are dropped rather than lowered into the taken
+/// path. This is a deliberately conservative over-approximation of
+/// reachability — unhandled diverging shapes (an exhaustive `match`, a `with`
+/// whose body diverges, …) simply report `false`, which keeps the trailing
+/// statements (the pre-#1686 behaviour) and is always sound: it never drops a
+/// statement that might run.
+fn block_diverges(stmts: &[Stmt]) -> bool {
+    stmts.last().is_some_and(stmt_diverges)
+}
+
+/// Does this single statement unconditionally transfer control away, so that
+/// the statement textually after it cannot execute? See [`block_diverges`].
+fn stmt_diverges(st: &Stmt) -> bool {
+    match st {
+        Stmt::Return { .. } | Stmt::Raise { .. } | Stmt::Break(_) | Stmt::Continue(_) => true,
+        // An `if` chain diverges only when it is total — there is an `else`, so
+        // some arm always runs — and every arm's body diverges. Without an
+        // `else`, control can fall through when no condition matched.
+        Stmt::If {
+            branches,
+            else_block: Some(eb),
+            ..
+        } => {
+            branches.iter().all(|(_, body)| block_diverges(&body.stmts))
+                && block_diverges(&eb.stmts)
+        }
+        _ => false,
+    }
+}
+
 /// Collect the names of aliases referenced anywhere in `t` (#606 cycle
 /// detection); only names present in `aliases` are recorded.
 fn collect_alias_refs(
@@ -2757,7 +2793,23 @@ impl Mono<'_> {
                             span: b.span,
                         };
                         let rewritten = self.rewrite_block(&taken_block, env)?;
+                        // #1686: the pruned `if` stood in for a conditional, so
+                        // the statements that followed it in this block ran only
+                        // when control fell through the (now folded-in) branch.
+                        // When the taken branch cannot fall through — it
+                        // unconditionally `return`s / `raise`s — those trailing
+                        // statements are statically unreachable in this
+                        // specialization and must NOT be spliced in; otherwise an
+                        // early `return` inside the folded branch would be
+                        // followed by a leftover `raise`/side effect that the
+                        // backend lowers into the taken path. A branch that can
+                        // fall through keeps the trailing statements (e.g. the
+                        // false specialization where the taken branch is empty).
+                        let diverges = block_diverges(&rewritten.stmts);
                         stmts.extend(rewritten.stmts);
+                        if diverges {
+                            break;
+                        }
                         continue;
                     }
                 }
@@ -8482,5 +8534,65 @@ mod tests {
             ("Out", 0),
             "generic interface return must be left as-is"
         );
+    }
+
+    // ---- #1686: divergence analysis for pruned comptime-`if` splicing -------
+
+    /// Parse the statements of a one-function body (indented under `def __h():`).
+    fn body_stmts(body_src: &str) -> Vec<Stmt> {
+        let indented: String = body_src.lines().map(|l| format!("    {l}\n")).collect();
+        let src = format!("def __h():\n{indented}");
+        let (m, perrs, lerrs) = parse_str(&src);
+        assert!(perrs.is_empty() && lerrs.is_empty(), "{perrs:?} {lerrs:?}");
+        m.items
+            .into_iter()
+            .find_map(|i| match i {
+                Item::Function(f) => Some(f.body.stmts),
+                _ => None,
+            })
+            .expect("a function")
+    }
+
+    #[test]
+    fn diverges_on_terminators() {
+        assert!(block_diverges(&body_stmts("return 1")));
+        assert!(block_diverges(&body_stmts("return")));
+        assert!(block_diverges(&body_stmts("raise ValueError(\"x\")")));
+        // Divergence is decided by the *last* statement of the sequence.
+        assert!(block_diverges(&body_stmts("x = 1\nreturn x")));
+    }
+
+    #[test]
+    fn break_and_continue_are_terminators() {
+        // Build the statements directly so `break`/`continue` sit at the end of a
+        // sequence (not nested in a loop) — the helper is purely syntactic.
+        let brk = vec![Stmt::Break(Span::new(0, 0))];
+        let cont = vec![Stmt::Continue(Span::new(0, 0))];
+        assert!(block_diverges(&brk));
+        assert!(block_diverges(&cont));
+    }
+
+    #[test]
+    fn falls_through_on_non_terminators() {
+        assert!(!block_diverges(&body_stmts("x = 1")));
+        assert!(!block_diverges(&body_stmts("pass")));
+        assert!(!block_diverges(&[]), "an empty sequence falls through");
+        // The last statement is what matters: a `return` followed by an
+        // assignment can fall through the assignment.
+        assert!(!block_diverges(&body_stmts("return 1\nx = 2")));
+    }
+
+    #[test]
+    fn if_diverges_only_when_total_and_every_arm_diverges() {
+        // No `else`: can fall through when no condition matched.
+        assert!(!block_diverges(&body_stmts("if a:\n    return 1")));
+        // `else` present but one arm falls through.
+        assert!(!block_diverges(&body_stmts(
+            "if a:\n    return 1\nelse:\n    x = 2"
+        )));
+        // `else` present and every arm diverges.
+        assert!(block_diverges(&body_stmts(
+            "if a:\n    return 1\nelif b:\n    raise ValueError(\"x\")\nelse:\n    return 3"
+        )));
     }
 }
