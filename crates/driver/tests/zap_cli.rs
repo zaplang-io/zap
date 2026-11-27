@@ -4083,6 +4083,92 @@ def main():
 }
 
 #[test]
+fn derive_json_decodes_optional_payloads_beyond_scalar_fast_paths() {
+    // #1696: the library `@derive(Json)` DECODE used to handle only `int64` /
+    // `str` Optional payloads and rejected every other inner type with
+    // `@derive(Json): unsupported Optional payload` — which blocked 274/435
+    // generated AWS clients (an Optional field of a float / bool / list / nested
+    // struct / open enum). Decode is now symmetric with encode, recursing into
+    // the payload through the shared element codec (`__json_dec_elem[f.ty.inner]`)
+    // and wrapping the result in `Some`. This AWS-flavored shape — the kind that
+    // failed — must lower through the library decoder. Byte-identical round-trips
+    // are pinned by `json_derive_optional_payloads` on the CI LLVM matrix.
+    let src = "\
+@derive(Json)
+@json(open)
+enum Status:
+    Active
+    Unknown(str v)
+
+@derive(Json)
+struct Tag:
+    str key
+    str value
+
+@derive(Json)
+struct Resource:
+    str name
+    Optional[float64] ratio
+    Optional[bool] enabled
+    Optional[list[str]] zones
+    Optional[Tag] primary_tag
+    Optional[Status] status
+
+def main():
+    auto r = Resource.from_json(\"{\\\"name\\\":\\\"r\\\"}\")
+    print(r.name)
+";
+    let f = write_zap("derive-json-optional-payloads", src);
+    let out = zap().arg("ir").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a @derive(Json) struct with Optional fields of float / bool / list / \
+         nested-struct / open-enum payloads must lower (#1696); stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unsupported Optional payload"),
+        "the Optional-payload decode reject must be gone (#1696): {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("__derive_json_from"),
+        "decode routes to the prelude library Json generator: {stdout}"
+    );
+}
+
+#[test]
+fn derive_json_rejects_optional_bytes_and_datetime_payloads_cleanly() {
+    // #1696 scope boundary: `bytes` and `DateTime` carry bespoke top-level codecs
+    // (base64 / epoch-or-iso8601) that the shared element codec does not reach, so
+    // an Optional *of* one stays a clean `unsupported Optional payload` reject
+    // (full support is a separate follow-up) rather than falling into the element
+    // codec and emitting a dangling symbol or a confusing internal error. This is
+    // symmetric with encode, which never supported those Optional payloads either.
+    for (tag, field) in [
+        ("opt-bytes", "Optional[bytes] blob"),
+        ("opt-datetime", "Optional[DateTime] when"),
+    ] {
+        let src = format!("@derive(Json)\nstruct F:\n    {field}\n\ndef main():\n    print(0)\n");
+        let f = write_zap(tag, &src);
+        let out = zap().arg("ir").arg(&f).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "an Optional {field} payload must fail to derive the decoder; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("@derive(Json): unsupported Optional payload"),
+            "the reject is the clean `unsupported Optional payload` diagnostic for {field}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("panicked") && !stderr.contains("is not a non-generic struct"),
+            "it is the clean diagnostic, not a panic or an internal construct error for {field}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn derive_yaml_supports_scalar_list_and_dict_fields() {
     // #1532 (epic #1529): @derive(Yaml) now encodes a `list[T]` / `dict[str,V]`
     // field in JSON flow (valid YAML, YAML 1.2 ⊃ JSON) and decodes it through the
