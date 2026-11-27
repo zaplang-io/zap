@@ -11353,8 +11353,20 @@ impl Checker {
                             }
                         }
                     }
-                    self.check_generic_arg_consistency(&key, &positional_tys, &keyword_tys);
-                    return sig.ret.clone();
+                    // #1663: bind the generic method's return type like the struct
+                    // path (#1643). `check_generic_arg_consistency` returns the
+                    // result type with the bound type parameters substituted into
+                    // the un-erased return (`Some` only when generic; an unbound
+                    // parameter becomes `Unknown`). Use it in place of the erased
+                    // `sig.ret` only when the method is generic AND the substitution
+                    // produced a concrete type, so a non-generic enum method and a
+                    // generic one whose return did not bind keep `sig.ret`.
+                    let bound_ret =
+                        self.check_generic_arg_consistency(&key, &positional_tys, &keyword_tys);
+                    return match bound_ret {
+                        Some(ret) if !matches!(ret, Ty::Unknown) => ret,
+                        _ => sig.ret.clone(),
+                    };
                 }
             }
             for a in args {
