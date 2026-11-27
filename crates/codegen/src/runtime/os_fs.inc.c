@@ -3170,6 +3170,7 @@ void *zap_sys_getpass(void *prompt_) {
 #endif
 }
 
+/* Buffered reader over an fd. All fields are pointer-free, so the handle's
  * ZapStr buffer is traced safely by the precise collector. */
 #define ZAP_IO_RBUF 8192
 typedef struct {
