@@ -540,6 +540,15 @@ struct StructCtx {
     /// dispatches here; registered alongside `sigs`/`call_params`, whose entries
     /// for these names carry the full parameter list (no implicit `self` dropped).
     associated_fns: HashSet<String>,
+    /// Sema's inferred type for every expression it visited (#1167), span-keyed.
+    /// Lowering's own collection-literal inference reads the element type off the
+    /// *first* element, which a leading empty/ambiguous element (`[[], [..]]`)
+    /// defaults wrongly (#1708); when the first element gives no usable element
+    /// type, lowering consults sema's already-joined type here instead of
+    /// accepting the literal and then failing to store a sibling. Empty on the
+    /// host-only `lower_module` path (no sema analysis ran); the real compile and
+    /// REPL paths thread the driver's `analyze_types` map through.
+    types: crate::mono::TypeMap,
 }
 
 /// One classified axis of an array subscript (#510). `Slice`'s pairs are the
@@ -1745,6 +1754,7 @@ pub fn lower_module_opts_with_types_located(
             index: zapc_diag::render::LineIndex::new(l.src),
         }),
         associated_fns: HashSet::new(),
+        types: types.clone(),
     };
 
     // Signatures: top-level functions and struct methods (mangled `S__m`).
@@ -8362,8 +8372,8 @@ impl<'a> FnLower<'a> {
                 flags,
                 ..
             } => self.lower_regex_subst(subject, pattern, replacement, flags),
-            Expr::List(elems, _) => self.lower_list_lit(elems),
-            Expr::Dict(items, _) => self.lower_dict_lit(items),
+            Expr::List(elems, span) => self.lower_list_lit(elems, *span),
+            Expr::Dict(items, span) => self.lower_dict_lit(items, *span),
             Expr::Set(elems, _) => self.lower_set_lit(elems),
             Expr::Tuple(elems, _) => self.lower_tuple_lit(elems),
             // A `*expr` is only meaningful as a direct element of a
@@ -12160,8 +12170,74 @@ impl<'a> FnLower<'a> {
         }
     }
 
-    fn lower_list_lit(&mut self, elems: &[Expr]) -> Result<(Value, Ty), LowerError> {
-        self.lower_list_lit_expected(elems, None)
+    fn lower_list_lit(&mut self, elems: &[Expr], span: Span) -> Result<(Value, Ty), LowerError> {
+        // With no type-annotated destination, `lower_list_lit_expected` infers the
+        // element kind from the *first* element. A leading empty/ambiguous element
+        // defaults that inference wrongly — `[[], ["a"]]` locks the element to the
+        // empty `[]`'s `list[i64]` default, then rejects the `list[str]` sibling at
+        // lowering (#1708). Sema already joined the siblings to the right element
+        // type (`list[list[str]]`); consult it so lowering agrees instead of
+        // accepting the literal and failing to store. The hint only fires for a
+        // nested-collection element (the one case the naive inference gets wrong),
+        // so every scalar-element list stays on the existing first-element path.
+        let hint = self.sema_list_elem_hint(span);
+        self.lower_list_lit_expected(elems, hint)
+    }
+
+    /// Sema's inferred element kind for a `list` literal recorded at `span`
+    /// (#1708), as a lowering [`Elem`], when (a) a span-keyed sema type map is
+    /// present (the real compile / REPL paths; empty on host `lower_module`),
+    /// (b) the recorded type is a `list`, and (c) its element is itself a nested
+    /// collection — the only shape the first-element inference defaults wrongly
+    /// for a leading empty element. Returns `None` otherwise, leaving every
+    /// scalar-element case to the unchanged first-element inference.
+    fn sema_list_elem_hint(&self, span: Span) -> Option<Elem> {
+        match self.ctx.types.type_at(span)? {
+            crate::mono::SemaTy::List(elem) => self.sema_nested_elem(elem),
+            _ => None,
+        }
+    }
+
+    /// Bridge a sema element type to a lowering [`Elem`], but only when it is a
+    /// nested collection (`Elem::Nested`). An un-bridgeable element (an
+    /// unresolved `Unknown` payload, e.g. an all-empty `[[], []]`) and every
+    /// scalar element return `None`, so the caller falls back to its own
+    /// first-element inference and byte-identical output for those cases. The
+    /// bridge reuses the shared `SemaTy -> ast::Type -> resolve_ty` path (#1167).
+    fn sema_nested_elem(&self, elem: &crate::mono::SemaTy) -> Option<Elem> {
+        let at = elem.to_ast_type()?;
+        let ty = resolve_ty(&at, &self.ctx.tyenv()).ok()?;
+        let ek = list_elem_kind(ty, &self.ctx.nested).ok()?;
+        matches!(ek, Elem::Nested(_)).then_some(ek)
+    }
+
+    /// Bridge a sema KEY-position element type to a lowering [`Elem`] (dict key),
+    /// with no nested-collection gate: a key is hashable and concrete, so any
+    /// bridgeable kind is used. Returns `None` for an un-bridgeable (`Unknown`)
+    /// key, so the caller keeps its first-entry inference.
+    fn sema_key_elem(&self, elem: &crate::mono::SemaTy) -> Option<Elem> {
+        let at = elem.to_ast_type()?;
+        let ty = resolve_ty(&at, &self.ctx.tyenv()).ok()?;
+        elem_kind(ty, &self.ctx.nested).ok()
+    }
+
+    /// Sema's inferred `(key, value)` element kinds for a `dict` literal recorded
+    /// at `span` (#1708), supplied only when the VALUE is a nested collection —
+    /// the dict counterpart of a leading empty list element: `{1: [], 2: ["x"]}`
+    /// otherwise locks the value to the empty `[]`'s `list[i64]` default and then
+    /// rejects the `list[str]` sibling. A dict key is hashable and concrete, so a
+    /// nested-empty value never comes through the key position; the key kind is
+    /// taken from sema only to pair with the overridden value kind. Returns `None`
+    /// for every scalar-value dict, leaving the first-entry inference unchanged.
+    fn sema_dict_kinds_hint(&self, span: Span) -> Option<(Elem, Elem)> {
+        match self.ctx.types.type_at(span)? {
+            crate::mono::SemaTy::Dict(k, v) => {
+                let vk = self.sema_nested_elem(v)?;
+                let kk = self.sema_key_elem(k)?;
+                Some((kk, vk))
+            }
+            _ => None,
+        }
     }
 
     fn lower_list_lit_expected(
@@ -12243,8 +12319,16 @@ impl<'a> FnLower<'a> {
         Ok((list, Ty::List(ek)))
     }
 
-    fn lower_dict_lit(&mut self, items: &[DictItem]) -> Result<(Value, Ty), LowerError> {
-        self.lower_dict_lit_expected(items, None)
+    fn lower_dict_lit(
+        &mut self,
+        items: &[DictItem],
+        span: Span,
+    ) -> Result<(Value, Ty), LowerError> {
+        // Same leading-empty inference gap as `lower_list_lit` (#1708), on the
+        // dict VALUE: `{1: [], 2: ["x"]}` otherwise defaults the value kind off
+        // the empty `[]` and rejects the sibling. Consult sema's joined type.
+        let hint = self.sema_dict_kinds_hint(span);
+        self.lower_dict_lit_expected(items, hint)
     }
 
     fn lower_dict_lit_expected(
