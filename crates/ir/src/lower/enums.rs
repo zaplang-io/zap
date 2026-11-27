@@ -310,6 +310,15 @@ impl<'a> FnLower<'a> {
     ) -> Result<(), LowerError> {
         let (sv, sty) = self.expr(scrutinee)?;
         let merge = self.new_block();
+        // #1675: when the scrutinee is an enum, track which variants the arms
+        // seen so far cover. Once the set is exhaustive, every later arm is
+        // unreachable at this specialization (the enum analog of the single-arm
+        // irrefutable break below) and is dropped before its body is lowered —
+        // so a trailing `case _:` whose body is type-correct only for a different
+        // specialization never reaches lowering. `None` for a non-enum scrutinee.
+        let enum_variants: Option<(String, std::collections::HashSet<String>)> =
+            self.match_enum_variants(sty);
+        let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
         for arm in arms {
             // Elide an arm whose pattern can never match this scrutinee type
             // (#1326). The branch would be a compile-time-constant `false`, yet
@@ -369,6 +378,20 @@ impl<'a> FnLower<'a> {
             self.position(next_bb);
             if irrefutable {
                 break;
+            }
+            // #1675: accumulate this unguarded arm's covered enum variants. A
+            // guarded arm may fall through, so it never counts toward coverage.
+            // Once every variant is covered the match is exhaustive and the
+            // remaining arms are unreachable.
+            if arm.guard.is_none() {
+                if let Some((ename, total)) = &enum_variants {
+                    if let Some(names) = arm_covered_variants(ename, &arm.pattern) {
+                        covered.extend(names);
+                        if total.iter().all(|v| covered.contains(v)) {
+                            break;
+                        }
+                    }
+                }
             }
         }
         // Fall-through (no arm matched): for a non-enum scrutinee this is the
@@ -518,6 +541,29 @@ impl<'a> FnLower<'a> {
             }
         }
         true
+    }
+
+    /// If `sty` is an enum scrutinee, return its name and the full set of its
+    /// variant/member names, for the exhaustive-coverage match pruning (#1675).
+    /// A tier-1 enum is `Ty::Enum(id)` (its members); a tier-3 enum is
+    /// `Ty::Struct(sid)` whose id matches a tagged enum (its variants). A plain
+    /// struct or any other type is `None`.
+    fn match_enum_variants(&self, sty: Ty) -> Option<(String, std::collections::HashSet<String>)> {
+        let info = match sty {
+            Ty::Enum(eid) => self
+                .ctx
+                .enums
+                .values()
+                .find(|e| !e.is_sum && e.enum_id == eid)?,
+            Ty::Struct(sid) => self.ctx.enums.values().find(|e| e.sid == Some(sid))?,
+            _ => return None,
+        };
+        let names = if info.is_sum {
+            info.variants.iter().map(|v| v.name.clone()).collect()
+        } else {
+            info.members.iter().map(|(n, _)| n.clone()).collect()
+        };
+        Some((info.enum_name.clone(), names))
     }
 
     /// Emit the test for one pattern against the scrutinee and return its `i1`
@@ -1163,5 +1209,43 @@ impl<'a> FnLower<'a> {
                 self.bind_pattern(fv, fty, sub)
             }
         }
+    }
+}
+
+/// The set of `enum_name` variants an unguarded arm's pattern covers completely
+/// (#1675), or `None` when the pattern is not a clean full-variant cover (so it
+/// must not count toward exhaustiveness). A bare variant pattern `E.V` or one
+/// whose every payload sub-pattern is a bare binder (`E.V(x)` / `E.V(_)`) matches
+/// every value of that variant; an or-pattern covers the union of its
+/// alternatives, and `<pat> as name` covers what its inner pattern does. A
+/// variant pattern with a refutable payload (`E.V(0)`), a literal, a wildcard
+/// (handled by the irrefutable break), or a pattern of some other enum is not a
+/// cover.
+fn arm_covered_variants(
+    enum_name: &str,
+    pat: &Pattern,
+) -> Option<std::collections::HashSet<String>> {
+    match pat {
+        Pattern::As { pattern, .. } => arm_covered_variants(enum_name, pattern),
+        Pattern::Or(patterns, _) => {
+            let mut set = std::collections::HashSet::new();
+            for p in patterns {
+                set.extend(arm_covered_variants(enum_name, p)?);
+            }
+            Some(set)
+        }
+        Pattern::Struct { path, args, .. } if path.len() == 2 && path[0] == enum_name => {
+            // A payload-free variant (`args == None`) or one bound only by bare
+            // captures/wildcards matches every value of the variant; a refutable
+            // payload sub-pattern (a literal, a nested destructure) does not.
+            let full = match args {
+                None => true,
+                Some(args) => args
+                    .iter()
+                    .all(|a| matches!(a.pattern, Pattern::Wildcard(_) | Pattern::Capture { .. })),
+            };
+            full.then(|| std::collections::HashSet::from([path[1].clone()]))
+        }
+        _ => None,
     }
 }
