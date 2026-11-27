@@ -1227,6 +1227,44 @@ fn argparse_parser_ctor_bad_arg_type_rejected() {
     );
 }
 
+// The object-model `add_argument` method (and the group variants) accept the
+// `hidden=` visibility keyword (#1702). These are prelude struct methods, so
+// their keyword binding resolves against the declared parameters directly (not
+// a module seam); the test guards that `hidden=` is a known parameter and that
+// a misspelling is still rejected.
+#[test]
+fn argparse_add_argument_hidden_keyword_accepted() {
+    assert_ok(&prog(
+        "    auto p = argparse.ArgumentParser(prog=\"demo\")\n    \
+         auto a = p.add_argument(\"--internal\", action=\"store_true\", hidden=True, help=\"Compatibility flag\")\n",
+    ));
+}
+
+#[test]
+fn argparse_add_argument_group_hidden_keyword_accepted() {
+    assert_ok(&prog(
+        "    auto p = argparse.ArgumentParser(prog=\"demo\")\n    \
+         auto g = p.add_argument_group(\"grp\")\n    \
+         auto a = g.add_argument(\"--secret\", hidden=True)\n",
+    ));
+    assert_ok(&prog(
+        "    auto p = argparse.ArgumentParser(prog=\"demo\")\n    \
+         auto mx = p.add_mutually_exclusive_group()\n    \
+         auto a = mx.add_argument(\"--json\", action=\"store_true\", hidden=True)\n",
+    ));
+}
+
+#[test]
+fn argparse_add_argument_unknown_keyword_rejected() {
+    assert_code(
+        &prog(
+            "    auto p = argparse.ArgumentParser(prog=\"demo\")\n    \
+             auto a = p.add_argument(\"--internal\", hiden=True)\n",
+        ),
+        "ZAP4023",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // xml — DOM parse / serialize / construct.
 // ---------------------------------------------------------------------------
