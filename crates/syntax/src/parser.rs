@@ -2286,6 +2286,47 @@ struct Namespace:
     def get_complex(self, str name) -> complex:
         return complex(self._vals[name])
 
+    # Replace the resolved binding for an already-declared destination `name`
+    # with a new raw string `value`, in place (#1698). The destination MUST
+    # already exist (every declared argument is seeded by `_fill_defaults`, so
+    # any declared dest qualifies); replacing an unknown destination raises a
+    # catchable `KeyError` — the documented typed error path. Argv presence
+    # (`has`) and help state are left untouched, so a value swapped in by a
+    # validation/transform callback keeps its supplied-vs-default status and
+    # every other binding (and every separate parse) is unaffected.
+    def _replace(self, str name, str value):
+        if name not in self._vals:
+            raise KeyError(\"no such argparse destination: '\" + name + \"'\")
+        self._vals[name] = value
+
+    # Replace `name`'s binding with a raw string — the universal setter, mirror
+    # of `get`/`get_str` (`set` alone is a reserved type name). Works for any
+    # declared destination whatever its declared `type`, since every typed
+    # getter reads this same stored string, so it is also how a
+    # `char`/`bytes`/`bigint`/`complex` binding is replaced.
+    def set_str(self, str name, str value):
+        self._replace(name, value)
+
+    # Replace `name`'s binding with an integer; a later `get_int` (or a narrowing
+    # scalar read built on it) sees it. Mirror of `get_int`.
+    def set_int(self, str name, int64 value):
+        self._replace(name, str(value))
+
+    # Replace `name`'s binding with a float; a later `get_float` read sees it.
+    # Mirror of `get_float`; stored in canonical string form, exactly like a
+    # declared `default`.
+    def set_float(self, str name, float64 value):
+        self._replace(name, str(value))
+
+    # Replace a boolean flag's binding; a later `get_flag` read sees it. Mirror
+    # of `get_flag`: stored as the canonical \"true\"/\"false\" string `get_flag`
+    # reads back, never a raw `str(bool)`.
+    def set_flag(self, str name, bool value):
+        if value:
+            self._replace(name, \"true\")
+        else:
+            self._replace(name, \"false\")
+
     # Whether `name` was explicitly supplied on the command line (vs defaulted).
     def has(self, str name) -> bool:
         if name in self._present:
