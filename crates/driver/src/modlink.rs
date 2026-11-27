@@ -19,6 +19,12 @@
 //!      lives at `<pkg_root>/<name>` and the module is `<pkg_root>/<name>/src/…`
 //!      (Stage B); the remaining path segments map inside the package's `src/`,
 //!      and a bare `import <name>` selects `src/<name>.zap`.
+//!      *Self-reference exception (I#1697):* when the importing file lives inside
+//!      this very package's own `src/` (its first segment names the package's own
+//!      directory), the full dotted path is kept — `<name>.<sub>` →
+//!      `src/<name>/<sub>.zap` — so the package reaches a nested submodule it
+//!      ships exactly as it does standalone (tier 3), rather than having the
+//!      leading `<name>` stripped to `src/<sub>.zap`.
 //!   3. a **local** module — resolved relative to the *importing* file's own
 //!      package source root: `a` → `<root>/a.zap`, `a.b` → `<root>/a/b.zap`
 //!      (Stage A). For the entry file `<root>` is its own directory.
@@ -303,6 +309,31 @@ impl<'t> Loader<'t> {
                 continue;
             }
             let dep_src = pkg_dir.join("src");
+            // Self-reference (#1697): the importing file lives inside *this*
+            // package's own `src/`, so the leading segment names the package's
+            // own directory. Resolve the full dotted path under `src/` exactly as
+            // the package does standalone (tier 3) — `<name>.<sub>` ->
+            // `src/<name>/<sub>.zap` — so a nested submodule the package ships
+            // (and imports from its own code) is reachable when the package is
+            // pulled in as a dependency. Stripping the `<name>` prefix here would
+            // look for `src/<sub>.zap` and miss the nested module.
+            if canonical(&dep_src) == canonical(importer_root) {
+                let rel: PathBuf = path.split('.').collect();
+                let f = dep_src.join(rel).with_extension("zap");
+                if f.exists() {
+                    return Some((f, Some(dep_src)));
+                }
+                self.diag(
+                    ErrorCode::ZAP3010,
+                    format!(
+                        "cannot find module `{path}` in package `{first}` (looked for `{}`)",
+                        f.display()
+                    ),
+                    span,
+                    file,
+                );
+                return None;
+            }
             // The remaining segments map inside the package's `src/`; a bare
             // `import <name>` selects `src/<name>.zap`.
             let rest = path.strip_prefix(first).unwrap_or("");

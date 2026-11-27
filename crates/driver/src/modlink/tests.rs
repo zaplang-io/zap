@@ -506,6 +506,72 @@ fn service_depends_on_core_transitively() {
 }
 
 #[test]
+fn dependency_imports_its_own_nested_submodule() {
+    // #1697: a dependency ships a nested module `src/<name>/<sub>.zap` and its
+    // own top module imports it as `<name>.<sub>`. This is exactly how the
+    // package resolves the import when built standalone (tier 3, full dotted
+    // path under its own `src/`), so it must resolve the same way when the
+    // package is pulled in as a dependency — the leading `<name>` segment
+    // naming the package's *own* directory must not be stripped.
+    let p = Project::new("depnested");
+    p.write(
+        "pkg/validation/src/validation/pattern.zap",
+        "def is_valid(int64 n) -> int64:\n    return n % 2\n",
+    );
+    p.write(
+        "pkg/validation/src/validation.zap",
+        "import validation.pattern\n\ndef check(int64 n) -> int64:\n    \
+         return pattern.is_valid(n)\n",
+    );
+    p.write(
+        "proj/main.zap",
+        "import validation\n\ndef main():\n    print(validation.check(7))\n",
+    );
+    let m = load_program_with(&p.entry("proj/main.zap"), &target(), vec![p.path("pkg")])
+        .expect("links the dependency and its nested submodule");
+    let names = fn_names(&m);
+    assert!(names.contains(&"main".to_string()));
+    assert!(
+        names.iter().any(|n| n.contains("check")),
+        "dependency top module should contribute, got {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.contains("is_valid")),
+        "nested submodule of the dependency should contribute, got {names:?}"
+    );
+}
+
+#[test]
+fn deep_nested_dependency_submodule_chain_resolves() {
+    // Two levels of nesting inside one dependency, each importing the next:
+    // `src/pkg.zap` -> `src/pkg/a.zap` -> `src/pkg/a/b.zap`. Guards the walk
+    // past a single level of nesting (#1697).
+    let p = Project::new("depdeep");
+    p.write(
+        "pkg/pkg/src/pkg/a/b.zap",
+        "def leaf(int64 n) -> int64:\n    return n + 100\n",
+    );
+    p.write(
+        "pkg/pkg/src/pkg/a.zap",
+        "import pkg.a.b\n\ndef mid(int64 n) -> int64:\n    return b.leaf(n) + 10\n",
+    );
+    p.write(
+        "pkg/pkg/src/pkg.zap",
+        "import pkg.a\n\ndef top(int64 n) -> int64:\n    return a.mid(n)\n",
+    );
+    p.write(
+        "proj/main.zap",
+        "import pkg\n\ndef main():\n    print(pkg.top(1))\n",
+    );
+    let m = load_program_with(&p.entry("proj/main.zap"), &target(), vec![p.path("pkg")])
+        .expect("links a two-level nested submodule chain");
+    let names = fn_names(&m);
+    assert!(names.iter().any(|n| n.contains("top")), "{names:?}");
+    assert!(names.iter().any(|n| n.contains("mid")), "{names:?}");
+    assert!(names.iter().any(|n| n.contains("leaf")), "{names:?}");
+}
+
+#[test]
 fn missing_dependency_module_reports() {
     // The dependency dir exists but the requested module file does not.
     let p = Project::new("depmissing");

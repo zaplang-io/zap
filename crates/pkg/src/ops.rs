@@ -1003,6 +1003,50 @@ mod tests {
     }
 
     #[test]
+    fn zenv_create_materializes_nested_path_modules() {
+        // #1697 walled garden: a path dependency that ships a nested module
+        // `src/<name>/<sub>.zap` must have that nested file materialized into the
+        // zenv copy (the `copy_tree` walk recurses into subdirectories), so the
+        // dependency's own `import <name>.<sub>` can resolve against it.
+        let base = tmp("zenvnested");
+        let app = base.join("app");
+        let dep = base.join("validation");
+        project(&dep, "validation", "0.4.0", "");
+        fs::create_dir_all(dep.join("src/validation")).unwrap();
+        fs::write(
+            dep.join("src/validation.zap"),
+            "import validation.pattern\n",
+        )
+        .unwrap();
+        fs::write(
+            dep.join("src/validation/pattern.zap"),
+            "def is_valid(): pass\n",
+        )
+        .unwrap();
+        project(&app, "app", "0.1.0", "");
+        add(
+            &app,
+            "validation",
+            &Source::Path {
+                dir: "../validation".into(),
+            },
+        )
+        .unwrap();
+
+        let report = zenv_create(&app, true).unwrap();
+        assert_eq!(report.modules_materialized, 1);
+        let pkg = zenv::pkg_dir(&app).join("validation");
+        assert!(
+            pkg.join("src/validation.zap").exists(),
+            "top module should materialize"
+        );
+        assert!(
+            pkg.join("src/validation/pattern.zap").exists(),
+            "nested submodule should materialize into the zenv copy"
+        );
+    }
+
+    #[test]
     fn add_without_manifest_errors() {
         let base = tmp("nomani");
         assert!(add(&base, "x", &Source::Path { dir: "y".into() }).is_err());
