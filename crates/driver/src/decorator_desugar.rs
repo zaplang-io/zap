@@ -779,16 +779,16 @@ fn namespace_seam(t: &Option<Type>) -> Option<Option<Type>> {
 /// (#1544/#1625/#1655): the typed getter to call, and an optional conversion
 /// builtin to wrap its result in when the parameter is narrower than the getter's
 /// type. The `Namespace` exposes `get_int` (`int64`), `get_float` (`float64`),
-/// `get_flag` (`bool`), `get_str` (`str`), and the non-numeric `get_char` (`char`)
-/// and `get_bytes` (`bytes`, the argument's UTF-8 encoding). A narrower numeric
-/// scalar reads the wide getter and converts, e.g. `int32 n` →
+/// `get_flag` (`bool`), `get_str` (`str`), and the non-numeric `get_char` (`char`),
+/// `get_bytes` (`bytes`, the argument's UTF-8 encoding), `get_bigint` (`bigint`)
+/// and `get_complex` (`complex`) — the last two parse the argument string (#1657).
+/// A narrower numeric scalar reads the wide getter and converts, e.g. `int32 n` →
 /// `int32(ns.get_int("n"))`, `float32 r` → `float32(ns.get_float("r"))`; a
 /// non-numeric scalar reads its dedicated getter directly (no wrap).
 ///
 /// `None` for any other type — a parameter that cannot be bound from the command
-/// line in v1 (no `Context`/struct binding, and the still-unsupported scalars
-/// `int8`/`int16` (no scalar type, epic #1644/#1654) and `bigint`/`complex` (no
-/// `str`-parse getter yet, #1655)), reported at synthesis.
+/// line in v1 (no `Context`/struct binding, and `int8`/`int16`, which are not
+/// scalar value types in Zap, epic #1644/#1654), reported at synthesis.
 fn namespace_getter_for(t: &Option<Type>) -> Option<(&'static str, Option<&'static str>)> {
     let Some(Type::Named { name, args, .. }) = t else {
         return None;
@@ -813,6 +813,10 @@ fn namespace_getter_for(t: &Option<Type>) -> Option<(&'static str, Option<&'stat
         // single-codepoint parse, `bytes` the argument's UTF-8 encoding.
         "char" => Some(("get_char", None)),
         "bytes" => Some(("get_bytes", None)),
+        // `bigint`/`complex` parse the argument string (#1657); the getter returns
+        // the final type directly, like `char`/`bytes`.
+        "bigint" => Some(("get_bigint", None)),
+        "complex" => Some(("get_complex", None)),
         _ => None,
     }
 }
@@ -929,10 +933,10 @@ fn synth_namespace_adapter(
                             format!(
                                 "handler parameter `{}` has a type that cannot be bound from the \
                                  command-line namespace; an argparse-backed handler takes scalar \
-                                 parameters (bool, str, char, bytes, the integer types \
-                                 int/int32/uint8..uint64/usize, and float/float32), an optional \
-                                 typed context as its first parameter, and injected `Depends(...)` \
-                                 parameters",
+                                 parameters (bool, str, char, bytes, bigint, complex, the integer \
+                                 types int/int32/uint8..uint64/usize, and float/float32), an \
+                                 optional typed context as its first parameter, and injected \
+                                 `Depends(...)` parameters",
                                 p.name
                             ),
                             p.span,
@@ -2928,13 +2932,13 @@ mod tests {
 
     #[test]
     fn non_conversion_scalar_param_errors() {
-        // `bigint`/`complex` have no `str`-parse namespace getter yet (#1655), and
-        // `int8`/`int16` are not scalar types (epic #1644/#1654), so none can be
-        // bound — a precise decoration-site error.
+        // `int8`/`int16` are not scalar value types in Zap (array dtypes only;
+        // epic #1644/#1654), so they cannot be bound — a precise decoration-site
+        // error. (`bigint`/`complex` now bind via #1657; see the #1657 test below.)
         let mut m = module(
             "struct Command:\n    def run(self):\n        print(\"ran\")\n\
              struct Cli:\n    def command(self, fn(Namespace) -> str handler) -> Command:\n        return Command()\n\
-             @cli.command\ndef greet(bigint n) -> str:\n    return \"x\"\n\
+             @cli.command\ndef greet(int8 n) -> str:\n    return \"x\"\n\
              def main():\n    auto cli = Cli()\n    greet.run()\n",
         );
         let diags = desugar_registering_decorators(&mut m, &HashMap::new());
@@ -3326,19 +3330,33 @@ mod tests {
     }
 
     #[test]
-    fn complex_param_still_errors_pending_str_parse() {
-        // #1655: `complex` (and `bigint`) have no `str`-parse namespace getter yet
-        // — a core dependency — so they remain a precise decoration-site error.
+    fn bigint_and_complex_params_bind_via_dedicated_getters() {
+        // #1657: `bigint`/`complex` now read a dedicated typed getter
+        // (`get_bigint`/`get_complex`) that parses the argument string — like
+        // `char`/`bytes`, read directly with no conversion wrapper.
         let mut m = module(
             "struct Command:\n    def run(self):\n        print(\"ran\")\n\
              struct Cli:\n    def command(self, fn(Namespace) -> str handler) -> Command:\n        return Command()\n\
-             @cli.command\ndef greet(complex z) -> str:\n    return \"x\"\n\
+             @cli.command\ndef greet(bigint n, complex z) -> str:\n    return \"x\"\n\
              def main():\n    auto cli = Cli()\n    greet.run()\n",
         );
         let diags = desugar_registering_decorators(&mut m, &HashMap::new());
-        assert!(
-            diags.iter().any(|d| d.message.contains("`z`")),
-            "expected an unsupported-parameter diagnostic for `z`, got: {diags:?}"
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let adapter = func(&m, "greet$adapter").expect("adapter synthesized");
+        let Stmt::Return {
+            value: Some(Expr::Call { args, .. }),
+            ..
+        } = &body(adapter)[0]
+        else {
+            panic!("expected return call");
+        };
+        assert_eq!(
+            getter_call(&args[0].value),
+            Some(("get_bigint".into(), "n".into()))
+        );
+        assert_eq!(
+            getter_call(&args[1].value),
+            Some(("get_complex".into(), "z".into()))
         );
     }
 

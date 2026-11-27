@@ -24,6 +24,8 @@ parameters through them:
 |-----------------|---------|--------------------------------------------------------------|
 | `get_bytes(n)`  | `bytes` | the raw argument string's **UTF-8 encoding** (`bytes(str)`)  |
 | `get_char(n)`   | `char`  | **exactly one Unicode codepoint**; `len != 1` raises a catchable `ValueError` |
+| `get_bigint(n)` | `bigint`| `bigint(str)` — arbitrary-precision parse (added once #1657 landed) |
+| `get_complex(n)`| `complex`| `complex(str)` — Python-style literal parse (added once #1657 landed) |
 
 So a handler `def show(char c, bytes b)` now adapts, where it was a
 decoration-site error (`ZAP5048`) before:
@@ -41,15 +43,14 @@ wrapper.
 
 ## Scope
 
-This is sub-issue #1655 of epic #1644. Still **not** bound by the adapter:
+This is sub-issue #1655 of epic #1644. `char`/`bytes` landed first; `bigint`/
+`complex` were added once their `str`-parse core dependency (**#1657**) landed —
+`get_bigint`/`get_complex` are the same one-line `bigint(self._vals[name])` /
+`complex(self._vals[name])` shape, so no workaround was needed. Still **not** bound
+by the adapter:
 
 - `int8`/`int16` — not scalar value types in Zap (array dtypes only); a first-class
   signed-narrow scalar family is sub-issue **#1654**, handled separately.
-- `bigint`/`complex` — no `str`-parse scalar conversion exists (`bigint(str)` /
-  `complex(str)` raise `ZAP4024`), so no `get_bigint`/`get_complex` can be written
-  without working around a core gap. That gap is filed as **#1657**; these two
-  remain a precise `ZAP5048` until it lands (core-defect golden rule — no
-  workaround).
 
 ## Rationale
 
