@@ -172,21 +172,36 @@ def __derive_json_from[T](str s) -> T:
                 m = {}
         comptime for f in reflect.type_info(T).fields:
             if f.ty.kind.name == "optional":
-                if f.name in m:
-                    if f.ty.inner.name == "int64":
-                        match m[f.name]:
-                            case JsonValue.Int(i):
-                                reflect.set_field(out, comptime f.index, Optional.Some(i))
-                            case _:
-                                pass
-                    elif f.ty.inner.name == "str":
-                        match m[f.name]:
-                            case JsonValue.Str(x):
-                                reflect.set_field(out, comptime f.index, Optional.Some(x))
-                            case _:
-                                pass
-                    else:
-                        comptime.error(f.span, "@derive(Json): unsupported Optional payload")
+                # An Optional field is decoded symmetrically to its encode
+                # (`__json_enc_elem[f.ty.inner]`): recurse into the payload type
+                # through the shared element codec and wrap the result in `Some`.
+                # An absent key OR an explicit JSON null leaves the field at the
+                # `None` the zero-construct already gave it; any other value is
+                # `Some(decode payload)`. This handles every payload the element
+                # codec does — scalars, `list` / `dict`, a nested derived struct,
+                # and an open enum — not just the `int64` / `str` fast paths that
+                # #1696 was stuck on (274/435 generated AWS clients had an
+                # Optional field of some other payload type).
+                #
+                # `bytes` and `DateTime` carry bespoke top-level codecs (base64 /
+                # epoch-or-iso8601) that the shared element codec does NOT reach,
+                # and a nested `Optional` payload has no element form — so an
+                # Optional *of* one of those stays a clean "unsupported Optional
+                # payload" reject rather than falling into the element codec and
+                # emitting a dangling symbol (full support is a follow-up).
+                if f.ty.inner.name == "bytes":
+                    comptime.error(f.span, "@derive(Json): unsupported Optional payload")
+                elif f.ty.inner.name == "DateTime":
+                    comptime.error(f.span, "@derive(Json): unsupported Optional payload")
+                elif f.ty.inner.kind.name == "optional":
+                    comptime.error(f.span, "@derive(Json): unsupported Optional payload")
+                else:
+                    auto jf = __json_get(m, f.name)
+                    match jf:
+                        case JsonValue.Null:
+                            pass
+                        case _:
+                            reflect.set_field(out, comptime f.index, Optional.Some(__json_dec_elem[f.ty.inner](jf)))
             elif f.ty.name == "bytes":
                 reflect.set_field(out, comptime f.index, base64.decode(__json_rd_str(__json_get(m, f.name))))
             elif f.ty.name == "DateTime":
