@@ -318,7 +318,8 @@ enum {
     ZAP_TD_MATCH = 9,  /* ZapMatch (regex): groups/names buffers of ZapStr*     */
     ZAP_TD_SCOPE = 10, /* Scope: excs buffer of ZapStr* pending failures        */
     ZAP_TD_ATOMICARRAY = 11, /* ZapAtomicArray: slots buffer of CAS-able words  */
-    ZAP_TD_DEQUE = 12  /* ZapDeque: ring buffer of element words (#983)         */
+    ZAP_TD_DEQUE = 12, /* ZapDeque: ring buffer of element words (#983)         */
+    ZAP_TD_BYTEARRAY = 13 /* ZapByteArray: {len,cap,data}; forward the atomic data slot (#1385) */
 };
 
 /* Runtime-internal container descriptors (defined at the bottom of this file). */
@@ -338,6 +339,7 @@ extern const ZapTypeDesc zap_desc_gobj;    /* scheduler G (precise)             
 extern const ZapTypeDesc zap_desc_ptrs;    /* a generic array-of-pointers buffer */
 extern const ZapTypeDesc zap_desc_sigsub;  /* SigSub: {next, chan} (ticket #77)  */
 extern const ZapTypeDesc zap_desc_atomicarray; /* AtomicArray[T] (#844)           */
+extern const ZapTypeDesc zap_desc_bytearray; /* ZapByteArray (#1385): {len,cap,data} */
 extern const ZapTypeDesc zap_desc_ctxvar;  /* ContextVar[T] key object (#1237)   */
 extern const ZapTypeDesc zap_desc_ctxnode; /* ContextVar binding node (#1237)    */
 extern const ZapTypeDesc zap_desc_ctxtoken;/* ContextVar reset token (#1237)     */
@@ -11467,6 +11469,10 @@ int64_t zap_signal_selftest(void) {
 /* uuid (#975, D-0232/D-0233): after crypto.inc.c — reuses its CSPRNG/MD5/SHA-1. */
 #include "runtime/uuid.inc.c"
 #include "runtime/bytes.inc.c"
+/* bytearray (#1385): the mutable growable byte buffer. After bytes.inc.c — it
+ * reuses the `ZapStr` layout, the slice helpers, and the `zap_desc_bytearray`
+ * descriptor defined below. */
+#include "runtime/bytearray.inc.c"
 /* Bundled IANA timezone tables (#1045, D-0225) — must precede time_datetime,
  * which binary-searches ZAP_TZ_ZONES. */
 #include "runtime/tzdata_generated.inc.c"
@@ -11520,6 +11526,10 @@ const ZapTypeDesc zap_desc_matchobj = {(int64_t)sizeof(ZapMatch), ZAP_TD_MATCH, 
 const ZapTypeDesc zap_desc_scope = {(int64_t)sizeof(Scope), ZAP_TD_SCOPE, 0, NULL};
 const ZapTypeDesc zap_desc_atomicarray =
     {(int64_t)sizeof(ZapAtomicArray), ZAP_TD_ATOMICARRAY, 0, NULL};
+/* bytearray (#1385): a fixed-size header {len, cap, data}; the `data` buffer is
+ * a separate atomic leaf, forwarded by the ZAP_TD_BYTEARRAY trace case. */
+const ZapTypeDesc zap_desc_bytearray =
+    {(int64_t)sizeof(ZapByteArray), ZAP_TD_BYTEARRAY, 0, NULL};
 /* ZapPy wraps a borrowed CPython reference, not a GC pointer, so it is a leaf. */
 const ZapTypeDesc zap_desc_pyobj = {(int64_t)sizeof(ZapPy), ZAP_TD_ATOMIC, 0, NULL};
 /* One-object string (#837, D-0145): header + inline byte payload. ATOMIC — the

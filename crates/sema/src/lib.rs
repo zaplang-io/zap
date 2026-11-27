@@ -3742,6 +3742,8 @@ impl Checker {
                 "bool" => Ty::Bool,
                 "str" => Ty::Str,
                 "bytes" => Ty::Bytes,
+                // Mutable growable byte buffer (#1385), the mutable sibling of `bytes`.
+                "bytearray" => Ty::ByteArray,
                 // A borrowed, non-owning view of a `str`'s bytes (#1082).
                 "strview" => Ty::StrView,
                 "bytesview" => Ty::BytesView,
@@ -4050,6 +4052,7 @@ impl Checker {
                 "bool" => Ty::Bool,
                 "str" => Ty::Str,
                 "bytes" => Ty::Bytes,
+                "bytearray" => Ty::ByteArray,
                 "strview" => Ty::StrView,
                 "bytesview" => Ty::BytesView,
                 "char" => Ty::Char,
@@ -5633,12 +5636,24 @@ impl Checker {
                     self.note_share_access(n, *span);
                     match self.lookup(n) {
                         Some(tt) => {
+                            // `bytearray += bytes|bytearray|list[int]` is an
+                            // IN-PLACE extend (#1385) — broader than the `+`
+                            // expression (which does not take `list[int]`), and
+                            // never a fresh allocation, so it is accepted here
+                            // before the generic arithmetic rule.
                             // `t += v` on a user struct calls the in-place dunder
                             // (`__iadd__` etc.) when defined, else derives from the
                             // binary operator's `__add__` etc. (D-0047).
-                            let r = match self.check_struct_aug_assign(*op, &tt, &vt, *span) {
-                                Some(ty) => ty,
-                                None => self.arith_result(*op, &tt, &vt, *span),
+                            let r = if matches!(tt, Ty::ByteArray)
+                                && matches!(op, BinOp::Add)
+                                && self.bytearray_extend_operand_ok(&vt)
+                            {
+                                Ty::ByteArray
+                            } else {
+                                match self.check_struct_aug_assign(*op, &tt, &vt, *span) {
+                                    Some(ty) => ty,
+                                    None => self.arith_result(*op, &tt, &vt, *span),
+                                }
                             };
                             // #1654 rule 3: `c += <literal>` keeps `c`'s
                             // fixed-width type (the counter case), so the literal
@@ -6920,6 +6935,9 @@ impl Checker {
                     // `bytes` indexing yields the byte value as an `int64`
                     // (0..=255), not a char (I#337).
                     Ty::Bytes => Ty::Int64,
+                    // `bytearray` indexing likewise yields the byte as an `int64`
+                    // (0..=255); unlike `bytes`, `a[i] = v` is also assignable (#1385).
+                    Ty::ByteArray => Ty::Int64,
                     Ty::Range => Ty::Int64,
                     _ => Ty::Unknown,
                 }
@@ -6941,6 +6959,8 @@ impl Checker {
                     Ty::Str => Ty::Str,
                     // A `bytes` slice is `bytes` (byte-based, I#337).
                     Ty::Bytes => Ty::Bytes,
+                    // A `bytearray` slice is a fresh `bytearray` (byte-based, #1385).
+                    Ty::ByteArray => Ty::ByteArray,
                     _ => Ty::Unknown,
                 }
             }
@@ -7256,6 +7276,14 @@ impl Checker {
                 } else if matches!(l, Ty::Bytes) && matches!(r, Ty::Bytes) {
                     // `bytes + bytes` concatenates (I#337).
                     Ty::Bytes
+                } else if (matches!(l, Ty::ByteArray) && matches!(r, Ty::ByteArray | Ty::Bytes))
+                    || (matches!(l, Ty::Bytes) && matches!(r, Ty::ByteArray))
+                {
+                    // `bytearray + bytearray|bytes` (and `bytes + bytearray`)
+                    // concatenate into a NEW `bytearray` (#1385). `bytearray +=`
+                    // is handled separately as an in-place extend (and also
+                    // accepts `list[int]`), so it is not reached here.
+                    Ty::ByteArray
                 } else if matches!(l, Ty::List(_)) && matches!(r, Ty::List(_)) {
                     l.clone()
                 } else if matches!(l, Ty::VarTuple(_)) && matches!(r, Ty::VarTuple(_)) {
@@ -7486,6 +7514,9 @@ impl Checker {
             // 0..=255 (#1349), byte-wise (not UTF-8-decoded) — matching Python,
             // and distinct from `str`'s codepoint (`char`) iteration.
             Ty::Bytes => Some(Ty::Int64),
+            // Iterating a `bytearray` yields its bytes as unsigned `int64`s in
+            // 0..=255 (#1385), byte-wise like `bytes`.
+            Ty::ByteArray => Some(Ty::Int64),
             Ty::Unknown | Ty::Py => Some(Ty::Unknown),
             // A value typed as the built-in generic `Iterator[T]` / `Iterable[T]`
             // interface (#1382 phase 1, RFC #1417) iterates at element type `T`:
@@ -8113,9 +8144,89 @@ impl Checker {
     /// every scalar (`int*`/`float*`/`bool`/`char`/`range`), a `tuple`, and the
     /// borrowed views (`strview`/`bytesview`) can never be None — `is None` /
     /// `== None` on them is rejected with ZAP4074.
+    /// Operand types accepted by `bytearray.extend(...)` and `bytearray +=`
+    /// (#1385): `bytes`, another `bytearray`, or a `list[int]` (any integer
+    /// element). `Unknown` stays permissive.
+    fn bytearray_extend_operand_ok(&self, vt: &Ty) -> bool {
+        match vt {
+            Ty::Bytes | Ty::ByteArray | Ty::Unknown => true,
+            Ty::List(e) => e.is_int() || matches!(**e, Ty::Unknown),
+            _ => false,
+        }
+    }
+
+    /// Built-in `bytearray` mutation methods (#1385): `append(int)` and
+    /// `extend(bytes|bytearray|list[int])`, both returning `None` (`Ty::Unit`).
+    /// Any other name is rejected (ZAP4080). Positional-only intrinsics, so no
+    /// `seam_sigs.rs` row applies (the `bytes.translate` precedent).
+    fn check_bytearray_method(&mut self, name: &str, args: &[Arg], span: Span) -> Ty {
+        match name {
+            "append" => {
+                if args.len() != 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!("bytearray.append(x) takes one argument, got {}", args.len()),
+                        span,
+                    );
+                }
+                for (i, a) in args.iter().enumerate() {
+                    let at = self.infer(&a.value);
+                    if i == 0 && !at.is_int() && !matches!(at, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!("bytearray.append() expects an int, found {}", at.display()),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+                Ty::Unit
+            }
+            "extend" => {
+                if args.len() != 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!(
+                            "bytearray.extend(other) takes one argument, got {}",
+                            args.len()
+                        ),
+                        span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                } else {
+                    let at = self.infer(&args[0].value);
+                    if !self.bytearray_extend_operand_ok(&at) {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!(
+                                "bytearray.extend() expects bytes, bytearray, or list[int], \
+                                 found {}",
+                                at.display()
+                            ),
+                            expr_span(&args[0].value),
+                        );
+                    }
+                }
+                Ty::Unit
+            }
+            other => {
+                for a in args {
+                    self.infer(&a.value);
+                }
+                self.error(
+                    ErrorCode::ZAP4080,
+                    format!("bytearray has no method '{other}' (supported: append, extend)"),
+                    span,
+                );
+                Ty::Unknown
+            }
+        }
+    }
+
     fn is_nullable_ty(&self, t: &Ty) -> bool {
         match t {
-            Ty::Str | Ty::Bytes => true,
+            Ty::Str | Ty::Bytes | Ty::ByteArray => true,
             Ty::Named(n) if self.is_interface(n) => true,
             _ => self.is_identity_ty(t),
         }
@@ -10428,14 +10539,17 @@ impl Checker {
                     }
                     for a in args {
                         let at = self.infer(&a.value);
-                        let ok = matches!(at, Ty::Str | Ty::Bytes | Ty::Unknown | Ty::Py)
-                            || (at.is_int() && !matches!(at, Ty::Bigint))
+                        // `bytes(bytearray)` makes an immutable copy (#1385).
+                        let ok = matches!(
+                            at,
+                            Ty::Str | Ty::Bytes | Ty::ByteArray | Ty::Unknown | Ty::Py
+                        ) || (at.is_int() && !matches!(at, Ty::Bigint))
                             || matches!(&at, Ty::List(e) if e.is_int() || matches!(**e, Ty::Unknown));
                         if !ok {
                             self.error(
                                 ErrorCode::ZAP4024,
                                 format!(
-                                    "bytes() expects an int count, a str, or a list of integers, found {}",
+                                    "bytes() expects an int count, a str, bytes/bytearray, or a list of integers, found {}",
                                     at.display()
                                 ),
                                 expr_span(&a.value),
@@ -10443,6 +10557,40 @@ impl Checker {
                         }
                     }
                     return Ty::Bytes;
+                }
+                "bytearray" => {
+                    // bytearray(): empty; bytearray(int n): n zero bytes (negative
+                    // -> ValueError at runtime); bytearray(str): UTF-8 encode (a
+                    // mutable copy, matching bare `bytes(str)`); bytearray(bytes):
+                    // a copy; bytearray(bytearray): a copy; bytearray(list[int]):
+                    // one byte per element (0..=255 at runtime). (#1385)
+                    if args.len() > 1 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "bytearray() takes at most one argument".to_string(),
+                            span,
+                        );
+                    }
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        let ok = matches!(
+                            at,
+                            Ty::Str | Ty::Bytes | Ty::ByteArray | Ty::Unknown | Ty::Py
+                        ) || (at.is_int() && !matches!(at, Ty::Bigint))
+                            || matches!(&at, Ty::List(e) if e.is_int() || matches!(**e, Ty::Unknown));
+                        if !ok {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "bytearray() expects an int count, a str, bytes/bytearray, \
+                                     or a list of integers, found {}",
+                                    at.display()
+                                ),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::ByteArray;
                 }
                 "set" => {
                     // set(iterable): a new set of the iterable's deduplicated
@@ -11256,6 +11404,10 @@ impl Checker {
             }
             if matches!(bt, Ty::Str) {
                 return self.check_str_method(name, args, *span);
+            }
+            // `bytearray` mutation methods (#1385): append / extend.
+            if matches!(bt, Ty::ByteArray) {
+                return self.check_bytearray_method(name, args, *span);
             }
             // Borrowed `strview` (#1082): the read-only consumer subset only.
             if matches!(bt, Ty::StrView) {

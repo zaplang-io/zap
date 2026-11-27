@@ -5125,6 +5125,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             | Ty::ContextVar(_)
             | Ty::CtxToken
             | Ty::Bytes
+            | Ty::ByteArray
             | Ty::Match
             | Ty::Func(_)
             | Ty::Py

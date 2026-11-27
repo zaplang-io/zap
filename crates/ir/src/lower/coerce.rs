@@ -386,6 +386,8 @@ impl<'a> FnLower<'a> {
         // `ZapStr {len, data}` layout, so both use `zap_str_len`.
         let len_fn = match t {
             Ty::Ptr | Ty::Bytes => Some("zap_str_len"),
+            // A `bytearray` is truthy when non-empty (#1385).
+            Ty::ByteArray => Some("zap_bytearray_len"),
             Ty::List(_) => Some("zap_list_len"),
             Ty::Dict(..) => Some("zap_dict_len"),
             Ty::Set(_) => Some("zap_set_len"),

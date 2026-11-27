@@ -2637,6 +2637,8 @@ impl<'a> FnLower<'a> {
             // `sum(bytes)` reduces the byte values as `int64`s (#1355), the same
             // elements `for b in data` yields; iterated via `iterate_bytes`.
             Ty::Bytes => Ty::I64,
+            // `sum(bytearray)` likewise reduces its bytes as `int64`s (#1385).
+            Ty::ByteArray => Ty::I64,
             other => {
                 return Err(err(format!(
                     "sum() expects an array, list, iterator, or bytes value, found {other:?}"
@@ -2674,6 +2676,7 @@ impl<'a> FnLower<'a> {
             Ty::Struct(sid) => self.drive_iteration(v, sid, add)?,
             Ty::List(e) => self.iterate_list(v, e, add)?,
             Ty::Bytes => self.iterate_bytes(v, add)?,
+            Ty::ByteArray => self.iterate_bytearray(v, add)?,
             _ => unreachable!("element type already classified above"),
         }
         let result = self.load(acc, elem_ty);
@@ -2902,6 +2905,9 @@ impl<'a> FnLower<'a> {
             // `bytes` operand, matching the statement-`for` path
             // (`lower_for_bytes`). Distinct from `str`'s codepoint iteration.
             Ty::Bytes => self.iterate_bytes(val, body),
+            // `bytearray` iterates its bytes as unsigned `int64`s (#1385), byte-
+            // wise like `bytes`.
+            Ty::ByteArray => self.iterate_bytearray(val, body),
             Ty::Struct(sid) => self.drive_iteration(val, sid, body),
             other => Err(err(format!(
                 "value of type {other:?} is not iterable (D-0048)"
@@ -3024,6 +3030,74 @@ impl<'a> FnLower<'a> {
         self.emit(Inst::Call {
             dest: Some(byte),
             func: "zap_bytes_index".to_string(),
+            args: vec![data, i],
+        });
+        self.push_loop(incr_bb, end_bb);
+        body(self, byte, Ty::I64)?;
+        self.loops.pop();
+        self.ensure_br(incr_bb);
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+        self.position(end_bb);
+        self.pop_scope();
+        Ok(())
+    }
+
+    /// Iterate a `bytearray`, invoking `body` with each byte as an unsigned
+    /// `int64` in 0..=255 (#1385). The closure form of [`Self::lower_for_bytearray`]
+    /// — length via `zap_bytearray_len`, element via `zap_bytearray_get`. Used by
+    /// the general iteration protocol ([`Self::iterate`]) for comprehensions,
+    /// `sum(...)`, and the `set`/`list` constructors over a `bytearray`.
+    pub(super) fn iterate_bytearray(
+        &mut self,
+        data: Value,
+        mut body: impl FnMut(&mut FnLower<'a>, Value, Ty) -> Result<(), LowerError>,
+    ) -> Result<(), LowerError> {
+        self.push_scope();
+        let idx = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let end_bb = self.new_block();
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let nbytes = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(nbytes),
+            func: "zap_bytearray_len".to_string(),
+            args: vec![data],
+        });
+        let c = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: c,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: nbytes,
+        });
+        self.set_term(Term::BrIf {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let byte = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(byte),
+            func: "zap_bytearray_get".to_string(),
             args: vec![data, i],
         });
         self.push_loop(incr_bb, end_bb);
@@ -3629,6 +3703,11 @@ impl<'a> FnLower<'a> {
                 // UTF-8-decoded, and the loop variable is an integer, not a char.
                 if lty == Ty::Bytes {
                     return self.lower_for_bytes(target, lst, body);
+                }
+                // `for b in a` where `a : bytearray` — byte-wise, binding each
+                // byte as an unsigned `int64` in 0..=255 (#1385).
+                if lty == Ty::ByteArray {
+                    return self.lower_for_bytearray(target, lst, body);
                 }
                 // `for x in <user iterable>` — the general D-0048 protocol.
                 if let Ty::Struct(sid) = lty {
@@ -4532,6 +4611,49 @@ impl<'a> FnLower<'a> {
         data: Value,
         body: &ast::Block,
     ) -> Result<(), LowerError> {
+        // `bytes` lowers to `Ty::Bytes` over the `ZapStr` buffer: byte count via
+        // `zap_str_len`, element via `zap_bytes_index`.
+        self.lower_for_byteseq(
+            target,
+            data,
+            body,
+            "zap_str_len",
+            "zap_bytes_index",
+            Ty::Bytes,
+        )
+    }
+
+    /// `for b in a` where `a : bytearray` (#1385): byte-wise, binding each byte as
+    /// an unsigned `int64` in 0..=255 — the same shape as `lower_for_bytes`, over
+    /// the `ZapByteArray` entry points.
+    fn lower_for_bytearray(
+        &mut self,
+        target: &Expr,
+        data: Value,
+        body: &ast::Block,
+    ) -> Result<(), LowerError> {
+        self.lower_for_byteseq(
+            target,
+            data,
+            body,
+            "zap_bytearray_len",
+            "zap_bytearray_get",
+            Ty::ByteArray,
+        )
+    }
+
+    /// Shared byte-wise `for` loop for `bytes` / `bytearray`: length via `len_fn`,
+    /// each element via `index_fn`, with the handle spilled/reloaded as `buf_ty`
+    /// so it survives a `yield` in a generator body (I#453).
+    fn lower_for_byteseq(
+        &mut self,
+        target: &Expr,
+        data: Value,
+        body: &ast::Block,
+        len_fn: &str,
+        index_fn: &str,
+        buf_ty: Ty,
+    ) -> Result<(), LowerError> {
         let name = match target {
             Expr::Name(n, _) => n.clone(),
             _ => {
@@ -4553,11 +4675,11 @@ impl<'a> FnLower<'a> {
         let nbytes = self.new_value(Ty::I64);
         self.emit(Inst::Call {
             dest: Some(nbytes),
-            func: "zap_str_len".to_string(),
+            func: len_fn.to_string(),
             args: vec![data],
         });
         let nbytes_slot = self.spill_invariant(nbytes, Ty::I64);
-        let data_slot = self.spill_invariant(data, Ty::Bytes);
+        let data_slot = self.spill_invariant(data, buf_ty);
         // Each byte binds as an unsigned `int64` in 0..=255 (#1349).
         let var = self.decl_slot(&name, Ty::I64);
 
@@ -4585,11 +4707,11 @@ impl<'a> FnLower<'a> {
 
         self.position(body_bb);
         let i = self.load(idx, Ty::I64);
-        let data_b = self.reload_invariant(data_slot, data, Ty::Bytes);
+        let data_b = self.reload_invariant(data_slot, data, buf_ty);
         let byte = self.new_value(Ty::I64);
         self.emit(Inst::Call {
             dest: Some(byte),
-            func: "zap_bytes_index".to_string(),
+            func: index_fn.to_string(),
             args: vec![data_b, i],
         });
         self.store(var, byte);

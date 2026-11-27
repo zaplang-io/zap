@@ -1031,6 +1031,18 @@ static void zap_trace_children(void *payload) {
         }
         return;
     }
+    case ZAP_TD_BYTEARRAY: {
+        /* bytearray (#1385): the header holds one slot, `data`, pointing at a
+         * separate atomic (pointer-free) leaf byte buffer. Forward only that slot
+         * — the buffer holds bytes, never pointers, so it is never scanned. The
+         * header is pinned in place (not in the evac move set), so its identity is
+         * stable across appends; only `data` is reallocated/relocated. */
+        ZapByteArray *ba = (ZapByteArray *)payload;
+        if (ba->data) {
+            zap_process_slot((void **)&ba->data);
+        }
+        return;
+    }
     case ZAP_TD_ATOMICARRAY: {
         /* AtomicArray[T] (#844): forward the slots buffer itself, then — when the
          * slots hold references — mark + forward every non-null slot, exactly like
