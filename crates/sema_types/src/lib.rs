@@ -18,6 +18,16 @@ use zapc_syntax::span::Span;
 pub enum Ty {
     Int64,
     Int32,
+    /// Signed fixed-width narrow integers (#1654), first-class scalar value
+    /// types completing the signed family below `int32`. Width-stable and
+    /// wrapping (two's-complement), inferring literals to context and widening
+    /// implicitly up the signed tower (`int8`→`int16`→`int32`→`int64`), exactly
+    /// like `int32`/`int64` (ADR `decisions/lang/1654-fixed-width-integer-semantics.md`).
+    /// Narrowing is always an explicit `intN(...)` cast (D-0020). They
+    /// previously existed only as array `Dtype`s / ZIR `I8`/`I16` types with no
+    /// scalar `Ty`, so a scalar annotation `int8 x` resolved to `Ty::Unknown`.
+    Int8,
+    Int16,
     /// Unsigned fixed-width integers (#552, D-0019 amendment). Reintroduced for
     /// C FFI (#539) and array dtypes. They are a distinct, non-interchangeable
     /// family: there is **no implicit conversion** between signed and unsigned
@@ -200,6 +210,8 @@ impl Ty {
             self,
             Ty::Int64
                 | Ty::Int32
+                | Ty::Int16
+                | Ty::Int8
                 | Ty::Uint8
                 | Ty::Uint16
                 | Ty::Uint32
@@ -219,6 +231,8 @@ impl Ty {
             self,
             Ty::Int64
                 | Ty::Int32
+                | Ty::Int16
+                | Ty::Int8
                 | Ty::Uint8
                 | Ty::Uint16
                 | Ty::Uint32
@@ -238,11 +252,12 @@ impl Ty {
         )
     }
 
-    /// A concrete *signed* machine integer (`int32`/`int64`). Excludes `bigint`,
+    /// A concrete *signed* machine integer (`int8`/`int16`/`int32`/`int64`).
+    /// Excludes `bigint`,
     /// the untyped literal, and every unsigned type. Used to detect mixed-sign
     /// arithmetic (#552).
     pub fn is_signed_int(&self) -> bool {
-        matches!(self, Ty::Int64 | Ty::Int32)
+        matches!(self, Ty::Int64 | Ty::Int32 | Ty::Int16 | Ty::Int8)
     }
 
     /// Bit width of a fixed-width unsigned type, for implicit-widening checks
@@ -267,6 +282,8 @@ impl Ty {
     /// literal, and every non-integer type.
     pub fn int_width(&self) -> Option<u32> {
         Some(match self {
+            Ty::Int8 => 8,
+            Ty::Int16 => 16,
             Ty::Int32 => 32,
             Ty::Int64 => 64,
             Ty::Uint8 => 8,
@@ -282,6 +299,8 @@ impl Ty {
         match self {
             Ty::Int64 => "int64".into(),
             Ty::Int32 => "int32".into(),
+            Ty::Int16 => "int16".into(),
+            Ty::Int8 => "int8".into(),
             Ty::Uint8 => "uint8".into(),
             Ty::Uint16 => "uint16".into(),
             Ty::Uint32 => "uint32".into(),
@@ -372,6 +391,8 @@ impl Ty {
         Some(match self {
             Ty::Int64 | Ty::UntypedInt => named("int64", vec![]),
             Ty::Int32 => named("int32", vec![]),
+            Ty::Int16 => named("int16", vec![]),
+            Ty::Int8 => named("int8", vec![]),
             Ty::Uint8 => named("uint8", vec![]),
             Ty::Uint16 => named("uint16", vec![]),
             Ty::Uint32 => named("uint32", vec![]),
@@ -515,7 +536,9 @@ pub fn assignable(from: &Ty, to: &Ty) -> bool {
         // Untyped literals fit any appropriate numeric type.
         (
             Ty::UntypedInt,
-            Ty::Int32
+            Ty::Int8
+            | Ty::Int16
+            | Ty::Int32
             | Ty::Int64
             | Ty::Float32
             | Ty::Float64
@@ -538,12 +561,23 @@ pub fn assignable(from: &Ty, to: &Ty) -> bool {
         {
             from.uint_width() <= to.uint_width()
         }
-        // Concrete widening.
-        (Ty::Int32, Ty::Int64) => true,
-        (Ty::Int32 | Ty::Int64, Ty::Float64 | Ty::Float32) => true,
+        // Implicit widening up the signed tower
+        // (`int8`→`int16`→`int32`→`int64`): always value-preserving
+        // (sign-extend), mirroring the unsigned-tower arm above and the
+        // pre-#1654 `int32`→`int64` widening it generalizes. Narrowing
+        // (`int64`→`int8`, …) stays explicit (`intN(...)`, D-0020) — this arm
+        // returns `false` for it. Signed↔unsigned crossings never reach here
+        // (`is_signed_int` excludes the unsigned family and `usize`). (#1654)
+        (from, to) if from.is_signed_int() && to.is_signed_int() => {
+            from.int_width() <= to.int_width()
+        }
+        (Ty::Int8 | Ty::Int16 | Ty::Int32 | Ty::Int64, Ty::Float64 | Ty::Float32) => true,
         (Ty::Float32, Ty::Float64) => true,
-        (Ty::Int32 | Ty::Int64, Ty::Bigint) => true,
-        (Ty::Int32 | Ty::Int64 | Ty::Float32 | Ty::Float64 | Ty::Bigint, Ty::Complex) => true,
+        (Ty::Int8 | Ty::Int16 | Ty::Int32 | Ty::Int64, Ty::Bigint) => true,
+        (
+            Ty::Int8 | Ty::Int16 | Ty::Int32 | Ty::Int64 | Ty::Float32 | Ty::Float64 | Ty::Bigint,
+            Ty::Complex,
+        ) => true,
         (Ty::List(a), Ty::List(b)) => assignable(a, b),
         (Ty::Set(a), Ty::Set(b)) => assignable(a, b),
         (Ty::Heap(a), Ty::Heap(b)) => assignable(a, b),
@@ -600,6 +634,8 @@ pub fn primitive_type_value_ty(name: &str) -> Option<Ty> {
     Some(match name {
         "int" | "int64" | "i64" => Ty::Int64,
         "int32" | "i32" => Ty::Int32,
+        "int16" | "i16" => Ty::Int16,
+        "int8" | "i8" => Ty::Int8,
         "uint8" | "u8" => Ty::Uint8,
         "uint16" | "u16" => Ty::Uint16,
         "uint32" | "u32" => Ty::Uint32,
@@ -640,6 +676,9 @@ pub fn type_value_id(ty: &Ty) -> Option<i64> {
         Ty::Char => 13,
         Ty::Bigint => 14,
         Ty::Complex => 15,
+        // New stable ids appended (#1654) — existing ids are never renumbered.
+        Ty::Int16 => 16,
+        Ty::Int8 => 17,
         _ => return None,
     })
 }
@@ -1252,6 +1291,8 @@ pub fn primitive_name(ty: &Ty) -> Option<&'static str> {
     Some(match ty {
         Ty::Int64 | Ty::UntypedInt => "int64",
         Ty::Int32 => "int32",
+        Ty::Int16 => "int16",
+        Ty::Int8 => "int8",
         Ty::Uint8 => "uint8",
         Ty::Uint16 => "uint16",
         Ty::Uint32 => "uint32",
@@ -1420,6 +1461,104 @@ mod tests {
         assert_eq!(num_join(&Ty::Int64, &Ty::Complex), Ty::Complex);
         assert_eq!(num_join(&Ty::Int32, &Ty::Bigint), Ty::Bigint);
         assert_eq!(num_join(&Ty::UntypedInt, &Ty::Bigint), Ty::Bigint);
+    }
+
+    #[test]
+    fn int8_int16_are_first_class_signed_scalars() {
+        // #1654: the narrow signed scalars classify exactly like `int32` —
+        // numeric, integer, signed; not unsigned.
+        for t in [Ty::Int8, Ty::Int16] {
+            assert!(t.is_numeric(), "{t:?} should be numeric");
+            assert!(t.is_int(), "{t:?} should be an int");
+            assert!(t.is_signed_int(), "{t:?} should be a signed int");
+            assert!(!t.is_unsigned(), "{t:?} is not unsigned");
+            // The signed family is excluded from `uint_width`, included in the
+            // universal `int_width`.
+            assert_eq!(t.uint_width(), None, "{t:?} is not an unsigned width");
+        }
+        assert_eq!(Ty::Int8.int_width(), Some(8));
+        assert_eq!(Ty::Int16.int_width(), Some(16));
+        // Display + reflection spellings.
+        assert_eq!(Ty::Int8.display(), "int8");
+        assert_eq!(Ty::Int16.display(), "int16");
+        assert_eq!(primitive_name(&Ty::Int8), Some("int8"));
+        assert_eq!(primitive_name(&Ty::Int16), Some("int16"));
+    }
+
+    #[test]
+    fn int8_int16_type_values_and_ast_bridge() {
+        // Every spelling denotes the same canonical type value (#1527).
+        assert_eq!(primitive_type_value_ty("int8"), Some(Ty::Int8));
+        assert_eq!(primitive_type_value_ty("i8"), Some(Ty::Int8));
+        assert_eq!(primitive_type_value_ty("int16"), Some(Ty::Int16));
+        assert_eq!(primitive_type_value_ty("i16"), Some(Ty::Int16));
+        // New stable type-ids, appended without renumbering the shipped ones.
+        assert_eq!(type_value_id(&Ty::Int16), Some(16));
+        assert_eq!(type_value_id(&Ty::Int8), Some(17));
+        assert_eq!(type_value_id(&Ty::Int64), Some(1), "shipped ids unchanged");
+        // The AST bridge mangles to the canonical source spelling.
+        assert_eq!(
+            Ty::Int8.to_ast_type().and_then(|t| match t {
+                Type::Named { name, .. } => Some(name),
+                _ => None,
+            }),
+            Some("int8".to_string())
+        );
+        assert_eq!(
+            Ty::Int16.to_ast_type().and_then(|t| match t {
+                Type::Named { name, .. } => Some(name),
+                _ => None,
+            }),
+            Some("int16".to_string())
+        );
+    }
+
+    #[test]
+    fn int8_int16_assignability_signed_tower() {
+        // Implicit widening runs up the whole signed tower (sign-extend,
+        // value-preserving) — int8 → int16 → int32 → int64.
+        assert!(assignable(&Ty::Int8, &Ty::Int16));
+        assert!(assignable(&Ty::Int8, &Ty::Int32));
+        assert!(assignable(&Ty::Int8, &Ty::Int64));
+        assert!(assignable(&Ty::Int16, &Ty::Int32));
+        assert!(assignable(&Ty::Int16, &Ty::Int64));
+        // Narrowing is NOT implicit (requires an explicit `intN(...)` cast).
+        assert!(!assignable(&Ty::Int16, &Ty::Int8));
+        assert!(!assignable(&Ty::Int64, &Ty::Int8));
+        assert!(!assignable(&Ty::Int32, &Ty::Int16));
+        // Into the wider numeric families, like int32/int64.
+        assert!(assignable(&Ty::Int8, &Ty::Float64));
+        assert!(assignable(&Ty::Int16, &Ty::Float32));
+        assert!(assignable(&Ty::Int8, &Ty::Bigint));
+        assert!(assignable(&Ty::Int16, &Ty::Complex));
+        // An untyped literal still fits either narrow signed type.
+        assert!(assignable(&Ty::UntypedInt, &Ty::Int8));
+        assert!(assignable(&Ty::UntypedInt, &Ty::Int16));
+        // No implicit signed<->unsigned crossing (ZAP4015 territory).
+        assert!(!assignable(&Ty::Int8, &Ty::Uint8));
+        assert!(!assignable(&Ty::Uint8, &Ty::Int8));
+        assert!(!assignable(&Ty::Uint8, &Ty::Int16));
+    }
+
+    #[test]
+    fn int8_int16_num_join_is_width_stable() {
+        // Rule 1: same-width stays that width.
+        assert_eq!(num_join(&Ty::Int8, &Ty::Int8), Ty::Int8);
+        assert_eq!(num_join(&Ty::Int16, &Ty::Int16), Ty::Int16);
+        // Rule 2: mixed-width widens to the larger operand.
+        assert_eq!(num_join(&Ty::Int8, &Ty::Int16), Ty::Int16);
+        assert_eq!(num_join(&Ty::Int16, &Ty::Int8), Ty::Int16);
+        assert_eq!(num_join(&Ty::Int8, &Ty::Int32), Ty::Int32);
+        assert_eq!(num_join(&Ty::Int16, &Ty::Int64), Ty::Int64);
+        assert_eq!(num_join(&Ty::Int8, &Ty::Int64), Ty::Int64);
+        // Rule 3: an untyped literal adopts the narrow concrete type.
+        assert_eq!(num_join(&Ty::Int8, &Ty::UntypedInt), Ty::Int8);
+        assert_eq!(num_join(&Ty::UntypedInt, &Ty::Int8), Ty::Int8);
+        assert_eq!(num_join(&Ty::Int16, &Ty::UntypedInt), Ty::Int16);
+        // The non-integer families still win.
+        assert_eq!(num_join(&Ty::Int8, &Ty::Float64), Ty::Float64);
+        assert_eq!(num_join(&Ty::Int16, &Ty::Bigint), Ty::Bigint);
+        assert_eq!(num_join(&Ty::Int8, &Ty::Complex), Ty::Complex);
     }
 
     #[test]

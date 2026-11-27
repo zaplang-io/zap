@@ -2360,6 +2360,11 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
         ast::Type::Named { name, args, .. } => match name.as_str() {
             "int" | "int64" | "i64" => Ok(Ty::I64),
             "int32" | "i32" => Ok(Ty::I32),
+            // Signed narrow fixed-width integers, first-class scalars (#1654):
+            // the signed mirrors of `uint8`/`uint16`. They lower to the ZIR
+            // `I8`/`I16` types (which already wrap at their width, D-0005).
+            "int16" | "i16" => Ok(Ty::I16),
+            "int8" | "i8" => Ok(Ty::I8),
             // `float` is the Python-facing name for the 64-bit IEEE double
             // (I#569); `float64`/`f64` are the explicit-width spellings.
             "float" | "float64" | "f64" => Ok(Ty::F64),
@@ -18650,6 +18655,11 @@ fn numeric_conv_ty(name: &str) -> Option<Ty> {
     match name {
         "int32" | "i32" => Some(Ty::I32),
         "int64" | "i64" => Some(Ty::I64),
+        // Signed narrow conversions (#1654): the wrap escape hatch for the
+        // width-stable family (`int8(300) == 44`). ZIR `convert()` truncates /
+        // sign-extends into `I8`/`I16`.
+        "int8" | "i8" => Some(Ty::I8),
+        "int16" | "i16" => Some(Ty::I16),
         // Unsigned conversions (#552). `usize` is pointer-width → `u64`.
         "uint8" | "u8" => Some(Ty::U8),
         "uint16" | "u16" => Some(Ty::U16),

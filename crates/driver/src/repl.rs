@@ -985,7 +985,9 @@ mod engine {
     /// does not persist it across entries (floats, user types, closures, ...).
     fn rep_of(ty: &Ty) -> Option<Rep> {
         match ty {
-            Ty::Int64 | Ty::Int32 | Ty::Bool | Ty::Char | Ty::UntypedInt => Some(Rep::I64),
+            Ty::Int64 | Ty::Int32 | Ty::Int16 | Ty::Int8 | Ty::Bool | Ty::Char | Ty::UntypedInt => {
+                Some(Rep::I64)
+            }
             Ty::Float64 | Ty::Float32 | Ty::UntypedFloat => Some(Rep::F64),
             Ty::Str | Ty::Bytes | Ty::List(_) | Ty::Dict(_, _) | Ty::Set(_) => Some(Rep::Ptr),
             _ => None,
@@ -998,6 +1000,8 @@ mod engine {
         Some(match ty {
             Ty::Int64 | Ty::UntypedInt => "int64".to_string(),
             Ty::Int32 => "int32".to_string(),
+            Ty::Int16 => "int16".to_string(),
+            Ty::Int8 => "int8".to_string(),
             Ty::Float64 | Ty::UntypedFloat => "float64".to_string(),
             Ty::Float32 => "float32".to_string(),
             Ty::Bool => "bool".to_string(),

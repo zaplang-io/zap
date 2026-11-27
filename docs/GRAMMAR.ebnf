@@ -876,7 +876,8 @@ dotted_name   ::= IDENT { "." IDENT } ;
               present and "None" when absent (#498), like Python's f"{d.get(k)}".
               spec = [[fill]align][sign]["#"]["0"][width]["." precision][type]
               (Python format mini-language subset; see SPEC §9.3).
-   TYPE_KEYWORD  int int32 int64 float float32 float64 i32 i64 f32 f64 bool
+   TYPE_KEYWORD  int int8 int16 int32 int64 float float32 float64
+                 i8 i16 i32 i64 f32 f64 bool
                  uint8 uint16 uint32 uint64 u8 u16 u32 u64 usize
                  char str bytes bigint complex list dict set heap array
                  Python-facing scalar synonyms: `int` is the name for the 64-bit
@@ -892,6 +893,14 @@ dotted_name   ::= IDENT { "." IDENT } ;
                  implicit signed<->unsigned conversion and no unsigned literal
                  suffix — `uintN(x)`/`usize(x)` conversions produce them. `size_t`
                  is only the C mapping target of `usize`, never a Zap alias.
+                 Signed narrow integers (#1654): `int8`/`int16` with short
+                 `i8`/`i16` spellings — the signed mirrors of `uint8`/`uint16` —
+                 are first-class scalar value types and ARE reserved type
+                 keywords. Fixed-width integer arithmetic is width-stable and
+                 wraps (ADR `decisions/lang/1654-fixed-width-integer-semantics.md`):
+                 literals infer to the context type, implicit widening runs up
+                 the signed tower (`int8`→`int16`→`int32`→`int64`), and narrowing
+                 is the explicit `int8(x)`/`int16(x)` wrap cast.
    DELIM      a regex delimiter char after m/s (e.g. "/", "{", "!")
    Comments   "#" to end of line. Discarded by the parser, but recoverable as
               trivia for tooling (zap fmt/doc) via tokenize_with_trivia (#225).

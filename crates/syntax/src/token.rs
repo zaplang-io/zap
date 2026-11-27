@@ -197,10 +197,14 @@ pub enum Keyword {
     /// in Python.
     Is,
     // Built-in type names
+    Int8,
+    Int16,
     Int32,
     Int64,
     Float32,
     Float64,
+    I8,
+    I16,
     I32,
     I64,
     F32,
@@ -279,10 +283,14 @@ impl Keyword {
             "or" => Or,
             "not" => Not,
             "is" => Is,
+            "int8" => Int8,
+            "int16" => Int16,
             "int32" => Int32,
             "int64" => Int64,
             "float32" => Float32,
             "float64" => Float64,
+            "i8" => I8,
+            "i16" => I16,
             "i32" => I32,
             "i64" => I64,
             "f32" => F32,
@@ -320,10 +328,13 @@ impl Keyword {
         use Keyword::*;
         matches!(
             self,
-            Int32
+            Int8 | Int16
+                | Int32
                 | Int64
                 | Float32
                 | Float64
+                | I8
+                | I16
                 | I32
                 | I64
                 | F32
@@ -395,10 +406,14 @@ impl Keyword {
             Or => "or",
             Not => "not",
             Is => "is",
+            Int8 => "int8",
+            Int16 => "int16",
             Int32 => "int32",
             Int64 => "int64",
             Float32 => "float32",
             Float64 => "float64",
+            I8 => "i8",
+            I16 => "i16",
             I32 => "i32",
             I64 => "i64",
             F32 => "f32",
@@ -431,10 +446,13 @@ impl Keyword {
         use Keyword::*;
         matches!(
             self,
-            Int32
+            Int8 | Int16
+                | Int32
                 | Int64
                 | Float32
                 | Float64
+                | I8
+                | I16
                 | I32
                 | I64
                 | F32

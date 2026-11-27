@@ -144,6 +144,8 @@ fn ty_of_decl(t: &Type) -> Ty {
     match name.as_str() {
         "int64" => Ty::Int64,
         "int32" => Ty::Int32,
+        "int16" => Ty::Int16,
+        "int8" => Ty::Int8,
         "uint8" => Ty::Uint8,
         "uint16" => Ty::Uint16,
         "uint32" => Ty::Uint32,

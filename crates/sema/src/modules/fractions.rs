@@ -40,7 +40,10 @@ fn fraction_ty() -> Ty {
 
 /// Is `t` an integer word acceptable as a numerator/denominator component?
 fn is_int(t: &Ty) -> bool {
-    matches!(t, Ty::Int32 | Ty::Int64 | Ty::UntypedInt)
+    matches!(
+        t,
+        Ty::Int8 | Ty::Int16 | Ty::Int32 | Ty::Int64 | Ty::UntypedInt
+    )
 }
 
 /// Emit the float-rejection diagnostic (ZAP4024) steering to the `str` form.

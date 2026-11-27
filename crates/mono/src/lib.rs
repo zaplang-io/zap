@@ -169,7 +169,7 @@ fn num_kind(c: &CTy) -> Option<Num> {
     }
     Some(match name.as_str() {
         // `int` is the untyped-int literal's name; it joins like `int64`.
-        "int" | "int32" | "int64" => Num::Signed,
+        "int" | "int8" | "int16" | "int32" | "int64" => Num::Signed,
         "uint8" | "uint16" | "uint32" | "uint64" | "usize" => Num::Unsigned,
         "bigint" => Num::Bigint,
         // `float` is the untyped-float literal's name; it joins like `float64`.
@@ -943,6 +943,8 @@ fn canon_prim(name: &str) -> &str {
     match name {
         "i64" => "int64",
         "i32" => "int32",
+        "i16" => "int16",
+        "i8" => "int8",
         "f64" => "float64",
         "f32" => "float32",
         "u8" => "uint8",
@@ -1977,8 +1979,8 @@ impl Mono<'_> {
         match canon_prim(name) {
             // Scalars have equality, a hash, and a total order intrinsically
             // (`float`: `-0.0` canonicalized, `NaN` handled per #803).
-            "int64" | "int32" | "uint8" | "uint16" | "uint32" | "uint64" | "usize" | "bool"
-            | "char" | "str" | "bytes" | "float64" | "float32" => Ok(()),
+            "int64" | "int32" | "int16" | "int8" | "uint8" | "uint16" | "uint32" | "uint64"
+            | "usize" | "bool" | "char" | "str" | "bytes" | "float64" | "float32" => Ok(()),
             // Representation gaps: no stable hash/order slot yet (the built-in
             // collections reject these too, ZAP4024).
             "bigint" | "complex" | "pyobject" => Err(vec![format!(
