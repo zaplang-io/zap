@@ -9938,6 +9938,14 @@ impl<'a> FnLower<'a> {
                     return Err(err("bigint() takes exactly one argument"));
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
+                if vt == Ty::Ptr {
+                    // Parse a `str` as an arbitrary-precision integer (#1657). A
+                    // malformed string raises a catchable `ValueError`, so this is a
+                    // throwing `invoke` inside any active `try`, like `int(str)`.
+                    let d = self.new_value(Ty::Bigint);
+                    self.throwing_call(Some(d), "zap_bigint_from_str", vec![v]);
+                    return Ok((d, Ty::Bigint));
+                }
                 return Ok((self.coerce(v, vt, Ty::Bigint), Ty::Bigint));
             }
             if fname == "complex" {
@@ -9953,6 +9961,14 @@ impl<'a> FnLower<'a> {
                 }
                 if args.len() == 1 {
                     let (v, vt) = self.expr(&args[0].value)?;
+                    if vt == Ty::Ptr {
+                        // Parse a `str` as a Python-style complex literal (#1657),
+                        // e.g. `"1+2j"`. A malformed string raises a catchable
+                        // `ValueError`, so this is a throwing `invoke`.
+                        let d = self.new_value(Ty::Complex);
+                        self.throwing_call(Some(d), "zap_complex_from_str", vec![v]);
+                        return Ok((d, Ty::Complex));
+                    }
                     let d = self.coerce(v, vt, Ty::Complex);
                     return Ok((d, Ty::Complex));
                 }

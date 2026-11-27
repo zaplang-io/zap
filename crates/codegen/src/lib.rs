@@ -3513,6 +3513,8 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // the same representation and semantics.
         self.declare_rt("zap_complex_new", &[f.into(), f.into()], Some(p.into()));
         self.declare_rt("zap_complex_from_f64", &[f.into()], Some(p.into()));
+        // `complex(str)` string parse (#1657); raises a catchable ValueError.
+        self.declare_rt("zap_complex_from_str", &[p.into()], Some(p.into()));
         for name in [
             "zap_complex_add",
             "zap_complex_sub",
