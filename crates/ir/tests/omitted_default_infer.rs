@@ -261,9 +261,12 @@ fn explicit_type_argument_overrides_default() {
 #[test]
 fn expected_return_sink_overrides_default() {
     // The return type `-> T` unifies with the binding's declared `str`, so `T`
-    // is `str` from the expected sink — which runs before the default sink.
+    // is `str` from the expected sink — which runs before the default sink. The
+    // omitted default (also `str`) is compatible with that choice. (An *int*
+    // default here would be pinned to `str` by the sink yet be unassignable to
+    // it — that is the #1705 case, checked in `generic_default_typecheck_1705`.)
     let m = lower_ok(
-        "def f[T](T value=0) -> T:\n\
+        "def f[T](T value=\"\") -> T:\n\
         \x20   return value\n\
         def main():\n\
         \x20   str s = f()\n\
@@ -277,10 +280,12 @@ fn expected_return_sink_overrides_default() {
 
 #[test]
 fn argument_pins_t_even_when_another_param_has_a_default() {
-    // `pair("hi")` binds `a`, so `T = str`; the omitted `b`'s `int` default
-    // does not override the already-chosen specialization.
+    // `pair("hi")` binds `a`, so `T = str`; the omitted `b` falls back to its
+    // (compatible, `str`) default without changing the already-chosen
+    // specialization. (A `str`-incompatible default for `b` would be the #1705
+    // case, checked in `generic_default_typecheck_1705`.)
     let m = lower_ok(
-        "def pair[T](T a, T b=0) -> T:\n\
+        "def pair[T](T a, T b=\"!\") -> T:\n\
         \x20   return a\n\
         def main():\n\
         \x20   print(pair(\"hi\"))\n",
