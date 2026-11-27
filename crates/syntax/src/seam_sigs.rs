@@ -349,6 +349,10 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("sys", "cpu_has", &["name"]),
     // Standard-stream write (#1035, D-0217); stdin/stdout/stderr take no args.
     ("sys", "write", &["stream", "data"]),
+    // Hidden line input (#1684): sys.getpass([prompt]) -> str. The single prompt
+    // is a trailing optional (default "Password: ", filled by the lowerer when
+    // omitted), rowed for a uniform keyword-capable surface (`sys.getpass(prompt=...)`).
+    ("sys", "getpass", &["prompt"]),
     // ---- url (ticket #335): percent-encoding + query builders ----
     ("url", "quote", &["s"]),
     ("url", "quote_path", &["s"]),
@@ -386,6 +390,9 @@ pub const SEAM_METHOD_SIGS: &[(&str, &str, &[&str])] = &[
     ("io", "read", &["fd", "n"]),
     ("io", "write", &["fd", "data"]),
     ("io", "close_fd", &["fd"]),
+    // Terminal detection (#1685): io.isatty(fd) -> bool. Single fd, rowed for a
+    // uniform keyword-capable surface (`io.isatty(fd=...)`).
+    ("io", "isatty", &["fd"]),
     // Buffered line-oriented input (#969, D-0212). `readn` materially benefits
     // from keywords (`io.readn(reader=r, n=8)`); the single-argument reader
     // verbs are rowed only for a uniform keyword-capable surface. The reader

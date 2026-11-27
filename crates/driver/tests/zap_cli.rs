@@ -1177,6 +1177,318 @@ fn sys_stdout_stderr_route_to_their_fds() {
     assert!(stderr.contains("to-err"), "stderr:\n{stderr}");
 }
 
+// --- terminal I/O: io.isatty (#1685) + sys.getpass (#1684) -------------------
+//
+// These exercise the two paths a pipe cannot reach: a descriptor that *is* a
+// terminal, and echo suppression. They spawn the real `zap` under a pseudo-
+// terminal (Unix only). The "false" side of io.isatty (pipes, regular files,
+// invalid fds) is covered deterministically by the `tests/golden/isatty.zap`
+// fixture; here we prove the "true" side and that two streams answer
+// independently, plus the full getpass contract.
+
+#[cfg(all(unix, feature = "codegen"))]
+mod pty {
+    use std::io::{Read, Write};
+    use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// Open a master/slave pseudo-terminal pair via the portable System V path
+    /// (`posix_openpt`/`grantpt`/`unlockpt`/`ptsname`), so no `-lutil` link is
+    /// needed. Both fds are close-on-exec-free raw descriptors the caller owns.
+    unsafe fn open_master_slave() -> (RawFd, RawFd) {
+        let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(master >= 0, "posix_openpt failed");
+        assert_eq!(libc::grantpt(master), 0, "grantpt failed");
+        assert_eq!(libc::unlockpt(master), 0, "unlockpt failed");
+        let name = libc::ptsname(master);
+        assert!(!name.is_null(), "ptsname failed");
+        let slave = libc::open(name, libc::O_RDWR | libc::O_NOCTTY);
+        assert!(slave >= 0, "open(ptsname) failed");
+        (master, slave)
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    pub struct PtyRun {
+        pub ok: bool,
+        pub output: String,
+    }
+
+    /// Spawn `zap run <prog>` with a pty slave as its stdin/stdout/stderr and
+    /// drive it with scripted `steps`: for each `(wait_for, send)`, block until
+    /// `wait_for` has appeared in everything the master has seen so far (so the
+    /// child has written its prompt and is at the read), then write `send` to the
+    /// master. Returns the child's success flag and the full master transcript.
+    ///
+    /// Waiting on the prompt before sending is what makes the password delivery
+    /// race-free: getpass disables echo with TCSAFLUSH *before* writing the
+    /// prompt, so once the prompt is visible the flush is done and the bytes we
+    /// then send are not discarded.
+    pub fn run_scripted(zap_bin: &Path, prog: &Path, steps: &[(&str, &[u8])]) -> PtyRun {
+        let (master, slave) = unsafe { open_master_slave() };
+        let child_in = unsafe { OwnedFd::from_raw_fd(slave) };
+        let child_out = child_in.try_clone().expect("dup slave");
+        let child_err = child_in.try_clone().expect("dup slave");
+        let mut child = Command::new(zap_bin)
+            .arg("run")
+            .arg(prog)
+            .stdin(Stdio::from(child_in))
+            .stdout(Stdio::from(child_out))
+            .stderr(Stdio::from(child_err))
+            .spawn()
+            .expect("spawn zap under a pty");
+
+        let mut writer = unsafe { std::fs::File::from_raw_fd(master) };
+        let mut reader = writer.try_clone().expect("dup master");
+        let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let reader_seen = Arc::clone(&seen);
+        let reader_thread = std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,  // EOF (macOS when slave closes)
+                    Err(_) => break, // EIO (Linux when slave closes)
+                    Ok(n) => reader_seen.lock().unwrap().extend_from_slice(&chunk[..n]),
+                }
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        for (wait_for, send) in steps {
+            while Instant::now() < deadline {
+                if contains(&seen.lock().unwrap(), wait_for.as_bytes()) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Write regardless after the wait so a hung child is unblocked and the
+            // test fails on an assertion rather than stalling forever.
+            let _ = writer.write_all(send);
+            let _ = writer.flush();
+        }
+
+        let status = child.wait().expect("wait for child");
+        drop(writer); // let the reader thread finish draining
+        reader_thread.join().ok();
+        let output = String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
+        PtyRun {
+            ok: status.success(),
+            output,
+        }
+    }
+
+    /// Run `zap run <prog>` with ONLY stdin wired to a pty slave; stdout/stderr
+    /// are ordinary pipes. Lets a test prove two descriptors answer `isatty`
+    /// independently (stdin is a tty, stdout is not). Returns (ok, stdout).
+    pub fn run_stdin_tty_stdout_pipe(zap_bin: &Path, prog: &Path) -> (bool, String) {
+        let (master, slave) = unsafe { open_master_slave() };
+        let child_in = unsafe { OwnedFd::from_raw_fd(slave) };
+        let out = Command::new(zap_bin)
+            .arg("run")
+            .arg(prog)
+            .stdin(Stdio::from(child_in))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn zap with a pty stdin")
+            .wait_with_output()
+            .expect("wait with output");
+        unsafe {
+            libc::close(master);
+        }
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    }
+}
+
+/// #1685: a descriptor connected to a terminal reads as true. Under a pty all
+/// three standard streams are the terminal, so each query is true — the "true"
+/// counterpart to the all-false golden fixture.
+#[cfg(all(unix, feature = "codegen"))]
+#[test]
+fn isatty_true_under_a_pty() {
+    let dir = scratch("isatty_pty");
+    let prog = dir.join("p.zap");
+    std::fs::write(
+        &prog,
+        "import io\nimport sys\ndef main():\n    \
+         print(\"in=\" + str(io.isatty(sys.stdin_fd())))\n    \
+         print(\"out=\" + str(io.isatty(sys.stdout_fd())))\n    \
+         print(\"err=\" + str(io.isatty(sys.stderr_fd())))\n",
+    )
+    .unwrap();
+    let run = pty::run_scripted(env!("CARGO_BIN_EXE_zap").as_ref(), &prog, &[]);
+    assert!(run.ok, "transcript:\n{}", run.output);
+    assert!(
+        run.output.contains("in=True"),
+        "transcript:\n{}",
+        run.output
+    );
+    assert!(
+        run.output.contains("out=True"),
+        "transcript:\n{}",
+        run.output
+    );
+    assert!(
+        run.output.contains("err=True"),
+        "transcript:\n{}",
+        run.output
+    );
+}
+
+/// #1685 acceptance: two streams answer independently when only one is
+/// redirected. stdin is a terminal, stdout is a pipe, so isatty disagrees.
+#[cfg(all(unix, feature = "codegen"))]
+#[test]
+fn isatty_distinguishes_redirected_streams() {
+    let dir = scratch("isatty_split");
+    let prog = dir.join("p.zap");
+    std::fs::write(
+        &prog,
+        "import io\nimport sys\ndef main():\n    \
+         print(\"in=\" + str(io.isatty(sys.stdin_fd())))\n    \
+         print(\"out=\" + str(io.isatty(sys.stdout_fd())))\n",
+    )
+    .unwrap();
+    let (ok, stdout) = pty::run_stdin_tty_stdout_pipe(env!("CARGO_BIN_EXE_zap").as_ref(), &prog);
+    assert!(ok, "stdout:\n{stdout}");
+    assert!(stdout.contains("in=True"), "stdout:\n{stdout}");
+    assert!(stdout.contains("out=False"), "stdout:\n{stdout}");
+}
+
+/// #1684 acceptance (the PTY test): the prompt is visible but the typed secret
+/// is not echoed, the secret is read back exactly, and echo is restored — the
+/// following visible `input()` is echoed again.
+#[cfg(all(unix, feature = "codegen"))]
+#[test]
+fn getpass_hides_input_and_restores_echo() {
+    let dir = scratch("getpass_pty");
+    let prog = dir.join("p.zap");
+    // Prints only derived facts about the secret, never the secret itself, so
+    // that finding "hunter2" in the transcript can only mean it was echoed.
+    std::fs::write(
+        &prog,
+        "import sys\ndef main():\n    \
+         auto s = sys.getpass(\"Password: \")\n    \
+         print(\"len=\" + str(len(s)))\n    \
+         print(\"match=\" + str(s == \"hunter2\"))\n    \
+         auto v = input(\"Echo: \")\n    \
+         print(\"vlen=\" + str(len(v)))\n",
+    )
+    .unwrap();
+    let run = pty::run_scripted(
+        env!("CARGO_BIN_EXE_zap").as_ref(),
+        &prog,
+        &[
+            ("Password: ", "hunter2\n".as_bytes()),
+            ("Echo: ", "visible\n".as_bytes()),
+        ],
+    );
+    assert!(run.ok, "transcript:\n{}", run.output);
+    // Prompt visible.
+    assert!(
+        run.output.contains("Password: "),
+        "prompt missing:\n{}",
+        run.output
+    );
+    // The secret is never echoed and never printed.
+    assert!(
+        !run.output.contains("hunter2"),
+        "secret leaked into the terminal:\n{}",
+        run.output
+    );
+    // It was nonetheless read back exactly.
+    assert!(run.output.contains("len=7"), "transcript:\n{}", run.output);
+    assert!(
+        run.output.contains("match=True"),
+        "transcript:\n{}",
+        run.output
+    );
+    // Echo restored: the later visible input IS echoed (only the terminal echo
+    // can put "visible" in the transcript — the program prints "vlen=7").
+    assert!(
+        run.output.contains("visible"),
+        "echo was not restored:\n{}",
+        run.output
+    );
+    assert!(run.output.contains("vlen=7"), "transcript:\n{}", run.output);
+}
+
+/// #1684 acceptance: end-of-input (Ctrl-D at line start) raises a catchable
+/// EOFError, and the terminal is left usable.
+#[cfg(all(unix, feature = "codegen"))]
+#[test]
+fn getpass_eof_raises_catchable_eoferror() {
+    let dir = scratch("getpass_eof");
+    let prog = dir.join("p.zap");
+    std::fs::write(
+        &prog,
+        "import sys\ndef main():\n    \
+         try:\n        \
+         auto s = sys.getpass(\"P: \")\n        \
+         print(\"got:\" + s)\n    \
+         except EOFError:\n        \
+         print(\"eof-caught\")\n",
+    )
+    .unwrap();
+    // \x04 is VEOF; at the start of a line it makes the read return end-of-input.
+    let run = pty::run_scripted(
+        env!("CARGO_BIN_EXE_zap").as_ref(),
+        &prog,
+        &[("P: ", "\x04".as_bytes())],
+    );
+    assert!(run.ok, "transcript:\n{}", run.output);
+    assert!(
+        run.output.contains("eof-caught"),
+        "transcript:\n{}",
+        run.output
+    );
+    assert!(!run.output.contains("got:"), "transcript:\n{}", run.output);
+}
+
+/// #1684 acceptance: a non-terminal stdin takes the documented typed failure
+/// path (a catchable OSError) *before* consuming or disclosing any input — the
+/// line the program would have read is still there for a subsequent `input()`,
+/// and no prompt or secret is written.
+#[cfg(feature = "codegen")]
+#[test]
+fn getpass_on_a_pipe_fails_typed_without_consuming() {
+    let dir = scratch("getpass_pipe");
+    let prog = dir.join("p.zap");
+    std::fs::write(
+        &prog,
+        "import sys\ndef main():\n    \
+         try:\n        \
+         auto s = sys.getpass(\"P: \")\n        \
+         print(\"got:\" + s)\n    \
+         except OSError:\n        \
+         print(\"caught\")\n    \
+         auto line = input()\n    \
+         print(\"line=\" + line)\n",
+    )
+    .unwrap();
+    let (ok, stdout, stderr) = run_with_stdin(&prog, b"secret\n");
+    assert!(ok, "stderr:\n{stderr}");
+    // getpass raised a catchable OSError without consuming stdin: input() still
+    // reads the "secret" line it would have taken.
+    assert_eq!(stdout, "caught\nline=secret\n", "stderr:\n{stderr}");
+    // No prompt was written (the failure precedes the prompt) and no secret
+    // appears in any diagnostic text on stderr.
+    assert!(!stdout.contains("P:"), "prompt leaked:\n{stdout}");
+    assert!(
+        !stderr.contains("secret"),
+        "secret leaked to stderr:\n{stderr}"
+    );
+    assert!(!stdout.contains("got:"), "stdout:\n{stdout}");
+}
+
 // --- comptime surface: a derive generator can guard with `.kind` and abort via
 // `comptime.error` (#1330). `zap ir` runs the full front-end + mono on the host,
 // so the compile-time abort is observable without LLVM. ---

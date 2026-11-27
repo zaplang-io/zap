@@ -20,6 +20,8 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_io_read", &[i.into(), i.into()], Some(p.into()));
     cg.declare_rt("zap_io_write", &[i.into(), p.into()], Some(i.into()));
     cg.declare_rt("zap_io_close", &[i.into()], None);
+    // Terminal detection (#1685). isatty(fd) -> i64 0/1, infallible.
+    cg.declare_rt("zap_io_isatty", &[i.into()], Some(i.into()));
     // Line-oriented input (#969, D-0212).
     cg.declare_rt("zap_input", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_io_reader_new", &[i.into()], Some(p.into()));
