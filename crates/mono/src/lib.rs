@@ -3609,6 +3609,128 @@ impl Mono<'_> {
         }
     }
 
+    /// The `sema_types::Ty` of a parameter default's value expression, for the
+    /// incompatible-default check (#1705). Unlike [`Self::default_cty`] (which
+    /// feeds inference and types a literal by its default concrete type), this
+    /// models a numeric literal as an **untyped** literal (`UntypedInt` /
+    /// `UntypedFloat`), so `assignable` lets it flow into any appropriate numeric
+    /// target — `value=0` fits an `int8`, `float64`, `bigint` … parameter without
+    /// a false positive, exactly as `int8 x = 0` does. Returns `None` for any
+    /// form it does not model (a char literal, a call, a collection or
+    /// constructor expression, an untyped name), so the check is skipped and
+    /// nothing is rejected on a guess.
+    fn default_check_ty(&self, e: &Expr) -> Option<SemaTy> {
+        match e {
+            Expr::Int(..) => Some(SemaTy::UntypedInt),
+            Expr::Float(..) => Some(SemaTy::UntypedFloat),
+            Expr::Imaginary(..) => Some(SemaTy::Complex),
+            Expr::Bool(..) => Some(SemaTy::Bool),
+            Expr::Str { bytes, .. } => Some(if *bytes { SemaTy::Bytes } else { SemaTy::Str }),
+            Expr::Unary { op, expr, .. } => match op {
+                UnOp::Not => Some(SemaTy::Bool),
+                UnOp::Neg | UnOp::Pos | UnOp::BitNot => self.default_check_ty(expr),
+            },
+            // An explicitly typed module global / `const` of a primitive type.
+            Expr::Name(n, _) => self.globals.get(n).and_then(|t| match self.apply_subst(t) {
+                Type::Named { name, args, .. } if args.is_empty() => {
+                    zapc_sema_types::primitive_type_value_ty(&name)
+                }
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Reject a generic call whose **omitted** parameter falls back to a default
+    /// that does not fit the parameter type of the specialization this call
+    /// selects (#1705). When a type parameter is pinned by a source other than
+    /// the default — an explicit type argument (`setting[str]()`), the
+    /// expected/return sink (`str s = setting()`), or another argument
+    /// (`pair("hi")`) — the omitted default was materialized at the call site and
+    /// reinterpreted into the chosen parameter type with no diagnostic, which is
+    /// unsound for a scalar/pointer mismatch (a `bool` default into a `str` slot).
+    ///
+    /// `subst` maps every type parameter in scope (the function's own, and a
+    /// method's owner's) to its chosen concrete type; `argpairs` are the supplied
+    /// arguments, so a parameter *not* covered by them is the one that falls back
+    /// to its default. The check reuses `sema_types::assignable` — the rule sema
+    /// applies to every other assignment — as the single source of truth, and is
+    /// fail-open: it fires only when the substituted parameter type is a known
+    /// primitive and the default's type is statically modeled by
+    /// [`Self::default_check_ty`], so it never rejects a default an existing
+    /// program relies on (an untyped literal still fits any numeric target, and a
+    /// user/container type or a non-literal default is skipped). It runs only for
+    /// generic callees — a non-generic call's defaults were already checked by
+    /// sema against their concrete parameter types.
+    fn check_omitted_defaults(
+        &self,
+        f: &Function,
+        subst: &HashMap<String, Type>,
+        argpairs: &[(Option<String>, CTy)],
+        skip_self: bool,
+    ) -> Result<(), LowerError> {
+        // Parameter names (self excluded for a method) that received an argument;
+        // mirrors the positional/keyword matching in `infer_fn_targs`.
+        let vparams: Vec<&str> = f
+            .params
+            .iter()
+            .filter(|p| !(skip_self && p.name == "self"))
+            .map(|p| p.name.as_str())
+            .collect();
+        let mut bound: HashSet<&str> = HashSet::new();
+        let mut pos = 0usize;
+        for (name, _) in argpairs {
+            match name {
+                Some(pname) => {
+                    bound.insert(pname.as_str());
+                }
+                None => {
+                    if let Some(n) = vparams.get(pos) {
+                        bound.insert(n);
+                    }
+                    pos += 1;
+                }
+            }
+        }
+        for p in f.params.iter().filter(|p| !(skip_self && p.name == "self")) {
+            if p.variadic || p.kwargs || bound.contains(p.name.as_str()) {
+                continue;
+            }
+            let (Some(decl), Some(default)) = (p.ty.as_ref(), p.default.as_ref()) else {
+                continue;
+            };
+            let Type::Named { name, args, .. } = subst_with(decl, subst) else {
+                continue;
+            };
+            if !args.is_empty() {
+                continue;
+            }
+            let Some(target) = zapc_sema_types::primitive_type_value_ty(&name) else {
+                continue;
+            };
+            let Some(value) = self.default_check_ty(default) else {
+                continue;
+            };
+            if zapc_sema_types::assignable(&value, &target) {
+                continue;
+            }
+            return Err(LowerError {
+                code: zapc_diag::ErrorCode::ZAP4001,
+                message: format!(
+                    "the default for omitted parameter '{}' has type '{}', which is not \
+                     assignable to its type '{}' in this call's specialization; a generic \
+                     parameter's default must fit the type argument it is used with — pass \
+                     the argument explicitly or a compatible default (#1705)",
+                    p.name,
+                    value.display(),
+                    name,
+                ),
+                derive: None,
+            });
+        }
+        Ok(())
+    }
+
     /// The element type produced by *iterating* a value of best-effort type `c`
     /// (a comprehension's `for v in ITER`), mirroring sema's `iterable_elem`
     /// (#1131): `range` → `int64`; `list`/`set`/`heap`/`deque`/`oset` → their
@@ -5700,6 +5822,12 @@ impl Mono<'_> {
                             &format!("method '{variant}' of '{owner}'"),
                             true,
                         )?;
+                        self.check_omitted_defaults(
+                            method,
+                            &self.full_subst(&owner_subst, &tparams, &targs),
+                            &argpairs,
+                            true,
+                        )?;
                         let ret_cty =
                             self.fn_ret_cty(method.ret.as_ref(), &owner_subst, &tparams, &targs);
                         let method_spec = self.request_method(&owner, &owner_args, variant, &targs);
@@ -5761,6 +5889,12 @@ impl Mono<'_> {
                     &format!("function '{g}'"),
                     false,
                 )?;
+                self.check_omitted_defaults(
+                    f,
+                    &self.full_subst(&empty, &tparams, &targs),
+                    &argpairs,
+                    false,
+                )?;
                 let ret_cty = self.fn_ret_cty(f.ret.as_ref(), &empty, &tparams, &targs);
                 let mangled = self.request_func(&g.clone(), &targs);
                 let node = Expr::Call {
@@ -5811,6 +5945,12 @@ impl Mono<'_> {
                         let tparams: Vec<String> =
                             f.generics.iter().map(|p| p.name.clone()).collect();
                         let empty = HashMap::new();
+                        self.check_omitted_defaults(
+                            f,
+                            &self.full_subst(&empty, &tparams, &targs),
+                            &argpairs,
+                            false,
+                        )?;
                         let ret_cty = self.fn_ret_cty(f.ret.as_ref(), &empty, &tparams, &targs);
                         let mangled = self.request_func(&g.clone(), &targs);
                         let node = Expr::Call {
@@ -5878,6 +6018,12 @@ impl Mono<'_> {
                                 let tparams: Vec<String> =
                                     method.generics.iter().map(|g| g.name.clone()).collect();
                                 let owner_subst = self.subst_map(&owner, &owner_args);
+                                self.check_omitted_defaults(
+                                    method,
+                                    &self.full_subst(&owner_subst, &tparams, &targs),
+                                    &argpairs,
+                                    true,
+                                )?;
                                 let ret_cty = self.fn_ret_cty(
                                     method.ret.as_ref(),
                                     &owner_subst,
@@ -6049,15 +6195,29 @@ impl Mono<'_> {
         targs: &[Type],
     ) -> CTy {
         match ret {
-            Some(rt) => {
-                let mut subst = owner_subst.clone();
-                for (p, a) in tparams.iter().zip(targs.iter()) {
-                    subst.insert(p.clone(), a.clone());
-                }
-                CTy::Ty(subst_with(rt, &subst))
-            }
+            Some(rt) => CTy::Ty(subst_with(
+                rt,
+                &self.full_subst(owner_subst, tparams, targs),
+            )),
             None => CTy::Unknown,
         }
+    }
+
+    /// The owner substitution extended with this call's chosen type arguments
+    /// (`tparams[i]` -> `targs[i]`): the full map that resolves every type
+    /// parameter in a generic function's / method's signature to a concrete type
+    /// for the specialization this call selects.
+    fn full_subst(
+        &self,
+        owner_subst: &HashMap<String, Type>,
+        tparams: &[String],
+        targs: &[Type],
+    ) -> HashMap<String, Type> {
+        let mut subst = owner_subst.clone();
+        for (p, a) in tparams.iter().zip(targs.iter()) {
+            subst.insert(p.clone(), a.clone());
+        }
+        subst
     }
 
     /// Rewrite a match pattern, renaming a generic-enum variant path to its
