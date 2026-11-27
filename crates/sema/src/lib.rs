@@ -175,6 +175,13 @@ fn subst_ty(ty: &Ty, subst: &HashMap<&str, &Ty>) -> Ty {
         Ty::Chan(e) => Ty::Chan(Box::new(subst_ty(e, subst))),
         Ty::AtomicArray(e) => Ty::AtomicArray(Box::new(subst_ty(e, subst))),
         Ty::ContextVar(e) => Ty::ContextVar(Box::new(subst_ty(e, subst))),
+        Ty::VarTuple(e) => Ty::VarTuple(Box::new(subst_ty(e, subst))),
+        // The prelude generic enum `Optional[T]` substitutes inside its payload
+        // (#1682), so a generic return `-> Optional[T]` binds `T` into the result
+        // type (`wrap[T](T x) -> Optional[T]` called with a `str` yields
+        // `Optional[str]`). Without this arm the payload stayed the `Ty::Named(T)`
+        // type variable and the call's result mis-typed as `Optional[T]`.
+        Ty::Optional(e) => Ty::Optional(Box::new(subst_ty(e, subst))),
         // A type value `Type[T]` substitutes inside its represented type (#1527).
         Ty::TypeVal(e) => Ty::TypeVal(Box::new(subst_ty(e, subst))),
         Ty::Dict(k, v) => Ty::Dict(Box::new(subst_ty(k, subst)), Box::new(subst_ty(v, subst))),
@@ -262,6 +269,16 @@ fn collect_tyvar_pairs_inner(
             for (p, a) in ps.iter().zip(a_s.iter()) {
                 collect_tyvar_pairs_inner(p, a, generics, from_type_value, out);
             }
+        }
+        // A raw (non-`Optional`) value supplied for an `Optional[T]` parameter
+        // lifts into the payload by implicit `Some(T)` wrapping (#1265), so the
+        // argument's type must bind and respect `T` just as the payload type would
+        // (#1682). The `(Optional, Optional)` arm above already handles an
+        // explicitly wrapped argument; this arm handles the bare-payload lift.
+        // (`Unknown`/`py` and the explicit-`Optional` argument are both handled
+        // earlier, so `aty` here is a concrete non-`Optional` value type.)
+        (Ty::Optional(p), _) => {
+            collect_tyvar_pairs_inner(p, aty, generics, from_type_value, out);
         }
         _ => {}
     }
@@ -3381,6 +3398,15 @@ impl Checker {
                     "ContextVar" => Ty::ContextVar(Box::new(elem(0))),
                     "ContextToken" => Ty::CtxToken,
                     "dict" => Ty::Dict(Box::new(elem(0)), Box::new(elem(1))),
+                    // The prelude generic enum `Optional[T]` (I#154) — resolve its
+                    // payload in the same generic scope (#1682) so a type parameter
+                    // in the payload (`Optional[T]`) is preserved as `Ty::Named(T)`
+                    // rather than erased to `Unknown`. Without this arm `Optional`
+                    // fell through to the unscoped `resolve_type`, which severed the
+                    // payload's connection to the function's type parameters and let
+                    // an incompatible raw payload slip past generic-consistency
+                    // checking once `Type[T]` had bound `T`.
+                    "Optional" => Ty::Optional(Box::new(elem(0))),
                     // A first-class type value `Type[T]` (#1527) — resolve its
                     // represented type in the same generic scope.
                     "Type" => Ty::TypeVal(Box::new(elem(0))),
