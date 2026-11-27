@@ -1,0 +1,20 @@
+usage: tool [-h] [--visible] [--name name] [--config config] src
+
+A demo tool.
+
+positional arguments:
+  src  source file
+
+options:
+  -h, --help  show this help message and exit
+  --visible  Public flag
+  --name name  your name
+
+global options:
+  --config config  config path
+---
+usage: build [-h] [--target target]
+
+options:
+  -h, --help  show this help message and exit
+  --target target  target triple

@@ -2352,6 +2352,7 @@ struct Argument:
     bool has_choices
     list[str] choices
     str help
+    bool hidden
     int64 mx_group
     str group_title
 
@@ -2373,8 +2374,8 @@ struct ArgumentGroup:
     ArgumentParser _p
     str _title
 
-    def add_argument(self, str name, str action=\"store\", str type=\"str\", str default=\"\", bool required=False, list[str] choices=[], str help=\"\", str metavar=\"\") -> Argument:
-        return self._p._add(name, action, type, default, required, choices, help, metavar, -1, self._title)
+    def add_argument(self, str name, str action=\"store\", str type=\"str\", str default=\"\", bool required=False, list[str] choices=[], str help=\"\", str metavar=\"\", bool hidden=False) -> Argument:
+        return self._p._add(name, action, type, default, required, choices, help, metavar, hidden, -1, self._title)
 
 # A set of arguments at most one of which may appear; supplying two raises. When
 # the group is `required`, exactly one must appear.
@@ -2382,8 +2383,8 @@ struct MutuallyExclusiveGroup:
     ArgumentParser _p
     int64 _idx
 
-    def add_argument(self, str name, str action=\"store\", str type=\"str\", str default=\"\", bool required=False, list[str] choices=[], str help=\"\", str metavar=\"\") -> Argument:
-        return self._p._add(name, action, type, default, required, choices, help, metavar, self._idx, \"\")
+    def add_argument(self, str name, str action=\"store\", str type=\"str\", str default=\"\", bool required=False, list[str] choices=[], str help=\"\", str metavar=\"\", bool hidden=False) -> Argument:
+        return self._p._add(name, action, type, default, required, choices, help, metavar, hidden, self._idx, \"\")
 
 # A command-line argument parser. A real value — build as many as you like.
 struct ArgumentParser:
@@ -2405,13 +2406,17 @@ struct ArgumentParser:
     # value when the argument is absent. For a boolean flag (`store_true`/
     # `store_false`) an omitted `default` keeps the action's implied value
     # (False / True); an explicit `default` must be \"true\" or \"false\" and seeds
-    # the absent flag, leaving it marked not-present (#1692).
-    def add_argument(self, str name, str action=\"store\", str type=\"str\", str default=\"\", bool required=False, list[str] choices=[], str help=\"\", str metavar=\"\") -> Argument:
-        return self._add(name, action, type, default, required, choices, help, metavar, -1, \"\")
+    # the absent flag, leaving it marked not-present (#1692). `hidden` (#1702)
+    # registers the argument so it parses exactly as normal but omits it from
+    # the generated usage line and help rows (Python argparse's suppression /
+    # Click's `hidden` option visibility flag).
+    def add_argument(self, str name, str action=\"store\", str type=\"str\", str default=\"\", bool required=False, list[str] choices=[], str help=\"\", str metavar=\"\", bool hidden=False) -> Argument:
+        return self._add(name, action, type, default, required, choices, help, metavar, hidden, -1, \"\")
 
-    # Shared registration for `add_argument` and the group variants (`mx` is the
+    # Shared registration for `add_argument` and the group variants (`hidden`
+    # suppresses the argument from usage/help only; `mx` is the
     # mutually-exclusive group index or -1; `group` is the help-section title).
-    def _add(self, str name, str action, str kind, str default, bool required, list[str] choices, str help, str metavar, int64 mx, str group) -> Argument:
+    def _add(self, str name, str action, str kind, str default, bool required, list[str] choices, str help, str metavar, bool hidden, int64 mx, str group) -> Argument:
         auto optional = name.startswith(\"-\")
         auto dest = __argparse_dest(name)
         auto is_flag = action == \"store_true\" or action == \"store_false\"
@@ -2436,7 +2441,7 @@ struct ArgumentParser:
         auto mv = metavar
         if mv == \"\":
             mv = dest
-        Argument a = Argument(name=name, dest=dest, metavar=mv, optional=optional, is_flag=is_flag, store_val=storev, kind=kind, default_raw=dflt, required=required, has_choices=len(choices) > 0, choices=choices, help=help, mx_group=mx, group_title=group)
+        Argument a = Argument(name=name, dest=dest, metavar=mv, optional=optional, is_flag=is_flag, store_val=storev, kind=kind, default_raw=dflt, required=required, has_choices=len(choices) > 0, choices=choices, help=help, hidden=hidden, mx_group=mx, group_title=group)
         if optional:
             self._opts.append(a)
         else:
@@ -2610,21 +2615,31 @@ struct ArgumentParser:
         if self.prog != \"\":
             u = u + \" \" + self.prog
         u = u + \" [-h]\"
+        # Hidden arguments (#1702) parse normally but never appear in usage.
         for a in self._opts:
-            u = u + \" \" + __argparse_usage_opt(a)
+            if not a.hidden:
+                u = u + \" \" + __argparse_usage_opt(a)
         for a in self._pos:
-            u = u + \" \" + a.metavar
+            if not a.hidden:
+                u = u + \" \" + a.metavar
         if self._has_sub:
             u = u + \" \" + self._sub_dest + \" ...\"
         lines.append(u)
         if self.description != \"\":
             lines.append(\"\")
             lines.append(self.description)
-        if len(self._pos) > 0 or self._has_sub:
+        # Count the visible positionals so a positionals-only section made up
+        # entirely of hidden arguments emits no heading (#1702).
+        auto vis_pos = 0
+        for a in self._pos:
+            if not a.hidden:
+                vis_pos = vis_pos + 1
+        if vis_pos > 0 or self._has_sub:
             lines.append(\"\")
             lines.append(\"positional arguments:\")
             for a in self._pos:
-                lines.append(__argparse_help_row(a.metavar, a.help))
+                if not a.hidden:
+                    lines.append(__argparse_help_row(a.metavar, a.help))
             if self._has_sub:
                 auto subnames = \"\"
                 auto f = True
@@ -2639,14 +2654,17 @@ struct ArgumentParser:
         lines.append(\"options:\")
         lines.append(\"  -h, --help  show this help message and exit\")
         for a in self._opts:
-            if a.group_title == \"\":
+            if a.group_title == \"\" and not a.hidden:
                 lines.append(__argparse_help_row(__argparse_opt_display(a), a.help))
+        # A group heading is emitted once, at its first VISIBLE member, so a
+        # group with only hidden members contributes no heading and hidden
+        # members never shift the order of the visible rows (#1702).
         for a in self._opts:
-            if a.group_title != \"\" and __argparse_first_in_group(self, a):
+            if a.group_title != \"\" and not a.hidden and __argparse_first_in_group(self, a):
                 lines.append(\"\")
                 lines.append(a.group_title + \":\")
                 for b in self._opts:
-                    if b.group_title == a.group_title:
+                    if b.group_title == a.group_title and not b.hidden:
                         lines.append(__argparse_help_row(__argparse_opt_display(b), b.help))
         auto out = \"\"
         auto first = True
@@ -2712,11 +2730,13 @@ def __argparse_help_row(str head, str help) -> str:
         return \"  \" + head
     return \"  \" + head + \"  \" + help
 
-# Is `a` the first-declared member of its (non-empty) help group? Used to emit
-# each group heading exactly once, in declaration order.
+# Is `a` the first-declared VISIBLE member of its (non-empty) help group? Used
+# to emit each group heading exactly once, in declaration order, anchored to the
+# first non-hidden member so a leading hidden member does not claim the heading
+# and an all-hidden group is skipped entirely (#1702).
 def __argparse_first_in_group(ArgumentParser p, Argument a) -> bool:
     for b in p._opts:
-        if b.group_title == a.group_title:
+        if b.group_title == a.group_title and not b.hidden:
             return b.name == a.name
     return False
 
