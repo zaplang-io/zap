@@ -7,8 +7,9 @@
 # operands to prove it rounds toward negative infinity, not toward zero.
 
 def scale(int32 n) -> int32:
-    # Arithmetic widens to int64 (D-0019), so an int32 result needs an explicit
-    # narrowing conversion back.
+    # Fixed-width integer arithmetic is width-stable (#1654): `n * 2` is already
+    # `int32` (the literal adopts the operand width), so the `int32(...)` here is
+    # a redundant no-op kept only to exercise the explicit-cast path.
     return int32(n * 2)
 
 def main():

@@ -121,14 +121,22 @@ value); rule 3 extends it to arithmetic context and signed narrows.
   variant is unnecessary.
 - **The out-of-range-literal question is folded into rule 3** — one unified rule
   rather than a separate narrow-literal-overflow decision.
-- **Mechanical surface is centralized.** The typing change lives at `num_join`
-  (when one operand is `UntypedInt` and the other a concrete fixed-width int,
-  adopt the concrete type instead of `default_type`-ing the literal to `int64`;
-  the checker range-checks the literal) plus the mixed-width rule. Codegen is
-  already width-aware (ZIR `I8/I16/U8…` already wrap, D-0005), so the gap is in
-  the front-end type system, not codegen. Existing tested invariants
-  (`unsigned_num_join_promotes_to_uint64`, the `int32`/`int64` join tests) and
-  any uint8/int32 arithmetic goldens are rewritten.
+- **Mechanical surface spans the front-end *and* the lowering.** The typing
+  change lives at `num_join` (when one operand is `UntypedInt` and the other a
+  concrete fixed-width int, adopt the concrete type instead of
+  `default_type`-ing the literal to `int64`; the checker range-checks the
+  literal) plus the mixed-width rule — this is the front-end foundation (#1676).
+  Although ZIR `I8/I16/U8…` ops wrap at their width (D-0005), the `zapc_ir`
+  lowering widens **scalar** integer arithmetic to a 64-bit compute type
+  (`operators.rs`) and does not consult sema's inferred type, so the front-end
+  change alone does not make the runtime wrap — `uint8(200) + uint8(100)` still
+  computes `300` until the lowering is fixed. The runtime half (#1677) therefore
+  narrows each arithmetic result back to the width-stable result type
+  (two's-complement truncation; the result width is recovered from the operand
+  ZIR types plus syntactic untyped-literal detection, mirroring `num_join`), and
+  aligns `zapc_mono`'s generic-inference `binary_result`. Existing tested
+  invariants (`unsigned_num_join_promotes_to_uint64`, the `int32`/`int64` join
+  tests) and any uint8/int32 arithmetic goldens are rewritten.
 - **Stale issue text.** #1654's "Design decision required" section asks about an
   implicit *widening lattice* `int8→int16→int32→int64`; this decision rejects
   implicit arithmetic widening in favor of width-stable + widen-to-larger, so

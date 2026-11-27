@@ -7393,6 +7393,165 @@ def main():
         assert!(calls(&m, "zap_u64_to_str"));
     }
 
+    // --- #1654 / I#1677: width-stable integer arithmetic wraps at the result
+    // width. Lowering computes arithmetic at a 64-bit width, then wraps the
+    // result back to the width-stable result type (truncation == two's-complement
+    // wrap). These host checks pin that the narrowing `Cast{Trunc}` is emitted on
+    // the arithmetic result (the runtime values — `uint8(200)+uint8(100) == 44` —
+    // are pinned by the `unsigned_ints` / width-stable goldens on the LLVM CI).
+
+    /// True if `main` wraps an integer arithmetic result (an Add/Sub/Mul `Bin`,
+    /// or a `zap_i*`/`zap_u*` arithmetic helper call) from a 64-bit width down to
+    /// `want` via a `Trunc`. This is the width-stable narrowing; it is distinct
+    /// from the operand-widening ZExt/SExt and from a literal-store truncation
+    /// (whose source is a const, not an arithmetic result).
+    fn arith_result_narrows_to(m: &Module, want: Ty) -> bool {
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        const ARITH_HELPERS: &[&str] = &[
+            "zap_imod",
+            "zap_umod",
+            "zap_ifloordiv",
+            "zap_udiv",
+            "zap_ipow",
+            "zap_upow",
+        ];
+        // Values that hold a 64-bit integer *arithmetic* result.
+        let mut arith_vals: Vec<Value> = Vec::new();
+        for b in &main.blocks {
+            for i in &b.insts {
+                match i {
+                    Inst::Bin {
+                        dest,
+                        op: BinOp::Add | BinOp::Sub | BinOp::Mul,
+                        ..
+                    } => arith_vals.push(*dest),
+                    Inst::Call {
+                        dest: Some(d),
+                        func,
+                        ..
+                    }
+                    | Inst::Invoke {
+                        dest: Some(d),
+                        func,
+                        ..
+                    } if ARITH_HELPERS.contains(&func.as_str()) => arith_vals.push(*d),
+                    _ => {}
+                }
+            }
+        }
+        main.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+            matches!(
+                i,
+                Inst::Cast { kind: CastKind::Trunc, val, dest }
+                    if arith_vals.contains(val)
+                        && main.value_ty(*dest) == want
+                        && main.value_ty(*val).int_width() == Some(64)
+            )
+        })
+    }
+
+    #[test]
+    fn same_width_arithmetic_wraps_at_that_width() {
+        // uint8 + uint8 stays uint8 (not promoted to uint64): the add's 64-bit
+        // result is truncated back to u8 so it wraps modulo 256.
+        let m =
+            lower_main("    uint8 a = 200\n    uint8 b = 100\n    auto c = a + b\n    print(c)\n");
+        assert!(
+            arith_result_narrows_to(&m, Ty::U8),
+            "uint8 + uint8 must wrap its result back to u8"
+        );
+        // Signed narrow family likewise: int32 + int32 -> int32.
+        let s = lower_main("    int32 a = 2\n    int32 b = 3\n    auto c = a + b\n    print(c)\n");
+        assert!(
+            arith_result_narrows_to(&s, Ty::I32),
+            "int32 + int32 must wrap its result back to i32"
+        );
+        // Multiplication and the width-16 type too.
+        let w = lower_main(
+            "    uint16 a = 300\n    uint16 b = 300\n    auto c = a * b\n    print(c)\n",
+        );
+        assert!(
+            arith_result_narrows_to(&w, Ty::U16),
+            "uint16 * uint16 must wrap its result back to u16"
+        );
+    }
+
+    #[test]
+    fn literal_operand_adopts_the_concrete_width() {
+        // `uint8_v + 5` stays uint8 — the untyped literal adopts the concrete
+        // operand's width, so the result wraps at u8.
+        let m = lower_main("    uint8 a = 10\n    auto c = a + 5\n    print(c)\n");
+        assert!(
+            arith_result_narrows_to(&m, Ty::U8),
+            "uint8 + <literal> must wrap its result back to u8"
+        );
+        // Order-independent.
+        let m2 = lower_main("    uint8 a = 10\n    auto c = 5 + a\n    print(c)\n");
+        assert!(arith_result_narrows_to(&m2, Ty::U8));
+    }
+
+    #[test]
+    fn mixed_width_arithmetic_widens_to_the_larger() {
+        // uint8 + uint16 -> uint16: the result narrows to u16 (the larger
+        // operand), not all the way to u8 and not up to u64.
+        let m =
+            lower_main("    uint8 a = 200\n    uint16 b = 300\n    auto c = a + b\n    print(c)\n");
+        assert!(
+            arith_result_narrows_to(&m, Ty::U16),
+            "uint8 + uint16 must wrap its result to the larger width u16"
+        );
+        assert!(
+            !arith_result_narrows_to(&m, Ty::U8),
+            "mixed-width result must not narrow to the smaller operand"
+        );
+    }
+
+    #[test]
+    fn sixty_four_bit_and_untyped_arithmetic_do_not_narrow() {
+        // uint64/int64 arithmetic already computes at the result width, so there
+        // is no width-stable narrowing to apply.
+        let u = lower_main(
+            "    uint64 a = 200\n    uint64 b = 100\n    auto c = a + b\n    print(c)\n",
+        );
+        assert!(!arith_result_narrows_to(&u, Ty::U8));
+        assert!(!arith_result_narrows_to(&u, Ty::U16));
+        assert!(!arith_result_narrows_to(&u, Ty::U32));
+        let s = lower_main("    int64 a = 2\n    int64 b = 3\n    auto c = a + b\n    print(c)\n");
+        assert!(!arith_result_narrows_to(&s, Ty::I32));
+        // Two untyped literals keep the int64 default — no narrowing.
+        let lit = lower_main("    auto c = 2 + 3\n    print(c)\n");
+        assert!(!arith_result_narrows_to(&lit, Ty::I32));
+    }
+
+    #[test]
+    fn comparison_and_bitwise_results_are_not_narrowed() {
+        // A comparison yields `bool`, and bitwise/shift keep the 64-bit width
+        // (matching sema): none of these are width-stable-narrowed.
+        let cmp =
+            lower_main("    uint8 a = 200\n    uint8 b = 100\n    auto c = a < b\n    print(c)\n");
+        assert!(!arith_result_narrows_to(&cmp, Ty::U8));
+        let band =
+            lower_main("    uint8 a = 200\n    uint8 b = 100\n    auto c = a & b\n    print(c)\n");
+        assert!(!arith_result_narrows_to(&band, Ty::U8));
+    }
+
+    #[test]
+    fn narrow_pow_and_floordiv_wrap_at_width() {
+        // The runtime-helper arithmetic ops narrow their result too.
+        let p =
+            lower_main("    uint8 a = 2\n    uint8 b = 10\n    auto c = a ** b\n    print(c)\n");
+        assert!(
+            arith_result_narrows_to(&p, Ty::U8),
+            "uint8 ** uint8 must wrap its result back to u8"
+        );
+        let f =
+            lower_main("    int32 a = 100\n    int32 b = 7\n    auto c = a // b\n    print(c)\n");
+        assert!(
+            arith_result_narrows_to(&f, Ty::I32),
+            "int32 // int32 must keep an i32 result"
+        );
+    }
+
     // --- #552 follow-up: subscript indices auto-promote to the i64 index word.
     //
     // The index position widens every integer type to the 64-bit index word: a
