@@ -324,6 +324,21 @@ impl<'a> FnLower<'a> {
             if self.pattern_statically_dead(sty, &arm.pattern) {
                 continue;
             }
+            // An arm whose pattern is statically irrefutable for this scrutinee
+            // type and carries no guard is a catch-all: every later arm is
+            // unreachable at this specialization, so after lowering this arm we
+            // drop the rest without lowering their bodies (#1668). This is the
+            // dual of the statically-dead elision above and is behaviour-
+            // preserving — an arm after an unconditional match never runs. It
+            // matters because a later arm's body may be type-correct only for a
+            // *different* specialization: in `build[Inner]`, `case Command() as
+            // composed:` irrefutably matches the `Inner = Command` instance, and
+            // the `case _:` body (`fn(..) handler = previous`) would otherwise be
+            // lowered against a `Command` and fail `check_fn_coercion` with
+            // ZAP4001 ("value of type `Command` is not a function"). The guard is
+            // computed before lowering, while `sty` is in hand.
+            let irrefutable =
+                arm.guard.is_none() && self.pattern_statically_irrefutable(sty, &arm.pattern);
             let (cond, _catch_all) = self.pattern_cond(sv, sty, &arm.pattern)?;
             let then_bb = self.new_block();
             let next_bb = self.new_block();
@@ -352,6 +367,9 @@ impl<'a> FnLower<'a> {
             self.ensure_br(merge);
             self.pop_scope();
             self.position(next_bb);
+            if irrefutable {
+                break;
+            }
         }
         // Fall-through (no arm matched): for a non-enum scrutinee this is the
         // Python no-op; for an exhaustive enum sema guarantees this is dead.
@@ -411,6 +429,95 @@ impl<'a> FnLower<'a> {
             Pattern::Sequence(..) => !matches!(sty, Ty::List(_)),
             _ => false,
         }
+    }
+
+    /// Whether `pat` can be statically proven to **always** match a scrutinee of
+    /// type `sty`, so an arm carrying it (with no guard) is a catch-all and every
+    /// later arm is unreachable at this specialization (#1668). This is the dual
+    /// of [`pattern_statically_dead`]: it reports `true` only when the match is
+    /// *certain*, so the elision stays behaviour-preserving (an arm after an
+    /// unconditional match never runs). Anything runtime-decidable — a literal, an
+    /// enum-variant discriminant, a refutable field/element sub-test — reports
+    /// `false` and keeps the later arms live.
+    ///
+    /// A nominal struct pattern `S(...)` against a scrutinee statically typed
+    /// exactly as `S` always matches when all of its field sub-patterns are
+    /// themselves irrefutable (a bare `S()` trivially so). A null non-`Optional`
+    /// reference is a `NullReferenceError`-class fault (#1489), not a match miss a
+    /// trailing `_` arm is expected to catch, so it does not make the arm
+    /// refutable here — the design decision recorded in
+    /// decisions/lang/1668-irrefutable-arm-specialization.md.
+    fn pattern_statically_irrefutable(&self, sty: Ty, pat: &Pattern) -> bool {
+        match pat {
+            // `_` / a bare capture always match.
+            Pattern::Wildcard(_) | Pattern::Capture { .. } => true,
+            // `<pat> as name` matches exactly when its inner pattern does.
+            Pattern::As { pattern, .. } => self.pattern_statically_irrefutable(sty, pattern),
+            // An or-pattern always matches when *any* alternative always matches.
+            Pattern::Or(patterns, _) => patterns
+                .iter()
+                .any(|p| self.pattern_statically_irrefutable(sty, p)),
+            // A nominal struct pattern against exactly its own type: irrefutable
+            // when every field sub-pattern is. An enum-variant pattern
+            // (`path.len() == 2`) is never irrefutable — a sum type has other
+            // variants — so it is left out.
+            Pattern::Struct { path, args, .. } if path.len() == 1 => {
+                let Some(&sid) = self.ctx.ids.get(&path[0]) else {
+                    return false;
+                };
+                if sty != Ty::Struct(sid) {
+                    return false;
+                }
+                match args {
+                    None => true,
+                    Some(args) => self.struct_field_patterns_irrefutable(sid, args),
+                }
+            }
+            // A tuple pattern against a tuple struct of matching arity, no `*rest`
+            // hole, with every element sub-pattern irrefutable.
+            Pattern::Tuple(patterns, _) => {
+                let Ty::Struct(sid) = sty else { return false };
+                if patterns.iter().any(|p| matches!(p, Pattern::Rest { .. })) {
+                    return false;
+                }
+                let Some(fields) = self.ctx.tuples.borrow().fields(sid) else {
+                    return false;
+                };
+                fields.len() == patterns.len()
+                    && patterns
+                        .iter()
+                        .zip(fields.iter())
+                        .all(|(p, &fty)| self.pattern_statically_irrefutable(fty, p))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether every field sub-pattern of a struct pattern on `sid` is
+    /// irrefutable against its field's type. Conservative: an unresolvable field
+    /// name or index reports `false` (keeps later arms live). Mirrors the
+    /// positional/by-name resolution of [`pattern_fields`].
+    fn struct_field_patterns_irrefutable(&self, sid: u32, args: &[PatArg]) -> bool {
+        let mut pos = 0usize;
+        for a in args {
+            let fty = if let Some(name) = &a.name {
+                self.ctx.field(sid, name).map(|(_, ty)| ty)
+            } else {
+                let ty = self
+                    .ctx
+                    .fields
+                    .get(sid as usize)
+                    .and_then(|fs| fs.get(pos))
+                    .map(|(_, ty)| *ty);
+                pos += 1;
+                ty
+            };
+            match fty {
+                Some(fty) if self.pattern_statically_irrefutable(fty, &a.pattern) => {}
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// Emit the test for one pattern against the scrutinee and return its `i1`
