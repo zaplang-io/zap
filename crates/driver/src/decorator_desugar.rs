@@ -104,6 +104,23 @@ pub fn desugar_registering_decorators(
         })
         .collect();
 
+    // Each top-level function's generic type-parameter names, keyed like `fn_sigs`
+    // (#1647). A decorator receiver whose handler parameter is typed as one of its
+    // own generics is a *uniform generic seam* — the innermost use adapts the
+    // handler into it, an outer use threads the previous layer's return value, so
+    // any layer may be innermost.
+    let fn_generics: HashMap<String, Vec<String>> = module
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Function(f) => Some((
+                f.name.clone(),
+                f.generics.iter().map(|g| g.name.clone()).collect(),
+            )),
+            _ => None,
+        })
+        .collect();
+
     // Snapshot the request-source resolver functions (#959, D-0198): top-level
     // `def`s carrying `@request_source`. A handler parameter whose default calls
     // one of these is a request-sourced parameter the adapter injects, rather
@@ -145,6 +162,7 @@ pub fn desugar_registering_decorators(
     // is adapted into that seam rather than passed raw. Imported-module receivers
     // read the same from `fn_sigs` below.
     let struct_method_params = collect_struct_method_params(module);
+    let struct_method_generics = collect_struct_method_generics(module);
 
     // Imported-module receivers (#1519, the cli#4 surface): a dotted decorator
     // whose root is an IMPORTED module (`import factory; @factory.command`)
@@ -187,7 +205,9 @@ pub fn desugar_registering_decorators(
             import_prefixes,
             &fn_rets,
             &struct_method_params,
+            &struct_method_generics,
             &fn_sigs,
+            &fn_generics,
             &source_fns,
             &mut diags,
         ) {
@@ -244,7 +264,9 @@ pub fn desugar_registering_decorators(
                 import_prefixes,
                 &fn_rets,
                 &struct_method_params,
+                &struct_method_generics,
                 &fn_sigs,
+                &fn_generics,
             ) {
                 Some(r) => (r.callee, r.root),
                 None => {
@@ -381,6 +403,28 @@ fn collect_struct_method_params(module: &Module) -> MethodParams {
     out
 }
 
+/// Each struct method's generic type-parameter names (#1647), keyed as
+/// `struct -> method -> [generic names]`, mirroring [`collect_struct_method_params`].
+/// Used to recognize a *uniform generic seam* parameter (one typed as the method's
+/// own generic).
+type MethodGenerics = HashMap<String, HashMap<String, Vec<String>>>;
+
+fn collect_struct_method_generics(module: &Module) -> MethodGenerics {
+    let mut out: MethodGenerics = HashMap::new();
+    for it in &module.items {
+        if let Item::Struct(s) = it {
+            let methods = out.entry(s.name.clone()).or_default();
+            for m in &s.methods {
+                methods.insert(
+                    m.name.clone(),
+                    m.generics.iter().map(|g| g.name.clone()).collect(),
+                );
+            }
+        }
+    }
+    out
+}
+
 /// Map a receiver variable name to the struct type it holds, for the forms we
 /// can resolve syntactically before sema: a typed parameter or `let`
 /// (`Cli cli`), or an `auto cli = Cli()` whose initializer calls a known
@@ -446,7 +490,9 @@ fn try_build_rebind(
     import_prefixes: &HashMap<String, String>,
     fn_rets: &HashMap<String, Option<Type>>,
     struct_method_params: &MethodParams,
+    struct_method_generics: &MethodGenerics,
     fn_sigs: &HashMap<String, Vec<Param>>,
+    fn_generics: &HashMap<String, Vec<String>>,
     source_fns: &HashSet<String>,
     diags: &mut Vec<TypeError>,
 ) -> Option<(Registration, Option<Function>)> {
@@ -461,7 +507,9 @@ fn try_build_rebind(
         import_prefixes,
         fn_rets,
         struct_method_params,
+        struct_method_generics,
         fn_sigs,
+        fn_generics,
     )?;
     // Non-void return → rebind; void or unknown/unresolvable receiver →
     // registering (mechanism A, return-type-driven).
@@ -515,9 +563,18 @@ fn try_build_rebind(
             import_prefixes,
             fn_rets,
             struct_method_params,
+            struct_method_generics,
             fn_sigs,
+            fn_generics,
         );
-        if let Some((pname, context_ty)) = ri.as_ref().and_then(|r| seam_param(&r.params)) {
+        if let Some(seam) = ri.as_ref().and_then(|r| seam_param(&r.params, &r.generics)) {
+            let (pname, context_ty) = match seam.kind {
+                // A literal `fn([C,] Namespace)` seam carries its context type.
+                SeamKind::Literal(ctx) => (seam.name, ctx),
+                // A uniform generic seam (#1647) carries no context type; infer it
+                // from the handler's own first non-scalar parameter (as #1621 does).
+                SeamKind::Generic => (seam.name, infer_handler_context(&f.params)),
+            };
             let (a, aname) = synth_namespace_adapter(
                 &orig_name,
                 &impl_name,
@@ -565,7 +622,9 @@ fn try_build_rebind(
             import_prefixes,
             fn_rets,
             struct_method_params,
+            struct_method_generics,
             fn_sigs,
+            fn_generics,
         ) else {
             continue;
         };
@@ -968,6 +1027,9 @@ struct ResolvedRecv {
     /// anywhere among them (e.g. before optional `name=`/`help=` metadata), so the
     /// decorated handler is adapted and passed to it *by name*, not positionally.
     params: Vec<(String, Option<Type>)>,
+    /// The receiver method's own generic type-parameter names (#1647). A parameter
+    /// typed as one of these is a *uniform generic seam*.
+    generics: Vec<String>,
 }
 
 /// Resolve a dotted decorator name `root.method` to the call it desugars to.
@@ -990,7 +1052,9 @@ fn resolve_dotted(
     import_prefixes: &HashMap<String, String>,
     fn_rets: &HashMap<String, Option<Type>>,
     struct_method_params: &MethodParams,
+    struct_method_generics: &MethodGenerics,
     fn_sigs: &HashMap<String, Vec<Param>>,
+    fn_generics: &HashMap<String, Vec<String>>,
 ) -> Option<ResolvedRecv> {
     let (recv_expr, method, root) = split_registering(name, span)?;
     if let Some(struct_name) = recv_struct.get(&root) {
@@ -999,6 +1063,11 @@ fn resolve_dotted(
             .and_then(|mm| mm.get(&method))
             .cloned();
         let params = struct_method_params
+            .get(struct_name)
+            .and_then(|mm| mm.get(&method))
+            .cloned()
+            .unwrap_or_default();
+        let generics = struct_method_generics
             .get(struct_name)
             .and_then(|mm| mm.get(&method))
             .cloned()
@@ -1012,6 +1081,7 @@ fn resolve_dotted(
             root,
             ret,
             params,
+            generics,
         });
     }
     if let Some(prefix) = import_prefixes.get(&root) {
@@ -1028,26 +1098,94 @@ fn resolve_dotted(
                     .collect()
             })
             .unwrap_or_default();
+        let generics = fn_generics.get(&fn_name).cloned().unwrap_or_default();
         return Some(ResolvedRecv {
             callee: Expr::Name(fn_name, span),
             root,
             ret,
+            generics,
             params,
         });
     }
     None
 }
 
-/// Find the receiver method's handler parameter — the one whose type is the
-/// uniform argparse seam `fn([C,] Namespace) -> R` (#1544/#1621) — among `params`
-/// (`self` already dropped). Returns the parameter's name (so the adapter is
-/// passed to it by keyword, independent of any surrounding optional metadata,
-/// #1626) and the seam's optional leading context type. Returns `None` when no
-/// parameter is a seam — the decorator receives the raw handler, unchanged.
-fn seam_param(params: &[(String, Option<Type>)]) -> Option<(String, Option<Type>)> {
-    params
+/// What kind of handler seam a receiver method's parameter is.
+enum SeamKind {
+    /// A literal `fn([C,] Namespace) -> R` seam (#1544/#1621), carrying the
+    /// dispatcher-supplied context type `C`, if any.
+    Literal(Option<Type>),
+    /// A **uniform generic seam** (#1647): the parameter is typed as one of the
+    /// receiver method's own generic type parameters, so one signature serves every
+    /// stack position — the innermost use adapts the handler into it, an outer use
+    /// threads the previous layer's return value. The context is inferred from the
+    /// handler (the seam carries none).
+    Generic,
+}
+
+/// The receiver method's handler seam — the parameter name and its kind.
+struct SeamInfo {
+    name: String,
+    kind: SeamKind,
+}
+
+/// Find the receiver method's handler seam parameter among `params` (`self` already
+/// dropped). A parameter is a seam when its type is the literal argparse seam
+/// `fn([C,] Namespace) -> R` (#1544/#1621), **or** a bare reference to one of the
+/// method's own generic type parameters `generics` (a uniform generic seam, #1647).
+/// The adapter is passed to it by keyword, independent of surrounding optional
+/// metadata (#1626). Returns `None` when no parameter is a seam — the decorator
+/// receives the raw handler, unchanged.
+fn seam_param(params: &[(String, Option<Type>)], generics: &[String]) -> Option<SeamInfo> {
+    // A literal `fn([C,] Namespace)` seam always wins.
+    if let Some(info) = params.iter().find_map(|(n, t)| {
+        namespace_seam(t).map(|ctx| SeamInfo {
+            name: n.clone(),
+            kind: SeamKind::Literal(ctx),
+        })
+    }) {
+        return Some(info);
+    }
+    // A uniform generic seam applies ONLY when the decorator has no explicit
+    // function-typed parameter: a raw-handler decorator (#1527) already owns the
+    // handler slot with its own `fn(...)` parameter, so a bare-generic parameter
+    // there is an ordinary one (e.g. a `T kind` type-value argument, #1527), not a
+    // seam. Without any `fn(...)` parameter, the first bare-generic parameter is
+    // the handler seam.
+    if params
         .iter()
-        .find_map(|(n, t)| namespace_seam(t).map(|ctx| (n.clone(), ctx)))
+        .any(|(_, t)| matches!(t, Some(Type::Func { .. })))
+    {
+        return None;
+    }
+    params.iter().find_map(|(n, t)| {
+        is_generic_param_type(t, generics).then(|| SeamInfo {
+            name: n.clone(),
+            kind: SeamKind::Generic,
+        })
+    })
+}
+
+/// Whether `t` is a bare reference to one of `generics`: a `Type::Named` with no
+/// type arguments whose name is a declared generic parameter (#1647). This is the
+/// uniform-generic-seam marker — `Type[T]` (a type *value*) and concrete types are
+/// not seams.
+fn is_generic_param_type(t: &Option<Type>, generics: &[String]) -> bool {
+    matches!(t, Some(Type::Named { name, args, .. })
+        if args.is_empty() && generics.iter().any(|g| g == name))
+}
+
+/// Infer a generic-seam handler's context type (#1647): the type of the handler's
+/// first parameter when it is a non-argv (non-scalar) type with no default — the
+/// same "first parameter is the context" rule #1621 uses, excluding an injected
+/// `Depends(...)`/source parameter (which carries a default). `None` when the
+/// handler has no such leading context parameter (every parameter then binds from
+/// the namespace or is injected).
+fn infer_handler_context(params: &[Param]) -> Option<Type> {
+    params
+        .first()
+        .filter(|p| p.default.is_none() && namespace_getter_for(&p.ty).is_none())
+        .and_then(|p| p.ty.clone())
 }
 
 /// How a handler/provider parameter is bound by the adapter.
@@ -3201,6 +3339,154 @@ mod tests {
         assert!(
             diags.iter().any(|d| d.message.contains("`z`")),
             "expected an unsupported-parameter diagnostic for `z`, got: {diags:?}"
+        );
+    }
+
+    // ---- #1647: uniform generic seam (repeatable decorators) -----------------
+
+    #[test]
+    fn generic_seam_adapts_handler_with_inferred_context() {
+        // #1647: a receiver method whose handler parameter is typed as its own
+        // generic (`Inner previous`) is a uniform generic seam. The innermost use
+        // adapts the handler into it (so scalars/context still work), the adapter
+        // being passed to the generic parameter BY NAME. The context is inferred
+        // from the handler's first non-scalar parameter (the seam carries none).
+        let mut m = module(
+            "struct Context:\n    str command_name\n\
+             struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command[Inner](self, Inner previous, str name = \"\") -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(Context ctx, str who) -> str:\n    return who\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let adapter = func(&m, "greet$adapter").expect("adapter synthesized for a generic seam");
+        assert_eq!(
+            adapter.params.len(),
+            2,
+            "context inferred from the handler => (Context, Namespace) adapter"
+        );
+        assert!(
+            matches!(&adapter.params[0].ty, Some(Type::Named { name, .. }) if name == "Context"),
+            "the inferred context type is the handler's first non-scalar parameter type"
+        );
+        // The adapter is passed to the generic seam parameter `previous` by name.
+        let args = rebind_call_args(&main_stmts(&m)[1], "greet").expect("greet rebound");
+        assert!(
+            args.iter().any(|a| a.name.as_deref() == Some("previous")
+                && matches!(&a.value, Expr::Name(n, _) if n == "greet$adapter")),
+            "adapter bound to the generic seam `previous` by keyword: {args:?}"
+        );
+        // Body: `return greet$impl($ctx, $ns.get_str("who"))`.
+        let ctx_name = adapter.params[0].name.clone();
+        let Stmt::Return {
+            value: Some(Expr::Call { args: cargs, .. }),
+            ..
+        } = &body(adapter)[0]
+        else {
+            panic!("expected a return call");
+        };
+        assert!(is_name(&cargs[0].value, &ctx_name), "ctx passed through");
+        assert_eq!(
+            getter_call(&cargs[1].value),
+            Some(("get_str".into(), "who".into()))
+        );
+    }
+
+    #[test]
+    fn generic_type_value_param_is_not_a_seam() {
+        // #1647 guard: a decorator with a raw `fn(...)` handler (#1527) and a bare
+        // generic TYPE-VALUE parameter (`T kind`, which receives a type like
+        // `int64`) must NOT treat the generic parameter as the handler seam — the
+        // raw handler owns the slot, so no adapter is synthesized.
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def option[T](self, str name, T kind, fn(str) -> str handler) -> Command:\n        return Command()\n\
+             @cli.option(\"n\", int64)\ndef greet(str name) -> str:\n    return name\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        assert!(
+            func(&m, "greet$adapter").is_none(),
+            "a raw-handler decorator with a generic type-value parameter gets no adapter"
+        );
+        // The raw handler is threaded as the trailing positional argument, unchanged.
+        let args = rebind_call_args(&main_stmts(&m)[1], "greet").expect("greet rebound");
+        assert!(
+            args.last()
+                .is_some_and(|a| a.name.is_none()
+                    && matches!(&a.value, Expr::Name(n, _) if n == "greet$impl")),
+            "raw handler stays the trailing positional: {args:?}"
+        );
+    }
+
+    #[test]
+    fn generic_seam_context_free_handler() {
+        // #1647: a generic-seam handler with only scalar parameters infers NO
+        // context, so the adapter is the plain `(Namespace)` shape and every
+        // parameter binds from the namespace.
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command[Inner](self, Inner previous) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(str who) -> str:\n    return who\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let adapter = func(&m, "greet$adapter").expect("adapter synthesized");
+        assert_eq!(
+            adapter.params.len(),
+            1,
+            "no context inferred => a plain (Namespace) adapter"
+        );
+        assert!(
+            matches!(&adapter.params[0].ty, Some(Type::Named { name, .. }) if name == "Namespace")
+        );
+    }
+
+    #[test]
+    fn generic_seam_stacks_bottom_up() {
+        // #1647: two uniform-generic-seam decorators compose. The innermost adapts
+        // the handler; the outer receives the inner decorator's returned object
+        // (threaded as the trailing argument into its own generic seam).
+        let mut m = module(
+            "struct Context:\n    str command_name\n\
+             struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command[Inner](self, Inner previous, str name = \"\") -> Command:\n        return Command()\n\
+             struct Cli2:\n    def argument[Inner](self, str name, Inner previous) -> Command:\n        return Command()\n\
+             @cli.command\n@arg.argument(\"first\")\ndef greet(Context ctx, str who) -> str:\n    return who\n\
+             def main():\n    auto cli = Cli()\n    auto arg = Cli2()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        // The innermost (`arg.argument`) adapts the handler.
+        assert!(
+            func(&m, "greet$adapter").is_some(),
+            "innermost generic seam synthesizes the adapter"
+        );
+        // The rebind is the OUTER `cli.command(...)` call, threading the inner
+        // `arg.argument(...)` call as its trailing argument.
+        let (callee, args) = main_stmts(&m)
+            .iter()
+            .find_map(|s| match s {
+                Stmt::Let {
+                    name,
+                    value: Expr::Call { callee, args, .. },
+                    ..
+                } if name == "greet" => Some((callee, args)),
+                _ => None,
+            })
+            .expect("greet rebound to a call");
+        assert!(
+            matches!(callee.as_ref(), Expr::Attr { name, .. } if name == "command"),
+            "outermost wrap is cli.command"
+        );
+        assert!(
+            args.iter()
+                .any(|a| matches!(&a.value, Expr::Call { callee, .. }
+                if matches!(callee.as_ref(), Expr::Attr { name, .. } if name == "argument"))),
+            "the composed inner argument(...) object is threaded into command(...): {args:?}"
         );
     }
 }
