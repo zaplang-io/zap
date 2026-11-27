@@ -259,6 +259,25 @@ impl Ty {
         })
     }
 
+    /// Bit width of *any* concrete fixed-width integer type, signed or unsigned
+    /// (#1654). Unlike [`Ty::uint_width`], this also covers the signed family
+    /// (`int32`→32, `int64`→64). Used by the width-stable [`num_join`] to pick
+    /// the result width ("widen to the larger operand"). `usize` reports 64 (its
+    /// width on supported targets). Returns `None` for `bigint`, the untyped
+    /// literal, and every non-integer type.
+    pub fn int_width(&self) -> Option<u32> {
+        Some(match self {
+            Ty::Int32 => 32,
+            Ty::Int64 => 64,
+            Ty::Uint8 => 8,
+            Ty::Uint16 => 16,
+            Ty::Uint32 => 32,
+            Ty::Uint64 => 64,
+            Ty::Usize => 64,
+            _ => return None,
+        })
+    }
+
     pub fn display(&self) -> String {
         match self {
             Ty::Int64 => "int64".into(),
@@ -795,30 +814,76 @@ pub fn default_type(t: Ty) -> Ty {
     }
 }
 
-/// The result type of a numeric binary operation (promotion). Untyped operands
-/// are made concrete first, so arithmetic always yields a concrete type.
+/// The result type of a numeric binary operation.
+///
+/// Fixed-width integer arithmetic is **width-stable** and wraps at the operand
+/// width (two's-complement), superseding the promote-to-64 clause of D-0019 /
+/// #552 (ADR `decisions/lang/1654-fixed-width-integer-semantics.md`). The result
+/// is a fixed-width type of a definite width, not a silent promotion to 64-bit:
+///
+/// 1. **Same-width typed operands → that width.** `uint8 + uint8 → uint8`,
+///    `int32 + int32 → int32` (each wraps mod 2^width at codegen).
+/// 2. **Mixed-width typed operands → the larger operand's width.**
+///    `uint8 + uint16 → uint16`, `int32 + int64 → int64`. (Signed↔unsigned
+///    mixing is rejected by the checker, ZAP4015, *before* this runs, so a
+///    surviving concrete operand pairs only with the same signedness or an
+///    untyped-int literal.)
+/// 3. **An untyped literal adopts the concrete operand's type.**
+///    `uint8 + 5 → uint8`, `int32 + 5 → int32` — the literal infers to its
+///    context instead of defaulting to `int64`. The checker range-checks the
+///    literal against the adopted type (ZAP4016).
+/// 4. **No typed context → `int64` default.** `5 + 3 → int64` (both untyped).
+///
+/// `float`/`complex`/`bigint` operands still win over the integer families, as
+/// before. Untyped operands are made concrete for those non-integer cases, so
+/// arithmetic always yields a concrete type.
 pub fn num_join(l: &Ty, r: &Ty) -> Ty {
-    // Unsigned arithmetic promotes to `uint64` and wraps modulo 2^64, exactly
-    // mirroring the signed tower's promotion to `int64` (D-0019): a narrower
-    // unsigned result requires an explicit `uintN(...)` cast. Mixing signed and
-    // unsigned operands is rejected by the checker (ZAP4015) *before* this runs,
-    // so a surviving unsigned operand pairs only with another unsigned or an
-    // untyped-int literal. The flag is read from the *original* types, before
-    // `default_type` turns an `UntypedInt` into `Int64`, so `uint8 + 5` joins to
-    // `uint64`, not `int64`.
-    let unsigned = l.is_unsigned() || r.is_unsigned();
-    let l = default_type(l.clone());
-    let r = default_type(r.clone());
-    if matches!(l, Ty::Complex) || matches!(r, Ty::Complex) {
-        Ty::Complex
-    } else if matches!(l, Ty::Float64 | Ty::Float32) || matches!(r, Ty::Float64 | Ty::Float32) {
-        Ty::Float64
-    } else if unsigned {
-        Ty::Uint64
-    } else if matches!(l, Ty::Bigint) || matches!(r, Ty::Bigint) {
-        Ty::Bigint
-    } else {
-        Ty::Int64
+    // Non-integer numeric families take precedence and are unaffected by the
+    // width-stable rule. `default_type` collapses `UntypedFloat`→`Float64` so a
+    // float literal is detected here; the integer path below reads the
+    // *original* types so it can tell an `UntypedInt` literal (rule 3) apart
+    // from a concrete `int64`.
+    let ld = default_type(l.clone());
+    let rd = default_type(r.clone());
+    if matches!(ld, Ty::Complex) || matches!(rd, Ty::Complex) {
+        return Ty::Complex;
+    }
+    if matches!(ld, Ty::Float64 | Ty::Float32) || matches!(rd, Ty::Float64 | Ty::Float32) {
+        return Ty::Float64;
+    }
+    if matches!(ld, Ty::Bigint) || matches!(rd, Ty::Bigint) {
+        return Ty::Bigint;
+    }
+    // Both operands are now a fixed-width integer or an `UntypedInt` literal.
+    match (l, r) {
+        // Rule 4: both untyped → the `int64` default (context-free literal).
+        (Ty::UntypedInt, Ty::UntypedInt) => Ty::Int64,
+        // Rule 3: an untyped literal adopts the concrete operand's type. `t` is a
+        // concrete fixed-width int here — every non-integer case returned above.
+        (Ty::UntypedInt, t) | (t, Ty::UntypedInt) => t.clone(),
+        // Rules 1 & 2: two concrete fixed-width ints stay width-stable, widening
+        // to the larger operand.
+        _ => int_widen(l, r),
+    }
+}
+
+/// The width-stable join of two *concrete* fixed-width integer types (#1654):
+/// identical types stay put, otherwise the result is the wider operand's type
+/// ("widen to the larger operand, wrap there"). Signed↔unsigned mixing never
+/// reaches here (the checker rejects it with ZAP4015 first); the only
+/// equal-width-but-distinct pair in the shipped family is `usize` vs `uint64`,
+/// both 64-bit unsigned, for which the concrete-width `uint64` is returned.
+fn int_widen(l: &Ty, r: &Ty) -> Ty {
+    if l == r {
+        return l.clone();
+    }
+    let lw = l.int_width().unwrap_or(64);
+    let rw = r.int_width().unwrap_or(64);
+    match lw.cmp(&rw) {
+        std::cmp::Ordering::Greater => l.clone(),
+        std::cmp::Ordering::Less => r.clone(),
+        // Equal width, distinct types: `usize`/`uint64` → `uint64`.
+        std::cmp::Ordering::Equal => Ty::Uint64,
     }
 }
 
@@ -1306,14 +1371,71 @@ mod tests {
     }
 
     #[test]
-    fn unsigned_num_join_promotes_to_uint64() {
-        // Any unsigned operand (incl. with an untyped literal) promotes to u64,
-        // wrapping at 2^64 — mirroring the signed tower's promotion to i64.
-        assert_eq!(num_join(&Ty::Uint8, &Ty::Uint8), Ty::Uint64);
+    fn num_join_is_width_stable() {
+        // #1654 / ADR `decisions/lang/1654-fixed-width-integer-semantics.md`:
+        // fixed-width integer arithmetic is width-stable and wraps at the
+        // operand width, superseding the promote-to-64 clause of D-0019 / #552.
+
+        // Rule 1: same-width typed operands stay that width (no promote-to-64).
+        assert_eq!(num_join(&Ty::Uint8, &Ty::Uint8), Ty::Uint8);
+        assert_eq!(num_join(&Ty::Uint16, &Ty::Uint16), Ty::Uint16);
+        assert_eq!(num_join(&Ty::Uint32, &Ty::Uint32), Ty::Uint32);
+        assert_eq!(num_join(&Ty::Uint64, &Ty::Uint64), Ty::Uint64);
+        assert_eq!(num_join(&Ty::Int32, &Ty::Int32), Ty::Int32);
+        assert_eq!(num_join(&Ty::Int64, &Ty::Int64), Ty::Int64);
+        assert_eq!(num_join(&Ty::Usize, &Ty::Usize), Ty::Usize);
+
+        // Rule 2: mixed-width typed operands widen to the larger operand.
+        assert_eq!(num_join(&Ty::Uint8, &Ty::Uint16), Ty::Uint16);
+        assert_eq!(num_join(&Ty::Uint16, &Ty::Uint8), Ty::Uint16);
+        assert_eq!(num_join(&Ty::Uint8, &Ty::Uint32), Ty::Uint32);
+        assert_eq!(num_join(&Ty::Uint16, &Ty::Uint64), Ty::Uint64);
         assert_eq!(num_join(&Ty::Uint32, &Ty::Uint64), Ty::Uint64);
-        assert_eq!(num_join(&Ty::Uint8, &Ty::UntypedInt), Ty::Uint64);
-        assert_eq!(num_join(&Ty::UntypedInt, &Ty::Usize), Ty::Uint64);
-        // All-signed arithmetic is unchanged.
         assert_eq!(num_join(&Ty::Int32, &Ty::Int64), Ty::Int64);
+        assert_eq!(num_join(&Ty::Int64, &Ty::Int32), Ty::Int64);
+        // `usize` widens the narrow unsigned types just like `uint64` does, and
+        // the equal-width `usize`/`uint64` pair resolves to the concrete width.
+        assert_eq!(num_join(&Ty::Uint8, &Ty::Usize), Ty::Usize);
+        assert_eq!(num_join(&Ty::Usize, &Ty::Uint64), Ty::Uint64);
+        assert_eq!(num_join(&Ty::Uint64, &Ty::Usize), Ty::Uint64);
+
+        // Rule 3: an untyped literal adopts the concrete operand's type instead
+        // of defaulting to `int64`/`uint64` (order-independent).
+        assert_eq!(num_join(&Ty::Uint8, &Ty::UntypedInt), Ty::Uint8);
+        assert_eq!(num_join(&Ty::UntypedInt, &Ty::Uint8), Ty::Uint8);
+        assert_eq!(num_join(&Ty::Uint32, &Ty::UntypedInt), Ty::Uint32);
+        assert_eq!(num_join(&Ty::Int32, &Ty::UntypedInt), Ty::Int32);
+        assert_eq!(num_join(&Ty::UntypedInt, &Ty::Int32), Ty::Int32);
+        assert_eq!(num_join(&Ty::Uint64, &Ty::UntypedInt), Ty::Uint64);
+        assert_eq!(num_join(&Ty::UntypedInt, &Ty::Usize), Ty::Usize);
+        assert_eq!(num_join(&Ty::Int64, &Ty::UntypedInt), Ty::Int64);
+
+        // Rule 4: no typed context → the `int64` default (unchanged).
+        assert_eq!(num_join(&Ty::UntypedInt, &Ty::UntypedInt), Ty::Int64);
+
+        // The non-integer families still win and are unaffected by rules 1–4.
+        assert_eq!(num_join(&Ty::Uint8, &Ty::Float64), Ty::Float64);
+        assert_eq!(num_join(&Ty::Int32, &Ty::Float32), Ty::Float64);
+        assert_eq!(num_join(&Ty::UntypedInt, &Ty::UntypedFloat), Ty::Float64);
+        assert_eq!(num_join(&Ty::Int64, &Ty::Complex), Ty::Complex);
+        assert_eq!(num_join(&Ty::Int32, &Ty::Bigint), Ty::Bigint);
+        assert_eq!(num_join(&Ty::UntypedInt, &Ty::Bigint), Ty::Bigint);
+    }
+
+    #[test]
+    fn int_width_covers_the_whole_fixed_width_family() {
+        // The width-stable join keys off `int_width`, which (unlike
+        // `uint_width`) must report the signed family too (#1654).
+        assert_eq!(Ty::Int32.int_width(), Some(32));
+        assert_eq!(Ty::Int64.int_width(), Some(64));
+        assert_eq!(Ty::Uint8.int_width(), Some(8));
+        assert_eq!(Ty::Uint16.int_width(), Some(16));
+        assert_eq!(Ty::Uint32.int_width(), Some(32));
+        assert_eq!(Ty::Uint64.int_width(), Some(64));
+        assert_eq!(Ty::Usize.int_width(), Some(64));
+        // Not a fixed-width machine integer.
+        assert_eq!(Ty::Bigint.int_width(), None);
+        assert_eq!(Ty::UntypedInt.int_width(), None);
+        assert_eq!(Ty::Float64.int_width(), None);
     }
 }
