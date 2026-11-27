@@ -59,7 +59,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             let t = checker.infer(&args[0].value);
             match t {
                 Ty::Str => {}
-                Ty::Int32 | Ty::Int64 | Ty::UntypedInt => {}
+                Ty::Int8 | Ty::Int16 | Ty::Int32 | Ty::Int64 | Ty::UntypedInt => {}
                 Ty::Float32 | Ty::Float64 | Ty::UntypedFloat => checker.error(
                     ErrorCode::ZAP4024,
                     "decimal.Decimal() refuses a float argument: binary float cannot \

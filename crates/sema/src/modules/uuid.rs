@@ -60,7 +60,10 @@ fn expect_uuid(checker: &mut Checker, func: &str, arg: &Arg) {
 /// An integer-valued argument (NanoID size). Lowering coerces to i64.
 fn expect_int(checker: &mut Checker, func: &str, arg: &Arg) {
     let t = checker.infer(&arg.value);
-    if !matches!(t, Ty::Int32 | Ty::Int64 | Ty::UntypedInt | Ty::Unknown) {
+    if !matches!(
+        t,
+        Ty::Int8 | Ty::Int16 | Ty::Int32 | Ty::Int64 | Ty::UntypedInt | Ty::Unknown
+    ) {
         checker.error(
             ErrorCode::ZAP4024,
             format!("{func}() expects an int size, found {}", t.display()),

@@ -65,7 +65,9 @@ pub struct TypeError {
 fn is_fixed_width_numeric(t: &Ty) -> bool {
     matches!(
         t,
-        Ty::Int32
+        Ty::Int8
+            | Ty::Int16
+            | Ty::Int32
             | Ty::Int64
             | Ty::Uint8
             | Ty::Uint16
@@ -1004,7 +1006,9 @@ enum ArenaElem {
 fn is_leaf_scalar_name(n: &str) -> bool {
     matches!(
         n,
-        "int32"
+        "int8"
+            | "int16"
+            | "int32"
             | "int64"
             | "uint8"
             | "uint16"
@@ -1027,6 +1031,8 @@ fn is_leaf_scalar_ty(t: &Ty) -> bool {
         t,
         Ty::Int64
             | Ty::Int32
+            | Ty::Int16
+            | Ty::Int8
             | Ty::Uint8
             | Ty::Uint16
             | Ty::Uint32
@@ -2000,6 +2006,8 @@ impl Checker {
         match t {
             Ty::Int64
             | Ty::Int32
+            | Ty::Int16
+            | Ty::Int8
             | Ty::Uint8
             | Ty::Uint16
             | Ty::Uint32
@@ -2024,6 +2032,8 @@ impl Checker {
                     e.as_ref(),
                     Ty::Int64
                         | Ty::Int32
+                        | Ty::Int16
+                        | Ty::Int8
                         | Ty::Uint8
                         | Ty::Uint16
                         | Ty::Uint32
@@ -3195,6 +3205,8 @@ impl Checker {
                 match name.as_str() {
                     "int64" | "i64" => return Some((64, true, 1)),
                     "int32" | "i32" => return Some((32, true, 1)),
+                    "int16" | "i16" => return Some((16, true, 1)),
+                    "int8" | "i8" => return Some((8, true, 1)),
                     // Unsigned fixed-width integers are natural C-style
                     // bitfields (#552): unsigned storage, exact bit width.
                     "uint64" | "u64" | "usize" => return Some((64, false, 1)),
@@ -3632,6 +3644,9 @@ impl Checker {
                 // (I#581); `float` is likewise the name for the 64-bit double.
                 "int" | "int64" | "i64" => Ty::Int64,
                 "int32" | "i32" => Ty::Int32,
+                // Signed narrow fixed-width integers, first-class scalars (#1654).
+                "int16" | "i16" => Ty::Int16,
+                "int8" | "i8" => Ty::Int8,
                 // Unsigned fixed-width integers + pointer-width `usize` (#552).
                 "uint8" | "u8" => Ty::Uint8,
                 "uint16" | "u16" => Ty::Uint16,
@@ -3944,6 +3959,8 @@ impl Checker {
             Expr::Name(n, _) => match n.as_str() {
                 "int" | "int64" | "i64" => Ty::Int64,
                 "int32" | "i32" => Ty::Int32,
+                "int16" | "i16" => Ty::Int16,
+                "int8" | "i8" => Ty::Int8,
                 "float" | "float64" | "f64" => Ty::Float64,
                 "float32" | "f32" => Ty::Float32,
                 "bool" => Ty::Bool,
@@ -5268,7 +5285,10 @@ impl Checker {
                 }
                 Some("timeout") => {
                     let ty = self.infer(&a.value);
-                    if !matches!(ty, Ty::Int32 | Ty::Int64 | Ty::UntypedInt | Ty::Unknown) {
+                    if !matches!(
+                        ty,
+                        Ty::Int8 | Ty::Int16 | Ty::Int32 | Ty::Int64 | Ty::UntypedInt | Ty::Unknown
+                    ) {
                         self.error(
                             ErrorCode::ZAP4024,
                             "scope timeout requires an integer duration in milliseconds"
@@ -8443,6 +8463,8 @@ impl Checker {
                                 Ty::Unknown
                                     | Ty::Bool
                                     | Ty::Char
+                                    | Ty::Int8
+                                    | Ty::Int16
                                     | Ty::Int32
                                     | Ty::Int64
                                     | Ty::UntypedInt
@@ -10728,14 +10750,18 @@ impl Checker {
                     }
                     return Ty::Complex;
                 }
-                "int32" | "int64" | "float32" | "float64" | "i32" | "i64" | "f32" | "f64"
-                | "uint8" | "uint16" | "uint32" | "uint64" | "u8" | "u16" | "u32" | "u64"
-                | "usize" => {
+                "int8" | "int16" | "int32" | "int64" | "i8" | "i16" | "i32" | "i64" | "float32"
+                | "float64" | "f32" | "f64" | "uint8" | "uint16" | "uint32" | "uint64" | "u8"
+                | "u16" | "u32" | "u64" | "usize" => {
                     // Explicit numeric conversion (D-0020): the way to narrow or
                     // cross the int/float *or* the signed<->unsigned boundary that
                     // implicit coercion refuses (#552). Out-of-range / negative
-                    // inputs wrap (C cast semantics, documented in D-0019).
+                    // inputs wrap (C cast semantics, documented in D-0019). The
+                    // narrow signed casts `int8(...)`/`int16(...)` are the wrap
+                    // escape hatch for the width-stable family (#1654).
                     let to = match fname.as_str() {
+                        "int8" | "i8" => Ty::Int8,
+                        "int16" | "i16" => Ty::Int16,
                         "int32" | "i32" => Ty::Int32,
                         "int64" | "i64" => Ty::Int64,
                         "uint8" | "u8" => Ty::Uint8,
@@ -11110,6 +11136,8 @@ impl Checker {
                     bt,
                     Ty::Int64
                         | Ty::Int32
+                        | Ty::Int16
+                        | Ty::Int8
                         | Ty::Uint8
                         | Ty::Uint16
                         | Ty::Uint32
@@ -14237,6 +14265,8 @@ fn bits_for(n: u64) -> u64 {
 /// checker, where the value is known).
 fn int_ty_range(t: &Ty) -> Option<(i128, i128)> {
     Some(match t {
+        Ty::Int8 => (i8::MIN as i128, i8::MAX as i128),
+        Ty::Int16 => (i16::MIN as i128, i16::MAX as i128),
         Ty::Int32 => (i32::MIN as i128, i32::MAX as i128),
         Ty::Uint8 => (0, u8::MAX as i128),
         Ty::Uint16 => (0, u16::MAX as i128),

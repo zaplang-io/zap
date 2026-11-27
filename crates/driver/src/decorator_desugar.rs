@@ -831,8 +831,10 @@ fn namespace_seam(t: &Option<Type>) -> Option<Option<Type>> {
 /// non-numeric scalar reads its dedicated getter directly (no wrap).
 ///
 /// `None` for any other type — a parameter that cannot be bound from the command
-/// line in v1 (no `Context`/struct binding, and `int8`/`int16`, which are not
-/// scalar value types in Zap, epic #1644/#1654), reported at synthesis.
+/// line in v1 (no `Context`/struct binding), reported at synthesis. The narrow
+/// signed scalars `int8`/`int16` are first-class as of #1654, so they bind here
+/// like `int32` (`int8 n` → `int8(ns.get_int("n"))`), closing the #1644 epic
+/// piece for them.
 fn namespace_getter_for(t: &Option<Type>) -> Option<(&'static str, Option<&'static str>)> {
     let Some(Type::Named { name, args, .. }) = t else {
         return None;
@@ -843,6 +845,8 @@ fn namespace_getter_for(t: &Option<Type>) -> Option<(&'static str, Option<&'stat
     match name.as_str() {
         "int64" | "int" | "i64" => Some(("get_int", None)),
         "int32" | "i32" => Some(("get_int", Some("int32"))),
+        "int16" | "i16" => Some(("get_int", Some("int16"))),
+        "int8" | "i8" => Some(("get_int", Some("int8"))),
         "uint8" | "u8" => Some(("get_int", Some("uint8"))),
         "uint16" | "u16" => Some(("get_int", Some("uint16"))),
         "uint32" | "u32" => Some(("get_int", Some("uint32"))),
@@ -2975,20 +2979,54 @@ mod tests {
     }
 
     #[test]
-    fn non_conversion_scalar_param_errors() {
-        // `int8`/`int16` are not scalar value types in Zap (array dtypes only;
-        // epic #1644/#1654), so they cannot be bound — a precise decoration-site
-        // error. (`bigint`/`complex` now bind via #1657; see the #1657 test below.)
+    fn narrow_signed_scalar_params_bind_via_conversion() {
+        // #1654: `int8`/`int16` are now first-class scalar value types — the
+        // signed mirrors of `uint8`/`uint16` — so a handler parameter of either
+        // type binds like `int32`: read the wide `get_int` getter and wrap in the
+        // narrow conversion (`int8(ns.get_int("n"))`). This closes the #1644
+        // handler-adapter epic piece for the narrow signed scalars.
         let mut m = module(
             "struct Command:\n    def run(self):\n        print(\"ran\")\n\
              struct Cli:\n    def command(self, fn(Namespace) -> str handler) -> Command:\n        return Command()\n\
-             @cli.command\ndef greet(int8 n) -> str:\n    return \"x\"\n\
+             @cli.command\ndef greet(int8 n, int16 m) -> str:\n    return \"x\"\n\
+             def main():\n    auto cli = Cli()\n    greet.run()\n",
+        );
+        let diags = desugar_registering_decorators(&mut m, &HashMap::new());
+        assert!(diags.is_empty(), "no diagnostics expected: {diags:?}");
+        let adapter = func(&m, "greet$adapter").expect("adapter synthesized");
+        let Stmt::Return {
+            value: Some(Expr::Call { args, .. }),
+            ..
+        } = &body(adapter)[0]
+        else {
+            panic!("expected return call");
+        };
+        assert_eq!(
+            conv_getter_call(&args[0].value),
+            Some(("int8".into(), "get_int".into(), "n".into()))
+        );
+        assert_eq!(
+            conv_getter_call(&args[1].value),
+            Some(("int16".into(), "get_int".into(), "m".into()))
+        );
+    }
+
+    #[test]
+    fn unbindable_param_type_errors() {
+        // A parameter whose type cannot be read from the command line in v1 (here
+        // a `list[int64]`, not a namespace scalar / Context / struct) is still a
+        // precise decoration-site error — the `namespace_getter_for` fail-closed
+        // path, unchanged by the #1654 narrow-scalar additions.
+        let mut m = module(
+            "struct Command:\n    def run(self):\n        print(\"ran\")\n\
+             struct Cli:\n    def command(self, fn(Namespace) -> str handler) -> Command:\n        return Command()\n\
+             @cli.command\ndef greet(list[int64] xs) -> str:\n    return \"x\"\n\
              def main():\n    auto cli = Cli()\n    greet.run()\n",
         );
         let diags = desugar_registering_decorators(&mut m, &HashMap::new());
         assert!(
-            diags.iter().any(|d| d.message.contains("`n`")),
-            "expected an unsupported-parameter diagnostic for `n`, got: {diags:?}"
+            diags.iter().any(|d| d.message.contains("`xs`")),
+            "expected an unsupported-parameter diagnostic for `xs`, got: {diags:?}"
         );
     }
 
