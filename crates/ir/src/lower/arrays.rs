@@ -1994,6 +1994,9 @@ impl<'a> FnLower<'a> {
     ///
     /// A shape mismatch raises a catchable `ValueError` from the runtime, so the
     /// calls are `throwing_call`s. Batched (≥ 3-D) matmul is a follow-up.
+    /// Complex operands are rejected at lowering (#1719): the promoted dtype is
+    /// `Complex`, which has no matmul kernel yet (#938), and the integer kernel
+    /// would reinterpret the complex pointer-word as an `int64` → silent garbage.
     /// `a.reshape(d0, d1, ...)` (#511, D-0174): a view over the compacted buffer
     /// with the given dims, one of which may be the literal `-1` (inferred at
     /// runtime). The result's static rank is the number of dim arguments. A
@@ -2148,6 +2151,21 @@ impl<'a> FnLower<'a> {
             ));
         }
         let out = Dtype::promote(ld, rd);
+        // Complex `@` / `dot` has no kernel yet (#938): the integer matmul path
+        // (`zap_array_doti` / `zap_array_matmul`'s `zap_matmul_i`) reads/writes a
+        // complex array's 16-byte `(re, im)` pointer-word as a raw `int64`, silently
+        // corrupting the result. Reject it cleanly here — exactly as sort/argsort/
+        // unique/ordering reject complex — until the real complex kernel
+        // (`zap_matmul_c` / `zap_array_dotc`) lands under #938. `promote` makes
+        // either-operand-complex collapse to `Complex`, so this single check also
+        // covers complex@real and real@complex, for every rank pairing and for both
+        // the `a @ b` and `dot(a, b)` spellings (zaplang-io/zap#1719).
+        if matches!(out, Dtype::Complex) {
+            return Err(err(
+                "'@'/dot (matrix multiply) is not yet supported for complex arrays \
+                 (tracked under zaplang-io/zap#938)",
+            ));
+        }
         if lnd == 1 && rnd == 1 {
             // Dot product -> scalar. Accumulate in the wide word, then narrow to
             // the promoted dtype (like `sum`).
