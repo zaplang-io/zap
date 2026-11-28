@@ -110,6 +110,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | EXC-5 | §10 | a typed `raise` exposes its message through `as e` | covered | exception_typed_dispatch |
 | EXC-6 | §10 | an uncaught exception unwinds and exits non-zero | TODO | — |
 | EXC-7 | §10 | typed clauses dispatch in order, match subclasses, and preserve cleanup/propagation | covered | exception_typed_dispatch |
+| EXC-8 | §10 | a null non-`Optional` reference deref (field read/store, method receiver, index base, for-iteration base) raises a catchable `NullReferenceError`, caught by its own name and by `except Exception` (#1489) | covered | exception_null_reference |
 
 ## Tuples (§4.8, D-0049)
 
