@@ -2454,6 +2454,26 @@ struct MutuallyExclusiveGroup:
     def add_argument(self, str name, str alias=\"\", str action=\"store\", str type=\"str\", str default=\"\", bool required=False, list[str] choices=[], str help=\"\", str metavar=\"\", bool hidden=False, str nargs=\"\", str const_value=\"\", str dest=\"\", str version=\"\") -> Argument:
         return self._p._add(name, alias, action, type, default, required, choices, help, metavar, hidden, self._idx, \"\", nargs, const_value, dest, version)
 
+# The result of `ArgumentParser.completion_context` (#1712): a read-only view of
+# what the cursor word is completing in a partial command line, with no parsing
+# side effects. `kind` is \"option\" (an option name), \"value\" (the value of
+# `active_option`, with `value_prefix` the part typed so far), \"positional\" (the
+# next positional `active_dest`), or \"subcommand\" (a child command). `command_path`
+# is the chain of subcommands already selected; `options_allowed` is False once a
+# `--` separator has been seen; `invalid` is True when a COMPLETED word (never the
+# incomplete cursor word) was an unknown option or an invalid subcommand;
+# `candidates` is the declared completions matching the cursor prefix (option
+# names, choice values, or subcommand names), a best-effort convenience.
+struct CompletionContext:
+    str kind = \"\"
+    str active_option = \"\"
+    str value_prefix = \"\"
+    str active_dest = \"\"
+    list[str] command_path = []
+    list[str] candidates = []
+    bool options_allowed = True
+    bool invalid = False
+
 # A command-line argument parser. A real value — build as many as you like.
 struct ArgumentParser:
     str prog
@@ -2737,6 +2757,160 @@ struct ArgumentParser:
         if len(extras) > 0:
             raise \"unrecognized arguments: \" + extras[0]
         return ns
+
+    # Read-only completion query (#1712): given the already-decoded words BEFORE
+    # the cursor and the incomplete `prefix` being typed (\"\" starts a new word),
+    # report the selected subcommand path and what the cursor word completes,
+    # reusing the same token matching as `parse_args` (subcommand selection,
+    # value-taking options vs flags, `--option=value`, `--`). The cursor word is
+    # treated as incomplete: it is never validated as a full choice and the
+    # selected parser's required arguments are never enforced. Pure: it never
+    # parses, prints, exits, invokes a handler, or changes `parse_args` behavior.
+    def completion_context(self, list[str] words, str prefix) -> CompletionContext:
+        ArgumentParser cur = self
+        list[str] path = []
+        auto opts_allowed = True
+        auto invalid = False
+        auto pending_opt = \"\"
+        auto pos_i = 0
+        auto i = 0
+        auto n = len(words)
+        while i < n:
+            auto tok = words[i]
+            if pending_opt != \"\":
+                # This completed word is the value for the pending option.
+                pending_opt = \"\"
+                i = i + 1
+            elif opts_allowed and tok == \"--\":
+                opts_allowed = False
+                i = i + 1
+            elif opts_allowed and cur._looks_option(tok):
+                auto lead = tok[:1]
+                auto islong = len(tok) >= 2 and tok[1:2] == lead
+                if islong:
+                    auto name = tok
+                    auto eq = tok.find(\"=\")
+                    auto has_inline = eq >= 0
+                    if has_inline:
+                        name = tok[:eq]
+                    auto oi = cur._find_opt(name)
+                    if oi < 0:
+                        auto ab = cur._find_opt_abbrev(name)
+                        if ab >= 0:
+                            oi = ab
+                    if oi < 0:
+                        invalid = True
+                    else:
+                        Argument a = cur._opts[oi]
+                        if not cur._is_zero_arity(a) and not has_inline:
+                            pending_opt = a.name
+                    i = i + 1
+                else:
+                    auto k = 1
+                    while k < len(tok):
+                        auto cname = lead + tok[k:k + 1]
+                        auto coi = cur._find_opt(cname)
+                        if coi < 0:
+                            invalid = True
+                            k = len(tok)
+                        else:
+                            Argument a = cur._opts[coi]
+                            if cur._is_zero_arity(a):
+                                k = k + 1
+                            else:
+                                auto rest = tok[k + 1:]
+                                if len(rest) == 0:
+                                    pending_opt = a.name
+                                k = len(tok)
+                    i = i + 1
+            else:
+                if cur._has_sub and pos_i >= len(cur._pos):
+                    auto si = cur._find_sub(tok)
+                    if si < 0:
+                        invalid = True
+                    else:
+                        path.append(tok)
+                        cur = cur._sub_parsers[si]
+                        pos_i = 0
+                    i = i + 1
+                else:
+                    if pos_i >= len(cur._pos):
+                        invalid = True
+                    else:
+                        pos_i = pos_i + 1
+                    i = i + 1
+        CompletionContext ctx = CompletionContext()
+        ctx.command_path = path
+        ctx.options_allowed = opts_allowed
+        ctx.invalid = invalid
+        list[str] cands = []
+        # The cursor word is the value of a pending value-taking option.
+        if pending_opt != \"\":
+            ctx.kind = \"value\"
+            ctx.active_option = pending_opt
+            ctx.value_prefix = prefix
+            auto oi = cur._find_opt(pending_opt)
+            if oi >= 0:
+                for c in cur._opts[oi].choices:
+                    if c.startswith(prefix):
+                        cands.append(c)
+            ctx.candidates = cands
+            return ctx
+        # An option-shaped cursor word (name completion, or `--opt=valuepart`).
+        if opts_allowed and len(prefix) >= 1 and cur._prefix_chars.find(prefix[:1]) >= 0:
+            auto eq = prefix.find(\"=\")
+            if eq >= 0 and prefix.startswith(\"--\"):
+                auto nm = prefix[:eq]
+                auto vp = prefix[eq + 1:]
+                ctx.kind = \"value\"
+                ctx.active_option = nm
+                ctx.value_prefix = vp
+                auto oi = cur._find_opt(nm)
+                if oi < 0:
+                    auto ab = cur._find_opt_abbrev(nm)
+                    if ab >= 0:
+                        oi = ab
+                if oi >= 0:
+                    for c in cur._opts[oi].choices:
+                        if c.startswith(vp):
+                            cands.append(c)
+                ctx.candidates = cands
+                return ctx
+            ctx.kind = \"option\"
+            if cur._add_help:
+                if \"-h\".startswith(prefix):
+                    cands.append(\"-h\")
+                if \"--help\".startswith(prefix):
+                    cands.append(\"--help\")
+            for a in cur._opts:
+                if not a.hidden:
+                    if a.name.startswith(prefix):
+                        cands.append(a.name)
+                    if a.alias != \"\" and a.alias.startswith(prefix):
+                        cands.append(a.alias)
+            ctx.candidates = cands
+            return ctx
+        # Otherwise the cursor word is a subcommand or the next positional.
+        if cur._has_sub and pos_i >= len(cur._pos):
+            ctx.kind = \"subcommand\"
+            ctx.active_dest = cur._sub_dest
+            for nm in cur._sub_names:
+                if nm.startswith(prefix):
+                    cands.append(nm)
+            for al in cur._sub_alias_names:
+                if al.startswith(prefix):
+                    cands.append(al)
+            ctx.candidates = cands
+            return ctx
+        ctx.kind = \"positional\"
+        if pos_i < len(cur._pos):
+            Argument pa = cur._pos[pos_i]
+            ctx.active_dest = pa.dest
+            for c in pa.choices:
+                if c.startswith(prefix):
+                    cands.append(c)
+        ctx.candidates = cands
+        return ctx
 
     # Seed every declared destination with its default (and mark it not-present),
     # so a getter never faults and `has` is accurate. List-valued destinations
