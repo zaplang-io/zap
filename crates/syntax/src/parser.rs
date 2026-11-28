@@ -2778,9 +2778,18 @@ struct ArgumentParser:
         while i < n:
             auto tok = words[i]
             if pending_opt != \"\":
-                # This completed word is the value for the pending option.
-                pending_opt = \"\"
-                i = i + 1
+                # This COMPLETED word is the value for the pending option. An
+                # option-like token or a `--` separator cannot satisfy a required
+                # value — strict `parse_args` raises \"expected one argument\"
+                # here — so mark the command line invalid and reprocess the
+                # token as an option/separator (do not consume it). A lone \"-\"
+                # and a negative number are still accepted as values (#1715).
+                if opts_allowed and (tok == \"--\" or cur._looks_option(tok)):
+                    invalid = True
+                    pending_opt = \"\"
+                else:
+                    pending_opt = \"\"
+                    i = i + 1
             elif opts_allowed and tok == \"--\":
                 opts_allowed = False
                 i = i + 1
@@ -2850,7 +2859,9 @@ struct ArgumentParser:
             ctx.active_option = pending_opt
             ctx.value_prefix = prefix
             auto oi = cur._find_opt(pending_opt)
-            if oi >= 0:
+            # A hidden option (#1702/#1716) parses normally but offers no choice
+            # suggestions, exactly like option-name completion.
+            if oi >= 0 and not cur._opts[oi].hidden:
                 for c in cur._opts[oi].choices:
                     if c.startswith(prefix):
                         cands.append(c)
@@ -2870,7 +2881,9 @@ struct ArgumentParser:
                     auto ab = cur._find_opt_abbrev(nm)
                     if ab >= 0:
                         oi = ab
-                if oi >= 0:
+                # Hidden options (#1716) get no choice suggestions, whether
+                # resolved by exact spelling or a unique abbreviation.
+                if oi >= 0 and not cur._opts[oi].hidden:
                     for c in cur._opts[oi].choices:
                         if c.startswith(vp):
                             cands.append(c)
@@ -2906,9 +2919,12 @@ struct ArgumentParser:
         if pos_i < len(cur._pos):
             Argument pa = cur._pos[pos_i]
             ctx.active_dest = pa.dest
-            for c in pa.choices:
-                if c.startswith(prefix):
-                    cands.append(c)
+            # A hidden positional (#1702/#1716) is still the completion target but
+            # offers no choice suggestions, like a hidden option.
+            if not pa.hidden:
+                for c in pa.choices:
+                    if c.startswith(prefix):
+                        cands.append(c)
         ctx.candidates = cands
         return ctx
 

@@ -42,6 +42,23 @@ as a full choice, and the selected parser's required arguments are **never**
 enforced. The query is pure — it never parses, prints, exits, invokes a handler,
 or changes `parse_args` behavior.
 
+Two refinements keep it faithful to the strict scanner and to visibility rules:
+
+- **A completed word in a required-value position must be a real value (#1715).**
+  When a value-taking option is pending, an option-like completed word or a `--`
+  separator cannot satisfy it — strict `parse_args` raises "expected one
+  argument" there — so the command line is marked `invalid` and the token is
+  reprocessed as an option/separator rather than swallowed as the value. A lone
+  `-` and a negative number are still accepted as values, and the *incomplete*
+  cursor word in that position is still a valid value prefix.
+- **Hidden arguments get no choice suggestions (#1716/#1702).** The pending-value
+  and attached-value branches apply the same visibility policy as option-name
+  completion: a `hidden=True` option parses normally but offers no `candidates`,
+  whether addressed by exact spelling or a unique abbreviation. The same gate
+  covers a **hidden positional** (a sibling of #1716 found by scanning the
+  candidate-producing branches): it stays the completion target (`active_dest`)
+  but suggests no choices.
+
 ## Rationale
 
 - **Shell completion lives in the CLI package, argv grammar lives in core**
