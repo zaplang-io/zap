@@ -29,6 +29,23 @@ def build_parser() -> ArgumentParser:
     return p
 
 
+def build_q() -> ArgumentParser:
+    # A flat parser (no subcommands) for the completed-value-word cases (#1715).
+    auto q = argparse.ArgumentParser(prog="q")
+    q.add_argument("--mode", choices=["debug", "release"])
+    q.add_argument("--release", action="store_true")
+    q.add_argument("pos")
+    return q
+
+
+def build_h() -> ArgumentParser:
+    # A parser with a hidden choice option and a visible one (#1716).
+    auto h = argparse.ArgumentParser(prog="h")
+    h.add_argument("--internal-mode", choices=["secret-mode"], hidden=True)
+    h.add_argument("--visible-mode", choices=["vis-a", "vis-b"])
+    return h
+
+
 def dump(CompletionContext c):
     print(c.kind)
     print(c.active_option)
@@ -63,3 +80,28 @@ def main():
     print("---")
     # An invalid COMPLETED word is reported without validating the cursor word.
     dump(p.completion_context(["bogus"], "x"))
+    print("===")
+    auto q = build_q()
+    # #1715: a completed option-like word cannot satisfy a required value, so it
+    # is invalid (matching strict parse_args), the option is reprocessed, and the
+    # cursor word becomes the next positional. Named option, unknown
+    # option-shaped word, and the `--` separator in the value position.
+    dump(q.completion_context(["--mode", "--release"], ""))
+    print("---")
+    dump(q.completion_context(["--mode", "--bogus"], ""))
+    print("---")
+    dump(q.completion_context(["--mode", "--"], ""))
+    print("---")
+    # The corresponding INCOMPLETE cursor value is still a valid value prefix.
+    dump(q.completion_context(["--mode"], ""))
+    print("===")
+    auto h = build_h()
+    # #1716: a hidden option offers no choice suggestions, by exact spelling or
+    # attached value; a visible option is unaffected.
+    dump(h.completion_context(["--internal-mode"], "sec"))
+    print("---")
+    dump(h.completion_context([], "--internal-mode=sec"))
+    print("---")
+    dump(h.completion_context(["--visible-mode"], "vis"))
+    print("---")
+    dump(h.completion_context([], "--visible-mode=vis"))
