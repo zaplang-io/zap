@@ -1,0 +1,27 @@
+usage: prog [-h] [--mode {debug,release}] [--jobs jobs] src [src ...]
+
+Do things with prog.
+
+positional arguments:
+  src  sources
+
+options:
+  -h, --help  show this help message and exit
+  --mode {debug,release}  build mode
+  --jobs jobs  jobs (default: 4)
+
+See prog --help.
+---
+usage: git [-h] [--retries retries] [--verbose] CMD ...
+
+options:
+  -h, --help  show this help message and exit
+  -v, --verbose  loud
+
+network:
+  connection options
+  --retries retries  retry count
+
+commands:
+  pick one
+  cmd  {build,test,b}

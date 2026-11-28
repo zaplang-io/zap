@@ -2243,10 +2243,48 @@ struct Namespace:
     dict[str, str] _vals = {}
     dict[str, bool] _present = {}
     bool _help = False
+    # Whether the `version` action fired (#1713 G19); mirrors `_help`.
+    bool _version = False
+    # List-valued bindings (#1713 G2): nargs */+/N and the append/extend
+    # actions accumulate here, read back with `get_list`. A list-valued
+    # destination keeps its `_vals` entry as the empty string.
+    dict[str, list[str]] _lists = {}
 
     # The raw string value for `name` (an option/positional destination).
     def get(self, str name) -> str:
         return self._vals[name]
+
+    # The list binding for a nargs-`*`/`+`/`N` or append/extend destination
+    # (#1713 G2). Returns the accumulated raw strings in order (empty when the
+    # argument was absent and had no list default).
+    def get_list(self, str name) -> list[str]:
+        if name in self._lists:
+            return self._lists[name]
+        return []
+
+    # The list binding converted element-wise to ints (#1713 G2/G8).
+    def get_int_list(self, str name) -> list[int64]:
+        list[int64] out = []
+        for v in self.get_list(name):
+            out.append(int(v))
+        return out
+
+    # The list binding converted element-wise to floats (#1713 G2/G8).
+    def get_float_list(self, str name) -> list[float64]:
+        list[float64] out = []
+        for v in self.get_list(name):
+            out.append(float(v))
+        return out
+
+    # The `count` action's running total for `name` (#1713 G4): the number of
+    # times the flag was seen (0 when absent).
+    def get_count(self, str name) -> int64:
+        return int(self._vals[name])
+
+    # Whether `--version` (the `version` action) appeared (#1713 G19); parsing
+    # does not auto-print or exit, exactly like `help_requested`.
+    def version_requested(self) -> bool:
+        return self._version
 
     # Same as `get` — the explicit string accessor.
     def get_str(self, str name) -> str:
@@ -2341,6 +2379,10 @@ struct Namespace:
 # use `add_argument`, never this struct directly.
 struct Argument:
     str name
+    # A second option spelling (#1713 G1), e.g. `-v` for `--verbose`; `\"\"` when
+    # the argument has only one spelling. Either spelling matches during parse
+    # and both are shown in help.
+    str alias
     str dest
     str metavar
     bool optional
@@ -2355,16 +2397,41 @@ struct Argument:
     bool hidden
     int64 mx_group
     str group_title
+    # The raw action tag (#1713 G4): one of \"store\", \"store_true\",
+    # \"store_false\", \"store_const\", \"append\", \"append_const\", \"count\",
+    # \"extend\", \"version\". `is_flag`/`store_val` stay as the fast path for the
+    # two original boolean actions.
+    str action
+    # `nargs` (#1713 G2): \"\" (exactly one), \"?\" (optional one, uses `const`/
+    # default), \"*\" (zero or more), \"+\" (one or more), a decimal count like
+    # \"2\", or \"...\" (REMAINDER). Only meaningful for value-taking args and
+    # positionals.
+    str nargs
+    # The `const` value (#1713 G4/G2) for store_const/append_const and for an
+    # omitted `nargs=\"?\"` optional. Named `const_val` because `const` is a
+    # reserved Zap keyword; the `add_argument` keyword is `const_value`.
+    str const_val
+    # The version string for the `version` action (#1713 G4/G19).
+    str version
+    # Whether this argument accumulates into a list binding (nargs */+/N or the
+    # append/extend actions) read back through `Namespace.get_list` (#1713 G2).
+    bool is_list
 
 # The handle returned by `add_subparsers()`; `add_parser` registers a nested
 # parser on the owning parent and hands it back for independent configuration.
 struct SubParsers:
     ArgumentParser _p
 
-    def add_parser(self, str name, str help=\"\") -> ArgumentParser:
-        ArgumentParser child = __argparse_new(name, help)
+    def add_parser(self, str name, list[str] aliases=[], str help=\"\") -> ArgumentParser:
+        ArgumentParser child = __argparse_new(name, \"\")
+        auto idx = len(self._p._sub_names)
         self._p._sub_names.append(name)
+        self._p._sub_help.append(help)
         self._p._sub_parsers.append(child)
+        # Aliases (#1713 G11) select the same child during parse.
+        for al in aliases:
+            self._p._sub_alias_names.append(al)
+            self._p._sub_alias_idx.append(idx)
         return child
 
 # A named help section. Its `add_argument` registers on the owning parent (so
@@ -2373,9 +2440,10 @@ struct SubParsers:
 struct ArgumentGroup:
     ArgumentParser _p
     str _title
+    str _desc = \"\"
 
-    def add_argument(self, str name, str action=\"store\", str type=\"str\", str default=\"\", bool required=False, list[str] choices=[], str help=\"\", str metavar=\"\", bool hidden=False) -> Argument:
-        return self._p._add(name, action, type, default, required, choices, help, metavar, hidden, -1, self._title)
+    def add_argument(self, str name, str alias=\"\", str action=\"store\", str type=\"str\", str default=\"\", bool required=False, list[str] choices=[], str help=\"\", str metavar=\"\", bool hidden=False, str nargs=\"\", str const_value=\"\", str dest=\"\", str version=\"\") -> Argument:
+        return self._p._add(name, alias, action, type, default, required, choices, help, metavar, hidden, -1, self._title, nargs, const_value, dest, version)
 
 # A set of arguments at most one of which may appear; supplying two raises. When
 # the group is `required`, exactly one must appear.
@@ -2383,20 +2451,59 @@ struct MutuallyExclusiveGroup:
     ArgumentParser _p
     int64 _idx
 
-    def add_argument(self, str name, str action=\"store\", str type=\"str\", str default=\"\", bool required=False, list[str] choices=[], str help=\"\", str metavar=\"\", bool hidden=False) -> Argument:
-        return self._p._add(name, action, type, default, required, choices, help, metavar, hidden, self._idx, \"\")
+    def add_argument(self, str name, str alias=\"\", str action=\"store\", str type=\"str\", str default=\"\", bool required=False, list[str] choices=[], str help=\"\", str metavar=\"\", bool hidden=False, str nargs=\"\", str const_value=\"\", str dest=\"\", str version=\"\") -> Argument:
+        return self._p._add(name, alias, action, type, default, required, choices, help, metavar, hidden, self._idx, \"\", nargs, const_value, dest, version)
 
 # A command-line argument parser. A real value — build as many as you like.
 struct ArgumentParser:
     str prog
     str description
+    # Text shown after the argument help (#1713 G15). Set with `set_epilog`.
+    str epilog = \"\"
     list[Argument] _opts = []
     list[Argument] _pos = []
     bool _has_sub = False
     str _sub_dest = \"command\"
     list[str] _sub_names = []
+    list[str] _sub_help = []
     list[ArgumentParser] _sub_parsers = []
+    # Alias name -> child index, parallel arrays (#1713 G11).
+    list[str] _sub_alias_names = []
+    list[int64] _sub_alias_idx = []
+    # Subparsers metadata (#1713 G11): a required selector raises when no command
+    # is given; title/description/metavar steer help rendering.
+    bool _sub_required = False
+    str _sub_title = \"\"
+    str _sub_desc = \"\"
+    str _sub_metavar = \"\"
     list[bool] _mx_required = []
+    # Construction knobs (#1713 G14). Zap's module-facet constructor takes only
+    # `(prog, description)`, so the rest are set with chainable methods
+    # (`set_*`/`inherit`) rather than CPython's constructor keywords. `_add_help`
+    # toggles the implicit `-h/--help`; `_allow_abbrev` enables unambiguous
+    # long-option prefix matching; `_prefix_chars` is the set of option-leader
+    # characters; `_formatter` is \"default\" or \"raw\"; `_argument_default` (when
+    # `_has_argdefault`) seeds every argument that declares no `default` of its
+    # own; `_conflict` is \"error\" or \"resolve\"; `_fromfile` enables @file
+    # argument expansion; `_exit_on_error` is accepted for parity and is inert
+    # because the parser never exits.
+    bool _add_help = True
+    bool _allow_abbrev = True
+    str _prefix_chars = \"-\"
+    str _formatter = \"default\"
+    str _argument_default = \"\"
+    bool _has_argdefault = False
+    str _conflict = \"error\"
+    str _fromfile = \"\"
+    bool _exit_on_error = True
+    # `set_defaults(...)`-style seeded destinations (#1713 G12), applied after
+    # per-argument defaults and overridable by argv.
+    dict[str, str] _defaults = {}
+    list[str] _default_names = []
+    # Help-group descriptions (#1713 B3), parallel to the titles seen on
+    # `Argument.group_title`.
+    list[str] _group_titles = []
+    list[str] _group_descs = []
 
     # Declare an argument. A `name` starting with \"-\" is an optional (`--name`
     # VALUE, or a boolean flag under action \"store_true\"/\"store_false\"); anything
@@ -2410,18 +2517,47 @@ struct ArgumentParser:
     # registers the argument so it parses exactly as normal but omits it from
     # the generated usage line and help rows (Python argparse's suppression /
     # Click's `hidden` option visibility flag).
-    def add_argument(self, str name, str action=\"store\", str type=\"str\", str default=\"\", bool required=False, list[str] choices=[], str help=\"\", str metavar=\"\", bool hidden=False) -> Argument:
-        return self._add(name, action, type, default, required, choices, help, metavar, hidden, -1, \"\")
+    def add_argument(self, str name, str alias=\"\", str action=\"store\", str type=\"str\", str default=\"\", bool required=False, list[str] choices=[], str help=\"\", str metavar=\"\", bool hidden=False, str nargs=\"\", str const_value=\"\", str dest=\"\", str version=\"\") -> Argument:
+        return self._add(name, alias, action, type, default, required, choices, help, metavar, hidden, -1, \"\", nargs, const_value, dest, version)
 
     # Shared registration for `add_argument` and the group variants (`hidden`
     # suppresses the argument from usage/help only; `mx` is the
     # mutually-exclusive group index or -1; `group` is the help-section title).
-    def _add(self, str name, str action, str kind, str default, bool required, list[str] choices, str help, str metavar, bool hidden, int64 mx, str group) -> Argument:
-        auto optional = name.startswith(\"-\")
-        auto dest = __argparse_dest(name)
+    # `self` is always the owning parser, so parser-wide settings (#1713:
+    # `_argument_default`, `_prefix_chars`) are read here.
+    def _add(self, str name, str alias, str action, str kind, str default, bool required, list[str] choices, str help, str metavar, bool hidden, int64 mx, str group, str nargs, str const_value, str dest_override, str version) -> Argument:
+        # A leading option-prefix character marks an optional (#1713 G14:
+        # `_prefix_chars`, default \"-\"); anything else is a positional.
+        auto optional = False
+        if len(name) > 0 and self._prefix_chars.find(name[:1]) >= 0:
+            optional = True
+        # Destination (#1713 G7): an explicit `dest=` wins; otherwise derive from
+        # the long spelling if there is one (CPython's rule), else from `name`.
+        auto dest = dest_override
+        if dest == \"\":
+            auto src = name
+            if name.startswith(\"--\") or not alias.startswith(\"--\"):
+                src = name
+            else:
+                src = alias
+            dest = __argparse_dest(src)
+        # B2 (#1713): `required` is only meaningful for optionals.
+        if required and not optional:
+            raise ValueError(\"argument \" + name + \": 'required' is only valid for optional arguments\")
         auto is_flag = action == \"store_true\" or action == \"store_false\"
         auto storev = action == \"store_true\"
+        # Does this argument accumulate into a list binding (#1713 G2)?
+        auto islist = action == \"append\" or action == \"extend\" or action == \"append_const\"
+        if nargs == \"*\" or nargs == \"+\" or nargs == \"...\":
+            islist = True
+        elif len(nargs) > 0 and nargs != \"?\" and nargs.isdigit():
+            islist = True
         auto dflt = default
+        # A parser-wide `argument_default` (#1713 G9) seeds any argument that
+        # declares no `default` of its own, except boolean flags (whose implied
+        # default is action-defined) and list actions (seeded with []).
+        if default == \"\" and self._has_argdefault and not is_flag and not islist:
+            dflt = self._argument_default
         if is_flag:
             # A zero-arity flag stores a boolean. With `default` omitted (the \"\"
             # sentinel) keep the action's implied default — False for store_true,
@@ -2438,27 +2574,54 @@ struct ArgumentParser:
                 dflt = default
             else:
                 raise ValueError(\"argument \" + name + \": invalid boolean default: '\" + default + \"' (expected \\\"true\\\" or \\\"false\\\")\")
+        elif action == \"count\":
+            # A counter's default is its starting count (0 unless overridden).
+            if default == \"\":
+                dflt = \"0\"
+        # The display metavar (#1713 G17): an explicit metavar wins; a
+        # choice-restricted argument shows `{a,b,c}`; otherwise the dest.
         auto mv = metavar
         if mv == \"\":
-            mv = dest
-        Argument a = Argument(name=name, dest=dest, metavar=mv, optional=optional, is_flag=is_flag, store_val=storev, kind=kind, default_raw=dflt, required=required, has_choices=len(choices) > 0, choices=choices, help=help, hidden=hidden, mx_group=mx, group_title=group)
+            if len(choices) > 0:
+                mv = __argparse_choice_str(choices)
+            else:
+                mv = dest
+        Argument a = Argument(name=name, alias=alias, dest=dest, metavar=mv, optional=optional, is_flag=is_flag, store_val=storev, kind=kind, default_raw=dflt, required=required, has_choices=len(choices) > 0, choices=choices, help=help, hidden=hidden, mx_group=mx, group_title=group, action=action, nargs=nargs, const_val=const_value, version=version, is_list=islist)
         if optional:
             self._opts.append(a)
         else:
             self._pos.append(a)
         return a
 
-    # Enable git-style subcommands. The chosen command name is stored under
-    # `dest` in the Namespace; each child parser handles the remaining argv.
-    def add_subparsers(self, str dest=\"command\", str help=\"\") -> SubParsers:
+    # Enable git-style subcommands (#1713 G11). The chosen command name is stored
+    # under `dest` in the Namespace; each child parser handles the remaining argv.
+    # `required` makes an absent command a parse error; `title`/`description`/
+    # `metavar` steer help rendering.
+    def add_subparsers(self, str dest=\"command\", str title=\"\", str description=\"\", str metavar=\"\", str prog=\"\", str help=\"\", bool required=False) -> SubParsers:
         self._has_sub = True
         self._sub_dest = dest
+        self._sub_title = title
+        self._sub_desc = description
+        self._sub_metavar = metavar
+        self._sub_required = required
         return SubParsers(_p=self)
 
     # A titled help section; arguments added to it parse as normal top-level
-    # arguments.
+    # arguments. `description` (#1713 B3) now renders under the heading.
     def add_argument_group(self, str title=\"\", str description=\"\") -> ArgumentGroup:
-        return ArgumentGroup(_p=self, _title=title)
+        if description != \"\":
+            self._group_titles.append(title)
+            self._group_descs.append(description)
+        return ArgumentGroup(_p=self, _title=title, _desc=description)
+
+    # The registered description for help group `title`, or \"\".
+    def _group_description(self, str title) -> str:
+        auto i = 0
+        for t in self._group_titles:
+            if t == title:
+                return self._group_descs[i]
+            i = i + 1
+        return \"\"
 
     # A mutually-exclusive set; supplying more than one member raises, and when
     # `required` is set, omitting all of them raises.
@@ -2467,46 +2630,376 @@ struct ArgumentParser:
         self._mx_required.append(required)
         return MutuallyExclusiveGroup(_p=self, _idx=idx)
 
+    # Construction knobs (#1713 G14), set after construction because Zap's
+    # module-facet `argparse.ArgumentParser(...)` takes only `(prog,
+    # description)`. Each returns `self` so calls chain.
+    def set_epilog(self, str text) -> ArgumentParser:
+        self.epilog = text
+        return self
+
+    def set_add_help(self, bool on) -> ArgumentParser:
+        self._add_help = on
+        return self
+
+    def set_allow_abbrev(self, bool on) -> ArgumentParser:
+        self._allow_abbrev = on
+        return self
+
+    def set_prefix_chars(self, str chars) -> ArgumentParser:
+        self._prefix_chars = chars
+        return self
+
+    def set_formatter(self, str kind) -> ArgumentParser:
+        # \"default\" (strip/collapse) or \"raw\" (verbatim description/epilog).
+        self._formatter = kind
+        return self
+
+    def set_conflict_handler(self, str kind) -> ArgumentParser:
+        self._conflict = kind
+        return self
+
+    def set_fromfile_prefix_chars(self, str chars) -> ArgumentParser:
+        self._fromfile = chars
+        return self
+
+    # Accepted for CPython parity; inert, because a Zap parser raises catchable
+    # errors instead of calling `exit()` (#1713 G14).
+    def set_exit_on_error(self, bool on) -> ArgumentParser:
+        self._exit_on_error = on
+        return self
+
+    # Parser-wide default for any argument that declares no `default` of its own
+    # (#1713 G9). Mirrors CPython's `argument_default=`.
+    def set_argument_default(self, str value) -> ArgumentParser:
+        self._argument_default = value
+        self._has_argdefault = True
+        return self
+
+    # Inherit every argument (and the subparser configuration) of `parent`
+    # (#1713 G14, CPython's `parents=[...]`). Call before declaring this
+    # parser's own arguments, as CPython does.
+    def inherit(self, ArgumentParser parent) -> ArgumentParser:
+        for a in parent._opts:
+            self._opts.append(a)
+        for a in parent._pos:
+            self._pos.append(a)
+        return self
+
+    # Seed `name` with `value` up front (#1713 G12); argv still overrides it.
+    # The subcommand-handler idiom (`func=`) is adapted as an ordinary stored
+    # string the caller dispatches on.
+    def set_default(self, str name, str value) -> ArgumentParser:
+        if name not in self._defaults:
+            self._default_names.append(name)
+        self._defaults[name] = value
+        return self
+
+    # The configured (or seeded) default for `name` (#1713 G12), or \"\" when
+    # none is known.
+    def get_default(self, str name) -> str:
+        if name in self._defaults:
+            return self._defaults[name]
+        for a in self._opts:
+            if a.dest == name:
+                return a.default_raw
+        for a in self._pos:
+            if a.dest == name:
+                return a.default_raw
+        return \"\"
+
     # Parse `argv` (WITHOUT the program name) and return the populated Namespace.
+    # Unknown tokens raise, as CPython's `parse_args`.
     def parse_args(self, list[str] argv) -> Namespace:
         Namespace ns = Namespace()
         self._fill_defaults(ns)
-        self._parse_into(ns, argv, 0)
+        list[str] extras = []
+        self._parse_into(ns, argv, 0, extras, False, False)
+        if len(extras) > 0:
+            raise \"unrecognized arguments: \" + extras[0]
+        return ns
+
+    # Parse `argv`, returning the Namespace and the list of unrecognized tokens
+    # instead of raising on them (#1713 G3; CPython's `parse_known_args`).
+    def parse_known_args(self, list[str] argv) -> (Namespace, list[str]):
+        Namespace ns = Namespace()
+        self._fill_defaults(ns)
+        list[str] extras = []
+        self._parse_into(ns, argv, 0, extras, True, False)
+        return (ns, extras)
+
+    # Parse `argv` with positionals and optionals freely interleaved (#1713 G18;
+    # CPython's `parse_intermixed_args`). Unknown tokens raise.
+    def parse_intermixed_args(self, list[str] argv) -> Namespace:
+        Namespace ns = Namespace()
+        self._fill_defaults(ns)
+        list[str] extras = []
+        self._parse_into(ns, argv, 0, extras, False, True)
+        if len(extras) > 0:
+            raise \"unrecognized arguments: \" + extras[0]
         return ns
 
     # Seed every declared destination with its default (and mark it not-present),
-    # so a getter never faults and `has` is accurate.
+    # so a getter never faults and `has` is accurate. List-valued destinations
+    # (#1713 G2) start empty; `set_default` seeds (#1713 G12) override.
     def _fill_defaults(self, Namespace ns):
         for a in self._opts:
             ns._vals[a.dest] = a.default_raw
             ns._present[a.dest] = False
+            if a.is_list:
+                ns._lists[a.dest] = []
         for a in self._pos:
             ns._vals[a.dest] = a.default_raw
             ns._present[a.dest] = False
+            if a.is_list:
+                ns._lists[a.dest] = []
+        for nm in self._default_names:
+            ns._vals[nm] = self._defaults[nm]
 
-    # Index of the optional declared as `name`, or -1.
+    # Index of the optional declared (or aliased, #1713 G1) as `name`, or -1.
     def _find_opt(self, str name) -> int64:
         auto i = 0
         for a in self._opts:
-            if a.name == name:
+            if a.name == name or a.alias == name:
                 return i
             i = i + 1
         return -1
 
-    # Index of the subcommand `name`, or -1.
+    # Index of an optional whose long spelling `name` is an UNAMBIGUOUS prefix of
+    # (#1713 G13, `allow_abbrev`): -1 none, -2 ambiguous, else the single match.
+    def _find_opt_abbrev(self, str name) -> int64:
+        if not self._allow_abbrev:
+            return -1
+        if not name.startswith(\"--\") or len(name) < 3:
+            return -1
+        auto found = -1
+        auto i = 0
+        for a in self._opts:
+            if a.name.startswith(name) or (a.alias != \"\" and a.alias.startswith(name)):
+                if found >= 0:
+                    return -2
+                found = i
+            i = i + 1
+        return found
+
+    # Index of the subcommand selected by `name`, matching primary names and
+    # aliases (#1713 G11), or -1.
     def _find_sub(self, str name) -> int64:
         auto i = 0
         for nm in self._sub_names:
             if nm == name:
                 return i
             i = i + 1
+        auto j = 0
+        for al in self._sub_alias_names:
+            if al == name:
+                return self._sub_alias_idx[j]
+            j = j + 1
         return -1
+
+    # Does this option consume no value token (#1713 G4)?
+    def _is_zero_arity(self, Argument a) -> bool:
+        if a.is_flag:
+            return True
+        return a.action == \"store_const\" or a.action == \"append_const\" or a.action == \"count\" or a.action == \"version\"
+
+    # Does `tok` look like an option (a prefix-led token that is not a bare
+    # prefix char and not a negative number, #1713 G5/G13/B1)?
+    def _looks_option(self, str tok) -> bool:
+        if len(tok) < 2:
+            return False
+        if self._prefix_chars.find(tok[:1]) < 0:
+            return False
+        if __argparse_is_negnum(tok):
+            return False
+        return True
+
+    # Record a mutually-exclusive hit, raising on a second member.
+    def _mx_mark(self, Argument a, str name, list[bool] mx_seen):
+        if a.mx_group >= 0:
+            if mx_seen[a.mx_group]:
+                raise \"argument \" + name + \": not allowed with another argument in the same group\"
+            mx_seen[a.mx_group] = True
+
+    # Fire a zero-arity action onto the namespace (#1713 G4).
+    def _bind_zero(self, Namespace ns, Argument a):
+        if a.action == \"store_true\":
+            ns._vals[a.dest] = \"true\"
+        elif a.action == \"store_false\":
+            ns._vals[a.dest] = \"false\"
+        elif a.action == \"store_const\":
+            ns._vals[a.dest] = a.const_val
+        elif a.action == \"append_const\":
+            list[str] cur = ns._lists[a.dest]
+            cur.append(a.const_val)
+            ns._lists[a.dest] = cur
+        elif a.action == \"count\":
+            ns._vals[a.dest] = str(int(ns._vals[a.dest]) + 1)
+        elif a.action == \"version\":
+            ns._version = True
+            # Make the version text readable as the destination's value so a
+            # caller can `print(ns.get(...))` (no auto-print/exit, #1713 G19).
+            ns._vals[a.dest] = a.version
+        ns._present[a.dest] = True
+
+    # Validate and store one value (#1713 G2/G8/G10): list actions accumulate,
+    # scalars overwrite. The last value is always mirrored into `_vals` so
+    # `get`/`get_str` work even for a list binding.
+    def _bind_value(self, Namespace ns, Argument a, str val):
+        __argparse_check(a, val)
+        if a.is_list:
+            list[str] cur = ns._lists[a.dest]
+            cur.append(val)
+            ns._lists[a.dest] = cur
+        ns._vals[a.dest] = val
+        ns._present[a.dest] = True
+
+    # Collect the value(s) for a value-taking option starting at `j`, honoring
+    # `nargs` (#1713 G2); returns the index after the consumed values.
+    def _take_values(self, Namespace ns, list[str] argv, int64 j, Argument a, str name) -> int64:
+        auto n = len(argv)
+        if a.nargs == \"?\":
+            if j < n and not self._looks_option(argv[j]) and argv[j] != \"--\":
+                self._bind_value(ns, a, argv[j])
+                return j + 1
+            # No value supplied: fall back to `const`.
+            ns._vals[a.dest] = a.const_val
+            ns._present[a.dest] = True
+            return j
+        elif a.nargs == \"*\" or a.nargs == \"+\":
+            auto got = 0
+            while j < n and not self._looks_option(argv[j]) and argv[j] != \"--\":
+                self._bind_value(ns, a, argv[j])
+                got = got + 1
+                j = j + 1
+            if a.nargs == \"+\" and got == 0:
+                raise \"argument \" + name + \": expected at least one argument\"
+            return j
+        elif a.nargs == \"...\":
+            while j < n:
+                self._bind_value(ns, a, argv[j])
+                j = j + 1
+            return j
+        elif len(a.nargs) > 0 and a.nargs.isdigit():
+            auto need = int(a.nargs)
+            auto c = 0
+            while c < need:
+                if j >= n or self._looks_option(argv[j]) or argv[j] == \"--\":
+                    raise \"argument \" + name + \": expected \" + a.nargs + \" arguments\"
+                self._bind_value(ns, a, argv[j])
+                j = j + 1
+                c = c + 1
+            return j
+        else:
+            if j >= n:
+                raise \"argument \" + name + \": expected one argument\"
+            auto nxt = argv[j]
+            if self._looks_option(nxt) or nxt == \"--\":
+                # A following option-like token does not satisfy a value-taking
+                # option (#1508).
+                raise \"argument \" + name + \": expected one argument\"
+            self._bind_value(ns, a, nxt)
+            return j + 1
+
+    # Consume a positional-argument declaration `a` at `i`, honoring `nargs`
+    # (#1713 G2); returns the index after the consumed tokens.
+    def _take_positional(self, Namespace ns, list[str] argv, int64 i, Argument a, bool end_of_opts) -> int64:
+        auto n = len(argv)
+        if a.nargs == \"*\" or a.nargs == \"+\" or a.nargs == \"...\":
+            auto got = 0
+            while i < n and (end_of_opts or (not self._looks_option(argv[i]) and argv[i] != \"--\")):
+                self._bind_value(ns, a, argv[i])
+                got = got + 1
+                i = i + 1
+            if a.nargs == \"+\" and got == 0:
+                raise \"the following arguments are required: \" + a.name
+            return i
+        elif a.nargs == \"?\":
+            self._bind_value(ns, a, argv[i])
+            return i + 1
+        elif len(a.nargs) > 0 and a.nargs.isdigit():
+            auto need = int(a.nargs)
+            auto c = 0
+            while c < need:
+                if i >= n or (not end_of_opts and (self._looks_option(argv[i]) or argv[i] == \"--\")):
+                    raise \"the following arguments are required: \" + a.name
+                self._bind_value(ns, a, argv[i])
+                i = i + 1
+                c = c + 1
+            return i
+        else:
+            self._bind_value(ns, a, argv[i])
+            return i + 1
+
+    # Consume one option token (long or short, #1713 G1/G4/G5/G13); returns the
+    # index after it. Unknown options go to `extras` when `known` is set.
+    def _consume_opt(self, Namespace ns, list[str] argv, int64 i, list[bool] mx_seen, list[str] extras, bool known) -> int64:
+        auto tok = argv[i]
+        auto lead = tok[:1]
+        auto islong = len(tok) >= 2 and tok[1:2] == lead
+        if islong:
+            auto name = tok
+            auto inlinev = \"\"
+            auto has_inline = False
+            auto eq = tok.find(\"=\")
+            if eq >= 0:
+                name = tok[:eq]
+                inlinev = tok[eq + 1:]
+                has_inline = True
+            auto oi = self._find_opt(name)
+            if oi < 0:
+                auto ab = self._find_opt_abbrev(name)
+                if ab == -2:
+                    raise \"ambiguous option: \" + name
+                oi = ab
+            if oi < 0:
+                if known:
+                    extras.append(tok)
+                    return i + 1
+                raise \"unrecognized arguments: \" + name
+            Argument a = self._opts[oi]
+            self._mx_mark(a, name, mx_seen)
+            if self._is_zero_arity(a):
+                if has_inline:
+                    raise \"argument \" + name + \": ignored explicit argument '\" + inlinev + \"'\"
+                self._bind_zero(ns, a)
+                return i + 1
+            if has_inline:
+                self._bind_value(ns, a, inlinev)
+                return i + 1
+            return self._take_values(ns, argv, i + 1, a, name)
+        # A short cluster: `-xvf` is `-x -v -f`; `-ovalue`/`-o=value` attaches a
+        # value to the first value-taking option (#1713 G5).
+        auto k = 1
+        while k < len(tok):
+            auto cname = lead + tok[k:k + 1]
+            auto coi = self._find_opt(cname)
+            if coi < 0:
+                if known:
+                    extras.append(cname)
+                    return i + 1
+                raise \"unrecognized arguments: \" + cname
+            Argument a = self._opts[coi]
+            self._mx_mark(a, cname, mx_seen)
+            if self._is_zero_arity(a):
+                self._bind_zero(ns, a)
+                k = k + 1
+            else:
+                auto rest = tok[k + 1:]
+                if len(rest) > 0:
+                    if rest[:1] == \"=\":
+                        rest = rest[1:]
+                    self._bind_value(ns, a, rest)
+                    return i + 1
+                return self._take_values(ns, argv, i + 1, a, cname)
+        return i + 1
 
     # The core scan: walk argv from `start`, binding optionals, positionals and
     # (when enabled) a subcommand that consumes the remaining argv into a child
-    # parser. Runs required/mutually-exclusive checks at the end unless help was
-    # requested.
-    def _parse_into(self, Namespace ns, list[str] argv, int64 start):
+    # parser. Unknown tokens go to `extras` when `known`; `intermixed` is a hint
+    # kept for API symmetry (the token-by-token walk already interleaves
+    # positionals and optionals). Runs the required checks at the end unless help
+    # or the version action fired.
+    def _parse_into(self, Namespace ns, list[str] argv, int64 start, list[str] extras, bool known, bool intermixed):
         list[bool] mx_seen = []
         for r in self._mx_required:
             mx_seen.append(False)
@@ -2516,7 +3009,7 @@ struct ArgumentParser:
         auto end_of_opts = False
         while i < n:
             auto tok = argv[i]
-            if not end_of_opts and (tok == \"-h\" or tok == \"--help\"):
+            if not end_of_opts and self._add_help and (tok == \"-h\" or tok == \"--help\"):
                 ns._help = True
                 i = i + 1
             elif not end_of_opts and tok == \"--\":
@@ -2524,52 +3017,8 @@ struct ArgumentParser:
                 # remaining token as a literal positional, like Python argparse.
                 end_of_opts = True
                 i = i + 1
-            elif not end_of_opts and tok.startswith(\"-\") and tok != \"-\" and not __argparse_is_negnum(tok):
-                auto name = tok
-                auto inlinev = \"\"
-                auto has_inline = False
-                auto eq = tok.find(\"=\")
-                if eq >= 0:
-                    name = tok[:eq]
-                    inlinev = tok[eq + 1:]
-                    has_inline = True
-                auto oi = self._find_opt(name)
-                if oi < 0:
-                    raise \"unrecognized arguments: \" + name
-                Argument a = self._opts[oi]
-                if a.mx_group >= 0:
-                    if mx_seen[a.mx_group]:
-                        raise \"argument \" + name + \": not allowed with another argument in the same group\"
-                    mx_seen[a.mx_group] = True
-                if a.is_flag:
-                    if has_inline:
-                        # A zero-arity flag takes no value (#1508); an attached
-                        # value (including an empty `--flag=`) is a usage error.
-                        raise \"argument \" + name + \": ignored explicit argument '\" + inlinev + \"'\"
-                    if a.store_val:
-                        ns._vals[a.dest] = \"true\"
-                    else:
-                        ns._vals[a.dest] = \"false\"
-                    ns._present[a.dest] = True
-                    i = i + 1
-                else:
-                    auto val = \"\"
-                    if has_inline:
-                        val = inlinev
-                        i = i + 1
-                    else:
-                        if i + 1 >= n:
-                            raise \"argument \" + name + \": expected one argument\"
-                        auto nxt = argv[i + 1]
-                        if nxt.startswith(\"-\") and nxt != \"-\" and not __argparse_is_negnum(nxt):
-                            # A following option-like token (known or unknown)
-                            # does not satisfy a value-taking option (#1508).
-                            raise \"argument \" + name + \": expected one argument\"
-                        val = nxt
-                        i = i + 2
-                    __argparse_check(a, val)
-                    ns._vals[a.dest] = val
-                    ns._present[a.dest] = True
+            elif not end_of_opts and self._looks_option(tok):
+                i = self._consume_opt(ns, argv, i, mx_seen, extras, known)
             else:
                 if self._has_sub and pos_i >= len(self._pos):
                     auto si = self._find_sub(tok)
@@ -2579,26 +3028,32 @@ struct ArgumentParser:
                     ns._present[self._sub_dest] = True
                     ArgumentParser child = self._sub_parsers[si]
                     child._fill_defaults(ns)
-                    child._parse_into(ns, argv, i + 1)
+                    child._parse_into(ns, argv, i + 1, extras, known, intermixed)
                     i = n
                 else:
                     if pos_i >= len(self._pos):
-                        raise \"unrecognized arguments: \" + tok
-                    Argument a = self._pos[pos_i]
-                    __argparse_check(a, tok)
-                    ns._vals[a.dest] = tok
-                    ns._present[a.dest] = True
-                    pos_i = pos_i + 1
-                    i = i + 1
-        if not ns._help:
+                        if known:
+                            extras.append(tok)
+                            i = i + 1
+                        else:
+                            raise \"unrecognized arguments: \" + tok
+                    else:
+                        Argument a = self._pos[pos_i]
+                        i = self._take_positional(ns, argv, i, a, end_of_opts)
+                        pos_i = pos_i + 1
+        if not ns._help and not ns._version:
             self._check_required(ns, pos_i, mx_seen)
 
-    # Enforce unmet positionals, required optionals, and required
-    # mutually-exclusive groups (all as catchable raises).
+    # Enforce unmet positionals, required optionals, required mutually-exclusive
+    # groups, and a required subparser (all as catchable raises). A `*`/`?`/`...`
+    # positional is not required (#1713 G2/G11).
     def _check_required(self, Namespace ns, int64 pos_consumed, list[bool] mx_seen):
-        if pos_consumed < len(self._pos):
-            Argument miss = self._pos[pos_consumed]
-            raise \"the following arguments are required: \" + miss.name
+        auto k = pos_consumed
+        while k < len(self._pos):
+            Argument miss = self._pos[k]
+            if miss.nargs != \"*\" and miss.nargs != \"?\" and miss.nargs != \"...\":
+                raise \"the following arguments are required: \" + miss.name
+            k = k + 1
         for a in self._opts:
             if a.required and not ns._present[a.dest]:
                 raise \"the following arguments are required: \" + a.name
@@ -2607,6 +3062,8 @@ struct ArgumentParser:
             if req and not mx_seen[gi]:
                 raise \"one of the arguments in mutually exclusive group is required\"
             gi = gi + 1
+        if self._has_sub and self._sub_required and not ns.has(self._sub_dest):
+            raise \"the following arguments are required: \" + self._sub_dest
 
     # Render just the usage synopsis (#1710), with no trailing newline. This is
     # the single `usage:` line that `format_help` leads with, exposed on its own
@@ -2616,65 +3073,84 @@ struct ArgumentParser:
         auto u = \"usage:\"
         if self.prog != \"\":
             u = u + \" \" + self.prog
-        u = u + \" [-h]\"
+        # The implicit -h is omitted when `add_help=False` (#1713 G14).
+        if self._add_help:
+            u = u + \" [-h]\"
         # Hidden arguments (#1702) parse normally but never appear in usage.
         for a in self._opts:
             if not a.hidden:
                 u = u + \" \" + __argparse_usage_opt(a)
         for a in self._pos:
             if not a.hidden:
-                u = u + \" \" + a.metavar
+                u = u + \" \" + __argparse_nargs_disp(a.metavar, a.nargs)
         if self._has_sub:
-            u = u + \" \" + self._sub_dest + \" ...\"
+            # The subcommand slot shows the configured metavar, else the dest
+            # (kept as the default for golden stability, #1710/#1713 G11).
+            auto sel = self._sub_dest
+            if self._sub_metavar != \"\":
+                sel = self._sub_metavar
+            u = u + \" \" + sel + \" ...\"
         return u
 
     # Render the usage + argument help (deterministic, for goldens/tooling).
     def format_help(self) -> str:
         list[str] lines = []
+        auto prog = self.prog
         # Lead with the shared synopsis so `format_usage` and `format_help`
         # never drift (#1710).
         lines.append(self.format_usage())
         if self.description != \"\":
             lines.append(\"\")
-            lines.append(self.description)
+            lines.append(__argparse_interp(self.description, \"\", prog))
         # Count the visible positionals so a positionals-only section made up
         # entirely of hidden arguments emits no heading (#1702).
         auto vis_pos = 0
         for a in self._pos:
             if not a.hidden:
                 vis_pos = vis_pos + 1
-        if vis_pos > 0 or self._has_sub:
+        if vis_pos > 0 or (self._has_sub and self._sub_title == \"\"):
             lines.append(\"\")
             lines.append(\"positional arguments:\")
             for a in self._pos:
                 if not a.hidden:
-                    lines.append(__argparse_help_row(a.metavar, a.help))
-            if self._has_sub:
-                auto subnames = \"\"
-                auto f = True
-                for nm in self._sub_names:
-                    if f:
-                        subnames = nm
-                        f = False
-                    else:
-                        subnames = subnames + \",\" + nm
-                lines.append(__argparse_help_row(self._sub_dest, \"{\" + subnames + \"}\"))
+                    lines.append(__argparse_help_row(a.metavar, __argparse_interp(a.help, a.default_raw, prog)))
+            # A subparsers block without its own title stays under the
+            # positional section, as before (#1710 golden); a configured title
+            # (#1713 G11) promotes it to its own heading below.
+            if self._has_sub and self._sub_title == \"\":
+                lines.append(__argparse_help_row(self._sub_dest, __argparse_subnames(self)))
         lines.append(\"\")
         lines.append(\"options:\")
-        lines.append(\"  -h, --help  show this help message and exit\")
+        if self._add_help:
+            lines.append(\"  -h, --help  show this help message and exit\")
         for a in self._opts:
             if a.group_title == \"\" and not a.hidden:
-                lines.append(__argparse_help_row(__argparse_opt_display(a), a.help))
+                lines.append(__argparse_help_row(__argparse_opt_display(a), __argparse_interp(a.help, a.default_raw, prog)))
         # A group heading is emitted once, at its first VISIBLE member, so a
         # group with only hidden members contributes no heading and hidden
-        # members never shift the order of the visible rows (#1702).
+        # members never shift the order of the visible rows (#1702). A group
+        # description (#1713 B3) is emitted right under its heading.
         for a in self._opts:
             if a.group_title != \"\" and not a.hidden and __argparse_first_in_group(self, a):
                 lines.append(\"\")
                 lines.append(a.group_title + \":\")
+                auto gd = self._group_description(a.group_title)
+                if gd != \"\":
+                    lines.append(\"  \" + gd)
                 for b in self._opts:
                     if b.group_title == a.group_title and not b.hidden:
-                        lines.append(__argparse_help_row(__argparse_opt_display(b), b.help))
+                        lines.append(__argparse_help_row(__argparse_opt_display(b), __argparse_interp(b.help, b.default_raw, prog)))
+        # A titled subparsers block (#1713 G11) is its own section.
+        if self._has_sub and self._sub_title != \"\":
+            lines.append(\"\")
+            lines.append(self._sub_title + \":\")
+            if self._sub_desc != \"\":
+                lines.append(\"  \" + self._sub_desc)
+            lines.append(__argparse_help_row(self._sub_dest, __argparse_subnames(self)))
+        # The epilog closes the message (#1713 G15).
+        if self.epilog != \"\":
+            lines.append(\"\")
+            lines.append(__argparse_interp(self.epilog, \"\", prog))
         auto out = \"\"
         auto first = True
         for ln in lines:
@@ -2684,6 +3160,18 @@ struct ArgumentParser:
             else:
                 out = out + \"\\n\" + ln
         return out
+
+    # Print `format_usage()` to stdout (#1713 G19 companion; mirrors CPython's
+    # `print_usage`). No trailing synopsis state is changed.
+    def print_usage(self):
+        print(self.format_usage())
+
+    # The configured version string for the `version` action (#1713 G19), or \"\".
+    def _version_text(self) -> str:
+        for a in self._opts:
+            if a.action == \"version\":
+                return a.version
+        return \"\"
 
     # Print `format_help()` to stdout.
     def print_help(self):
@@ -2701,37 +3189,124 @@ def __argparse_dest(str name) -> str:
         s = s[1:]
     return s.replace(\"-\", \"_\")
 
-# Is `tok` a negative number (so it is a value, not an option)? e.g. \"-5\".
+# Is `tok` a negative number (so it is a value, not an option, #1713 B1)?
+# Matches CPython's `-\\d+` / `-\\d*\\.\\d+`: integers and decimals (e.g. \"-5\",
+# \"-1.5\", \"-.5\") count, but exponent/hex forms do not, exactly as CPython
+# declines to treat `-1e3` as a negative number for option disambiguation.
 def __argparse_is_negnum(str tok) -> bool:
     if len(tok) < 2:
         return False
-    return tok[1:].isdigit()
+    if tok[:1] != \"-\":
+        return False
+    auto s = tok[1:]
+    if s.isdigit():
+        return True
+    auto dot = s.find(\".\")
+    if dot < 0:
+        return False
+    auto ip = s[:dot]
+    auto fp = s[dot + 1:]
+    if len(fp) == 0 or not fp.isdigit():
+        return False
+    if len(ip) == 0:
+        return True
+    return ip.isdigit()
 
-# Validate a value against an argument's choices and declared type (raises).
+# Convert a value to the canonical form used for choice comparison (#1713 G10),
+# so e.g. an int choice \"1\" matches the supplied \"01\".
+def __argparse_canon(str kind, str v) -> str:
+    if kind == \"int\":
+        return str(int(v))
+    elif kind == \"float\":
+        return str(float(v))
+    elif kind == \"bigint\":
+        return str(bigint(v))
+    return v
+
+# Validate a value against an argument's declared type and choices (raises a
+# catchable error). Types (#1713 G8): str/bytes/bool accept any string; int,
+# float, bigint, complex parse-validate; char must be one codepoint. Choices
+# (#1713 G10) compare against the converted canonical value.
 def __argparse_check(Argument a, str val):
-    if a.has_choices:
-        auto ok = False
-        for c in a.choices:
-            if c == val:
-                ok = True
-        if not ok:
-            raise \"argument \" + a.name + \": invalid choice: \" + val
     if a.kind == \"int\":
         int(val)
     elif a.kind == \"float\":
         float(val)
+    elif a.kind == \"bigint\":
+        bigint(val)
+    elif a.kind == \"complex\":
+        complex(val)
+    elif a.kind == \"char\":
+        if len(val) != 1:
+            raise \"argument \" + a.name + \": invalid char value: '\" + val + \"'\"
+    if a.has_choices:
+        auto cv = __argparse_canon(a.kind, val)
+        auto ok = False
+        for c in a.choices:
+            if __argparse_canon(a.kind, c) == cv:
+                ok = True
+        if not ok:
+            raise \"argument \" + a.name + \": invalid choice: \" + val
 
-# One option's token in the usage line.
+# A `{a,b,c}` choices string (#1713 G17).
+def __argparse_choice_str(list[str] choices) -> str:
+    auto s = \"{\"
+    auto f = True
+    for c in choices:
+        if f:
+            s = s + c
+            f = False
+        else:
+            s = s + \",\" + c
+    return s + \"}\"
+
+# Expand a metavar for `nargs` in a usage/help slot (#1713 G2).
+def __argparse_nargs_disp(str mv, str nargs) -> str:
+    if nargs == \"?\":
+        return \"[\" + mv + \"]\"
+    elif nargs == \"*\":
+        return \"[\" + mv + \" ...]\"
+    elif nargs == \"+\":
+        return mv + \" [\" + mv + \" ...]\"
+    elif nargs == \"...\":
+        return \"...\"
+    elif len(nargs) > 0 and nargs.isdigit():
+        auto need = int(nargs)
+        auto s = \"\"
+        auto c = 0
+        while c < need:
+            if c > 0:
+                s = s + \" \"
+            s = s + mv
+            c = c + 1
+        return s
+    return mv
+
+# Does an argument consume no value when displayed (#1713 G4)?
+def __argparse_zero_disp(Argument a) -> bool:
+    if a.is_flag:
+        return True
+    return a.action == \"store_const\" or a.action == \"append_const\" or a.action == \"count\" or a.action == \"version\"
+
+# One option's token in the usage line. A required optional is shown without
+# brackets, as CPython does (#1713).
 def __argparse_usage_opt(Argument a) -> str:
-    if a.is_flag:
-        return \"[\" + a.name + \"]\"
-    return \"[\" + a.name + \" \" + a.metavar + \"]\"
+    auto body = a.name
+    if not __argparse_zero_disp(a):
+        body = a.name + \" \" + __argparse_nargs_disp(a.metavar, a.nargs)
+    if a.required:
+        return body
+    return \"[\" + body + \"]\"
 
-# One option's left column in the help body.
+# One option's left column in the help body. Both spellings are shown when the
+# argument has an alias (#1713 G1).
 def __argparse_opt_display(Argument a) -> str:
-    if a.is_flag:
-        return a.name
-    return a.name + \" \" + a.metavar
+    auto head = a.name
+    if a.alias != \"\":
+        head = a.alias + \", \" + a.name
+    if __argparse_zero_disp(a):
+        return head
+    return head + \" \" + a.metavar
 
 # A two-column help row (\"  <head>  <help>\"), or just the head when no help.
 def __argparse_help_row(str head, str help) -> str:
@@ -2748,6 +3323,24 @@ def __argparse_first_in_group(ArgumentParser p, Argument a) -> bool:
         if b.group_title == a.group_title and not b.hidden:
             return b.name == a.name
     return False
+
+# The `{name,alias,...}` choice list for a parser's subcommands (#1713 G11):
+# primary names first, then every alias, in declaration order.
+def __argparse_subnames(ArgumentParser p) -> str:
+    list[str] all = []
+    for nm in p._sub_names:
+        all.append(nm)
+    for al in p._sub_alias_names:
+        all.append(al)
+    return __argparse_choice_str(all)
+
+# Interpolate the two help/description placeholders CPython supports (#1713
+# G16): `%(default)s` and `%(prog)s`. Done by plain substring replacement.
+def __argparse_interp(str text, str default, str prog) -> str:
+    auto s = text
+    s = s.replace(\"%(default)s\", default)
+    s = s.replace(\"%(prog)s\", prog)
+    return s
 
 # collections (#972, epic #966) — Python-`collections` conveniences, each a
 # generic prelude struct over the built-in capability-typed `dict`/`list`
