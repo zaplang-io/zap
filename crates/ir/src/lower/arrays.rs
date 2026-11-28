@@ -1223,6 +1223,32 @@ impl<'a> FnLower<'a> {
                 )))
             }
         };
+        // Complex reductions have no kernel (#1721, sibling of #1719): `min`/`max`/
+        // `prod`/`mean` on a complex array emit undefined `zap_array_{…}_complex`
+        // (a link error), and the axis forms route to `zap_array_reduce_axis` /
+        // `zap_array_mean_axis`, whose dtype switch has no `DTYPE_COMPLEX` case
+        // (`default: break`) → an unfilled result buffer (silently wrong). Reject
+        // at lowering: `min`/`max` have no ordering (permanent, as `sort` rejects);
+        // `prod`/`mean` are meaningful but their kernels are deferred to #938. Full
+        // `sum` is supported (`zap_array_sum_complex`); its axis form is guarded in
+        // the axis-reduction branch below.
+        if matches!(d, Dtype::Complex) {
+            match op_code {
+                1 | 2 => {
+                    return Err(err(format!(
+                        "{name}: complex arrays have no ordering \
+                         (operate on real/imag parts)"
+                    )))
+                }
+                3 | 4 => {
+                    return Err(err(format!(
+                        "{name}: not yet supported for complex arrays \
+                         (tracked under zaplang-io/zap#938)"
+                    )))
+                }
+                _ => {}
+            }
+        }
         let is_mean = op_code == 4;
         let raises = matches!(op_code, 1 | 2); // min/max raise on empty
                                                // The float result dtype for `mean` (f32 source stays f32).
@@ -1290,6 +1316,15 @@ impl<'a> FnLower<'a> {
         }
 
         // Axis reduction on a rank-(n>=2) array -> a rank-(n-1) array.
+        // Only `sum` reaches here for complex (min/max/prod/mean were rejected
+        // above); `zap_array_reduce_axis` has no `DTYPE_COMPLEX` case, so an axis
+        // sum over a complex array would leave the result buffer unfilled (#1721).
+        if matches!(d, Dtype::Complex) {
+            return Err(err(
+                "sum(axis=): axis reductions are not yet supported for complex \
+                 arrays (tracked under zaplang-io/zap#938)",
+            ));
+        }
         let ax = axis.unwrap();
         let (av, at) = self.expr(ax)?;
         let av = self.coerce(av, at, Ty::I64);
@@ -1910,6 +1945,27 @@ impl<'a> FnLower<'a> {
             _ => return Err(err("internal: non-comparison op in lower_array_cmp")),
         };
         let pred_v = self.iconst(Ty::I64, pred);
+        // Complex arrays have no comparison kernel (#1721, sibling of #1719): a
+        // complex element is a 16-byte `(re, im)` pointer-word, but `zap_array_cmp`
+        // / `zap_array_cmp_scalar` dispatch via `mm_load_{f,u,i}` with no
+        // `DTYPE_COMPLEX` case, so the word is compared as a raw `int64` → silent
+        // garbage. Reject at lowering: ordering has no meaning for complex (Zap
+        // rejects complex ordering, as `sort`/`argsort` do — a permanent rejection);
+        // `==` / `!=` are meaningful but their kernel is deferred to the complex
+        // epic #938.
+        let is_complex_array = |t: &Ty| matches!(t, Ty::Array(Dtype::Complex, _));
+        if is_complex_array(&lt) || is_complex_array(&rt) {
+            return Err(err(match op {
+                Lt | Le | Gt | Ge => {
+                    "array comparison: complex arrays have no ordering \
+                     (compare the real/imag parts)"
+                }
+                _ => {
+                    "array `==` / `!=` is not yet supported for complex arrays \
+                     (tracked under zaplang-io/zap#938)"
+                }
+            }));
+        }
         let is_scalar = |t: &Ty| t.is_float() || t.int_width().is_some();
         match (lt, rt) {
             (Ty::Array(_, lnd), Ty::Array(_, rnd)) => {
