@@ -1,0 +1,22 @@
+usage: demo [-h] [--jobs jobs] [--verbose] src
+---
+usage: [-h] [--name name]
+---
+usage: bare [-h]
+---
+usage: meta [-h] [--out FILE] PATH
+---
+usage: demo [-h] [--visible] shown
+---
+usage: git [-h] [--config config]
+---
+usage: git [-h] [--config config] command ...
+---
+usage: tool [-h] verb ...
+---
+True
+False
+True
+True
+4
+True

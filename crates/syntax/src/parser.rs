@@ -2608,9 +2608,11 @@ struct ArgumentParser:
                 raise \"one of the arguments in mutually exclusive group is required\"
             gi = gi + 1
 
-    # Render the usage + argument help (deterministic, for goldens/tooling).
-    def format_help(self) -> str:
-        list[str] lines = []
+    # Render just the usage synopsis (#1710), with no trailing newline. This is
+    # the single `usage:` line that `format_help` leads with, exposed on its own
+    # so tooling can reuse the synopsis without depending on the help layout.
+    # Mirrors Python's `ArgumentParser.format_usage()`; neither parses nor prints.
+    def format_usage(self) -> str:
         auto u = \"usage:\"
         if self.prog != \"\":
             u = u + \" \" + self.prog
@@ -2624,7 +2626,14 @@ struct ArgumentParser:
                 u = u + \" \" + a.metavar
         if self._has_sub:
             u = u + \" \" + self._sub_dest + \" ...\"
-        lines.append(u)
+        return u
+
+    # Render the usage + argument help (deterministic, for goldens/tooling).
+    def format_help(self) -> str:
+        list[str] lines = []
+        # Lead with the shared synopsis so `format_usage` and `format_help`
+        # never drift (#1710).
+        lines.append(self.format_usage())
         if self.description != \"\":
             lines.append(\"\")
             lines.append(self.description)
