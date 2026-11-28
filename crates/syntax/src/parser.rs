@@ -2919,9 +2919,12 @@ struct ArgumentParser:
         if pos_i < len(cur._pos):
             Argument pa = cur._pos[pos_i]
             ctx.active_dest = pa.dest
-            for c in pa.choices:
-                if c.startswith(prefix):
-                    cands.append(c)
+            # A hidden positional (#1702/#1716) is still the completion target but
+            # offers no choice suggestions, like a hidden option.
+            if not pa.hidden:
+                for c in pa.choices:
+                    if c.startswith(prefix):
+                        cands.append(c)
         ctx.candidates = cands
         return ctx
 

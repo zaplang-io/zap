@@ -51,10 +51,13 @@ Two refinements keep it faithful to the strict scanner and to visibility rules:
   reprocessed as an option/separator rather than swallowed as the value. A lone
   `-` and a negative number are still accepted as values, and the *incomplete*
   cursor word in that position is still a valid value prefix.
-- **Hidden options get no choice suggestions (#1716/#1702).** The pending-value
+- **Hidden arguments get no choice suggestions (#1716/#1702).** The pending-value
   and attached-value branches apply the same visibility policy as option-name
   completion: a `hidden=True` option parses normally but offers no `candidates`,
-  whether addressed by exact spelling or a unique abbreviation.
+  whether addressed by exact spelling or a unique abbreviation. The same gate
+  covers a **hidden positional** (a sibling of #1716 found by scanning the
+  candidate-producing branches): it stays the completion target (`active_dest`)
+  but suggests no choices.
 
 ## Rationale
 

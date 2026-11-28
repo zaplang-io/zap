@@ -46,6 +46,21 @@ def build_h() -> ArgumentParser:
     return h
 
 
+def build_hp() -> ArgumentParser:
+    # A hidden positional with choices (#1716 sibling: hidden positionals must
+    # not leak choice suggestions either).
+    auto p = argparse.ArgumentParser(prog="hp")
+    p.add_argument("hidden-pos", choices=["hp-a", "hp-b"], hidden=True)
+    return p
+
+
+def build_vp() -> ArgumentParser:
+    # A visible positional with choices (the control case).
+    auto p = argparse.ArgumentParser(prog="vp")
+    p.add_argument("shown-pos", choices=["sp-a", "sp-b"])
+    return p
+
+
 def dump(CompletionContext c):
     print(c.kind)
     print(c.active_option)
@@ -105,3 +120,9 @@ def main():
     dump(h.completion_context(["--visible-mode"], "vis"))
     print("---")
     dump(h.completion_context([], "--visible-mode=vis"))
+    print("===")
+    # #1716 sibling: a hidden positional is the completion target but offers no
+    # choice suggestions; a visible positional is unaffected.
+    dump(build_hp().completion_context([], "hp"))
+    print("---")
+    dump(build_vp().completion_context([], "sp"))
